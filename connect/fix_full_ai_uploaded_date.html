@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fix: Add uploaded_date to Full AI Messages</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f1f5f9; margin: 0; padding: 32px; }
+        .card { background: white; border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); padding: 32px; max-width: 720px; margin: 0 auto; }
+        h1 { margin: 0 0 8px 0; font-size: 22px; color: #1e293b; display: flex; align-items: center; gap: 10px; }
+        h1 i { color: #0d9488; }
+        .subtitle { color: #64748b; font-size: 14px; margin-bottom: 28px; line-height: 1.6; }
+        .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 24px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        .btn-primary { background: #0d9488; color: white; }
+        .btn-primary:hover:not(:disabled) { background: #0f766e; }
+        .btn-primary:disabled { background: #94a3b8; cursor: not-allowed; }
+        .log { margin-top: 24px; background: #0f172a; border-radius: 8px; padding: 16px; font-family: 'Courier New', monospace; font-size: 13px; line-height: 1.7; max-height: 480px; overflow-y: auto; display: none; }
+        .log-line { margin: 0; }
+        .log-line.info    { color: #94a3b8; }
+        .log-line.success { color: #34d399; }
+        .log-line.warning { color: #fbbf24; }
+        .log-line.error   { color: #f87171; }
+        .log-line.bold    { color: #e2e8f0; font-weight: 700; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 24px; display: none; }
+        .stat { background: #f8fafc; border-radius: 8px; padding: 16px; text-align: center; border: 1.5px solid #e2e8f0; }
+        .stat-value { font-size: 28px; font-weight: 700; color: #1e293b; }
+        .stat-label { font-size: 12px; color: #64748b; margin-top: 4px; }
+        .stat.success { border-color: #6ee7b7; }
+        .stat.warning { border-color: #fde68a; }
+        .stat.neutral  { border-color: #bfdbfe; }
+        #status-badge { display: none; margin-top: 16px; padding: 10px 16px; border-radius: 8px; font-size: 14px; font-weight: 600; }
+        #status-badge.done  { background: #d1fae5; color: #065f46; }
+        #status-badge.error { background: #fee2e2; color: #991b1b; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h1><i class="fas fa-wrench"></i> Fix: Add uploaded_date to Full AI Messages</h1>
+        <p class="subtitle">
+            Full AI Generate messages saved before the fix are missing the <code>uploaded_date</code> field,
+            which causes them to be invisible in Fast Connect Review (Firestore silently excludes documents
+            that lack a field used in <code>orderBy</code>).<br><br>
+            This tool scans <strong>connect_queue</strong> for all <code>source = "Full AI Generate"</code>
+            documents, and backfills <code>uploaded_date</code> on any that are missing it.
+        </p>
+
+        <button class="btn btn-primary" id="runBtn">
+            <i class="fas fa-play"></i> Scan and Fix Messages
+        </button>
+
+        <div id="status-badge"></div>
+
+        <div class="stats" id="statsGrid">
+            <div class="stat neutral">
+                <div class="stat-value" id="statScanned">-</div>
+                <div class="stat-label">Full AI docs scanned</div>
+            </div>
+            <div class="stat success">
+                <div class="stat-value" id="statFixed">-</div>
+                <div class="stat-label">Fixed (date added)</div>
+            </div>
+            <div class="stat warning">
+                <div class="stat-value" id="statSkipped">-</div>
+                <div class="stat-label">Already had date</div>
+            </div>
+        </div>
+
+        <div class="log" id="log"></div>
+    </div>
+
+    <script src="../js/auth.js"></script>
+    <script src="../js/clemail-firestore-wrapper.js"></script>
+
+    <script type="module">
+        import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
+
+        await window.firebaseReady;
+        const auth  = window.auth;
+        const db    = window.clemailDb;
+        const { collection, getDocs, updateDoc, doc, query, where } = window.clemailFirestore;
+
+        // ── Logging helpers ──────────────────────────────────────────────────────
+        const logEl = document.getElementById('log');
+        function log(msg, type = 'info') {
+            logEl.style.display = 'block';
+            const p = document.createElement('p');
+            p.className = `log-line ${type}`;
+            p.textContent = msg;
+            logEl.appendChild(p);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // ── Auth gate ────────────────────────────────────────────────────────────
+        let currentUser = null;
+        onAuthStateChanged(auth, user => { currentUser = user; });
+
+        // ── Main fix logic ───────────────────────────────────────────────────────
+        document.getElementById('runBtn').addEventListener('click', async function () {
+            if (!currentUser) { alert('Not signed in — please sign in first.'); return; }
+
+            this.disabled = true;
+            this.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Working...';
+
+            const badge   = document.getElementById('status-badge');
+            const grid    = document.getElementById('statsGrid');
+            badge.style.display = 'none';
+            grid.style.display  = 'none';
+
+            let scanned = 0, fixed = 0, skipped = 0, errors = 0;
+            const fixDate = new Date().toISOString();
+
+            try {
+                log('🔍 Querying connect_queue for source = "Full AI Generate"...', 'bold');
+
+                const q = query(
+                    collection(db, 'connect_queue'),
+                    where('source', '==', 'Full AI Generate')
+                );
+                const snap = await getDocs(q);
+                scanned = snap.size;
+                log(`   Found ${scanned} Full AI Generate document(s).`, 'info');
+
+                if (scanned === 0) {
+                    log('⚠️  No Full AI Generate messages found in connect_queue.', 'warning');
+                } else {
+                    log(`\n⚙️  Processing ${scanned} docs...`, 'bold');
+
+                    let i = 0;
+                    for (const docSnap of snap.docs) {
+                        i++;
+                        const data = docSnap.data();
+
+                        if (data.uploaded_date) {
+                            skipped++;
+                            if (i <= 5 || i === scanned) {
+                                log(`   [${i}/${scanned}] ${docSnap.id.substring(0, 10)}... already has uploaded_date — skip`, 'info');
+                            } else if (i === 6) {
+                                log(`   ... (skipping log for already-fixed docs) ...`, 'info');
+                            }
+                            continue;
+                        }
+
+                        // Use createdAt/generatedAt if available so the date is historically accurate.
+                        // These may be Firestore Timestamps (with .toDate()) or plain ISO strings.
+                        function toISO(val) {
+                            if (!val) return null;
+                            if (typeof val === 'string') return val;
+                            if (typeof val.toDate === 'function') return val.toDate().toISOString();
+                            if (val instanceof Date) return val.toISOString();
+                            return null;
+                        }
+                        const backfillDate = toISO(data.createdAt) || toISO(data.generatedAt) || fixDate;
+
+                        try {
+                            await updateDoc(doc(db, 'connect_queue', docSnap.id), {
+                                uploaded_date: backfillDate
+                            });
+                            fixed++;
+                            log(`   [${i}/${scanned}] ✔ Fixed ${docSnap.id.substring(0, 10)}... → uploaded_date = ${backfillDate.substring(0, 19)}`, 'success');
+                        } catch (updateErr) {
+                            errors++;
+                            log(`   [${i}/${scanned}] ✘ Error on ${docSnap.id.substring(0, 10)}...: ${updateErr.message}`, 'error');
+                        }
+                    }
+                }
+
+                log(`\n✅ Done. ${fixed} fixed, ${skipped} already had date, ${errors} errors.`, 'bold');
+
+                // Show stat cards
+                document.getElementById('statScanned').textContent = scanned;
+                document.getElementById('statFixed').textContent   = fixed;
+                document.getElementById('statSkipped').textContent = skipped;
+                grid.style.display = 'grid';
+
+                badge.className      = 'done';
+                badge.style.display  = 'block';
+                badge.textContent    = errors === 0
+                    ? `✅ Complete — ${fixed} message(s) fixed. Refresh Fast Connect Review to see them.`
+                    : `⚠️ Finished with ${errors} error(s). Check the log.`;
+
+            } catch (err) {
+                log(`❌ Fatal error: ${err.message}`, 'error');
+                badge.className     = 'error';
+                badge.style.display = 'block';
+                badge.textContent   = `Error: ${err.message}`;
+            }
+
+            this.disabled = false;
+            this.innerHTML = '<i class="fas fa-redo"></i> Run Again';
+        });
+    </script>
+</body>
+</html>

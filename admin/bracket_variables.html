@@ -1,0 +1,1278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bracket Variables - HealthLuminate Admin</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+  
+  <!-- HealthLuminate Centralized Auth System -->
+  <script src="../js/auth.js"></script>
+  <!-- Delay folder protection to allow Firebase to initialize -->
+  <script>
+    // Prevent auto-protection from folder-protection.js
+    window._skipAutoProtect = true;
+  </script>
+  <script src="../js/folder-protection.js"></script>
+  
+  <!-- Initialize Admin Panel Protection -->
+  <script>
+    // Initialize admin panel protection when Firebase is ready
+    window.firebaseReady.then(() => {
+      console.log('🔗 Bracket Variables Firebase ready, waiting for auth state...');
+    });
+  </script>
+  
+  <!-- CLEmail Secure API Wrapper -->
+  <script src="../js/clemail-firestore-wrapper.js"></script>
+  
+  <!-- Bracket Variables Firebase Functions -->
+  <script type="module">
+    // Wait for centralized Firebase to be ready (for authentication)
+    await window.firebaseReady;
+    
+    // Get CLEmail wrapper functions for secure access
+    const { collection, getDocs, doc, setDoc, deleteDoc, updateDoc, getDoc, query, where, orderBy } = window.clemailFirestore;
+    
+    // Verify main Firebase instances are available (for authentication)
+    let retryCount = 0;
+    const maxRetries = 10;
+    
+    while ((!window.auth || !window.db || !window.firebaseApp) && retryCount < maxRetries) {
+      console.log(`⏳ Waiting for main Firebase instances... (attempt ${retryCount + 1}/${maxRetries})`);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      retryCount++;
+    }
+    
+    if (!window.auth || !window.db || !window.firebaseApp) {
+      console.error('❌ Main Firebase instances not available after waiting');
+      throw new Error('Main Firebase not properly initialized after timeout');
+    }
+    
+    console.log('✅ Main Firebase instances are now available');
+    
+    // Use centralized Firebase instances for authentication
+    const firebaseAuth = window.auth;
+    const mainFirestore = window.db;
+    
+    // Use CLEmail secure wrapper for data access
+    const emailFirestore = window.clemailDb;
+    
+    console.log('🔒 CLEmail secure wrapper configured');
+    console.log('✅ All data access routes through authenticated Railway backend');
+    
+    // Set up database reference and expose globally (now using secure wrapper)
+    window.emailDB = emailFirestore;
+    
+    // Global variables
+    window.currentUser = null;
+    window.bracketVariables = [];
+    window.customers = [];
+    window.selectedCustomer = 'all'; // Filter for variables display
+    
+    // ADMIN FOLDER: Only HealthLuminate domains allowed
+    const ALLOWED_DOMAINS = ['healthluminate.com', 'careluminate.com'];
+    
+    function getDomainFromEmail(email) {
+      return email.split('@')[1].toLowerCase();
+    }
+
+    function hasAdminAccess(user) {
+      const domain = getDomainFromEmail(user.email);
+      return ALLOWED_DOMAINS.includes(domain);
+    }
+
+    // Wait for the centralized auth system to be ready
+    let bracketVariablesInitialized = false;
+    
+    // Function to initialize bracket variables when auth is ready
+    async function initializeBracketVariables() {
+      if (bracketVariablesInitialized) return;
+      
+      const user = window.auth?.currentUser;
+      if (!user) {
+        console.log('❌ No user found during bracket variables initialization');
+        return;
+      }
+      
+      console.log('✅ Bracket variables access granted to:', user.email);
+      window.currentUser = user;
+      
+      // Hide loading and show bracket variables content
+      const loadingEl = document.getElementById('loading');
+      const bracketVariablesEl = document.getElementById('bracket-variables-content');
+      
+      if (loadingEl) loadingEl.style.display = 'none';
+      if (bracketVariablesEl) bracketVariablesEl.style.display = 'block';
+      
+      // Load data
+      await loadCustomers();
+      await loadBracketVariables();
+      
+      bracketVariablesInitialized = true;
+    }
+    
+    // Listen for auth state changes via global callback
+    window.authStateChanged = async (authState) => {
+      console.log('🔄 Bracket variables received auth state change:', authState);
+      
+      if (authState.isLoggedIn && authState.isVerified) {
+        // Wait a bit to ensure window.db is available
+        let dbReady = false;
+        for (let i = 0; i < 20; i++) {
+          if (window.db) {
+            dbReady = true;
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 300));
+        }
+        
+        if (!dbReady) {
+          console.error('❌ Database not ready after auth state change');
+          return;
+        }
+        
+        // Additional delay to ensure folder-protection.js is ready
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Check admin access before initializing
+        try {
+          const hasAccess = await window.checkFolderAccess('admin', authState.user.email, {
+            allowOnError: false,
+            allowOnMissing: false
+          });
+          
+          if (hasAccess) {
+            await initializeBracketVariables();
+          } else {
+            window.showAccessDenied('admin', authState.user.email, 'This admin area is restricted to HealthLuminate team members only.');
+          }
+        } catch (error) {
+          console.error('❌ Error checking folder access:', error);
+          // Retry once after a delay
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          try {
+            const hasAccess = await window.checkFolderAccess('admin', authState.user.email, {
+              allowOnError: false,
+              allowOnMissing: false
+            });
+            
+            if (hasAccess) {
+              await initializeBracketVariables();
+            } else {
+              window.showAccessDenied('admin', authState.user.email, 'This admin area is restricted to HealthLuminate team members only.');
+            }
+          } catch (retryError) {
+            console.error('❌ Retry failed:', retryError);
+            window.showAccessDenied('admin', authState.user.email, 'Error checking permissions. Please refresh the page.');
+          }
+        }
+      } else if (!authState.isChecking && !authState.isLoggedIn) {
+        console.log('🔒 Auth state indicates user not logged in, redirecting...');
+        window.redirectToLogin('You must be logged in to access the bracket variables.');
+      }
+    };
+    
+    // Also try to initialize after a delay if auth is already ready
+    setTimeout(async () => {
+      if (window.auth?.currentUser && window.auth.currentUser.emailVerified && !bracketVariablesInitialized) {
+        const hasAccess = await window.checkFolderAccess('admin', window.auth.currentUser.email, {
+          allowOnError: false,
+          allowOnMissing: false
+        });
+        
+        if (hasAccess) {
+          await initializeBracketVariables();
+        }
+      }
+    }, 3000);
+
+    // ======= BRACKET VARIABLES FUNCTIONS =======
+    
+    // Load customers from Firebase
+    async function loadCustomers() {
+      try {
+        console.log('🔄 Loading customers from CLEmail project...');
+        const customersCollection = collection(window.emailDB, 'customerList');
+        const customersSnapshot = await getDocs(customersCollection);
+        
+        window.customers = [];
+        customersSnapshot.forEach((doc) => {
+          window.customers.push({
+            id: doc.id,
+            ...doc.data()
+          });
+        });
+        
+        console.log('✅ Customers loaded from CLEmail project:', window.customers.length, 'customers found');
+        updateCustomerSelectors();
+      } catch (error) {
+        console.error('❌ Error loading customers from CLEmail project:', error);
+        showAlert('Error loading customers: ' + error.message, 'error');
+        window.customers = [];
+      }
+    }
+
+    // Load bracket variables from Firebase
+    async function loadBracketVariables() {
+      try {
+        console.log('🔄 Loading bracket variables from CLEmail project...');
+        const variablesCollection = collection(window.emailDB, 'bracketVariables');
+        
+        // Start with a simple query (no composite index required)
+        // We'll sort on the client side to avoid index requirements
+        let variablesSnapshot;
+        
+        try {
+          // Try the optimized query first (requires composite index)
+          const variablesQuery = query(variablesCollection, orderBy('category'), orderBy('variable'));
+          variablesSnapshot = await getDocs(variablesQuery);
+          console.log('✅ Using optimized query with server-side sorting');
+        } catch (indexError) {
+          console.log('⚠️ Composite index not available, falling back to simple query with client-side sorting');
+          console.log('💡 To optimize performance, create the composite index at:', indexError.message.match(/https:\/\/[^\s]+/)?.[0]);
+          
+          // Fallback to simple query without orderBy
+          variablesSnapshot = await getDocs(variablesCollection);
+        }
+        
+        window.bracketVariables = [];
+        variablesSnapshot.forEach((doc) => {
+          window.bracketVariables.push({
+            id: doc.id,
+            ...doc.data()
+          });
+        });
+        
+        // Sort on client side to ensure consistent ordering
+        window.bracketVariables.sort((a, b) => {
+          const categoryA = (a.category || 'Uncategorized').toLowerCase();
+          const categoryB = (b.category || 'Uncategorized').toLowerCase();
+          
+          if (categoryA !== categoryB) {
+            return categoryA.localeCompare(categoryB);
+          }
+          
+          const variableA = (a.variable || '').toLowerCase();
+          const variableB = (b.variable || '').toLowerCase();
+          return variableA.localeCompare(variableB);
+        });
+        
+        console.log('✅ Bracket variables loaded from CLEmail project:', window.bracketVariables.length, 'variables found');
+        displayBracketVariables();
+        updateStats();
+      } catch (error) {
+        console.error('❌ Error loading bracket variables from CLEmail project:', error);
+        showAlert('Error loading bracket variables: ' + error.message, 'error');
+        window.bracketVariables = [];
+        displayBracketVariables();
+        updateStats();
+      }
+    }
+
+    // Display bracket variables
+    function displayBracketVariables() {
+      const container = document.getElementById('variables-list');
+      
+      // Filter variables by selected customer
+      let filteredVariables = window.bracketVariables;
+      if (window.selectedCustomer !== 'all') {
+        filteredVariables = window.bracketVariables.filter(v => v.customerId === window.selectedCustomer);
+      }
+      
+      if (window.bracketVariables.length === 0) {
+        container.innerHTML = `
+          <div class="no-variables">
+            <i class="fas fa-code"></i>
+            <h3>No Bracket Variables Configured</h3>
+            <p>Add your first bracket variable to start personalizing your outreach.</p>
+            <button onclick="showVariableForm()" class="btn btn-primary">
+              <i class="fas fa-plus"></i> Add First Variable
+            </button>
+          </div>
+        `;
+        return;
+      }
+      
+      if (filteredVariables.length === 0) {
+        const selectedCustomerName = window.customers.find(c => c.id === window.selectedCustomer)?.name || 'Selected Customer';
+        container.innerHTML = `
+          <div class="no-variables">
+            <i class="fas fa-filter"></i>
+            <h3>No Variables for ${selectedCustomerName}</h3>
+            <p>Add bracket variables for this customer.</p>
+            <button onclick="showVariableForm()" class="btn btn-primary">
+              <i class="fas fa-plus"></i> Add Variable
+            </button>
+          </div>
+        `;
+        return;
+      }
+
+      // Group variables by category
+      const categories = {};
+      filteredVariables.forEach(variable => {
+        const category = variable.category || 'Uncategorized';
+        if (!categories[category]) {
+          categories[category] = [];
+        }
+        categories[category].push(variable);
+      });
+
+      const customerName = window.selectedCustomer === 'all' ? 'All Customers' : 
+        (window.customers.find(c => c.id === window.selectedCustomer)?.name || 'Unknown Customer');
+      
+      let html = `
+        <div class="variables-header">
+          <h3>
+            Bracket Variables - ${customerName}
+            <span class="variable-count-badge">(${filteredVariables.length}${window.selectedCustomer === 'all' ? ` of ${window.bracketVariables.length}` : ''})</span>
+          </h3>
+          <button onclick="showVariableForm()" class="btn btn-primary">
+            <i class="fas fa-plus"></i> Add New Variable
+          </button>
+        </div>
+        
+        <div class="category-tabs">
+          ${Object.keys(categories).map(category => `
+            <button class="category-tab ${category === 'Contact' ? 'active' : ''}" onclick="showCategory('${category}')">
+              ${category} (${categories[category].length})
+            </button>
+          `).join('')}
+        </div>
+      `;
+      
+      Object.keys(categories).forEach(category => {
+        const isActive = category === 'Contact' || Object.keys(categories).length === 1;
+        
+        html += `
+          <div class="category-section ${isActive ? 'active' : ''}" id="category-${category}">
+            <div class="variables-grid">
+              ${categories[category].map(variable => {
+                const customer = window.customers.find(c => c.id === variable.customerId);
+                const customerDisplay = customer ? `${customer.shortName || customer.name}` : 'Global';
+                
+                return `
+                  <div class="variable-card">
+                    <div class="variable-header">
+                      <div class="variable-info">
+                        <div class="variable-name">
+                          <code class="bracket-code">{{${variable.variable}}}</code>
+                          <span class="customer-badge">${customerDisplay}</span>
+                        </div>
+                        <div class="variable-description">${variable.description}</div>
+                        <div class="variable-meta">
+                          <span class="usage-type ${variable.usageType}">${variable.usageType}</span>
+                          <span class="data-source">${variable.dataSource || 'Manual'}</span>
+                        </div>
+                      </div>
+                      <div class="variable-actions">
+                        <button onclick="copyVariable('${variable.variable}')" class="btn-small btn-secondary" title="Copy to clipboard">
+                          <i class="fas fa-copy"></i>
+                        </button>
+                        <button onclick="editVariable('${variable.id}')" class="btn-small btn-primary">
+                          <i class="fas fa-edit"></i>
+                        </button>
+                        <button onclick="deleteVariable('${variable.id}', '${variable.variable}')" class="btn-small btn-danger">
+                          <i class="fas fa-trash"></i>
+                        </button>
+                      </div>
+                    </div>
+                    ${variable.exampleValue ? `
+                      <div class="variable-example">
+                        <strong>Example:</strong> ${variable.exampleValue}
+                      </div>
+                    ` : ''}
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+        `;
+      });
+      
+      container.innerHTML = html;
+    }
+
+    // Update customer selectors
+    function updateCustomerSelectors() {
+      const selectors = document.querySelectorAll('.customer-selector');
+
+      selectors.forEach(select => {
+        let options = '';
+
+        // Different options for customer filter vs modal form
+        if (select.id === 'customer-filter') {
+          // Customer filter dropdown
+          options = `
+            <option value="all" ${window.selectedCustomer === 'all' ? 'selected' : ''}>All Customers</option>
+            ${window.customers.map(c => `<option value="${c.id}" ${window.selectedCustomer === c.id ? 'selected' : ''}>${c.shortName || c.name}</option>`).join('')}
+          `;
+        } else {
+          // Modal form dropdown
+          options = `
+            <option value="">Select a customer...</option>
+            <option value="global" ${window.selectedCustomer === 'global' ? 'selected' : ''}>🌐 Global (All Customers)</option>
+            ${window.customers.map(c => `<option value="${c.id}" ${window.selectedCustomer === c.id ? 'selected' : ''}>${c.shortName || c.name}</option>`).join('')}
+          `;
+        }
+
+        select.innerHTML = options;
+      });
+    }
+
+    // Show category
+    window.showCategory = (categoryName) => {
+      // Hide all category sections
+      document.querySelectorAll('.category-section').forEach(section => {
+        section.classList.remove('active');
+      });
+      
+      // Remove active class from all tabs
+      document.querySelectorAll('.category-tab').forEach(tab => {
+        tab.classList.remove('active');
+      });
+      
+      // Show selected category
+      document.getElementById(`category-${categoryName}`).classList.add('active');
+      event.target.classList.add('active');
+    };
+
+    // Filter variables by customer
+    window.filterVariablesByCustomer = () => {
+      window.selectedCustomer = document.getElementById('customer-filter').value;
+      displayBracketVariables();
+    };
+
+    // Show variable form modal
+    window.showVariableForm = (variableId = null) => {
+      const variable = variableId ? window.bracketVariables.find(v => v.id === variableId) : null;
+      const isEdit = !!variable;
+      
+      const modalHtml = `
+        <div id="variable-modal" class="modal">
+          <div class="modal-content">
+            <div class="modal-header">
+              <h3><i class="fas fa-${isEdit ? 'edit' : 'plus'}"></i> ${isEdit ? 'Edit' : 'Add'} Bracket Variable</h3>
+              <button onclick="closeVariableModal()" class="modal-close">&times;</button>
+            </div>
+            
+            <form id="variable-form" class="variable-form">
+              <div class="form-section">
+                <h4>Variable Information</h4>
+                <div class="form-row">
+                  <div class="form-group">
+                    <label for="variable-name">Variable Name *</label>
+                    <input type="text" id="variable-name" value="${variable?.variable || ''}" placeholder="firstName" required>
+                    <small>Enter without brackets. Example: firstName becomes {{firstName}}</small>
+                  </div>
+                  <div class="form-group">
+                    <label for="variable-category">Category *</label>
+                    <select id="variable-category" required>
+                      <option value="">Select category...</option>
+                      <option value="Contact" ${variable?.category === 'Contact' ? 'selected' : ''}>Contact Information</option>
+                      <option value="Company" ${variable?.category === 'Company' ? 'selected' : ''}>Company Details</option>
+                      <option value="Campaign" ${variable?.category === 'Campaign' ? 'selected' : ''}>Campaign Data</option>
+                      <option value="Custom" ${variable?.category === 'Custom' ? 'selected' : ''}>Custom Fields</option>
+                      <option value="System" ${variable?.category === 'System' ? 'selected' : ''}>System Variables</option>
+                    </select>
+                  </div>
+                </div>
+                
+                <div class="form-group">
+                  <label for="variable-description">Description *</label>
+                  <textarea id="variable-description" rows="2" required placeholder="Brief description of what this variable represents...">${variable?.description || ''}</textarea>
+                </div>
+                
+                <div class="form-row">
+                  <div class="form-group">
+                    <label for="variable-customer">Available For *</label>
+                    <select id="variable-customer" class="customer-selector" required>
+                      <option value="">Select availability...</option>
+                    </select>
+                    <small>Choose which customer(s) can use this variable</small>
+                  </div>
+                  <div class="form-group">
+                    <label for="variable-usage">Usage Type *</label>
+                    <select id="variable-usage" required>
+                      <option value="">Select usage...</option>
+                      <option value="email" ${variable?.usageType === 'email' ? 'selected' : ''}>Email Only</option>
+                      <option value="phone" ${variable?.usageType === 'phone' ? 'selected' : ''}>Phone Scripts Only</option>
+                      <option value="linkedin" ${variable?.usageType === 'linkedin' ? 'selected' : ''}>LinkedIn Only</option>
+                      <option value="all" ${variable?.usageType === 'all' ? 'selected' : ''}>All Channels</option>
+                    </select>
+                  </div>
+                </div>
+                
+                <div class="form-row">
+                  <div class="form-group">
+                    <label for="variable-data-source">Data Source</label>
+                    <select id="variable-data-source">
+                      <option value="Manual" ${variable?.dataSource === 'Manual' ? 'selected' : ''}>Manual Entry</option>
+                      <option value="CRM" ${variable?.dataSource === 'CRM' ? 'selected' : ''}>CRM Database</option>
+                      <option value="Campaign" ${variable?.dataSource === 'Campaign' ? 'selected' : ''}>Campaign Data</option>
+                      <option value="System" ${variable?.dataSource === 'System' ? 'selected' : ''}>System Generated</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label for="variable-example">Example Value</label>
+                    <input type="text" id="variable-example" value="${variable?.exampleValue || ''}" placeholder="John Doe">
+                    <small>Example of what this variable might contain</small>
+                  </div>
+                </div>
+                
+                <div class="form-group">
+                  <label for="variable-notes">Additional Notes</label>
+                  <textarea id="variable-notes" rows="3" placeholder="Any additional notes about usage, formatting, or special considerations...">${variable?.notes || ''}</textarea>
+                </div>
+              </div>
+              
+              <div class="form-actions">
+                <button type="submit" class="btn btn-success">
+                  <i class="fas fa-save"></i> ${isEdit ? 'Update' : 'Create'} Variable
+                </button>
+                <button type="button" onclick="closeVariableModal()" class="btn btn-secondary">
+                  <i class="fas fa-times"></i> Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+      
+      document.body.insertAdjacentHTML('beforeend', modalHtml);
+      
+      // Update customer selectors and set selected customer
+      updateCustomerSelectors();
+      if (variable?.customerId) {
+        document.getElementById('variable-customer').value = variable.customerId;
+      }
+      
+      document.getElementById('variable-form').addEventListener('submit', (e) => saveVariable(e, variableId));
+    };
+
+    // Close variable modal
+    window.closeVariableModal = () => {
+      const modal = document.getElementById('variable-modal');
+      if (modal) modal.remove();
+    };
+
+    // Save variable
+    const saveVariable = async (e, variableId = null) => {
+      e.preventDefault();
+      
+      const customerId = document.getElementById('variable-customer').value.trim();
+      if (!customerId) {
+        showAlert('Please select availability for this variable', 'error');
+        return;
+      }
+      
+      const variableName = document.getElementById('variable-name').value.trim().replace(/[{}]/g, '');
+      
+      // Check for duplicate variable names within the same customer scope
+      const existingVariable = window.bracketVariables.find(v => 
+        v.variable === variableName && 
+        v.customerId === customerId && 
+        v.id !== variableId
+      );
+      
+      if (existingVariable) {
+        showAlert(`Variable "{{${variableName}}}" already exists for this customer scope`, 'error');
+        return;
+      }
+      
+      const formData = {
+        variable: variableName,
+        description: document.getElementById('variable-description').value.trim(),
+        category: document.getElementById('variable-category').value,
+        customerId: customerId,
+        usageType: document.getElementById('variable-usage').value,
+        dataSource: document.getElementById('variable-data-source').value,
+        exampleValue: document.getElementById('variable-example').value.trim(),
+        notes: document.getElementById('variable-notes').value.trim()
+      };
+      
+      if (!variableId) {
+        formData.createdAt = new Date();
+        formData.createdBy = window.currentUser?.email || 'unknown';
+      }
+      formData.updatedAt = new Date();
+      formData.updatedBy = window.currentUser?.email || 'unknown';
+      
+      try {
+        const docId = variableId || `var_${Date.now()}`;
+        await setDoc(doc(window.emailDB, 'bracketVariables', docId), formData);
+        
+        await loadBracketVariables();
+        closeVariableModal();
+        showAlert(`Variable "{{${variableName}}}" ${variableId ? 'updated' : 'created'} successfully!`, 'success');
+      } catch (error) {
+        console.error('Error saving variable:', error);
+        showAlert('Error saving variable: ' + error.message, 'error');
+      }
+    };
+
+    // Edit variable
+    window.editVariable = (variableId) => {
+      showVariableForm(variableId);
+    };
+
+    // Copy variable to clipboard
+    window.copyVariable = async (variableName) => {
+      const textToCopy = `{{${variableName}}}`;
+      try {
+        await navigator.clipboard.writeText(textToCopy);
+        showAlert(`"${textToCopy}" copied to clipboard!`, 'success');
+      } catch (error) {
+        console.error('Error copying to clipboard:', error);
+        showAlert('Failed to copy to clipboard', 'error');
+      }
+    };
+
+    // Delete variable
+    window.deleteVariable = async (variableId, variableName) => {
+      if (!confirm(`Are you sure you want to delete the variable "{{${variableName}}}"?\n\nThis action cannot be undone.`)) {
+        return;
+      }
+      
+      try {
+        await deleteDoc(doc(window.emailDB, 'bracketVariables', variableId));
+        await loadBracketVariables();
+        showAlert(`Variable "{{${variableName}}}" deleted successfully!`, 'success');
+      } catch (error) {
+        console.error('Error deleting variable:', error);
+        showAlert('Error deleting variable: ' + error.message, 'error');
+      }
+    };
+
+    // Update statistics
+    function updateStats() {
+      const totalVariables = window.bracketVariables.length;
+      const emailVariables = window.bracketVariables.filter(v => v.usageType === 'email' || v.usageType === 'all').length;
+      const phoneVariables = window.bracketVariables.filter(v => v.usageType === 'phone' || v.usageType === 'all').length;
+      const linkedinVariables = window.bracketVariables.filter(v => v.usageType === 'linkedin' || v.usageType === 'all').length;
+      
+      document.getElementById('total-variables').textContent = totalVariables;
+      document.getElementById('email-variables').textContent = emailVariables;
+      document.getElementById('phone-variables').textContent = phoneVariables;
+      document.getElementById('linkedin-variables').textContent = linkedinVariables;
+    }
+
+    // Utility functions
+    function showAlert(message, type) {
+      const alertDiv = document.createElement('div');
+      alertDiv.className = `alert alert-${type}`;
+      alertDiv.textContent = message;
+      alertDiv.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        padding: 1rem 1.5rem;
+        border-radius: 5px;
+        z-index: 10000;
+        max-width: 400px;
+        word-wrap: break-word;
+        ${type === 'success' ? 'background: #d4edda; color: #155724; border: 1px solid #c3e6cb;' : 
+          type === 'error' ? 'background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb;' :
+          'background: #fff3cd; color: #856404; border: 1px solid #ffeaa7;'}
+      `;
+      
+      document.body.appendChild(alertDiv);
+      setTimeout(() => alertDiv.remove(), 5000);
+    }
+
+    // Make functions available globally
+    window.loadBracketVariables = loadBracketVariables;
+  </script>
+  
+  <style>
+    :root {
+      --gray: #5B5B5B;
+      --gold: #DBA660;
+      --blue: #44A1C4;
+      --dark-blue: #2D6B83;
+      --success: #28a745;
+      --danger: #dc3545;
+      --warning: #ffc107;
+      --info: #17a2b8;
+      --purple: #6f42c1;
+      --light-blue: #e7f3f8;
+      --light-purple: #f3e5f5;
+      --code-bg: #f8f9fa;
+    }
+    
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #fafafa;
+      margin: 0;
+      padding: 0;
+    }
+    
+    .loading {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      font-size: 1.2rem;
+      color: var(--gray);
+    }
+    
+    .admin-header {
+      background: linear-gradient(135deg, var(--purple), var(--dark-blue));
+      color: white;
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    
+    .admin-content {
+      padding: 2rem;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    
+    .admin-card {
+      background: white;
+      padding: 2rem;
+      border-radius: 10px;
+      box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
+      margin-bottom: 2rem;
+    }
+    
+    .admin-card h3 {
+      color: var(--dark-blue);
+      margin-bottom: 1rem;
+      border-bottom: 2px solid var(--purple);
+      padding-bottom: 0.5rem;
+    }
+    
+    .btn {
+      padding: 0.8rem 1.5rem;
+      background-color: var(--gold);
+      color: white;
+      text-decoration: none;
+      border-radius: 25px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+      display: inline-block;
+      margin-right: 1rem;
+      transition: all 0.2s ease;
+    }
+    
+    .btn-small {
+      padding: 0.4rem 0.8rem;
+      font-size: 0.9rem;
+      margin-right: 0.5rem;
+      border-radius: 15px;
+    }
+    
+    .btn-primary { background-color: var(--blue); }
+    .btn-secondary { background-color: var(--gray); }
+    .btn-warning { background-color: var(--warning); color: #212529; }
+    .btn-danger { background-color: var(--danger); }
+    .btn-success { background-color: var(--success); }
+    .btn-info { background-color: var(--info); }
+    
+    .btn:hover {
+      opacity: 0.9;
+      transform: translateY(-1px);
+    }
+    
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+    
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    
+    .stat-card {
+      background: white;
+      padding: 1.5rem;
+      border-radius: 8px;
+      text-align: center;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+    }
+    
+    .stat-number {
+      font-size: 2rem;
+      font-weight: bold;
+      color: var(--purple);
+      display: block;
+    }
+    
+    .stat-label {
+      color: var(--gray);
+      font-size: 0.9rem;
+    }
+
+    /* Variables Display */
+    .no-variables {
+      text-align: center;
+      padding: 3rem;
+      color: var(--gray);
+    }
+
+    .no-variables i {
+      font-size: 4rem;
+      margin-bottom: 1rem;
+      opacity: 0.5;
+    }
+
+    .variables-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1.5rem;
+    }
+
+    .variable-count-badge {
+      font-weight: normal;
+      font-size: 0.9rem;
+      color: var(--gray);
+    }
+
+    .category-tabs {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 2rem;
+      border-bottom: 2px solid #e9ecef;
+      flex-wrap: wrap;
+    }
+
+    .category-tab {
+      padding: 0.8rem 1.5rem;
+      background: none;
+      border: none;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s ease;
+      font-weight: 500;
+      color: var(--gray);
+    }
+
+    .category-tab.active {
+      color: var(--purple);
+      border-bottom-color: var(--purple);
+      background: var(--light-purple);
+    }
+
+    .category-tab:hover {
+      background: #f8f9fa;
+    }
+
+    .category-section {
+      display: none;
+    }
+
+    .category-section.active {
+      display: block;
+    }
+
+    .variables-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+      gap: 1.5rem;
+    }
+
+    .variable-card {
+      background: white;
+      border: 2px solid #e9ecef;
+      border-radius: 10px;
+      padding: 1.5rem;
+      transition: all 0.3s ease;
+    }
+
+    .variable-card:hover {
+      border-color: var(--purple);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(111, 66, 193, 0.15);
+    }
+
+    .variable-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 1rem;
+    }
+
+    .variable-info {
+      flex: 1;
+    }
+
+    .variable-name {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 0.5rem;
+    }
+
+    .bracket-code {
+      background: var(--code-bg);
+      color: var(--purple);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-family: 'Courier New', monospace;
+      font-weight: 600;
+      font-size: 0.9rem;
+      border: 1px solid var(--purple);
+    }
+
+    .customer-badge {
+      background: var(--info);
+      color: white;
+      font-size: 0.7rem;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-weight: 600;
+    }
+
+    .variable-description {
+      color: var(--gray);
+      font-size: 0.9rem;
+      margin-bottom: 0.8rem;
+      line-height: 1.4;
+    }
+
+    .variable-meta {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .usage-type {
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .usage-type.email {
+      background: #e3f2fd;
+      color: #1565c0;
+    }
+
+    .usage-type.phone {
+      background: #e8f5e8;
+      color: #2e7d32;
+    }
+
+    .usage-type.linkedin {
+      background: #fff3e0;
+      color: #ef6c00;
+    }
+
+    .usage-type.all {
+      background: var(--light-purple);
+      color: var(--purple);
+    }
+
+    .data-source {
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      background: #f5f5f5;
+      color: var(--gray);
+    }
+
+    .variable-actions {
+      display: flex;
+      gap: 0.5rem;
+      flex-shrink: 0;
+    }
+
+    .variable-example {
+      background: #f8f9fa;
+      padding: 10px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      border-left: 3px solid var(--purple);
+    }
+
+    /* Modal Styles */
+    .modal {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.5);
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 2rem;
+      z-index: 1000;
+      overflow-y: auto;
+    }
+    
+    .modal-content {
+      background: white;
+      border-radius: 10px;
+      width: 100%;
+      max-width: 700px;
+      margin: 2rem auto;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+    }
+    
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 1.5rem 2rem;
+      border-bottom: 2px solid var(--purple);
+      background: linear-gradient(135deg, var(--purple), var(--dark-blue));
+      color: white;
+      border-radius: 10px 10px 0 0;
+    }
+    
+    .modal-close {
+      background: none;
+      border: none;
+      color: white;
+      font-size: 1.5rem;
+      cursor: pointer;
+      padding: 0.5rem;
+      border-radius: 50%;
+      transition: background 0.2s ease;
+    }
+    
+    .modal-close:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+    
+    .variable-form {
+      padding: 2rem;
+    }
+    
+    .form-section {
+      margin-bottom: 2rem;
+      padding-bottom: 2rem;
+      border-bottom: 1px solid #e9ecef;
+    }
+    
+    .form-section:last-of-type {
+      border-bottom: none;
+    }
+    
+    .form-section h4 {
+      color: var(--dark-blue);
+      margin-bottom: 1rem;
+      font-size: 1.1rem;
+    }
+    
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    
+    .form-group {
+      display: flex;
+      flex-direction: column;
+    }
+    
+    .form-group label {
+      margin-bottom: 0.5rem;
+      font-weight: 600;
+      color: var(--dark-blue);
+      font-size: 0.9rem;
+    }
+    
+    .form-group input,
+    .form-group select,
+    .form-group textarea {
+      padding: 0.8rem;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      font-size: 1rem;
+      transition: border-color 0.2s ease;
+    }
+    
+    .form-group input:focus,
+    .form-group select:focus,
+    .form-group textarea:focus {
+      outline: none;
+      border-color: var(--purple);
+      box-shadow: 0 0 0 2px rgba(111, 66, 193, 0.2);
+    }
+
+    .form-group small {
+      margin-top: 0.3rem;
+      color: #6c757d;
+      font-size: 0.8rem;
+    }
+    
+    .form-actions {
+      display: flex;
+      gap: 1rem;
+      justify-content: flex-end;
+      padding-top: 1rem;
+      border-top: 1px solid #e9ecef;
+    }
+
+    /* Customer Filter */
+    .filter-controls {
+      display: flex;
+      gap: 15px;
+      align-items: center;
+      margin-bottom: 20px;
+      padding: 15px;
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+    }
+
+    .filter-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .filter-group label {
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: #374151;
+    }
+
+    .filter-group select {
+      padding: 6px 10px;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      font-size: 0.9rem;
+    }
+
+    /* Responsive Design */
+    @media (max-width: 768px) {
+      .admin-content {
+        padding: 1rem;
+      }
+      
+      .stats-grid {
+        grid-template-columns: 1fr;
+      }
+      
+      .variables-grid {
+        grid-template-columns: 1fr;
+      }
+      
+      .form-row {
+        grid-template-columns: 1fr;
+      }
+      
+      .variable-actions {
+        flex-direction: column;
+      }
+      
+      .variables-header {
+        flex-direction: column;
+        gap: 1rem;
+        text-align: center;
+      }
+      
+      .category-tabs {
+        justify-content: center;
+      }
+      
+      .modal {
+        padding: 1rem;
+      }
+      
+      .modal-content {
+        margin: 1rem auto;
+      }
+      
+      .variable-form {
+        padding: 1rem;
+      }
+      
+      .filter-controls {
+        flex-direction: column;
+        align-items: stretch;
+      }
+    }
+  </style>
+  <link rel="icon" type="image/png" href="../images/HealthLuminate-Bright.png">
+</head>
+<body>
+  <!-- Hidden auth elements required by auth.js -->
+  <div id="auth-loading" style="display: none;">Loading...</div>
+  <div id="not-logged-in" style="display: none;">Not logged in</div>
+  <div id="logged-in" style="display: none;">Logged in</div>
+  
+  <!-- Loading state -->
+  <div id="loading" class="loading">
+    <i class="fas fa-spinner fa-spin"></i> &nbsp; Loading bracket variables...
+  </div>
+
+  <!-- Bracket Variables content (hidden initially) -->
+  <div id="bracket-variables-content" style="display: none;">
+    <!-- Admin Header -->
+    <div class="admin-header">
+      <div>
+        <h1><i class="fas fa-code"></i> Bracket Variables Manager</h1>
+        <p>Personalize emails, phone scripts & LinkedIn outreach with dynamic variables</p>
+      </div>
+      <div>
+        <a href="email_controls.html" class="btn">Email Controls</a>
+        <a href="/admin/users.html" class="btn">Admin Panel</a>
+        <a href="/dashboard.html" class="btn">Dashboard</a>
+      </div>
+    </div>
+
+    <!-- Bracket Variables Content -->
+    <div class="admin-content">
+      <!-- Stats Overview -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <span class="stat-number" id="total-variables">0</span>
+          <span class="stat-label">Total Variables</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-number" id="email-variables">0</span>
+          <span class="stat-label">Email Variables</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-number" id="phone-variables">0</span>
+          <span class="stat-label">Phone Variables</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-number" id="linkedin-variables">0</span>
+          <span class="stat-label">LinkedIn Variables</span>
+        </div>
+      </div>
+
+      <!-- Filter Controls -->
+      <div class="filter-controls">
+        <div class="filter-group">
+          <label for="customer-filter">Customer Filter:</label>
+          <select id="customer-filter" class="customer-selector" onchange="filterVariablesByCustomer()">
+          </select>
+        </div>
+        <div style="margin-left: auto;">
+          <button onclick="showVariableForm()" class="btn btn-primary">
+            <i class="fas fa-plus"></i> Add Variable
+          </button>
+        </div>
+      </div>
+      
+      <!-- Bracket Variables Management -->
+      <div class="admin-card">
+        <div id="variables-list">
+          <div style="text-align: center; color: #666; padding: 2rem;">
+            <i class="fas fa-spinner fa-spin"></i> Loading bracket variables...
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

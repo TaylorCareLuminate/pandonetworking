@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Login Forwarding Rules - HealthLuminate Admin</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+  
+  <!-- HealthLuminate Centralized Auth System -->
+  <script src="../js/auth.js"></script>
+  <!-- Delay folder protection to allow Firebase to initialize -->
+  <script>
+    // Prevent auto-protection from folder-protection.js
+    window._skipAutoProtect = true;
+  </script>
+  <script src="../js/folder-protection.js"></script>
+  
+  <!-- Initialize Admin Panel Protection -->
+  <script>
+    // Initialize admin panel protection when Firebase is ready
+    window.firebaseReady.then(() => {
+      console.log('🔒 Forward To admin page Firebase ready, waiting for auth state...');
+    });
+  </script>
+  
+  <!-- Admin Panel Firebase Functions -->
+  <script type="module">
+    // Wait for centralized Firebase to be ready
+    await window.firebaseReady;
+    
+    // Import required Firebase functions
+    const { collection, getDocs, doc, setDoc, deleteDoc, updateDoc, getDoc } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
+    
+    // Verify Firebase instances are available
+    let retryCount = 0;
+    const maxRetries = 10;
+    
+    while ((!window.auth || !window.db || !window.firebaseApp) && retryCount < maxRetries) {
+      console.log(`⏳ Waiting for Firebase instances... (attempt ${retryCount + 1}/${maxRetries})`);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      retryCount++;
+    }
+    
+    if (!window.auth || !window.db || !window.firebaseApp) {
+      console.error('❌ Firebase instances not available after waiting');
+      throw new Error('Firebase not properly initialized after timeout');
+    }
+    
+    console.log('✅ Firebase instances are now available');
+    
+    // Use centralized Firebase instances
+    const firebaseAuth = window.auth;
+    const firestore = window.db;
+    const firebaseApp = window.firebaseApp;
+    
+    // Set up admin database reference and expose globally
+    window.adminDB = firestore;
+    
+    // Global variables
+    window.currentUser = null;
+    window.forwardingRules = [];
+    
+    // Global functions for button actions
+    window.addForwardingRule = async () => {
+      const type = document.getElementById('new-rule-type').value;
+      const identifier = document.getElementById('new-rule-identifier').value.trim();
+      const destination = document.getElementById('new-rule-destination').value.trim();
+      const description = document.getElementById('new-rule-description').value.trim();
+      
+      if (!identifier || !destination) {
+        showAlert('Please fill in identifier and destination fields', 'error');
+        return;
+      }
+      
+      // Validate identifier based on type
+      if (type === 'email') {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(identifier)) {
+          showAlert('Please enter a valid email address', 'error');
+          return;
+        }
+      } else if (type === 'domain') {
+        if (identifier.includes('@') || identifier.includes('http')) {
+          showAlert('Domain should be just the domain name (e.g., company.com)', 'error');
+          return;
+        }
+      }
+      
+      // Validate destination URL
+      if (!destination.endsWith('.html') && !destination.startsWith('/') && !destination.startsWith('http')) {
+        showAlert('Destination should be a valid page path (e.g., dashboard.html, /folder/page.html)', 'error');
+        return;
+      }
+      
+      const addButton = document.querySelector('button[onclick="addForwardingRule()"]');
+      const originalText = addButton.innerHTML;
+      addButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Adding...';
+      addButton.disabled = true;
+      
+      try {
+        const newRule = {
+          type: type,
+          identifier: identifier.toLowerCase(),
+          destination: destination,
+          description: description || `${type} forwarding rule`,
+          createdAt: new Date(),
+          createdBy: window.currentUser.email,
+          active: true
+        };
+        
+        // Generate rule ID
+        const ruleId = `${type}_${identifier.replace(/[@.]/g, '_')}_${Date.now()}`;
+        
+        await setDoc(doc(window.adminDB, 'loginForwardingRules', ruleId), newRule);
+        
+        // Clear form
+        document.getElementById('new-rule-identifier').value = '';
+        document.getElementById('new-rule-destination').value = '';
+        document.getElementById('new-rule-description').value = '';
+        
+        await loadForwardingRules();
+        showAlert(`Forwarding rule added successfully!`, 'success');
+        
+      } catch (error) {
+        console.error('Error adding forwarding rule:', error);
+        showAlert('Error adding rule: ' + error.message, 'error');
+      } finally {
+        addButton.innerHTML = originalText;
+        addButton.disabled = false;
+      }
+    };
+
+    window.deleteForwardingRule = async (ruleId) => {
+      const rule = window.forwardingRules.find(r => r.id === ruleId);
+      if (!rule) {
+        showAlert('Rule not found', 'error');
+        return;
+      }
+      
+      if (!confirm(`Are you sure you want to delete the forwarding rule for ${rule.identifier}?`)) {
+        return;
+      }
+      
+      const deleteButton = document.querySelector(`button[onclick="deleteForwardingRule('${ruleId}')"]`);
+      const originalText = deleteButton.innerHTML;
+      deleteButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+      deleteButton.disabled = true;
+      
+      try {
+        await deleteDoc(doc(window.adminDB, 'loginForwardingRules', ruleId));
+        await loadForwardingRules();
+        showAlert('Forwarding rule deleted successfully!', 'success');
+      } catch (error) {
+        console.error('Error deleting forwarding rule:', error);
+        showAlert('Error deleting rule: ' + error.message, 'error');
+      } finally {
+        deleteButton.innerHTML = originalText;
+        deleteButton.disabled = false;
+      }
+    };
+
+    window.toggleRuleStatus = async (ruleId) => {
+      const rule = window.forwardingRules.find(r => r.id === ruleId);
+      if (!rule) {
+        showAlert('Rule not found', 'error');
+        return;
+      }
+      
+      const toggleButton = document.querySelector(`button[onclick="toggleRuleStatus('${ruleId}')"]`);
+      const originalText = toggleButton.innerHTML;
+      toggleButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+      toggleButton.disabled = true;
+      
+      try {
+        const newStatus = !rule.active;
+        await setDoc(doc(window.adminDB, 'loginForwardingRules', ruleId), {
+          active: newStatus,
+          lastModified: new Date(),
+          lastModifiedBy: window.currentUser.email
+        }, { merge: true });
+        
+        await loadForwardingRules();
+        showAlert(`Rule ${newStatus ? 'activated' : 'deactivated'} successfully!`, 'success');
+      } catch (error) {
+        console.error('Error toggling rule status:', error);
+        showAlert('Error updating rule: ' + error.message, 'error');
+      } finally {
+        toggleButton.innerHTML = originalText;
+        toggleButton.disabled = false;
+      }
+    };
+
+    window.testForwardingRule = (identifier, type) => {
+      const rule = window.forwardingRules.find(r => 
+        r.identifier === identifier.toLowerCase() && r.type === type && r.active
+      );
+      
+      if (rule) {
+        showAlert(`Test Result: ${identifier} would be forwarded to ${rule.destination}`, 'success');
+      } else {
+        // Check if there's a domain rule for this email
+        if (type === 'email') {
+          const domain = identifier.split('@')[1].toLowerCase();
+          const domainRule = window.forwardingRules.find(r => 
+            r.identifier === domain && r.type === 'domain' && r.active
+          );
+          if (domainRule) {
+            showAlert(`Test Result: ${identifier} would be forwarded to ${domainRule.destination} (via domain rule for ${domain})`, 'info');
+            return;
+          }
+        }
+        showAlert(`Test Result: No forwarding rule found for ${identifier}. User would go to default destination.`, 'info');
+      }
+    };
+
+    // Global flag to indicate admin access
+    let adminInitialized = false;
+    
+    // Function to initialize admin panel when auth is ready
+    async function initializeAdminPanel() {
+      if (adminInitialized) return;
+      
+      const user = window.auth?.currentUser;
+      if (!user) {
+        console.log('❌ No user found during admin initialization');
+        return;
+      }
+      
+      console.log('✅ Admin access granted to:', user.email);
+      window.currentUser = user;
+      
+      // Hide loading and show admin content
+      const loadingEl = document.getElementById('loading');
+      const adminContentEl = document.getElementById('admin-content');
+      
+      if (loadingEl) loadingEl.style.display = 'none';
+      if (adminContentEl) adminContentEl.style.display = 'block';
+      
+      // Load data
+      await loadForwardingRules();
+      
+      adminInitialized = true;
+    }
+    
+    // Listen for auth state changes via global callback
+    window.authStateChanged = async (authState) => {
+      console.log('🔄 Forward To admin panel received auth state change:', authState);
+      
+      if (authState.isLoggedIn && authState.isVerified) {
+        // Wait a bit to ensure window.db is available
+        let dbReady = false;
+        for (let i = 0; i < 20; i++) {
+          if (window.db) {
+            dbReady = true;
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 300));
+        }
+        
+        if (!dbReady) {
+          console.error('❌ Database not ready after auth state change');
+          return;
+        }
+        
+        // Additional delay to ensure folder-protection.js is ready
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Check admin access before initializing
+        try {
+          const hasAccess = await window.checkFolderAccess('admin', authState.user.email, {
+            allowOnError: false,
+            allowOnMissing: false
+          });
+          
+          if (hasAccess) {
+            await initializeAdminPanel();
+          } else {
+            window.showAccessDenied('admin', authState.user.email, 'This admin area is restricted to HealthLuminate team members only.');
+          }
+        } catch (error) {
+          console.error('❌ Error checking folder access:', error);
+          window.showAccessDenied('admin', authState.user.email, 'Error checking permissions. Please refresh the page.');
+        }
+      } else if (!authState.isChecking && !authState.isLoggedIn) {
+        console.log('🔒 User not logged in, redirecting...');
+        window.redirectToLogin('You must be logged in to access the admin panel.');
+      }
+    };
+    
+    // Also try to initialize after a delay if auth is already ready
+    setTimeout(async () => {
+      if (window.auth?.currentUser && window.auth.currentUser.emailVerified && !adminInitialized) {
+        const hasAccess = await window.checkFolderAccess('admin', window.auth.currentUser.email, {
+          allowOnError: false,
+          allowOnMissing: false
+        });
+        
+        if (hasAccess) {
+          await initializeAdminPanel();
+        }
+      }
+    }, 3000);
+
+    // Load all forwarding rules
+    async function loadForwardingRules() {
+      try {
+        console.log('🔄 Loading forwarding rules from Firestore...');
+        const rulesCollection = collection(window.adminDB, 'loginForwardingRules');
+        const rulesSnapshot = await getDocs(rulesCollection);
+        
+        window.forwardingRules = [];
+        rulesSnapshot.forEach((doc) => {
+          window.forwardingRules.push({
+            id: doc.id,
+            ...doc.data()
+          });
+        });
+        
+        // Sort rules by type (email first, then domain) and then by identifier
+        window.forwardingRules.sort((a, b) => {
+          if (a.type !== b.type) {
+            return a.type === 'email' ? -1 : 1;
+          }
+          return a.identifier.localeCompare(b.identifier);
+        });
+        
+        console.log('✅ Loaded forwarding rules:', window.forwardingRules.length, 'rules found');
+        displayForwardingRules();
+      } catch (error) {
+        console.error('❌ Error loading forwarding rules:', error);
+        window.forwardingRules = [];
+        displayForwardingRules();
+      }
+    }
+
+    // Display forwarding rules
+    function displayForwardingRules() {
+      const tbody = document.getElementById('rules-table');
+      
+      if (window.forwardingRules.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="6" style="text-align: center; color: #666;">
+              No forwarding rules configured yet. Add rules above to automatically direct users after login.
+            </td>
+          </tr>
+        `;
+        return;
+      }
+      
+      let html = '';
+      window.forwardingRules.forEach(rule => {
+        const createdAt = rule.createdAt ? 
+          (rule.createdAt.seconds ? new Date(rule.createdAt.seconds * 1000) : new Date(rule.createdAt)) : 
+          new Date();
+        
+        html += `
+          <tr class="rule-row ${!rule.active ? 'inactive-rule' : ''}">
+            <td>
+              <span class="type-badge ${rule.type}">${rule.type.toUpperCase()}</span>
+            </td>
+            <td class="identifier-cell">${rule.identifier}</td>
+            <td class="destination-cell">
+              <code>${rule.destination}</code>
+            </td>
+            <td>${rule.description || 'No description'}</td>
+            <td>
+              <span class="status-badge ${rule.active ? 'active' : 'inactive'}">
+                <i class="fas fa-${rule.active ? 'check-circle' : 'pause-circle'}"></i>
+                ${rule.active ? 'Active' : 'Inactive'}
+              </span>
+            </td>
+            <td>
+              <button class="btn-small btn-info" onclick="testForwardingRule('${rule.identifier}', '${rule.type}')" title="Test this rule">
+                <i class="fas fa-play"></i> Test
+              </button>
+              <button class="btn-small ${rule.active ? 'btn-warning' : 'btn-success'}" onclick="toggleRuleStatus('${rule.id}')" title="${rule.active ? 'Deactivate' : 'Activate'} rule">
+                <i class="fas fa-${rule.active ? 'pause' : 'play'}"></i> ${rule.active ? 'Disable' : 'Enable'}
+              </button>
+              <button class="btn-small btn-danger" onclick="deleteForwardingRule('${rule.id}')" title="Delete rule">
+                <i class="fas fa-trash"></i> Delete
+              </button>
+            </td>
+          </tr>
+        `;
+      });
+      
+      tbody.innerHTML = html;
+      updateStats();
+    }
+
+    // Update stats
+    function updateStats() {
+      const totalRules = window.forwardingRules.length;
+      const activeRules = window.forwardingRules.filter(r => r.active).length;
+      const emailRules = window.forwardingRules.filter(r => r.type === 'email').length;
+      const domainRules = window.forwardingRules.filter(r => r.type === 'domain').length;
+      
+      document.getElementById('total-rules').textContent = totalRules;
+      document.getElementById('active-rules').textContent = activeRules;
+      document.getElementById('email-rules').textContent = emailRules;
+      document.getElementById('domain-rules').textContent = domainRules;
+    }
+
+    // Utility functions
+    function showAlert(message, type) {
+      const alertDiv = document.createElement('div');
+      alertDiv.className = `alert alert-${type}`;
+      alertDiv.textContent = message;
+      alertDiv.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        padding: 1rem 1.5rem;
+        border-radius: 5px;
+        z-index: 1000;
+        max-width: 400px;
+        ${type === 'success' ? 'background: #d4edda; color: #155724; border: 1px solid #c3e6cb;' : 
+          type === 'info' ? 'background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb;' :
+          'background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb;'}
+      `;
+      
+      document.body.appendChild(alertDiv);
+      setTimeout(() => alertDiv.remove(), 5000);
+    }
+
+    // Make functions available globally
+    window.loadForwardingRules = loadForwardingRules;
+    window.showAlert = showAlert;
+  </script>
+  
+  <style>
+    :root {
+      --gray: #5B5B5B;
+      --gold: #DBA660;
+      --blue: #44A1C4;
+      --dark-blue: #2D6B83;
+      --success: #28a745;
+      --danger: #dc3545;
+      --warning: #ffc107;
+      --info: #17a2b8;
+    }
+    
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #fafafa;
+      margin: 0;
+      padding: 0;
+    }
+    
+    .loading {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      font-size: 1.2rem;
+      color: var(--gray);
+    }
+    
+    .admin-header {
+      background: var(--dark-blue);
+      color: white;
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    
+    .admin-content {
+      padding: 2rem;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    
+    .admin-card {
+      background: white;
+      padding: 2rem;
+      border-radius: 10px;
+      box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
+      margin-bottom: 2rem;
+    }
+    
+    .admin-card h3 {
+      color: var(--dark-blue);
+      margin-bottom: 1rem;
+      border-bottom: 2px solid var(--blue);
+      padding-bottom: 0.5rem;
+    }
+    
+    .btn {
+      padding: 0.8rem 1.5rem;
+      background-color: var(--gold);
+      color: white;
+      text-decoration: none;
+      border-radius: 25px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+      display: inline-block;
+      margin-right: 1rem;
+    }
+    
+    .btn-small {
+      padding: 0.4rem 0.8rem;
+      font-size: 0.9rem;
+      margin-right: 0.5rem;
+    }
+    
+    .btn-primary { background-color: var(--blue); }
+    .btn-secondary { background-color: var(--gray); }
+    .btn-warning { background-color: var(--warning); color: #212529; }
+    .btn-danger { background-color: var(--danger); }
+    .btn-success { background-color: var(--success); }
+    .btn-info { background-color: var(--info); }
+    
+    .btn:hover {
+      opacity: 0.9;
+      transform: translateY(-1px);
+      transition: all 0.2s ease;
+    }
+    
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 2fr 2fr 3fr auto;
+      gap: 1rem;
+      align-items: end;
+      margin-bottom: 2rem;
+      padding: 1.5rem;
+      background: #f8f9fa;
+      border-radius: 8px;
+    }
+    
+    .form-group {
+      display: flex;
+      flex-direction: column;
+    }
+    
+    .form-group label {
+      margin-bottom: 0.5rem;
+      font-weight: 600;
+      color: var(--dark-blue);
+    }
+    
+    .form-input, .form-select {
+      padding: 0.8rem;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      font-size: 1rem;
+    }
+    
+    .form-input:focus, .form-select:focus {
+      outline: none;
+      border-color: var(--blue);
+      box-shadow: 0 0 0 2px rgba(68, 161, 196, 0.2);
+    }
+    
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 1rem;
+    }
+    
+    th, td {
+      padding: 1rem;
+      text-align: left;
+      border-bottom: 1px solid #eee;
+    }
+    
+    th {
+      background-color: #f8f9fa;
+      font-weight: 600;
+      color: var(--dark-blue);
+    }
+    
+    .rule-row {
+      transition: background-color 0.2s ease;
+    }
+    
+    .rule-row:hover {
+      background: #f8f9fa;
+    }
+    
+    .rule-row.inactive-rule {
+      opacity: 0.6;
+      background: #f5f5f5;
+    }
+    
+    .type-badge {
+      padding: 0.2rem 0.8rem;
+      border-radius: 15px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: white;
+    }
+    
+    .type-badge.email {
+      background: var(--success);
+    }
+    
+    .type-badge.domain {
+      background: var(--blue);
+    }
+    
+    .status-badge {
+      padding: 0.2rem 0.6rem;
+      border-radius: 15px;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    
+    .status-badge.active {
+      background: #d4edda;
+      color: #155724;
+    }
+    
+    .status-badge.inactive {
+      background: #fff3cd;
+      color: #856404;
+    }
+    
+    .identifier-cell {
+      font-family: monospace;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    
+    .destination-cell code {
+      background: #e9ecef;
+      padding: 0.2rem 0.5rem;
+      border-radius: 3px;
+      font-size: 0.9rem;
+    }
+    
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    
+    .stat-card {
+      background: white;
+      padding: 1.5rem;
+      border-radius: 8px;
+      text-align: center;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+    }
+    
+    .stat-number {
+      font-size: 2rem;
+      font-weight: bold;
+      color: var(--blue);
+      display: block;
+    }
+    
+    .stat-label {
+      color: var(--gray);
+      font-size: 0.9rem;
+    }
+    
+    .info-box {
+      background: #e7f3ff;
+      border: 1px solid #b3d7ff;
+      color: #0c5460;
+      padding: 1rem;
+      border-radius: 5px;
+      margin-bottom: 2rem;
+    }
+    
+    .info-box h4 {
+      margin: 0 0 0.5rem 0;
+      color: var(--dark-blue);
+    }
+    
+    .info-box ul {
+      margin: 0.5rem 0 0 1.5rem;
+      padding: 0;
+    }
+    
+    @media (max-width: 1200px) {
+      .form-grid {
+        grid-template-columns: 1fr;
+        gap: 1rem;
+      }
+      
+      table {
+        font-size: 0.9rem;
+      }
+      
+      .btn-small {
+        padding: 0.3rem 0.6rem;
+        font-size: 0.8rem;
+      }
+    }
+  </style>
+  <link rel="icon" type="image/png" href="../images/HealthLuminate-Bright.png">
+</head>
+<body>
+  <!-- Hidden auth elements required by auth.js -->
+  <div id="auth-loading" style="display: none;">Loading...</div>
+  <div id="not-logged-in" style="display: none;">Not logged in</div>
+  <div id="logged-in" style="display: none;">Logged in</div>
+  
+  <!-- Loading state -->
+  <div id="loading" class="loading">
+    <i class="fas fa-spinner fa-spin"></i> &nbsp; Loading forwarding rules admin...
+  </div>
+
+  <!-- Admin content (hidden initially) -->
+  <div id="admin-content" style="display: none;">
+    <!-- Admin Header -->
+    <div class="admin-header">
+      <div>
+        <h1><i class="fas fa-route"></i> Login Forwarding Rules</h1>
+        <p>Configure where users are directed after login based on their domain or email</p>
+      </div>
+      <div>
+        <a href="/admin/users.html" class="btn btn-info">User Management</a>
+        <a href="/dashboard.html" class="btn">Back to Dashboard</a>
+      </div>
+    </div>
+
+    <!-- Admin Content -->
+    <div class="admin-content">
+      <!-- Stats Overview -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <span class="stat-number" id="total-rules">0</span>
+          <span class="stat-label">Total Rules</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-number" id="active-rules">0</span>
+          <span class="stat-label">Active Rules</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-number" id="email-rules">0</span>
+          <span class="stat-label">Email Rules</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-number" id="domain-rules">0</span>
+          <span class="stat-label">Domain Rules</span>
+        </div>
+      </div>
+
+      <!-- Info Box -->
+      <div class="info-box">
+        <h4><i class="fas fa-info-circle"></i> How Forwarding Rules Work</h4>
+        <ul>
+          <li><strong>Email Rules:</strong> Specific email addresses are forwarded to designated pages (highest priority)</li>
+          <li><strong>Domain Rules:</strong> All users from a domain are forwarded to the same page (lower priority)</li>
+          <li><strong>Priority:</strong> Email rules override domain rules. If no rule matches, users go to the default destination</li>
+          <li><strong>Return URLs:</strong> If users come from another page, they'll return there instead of using these rules</li>
+          <li><strong>Examples:</strong> 
+            <ul>
+              <li>Domain: <code>clientcompany.com</code> → <code>hospitalpages/client-dashboard.html</code></li>
+              <li>Email: <code>admin@company.com</code> → <code>admin/users.html</code></li>
+            </ul>
+          </li>
+        </ul>
+      </div>
+
+      <!-- Add New Rule -->
+      <div class="admin-card">
+        <h3><i class="fas fa-plus-circle"></i> Add New Forwarding Rule</h3>
+        
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="new-rule-type">Type</label>
+            <select id="new-rule-type" class="form-select">
+              <option value="domain">Domain</option>
+              <option value="email">Email</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="new-rule-identifier">Identifier</label>
+            <input type="text" id="new-rule-identifier" class="form-input" placeholder="company.com or user@company.com">
+          </div>
+          <div class="form-group">
+            <label for="new-rule-destination">Destination Page</label>
+            <input type="text" id="new-rule-destination" class="form-input" placeholder="dashboard.html or /folder/page.html">
+          </div>
+          <div class="form-group">
+            <label for="new-rule-description">Description (Optional)</label>
+            <input type="text" id="new-rule-description" class="form-input" placeholder="Brief description of this rule">
+          </div>
+          <div class="form-group">
+            <button onclick="addForwardingRule()" class="btn btn-success">
+              <i class="fas fa-plus"></i> Add Rule
+            </button>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Forwarding Rules List -->
+      <div class="admin-card">
+        <h3><i class="fas fa-list"></i> Current Forwarding Rules</h3>
+        
+        <table>
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>Identifier</th>
+              <th>Destination</th>
+              <th>Description</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="rules-table">
+            <tr>
+              <td colspan="6" style="text-align: center; color: #666;">
+                <i class="fas fa-spinner fa-spin"></i> Loading forwarding rules...
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

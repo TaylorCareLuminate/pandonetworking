@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Contact Quality Analytics</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+  <style>
+    :root { --primary:#264653; --secondary:#2a9d8f; --card:#fff; --accent:#e9c46a; --light-blue:#f4f9fa; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif; background:#f9fafb; color:#263238; }
+    .container { max-width:1400px; margin:0 auto; padding:20px; }
+    .title { font-size:1.8rem; font-weight:700; color:var(--primary); margin-bottom:16px; }
+    .card { background:#fff; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,0.07); padding:16px; }
+    .controls { display:flex; gap:10px; margin-bottom:12px; }
+    .controls input, .controls select { padding:8px 10px; border:1px solid #ddd; border-radius:6px; }
+    table { width:100%; border-collapse:collapse; font-size:0.95rem; }
+    th, td { text-align:left; padding:10px; border-bottom:1px solid #eee; }
+    th { background:#f8fafc; font-weight:600; color:#374151; }
+    tbody tr:hover { background:#f8fafc; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.8rem; border:1px solid #e5e7eb; }
+  </style>
+</head>
+<body>
+  <!-- Hidden auth elements required by auth.js -->
+  <div id="auth-loading" style="display: none;">Loading...</div>
+  <div id="not-logged-in" style="display: none;">Not logged in</div>
+  <div id="logged-in" style="display: none;">Logged in</div>
+
+  <div id="header-container"></div>
+  <div class="container">
+    <div class="title"><i class="fas fa-chart-bar"></i> Contact Quality Analytics</div>
+    <div class="card">
+      <div class="controls">
+        <input id="search" placeholder="Search organization or domain" style="flex:1;"/>
+        <select id="typeFilter">
+          <option value="">All Types</option>
+          <option value="Bad Email">Bad Email</option>
+          <option value="Bad Phone">Bad Phone</option>
+          <option value="Bad LinkedIn">Bad LinkedIn</option>
+          <option value="Contact Has Left">Contact Has Left</option>
+        </select>
+      </div>
+      <div style="overflow:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Organization</th>
+              <th>Domain</th>
+              <th>Bad Email</th>
+              <th>Bad Phone</th>
+              <th>Bad LinkedIn</th>
+              <th>Contact Has Left</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody id="rows">
+            <tr><td colspan="7">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="../js/auth.js"></script>
+  <script>
+    // Load header partial
+    async function loadHeader() {
+      try {
+        const response = await fetch('header.html');
+        const headerHtml = await response.text();
+        document.getElementById('header-container').innerHTML = headerHtml;
+        const navSelect = document.querySelector('.nav-select');
+        if (navSelect) navSelect.value = 'contact_quality_analytics.html';
+      } catch (e) { console.error('Error loading header:', e); }
+    }
+    document.addEventListener('DOMContentLoaded', loadHeader);
+  </script>
+  <script type="module">
+    import { getDatabase, ref, get } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js';
+    
+    async function init() {
+      await window.firebaseReady;
+      const ok = await window.requireAuthResilient('You must be logged in to view this page.');
+      if (!ok) return;
+      
+      const db = getDatabase(window.firebaseApp);
+      const indexSnap = await get(ref(db, 'ppc_hotsheet_index25'));
+      const orgMap = {};
+      if (indexSnap.exists()) {
+        const data = indexSnap.val();
+        Object.entries(data).forEach(([firebaseKey, v]) => {
+          const orgName = v?.org || '';
+          const domain = v?.domain || '';
+          const internalId = v?.id || null;
+          // Map by both internal id and firebase key for robustness
+          if (internalId) orgMap[internalId] = { org: orgName, domain };
+          orgMap[firebaseKey] = { org: orgName, domain };
+        });
+      }
+      
+      const crmSnap = await get(ref(db, 'ppc_crm_25'));
+      const rows = [];
+      if (crmSnap.exists()) {
+        const crm = crmSnap.val();
+        Object.entries(crm).forEach(([orgId, contacts]) => {
+          const counts = { badEmail:0, badPhone:0, badLinkedIn:0, left:0 };
+          if (contacts && typeof contacts === 'object') {
+            Object.values(contacts).forEach(events => {
+              if (events && typeof events === 'object') {
+                Object.values(events).forEach(ev => {
+                  const t = ev?.type || '';
+                  if (t === 'Bad Email') counts.badEmail++;
+                  else if (t === 'Bad Phone') counts.badPhone++;
+                  else if (t === 'Bad LinkedIn') counts.badLinkedIn++;
+                  else if (t === 'Contact Has Left') counts.left++;
+                });
+              }
+            });
+          }
+          const total = counts.badEmail + counts.badPhone + counts.badLinkedIn + counts.left;
+          if (total > 0) {
+            const info = orgMap[orgId] || { org: '', domain: '' };
+            rows.push({ orgId, ...info, ...counts, total });
+          }
+        });
+      }
+      
+      const tbody = document.getElementById('rows');
+      const search = document.getElementById('search');
+      const typeFilter = document.getElementById('typeFilter');
+      
+      function render(list) {
+        const term = (search.value || '').toLowerCase();
+        const type = typeFilter.value;
+        const filtered = list.filter(r => {
+          if (type === 'Bad Email' && r.badEmail === 0) return false;
+          if (type === 'Bad Phone' && r.badPhone === 0) return false;
+          if (type === 'Bad LinkedIn' && r.badLinkedIn === 0) return false;
+          if (type === 'Contact Has Left' && r.left === 0) return false;
+          if (!term) return true;
+          const blob = `${r.org||''} ${r.domain||''}`.toLowerCase();
+          return blob.includes(term);
+        });
+        if (filtered.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7">No results</td></tr>';
+          return;
+        }
+        tbody.innerHTML = filtered
+          .sort((a,b) => b.total - a.total)
+          .map(r => `<tr>
+            <td>${r.org || ''}</td>
+            <td>${r.domain || ''}</td>
+            <td>${r.badEmail}</td>
+            <td>${r.badPhone}</td>
+            <td>${r.badLinkedIn}</td>
+            <td>${r.left}</td>
+            <td><span class="badge">${r.total}</span></td>
+          </tr>`).join('');
+      }
+      
+      render(rows);
+      search.addEventListener('input', () => render(rows));
+      typeFilter.addEventListener('change', () => render(rows));
+    }
+    
+    document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
+
+

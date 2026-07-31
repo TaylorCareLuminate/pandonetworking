@@ -1,0 +1,126 @@
+---
+description: Authentication patterns for HealthLuminate pages — prevents false relogins and session expiry errors
+globs: "**/*.html"
+alwaysApply: false
+---
+
+# Authentication Patterns
+
+This project uses a centralized auth system in `js/auth.js`. All pages in protected folders (`crm/`, `connect/`, `team/`, `kba/`, etc.) must follow these patterns to avoid false relogins caused by Firebase token refresh cycles.
+
+## Core Concept
+
+Firebase briefly sets `auth.currentUser = null` during every token refresh (~every 1 hour). `auth.js` has a 12-hour protection window that keeps `currentAuthState.isLoggedIn = true` during these moments. Any page code that checks `auth.currentUser` directly — without consulting auth.js — will falsely kick users out.
+
+---
+
+## Rule 1: Always guard redirects with `isTrulyLoggedOut()`
+
+When a page has its own `onAuthStateChanged` listener, NEVER redirect or show a session-expired banner without checking `window.isTrulyLoggedOut()` first.
+
+```js
+// ❌ BAD — redirects during normal token refresh cycles
+onAuthStateChanged(auth, (user) => {
+  if (!user) {
+    window.location.href = '../login.html';
+  }
+});
+
+// ✅ GOOD — respects auth.js protection window
+onAuthStateChanged(auth, (user) => {
+  if (!user) {
+    if (window.isTrulyLoggedOut?.()) {
+      window.location.href = '../login.html';
+    } else {
+      console.log('🛡️ Suppressing false logout — auth.js protection active');
+    }
+  }
+});
+```
+
+The same applies to any session-expired banner or alert — wrap it with `if (window.isTrulyLoggedOut?.())`.
+
+---
+
+## Rule 2: Never check `auth.currentUser` directly for session UI
+
+`auth.currentUser` can be null during token refresh even when the user is legitimately logged in. Always use `window.getCurrentAuthState()` or `window.isTrulyLoggedOut()` instead.
+
+```js
+// ❌ BAD
+if (!auth.currentUser) {
+  showSessionExpiredBanner();
+  return;
+}
+
+// ✅ GOOD
+if (window.isTrulyLoggedOut?.()) {
+  showSessionExpiredBanner();
+  return;
+}
+```
+
+---
+
+## Rule 3: Do NOT implement your own token refresh interval
+
+`auth.js` already runs a centralized token refresh every 45 minutes with cross-tab coordination. Adding a second interval on the same page creates duplicate simultaneous refreshes that generate noisy localStorage events, which can trigger false logout detection.
+
+If a page truly needs its own backup refresh, follow this template exactly:
+
+```js
+// ✅ ONLY if a page-level backup refresh is absolutely necessary
+const MAX_TOKEN_REFRESH_FAILURES = 10; // Must be 10 — never lower
+let tokenRefreshFailureCount = 0;
+
+async function refreshAuthToken() {
+  try {
+    if (auth.currentUser) {
+      // Defer to auth.js centralized refresh if available
+      if (window.refreshAuthToken && window.refreshAuthToken !== refreshAuthToken) {
+        await window.refreshAuthToken();
+      } else {
+        await auth.currentUser.getIdToken(true);
+      }
+      tokenRefreshFailureCount = 0;
+    }
+  } catch (error) {
+    tokenRefreshFailureCount++;
+    if (tokenRefreshFailureCount >= MAX_TOKEN_REFRESH_FAILURES) {
+      console.error('Token refresh failed — auth.js will handle session state');
+      tokenRefreshFailureCount = 0; // Reset; keep trying
+      // DO NOT alert() or redirect here — auth.js handles genuine expiry
+    }
+  }
+}
+
+// Must use 45 minutes to align with auth.js — never use 20 minutes or lower
+setInterval(refreshAuthToken, 45 * 60 * 1000);
+```
+
+---
+
+## Rule 4: Let `auth.js` and `folder-protection.js` do their jobs
+
+- Do not call `setPersistence()` on pages that load `auth.js` — it already sets `browserLocalPersistence`
+- Do not re-initialize Firebase if `auth.js` is loaded — use `window.auth`, `window.db`, `window.firebaseReady`
+- Do not add a second `protectFolder()` call — `folder-protection.js` auto-runs via `autoProtectFromPath()`
+
+```js
+// ✅ Correct way to get auth in a page that loads auth.js
+await window.firebaseReady;
+const auth = window.auth;
+const db = window.db;
+```
+
+---
+
+## Useful globals provided by `auth.js`
+
+| Global | What it does |
+|---|---|
+| `window.isTrulyLoggedOut()` | Returns `true` only when user is genuinely logged out (not mid-refresh) |
+| `window.getCurrentAuthState()` | Returns current auth state object: `{ isLoggedIn, isVerified, user, isChecking }` |
+| `window.firebaseReady` | Promise that resolves when Firebase + auth are fully initialized |
+| `window.requireAuthResilient(msg, ms)` | Async auth check with retry; redirects only after timeout |
+| `window.refreshAuthToken()` | Centralized token refresh — use this instead of `getIdToken(true)` directly |

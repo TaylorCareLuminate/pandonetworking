@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fix December 2025 Underpayments</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 3rem;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            color: #1f2937;
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: #6b7280;
+            margin-bottom: 2rem;
+        }
+
+        .record {
+            background: #f9fafb;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .record.found {
+            border-color: #10b981;
+            background: #f0fdf4;
+        }
+
+        .record.error {
+            border-color: #ef4444;
+            background: #fef2f2;
+        }
+
+        .record-header {
+            font-weight: 700;
+            font-size: 1.1rem;
+            color: #1f2937;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .record-details {
+            display: grid;
+            grid-template-columns: 150px 1fr;
+            gap: 0.5rem;
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+        }
+
+        .label {
+            color: #6b7280;
+            font-weight: 600;
+        }
+
+        .value {
+            color: #1f2937;
+        }
+
+        .change-box {
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 1rem;
+            margin-top: 1rem;
+        }
+
+        .change-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        .change-row:last-child {
+            border-bottom: none;
+        }
+
+        .old-value {
+            color: #dc2626;
+            text-decoration: line-through;
+        }
+
+        .new-value {
+            color: #16a34a;
+            font-weight: 700;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 1rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-top: 1rem;
+        }
+
+        .btn-primary {
+            background: #2563eb;
+            color: white;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: #1d4ed8;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
+        }
+
+        .btn-success {
+            background: #16a34a;
+            color: white;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .status {
+            margin-top: 1.5rem;
+            padding: 1rem;
+            border-radius: 8px;
+            display: none;
+        }
+
+        .status.success {
+            background: #dcfce7;
+            border: 2px solid #10b981;
+            color: #166534;
+            display: block;
+        }
+
+        .status.error {
+            background: #fee2e2;
+            border: 2px solid #ef4444;
+            color: #991b1b;
+            display: block;
+        }
+
+        .status.loading {
+            background: #e0e7ff;
+            border: 2px solid #6366f1;
+            color: #3730a3;
+            display: block;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-top-color: currentColor;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 Fix December 2025 Underpayments</h1>
+        <p class="subtitle">One-time correction for 3 scheduled meetings with incorrect Achievement Pool amounts</p>
+
+        <div id="recordsContainer"></div>
+
+        <button id="fixBtn" class="btn btn-primary" style="display: none;">
+            Fix All Records
+        </button>
+
+        <div id="status" class="status"></div>
+    </div>
+
+    <script src="../js/auth.js"></script>
+    <script src="../js/folder-protection.js"></script>
+    <script src="../js/clemail-firestore-wrapper.js"></script>
+
+    <script type="module">
+        await window.firebaseReady;
+
+        const { collection, getDocs, getDoc, doc, updateDoc, query, where, orderBy } = window.clemailFirestore;
+        const db = window.clemailDb;
+
+        // Import payment configuration from single source of truth
+        const { QUALIFYING_OUTCOMES, ACHIEVEMENT_POOL_CONFIG, calculateAchievementPool: calculateAchievementPoolImported } = 
+            await import('../js/payment-config.js');
+
+        const recordsContainer = document.getElementById('recordsContainer');
+        const fixBtn = document.getElementById('fixBtn');
+        const statusDiv = document.getElementById('status');
+
+        // Date-aware wrapper: pass meeting timestamp so historical meetings
+        // (scheduled before the soft cap was added) get the legacy calculation.
+        function calculateAchievementPool(qualifyingCalls, asOfDate = null) {
+            return calculateAchievementPoolImported(qualifyingCalls, asOfDate);
+        }
+
+        // SCAN ALL MEETINGS FROM 12/19 TO TODAY
+        console.log('\n🔍 SCANNING ALL SCHEDULED MEETINGS FROM 12/19/2025 TO TODAY...\n');
+        
+        const scanStart = new Date('2025-12-19T00:00:00');
+        const scanEnd = new Date(); // Today, right now
+        scanEnd.setHours(23, 59, 59, 999); // End of today
+        
+        // Get ALL calls, sorted by timestamp
+        const allCallsSnapshot = await getDocs(query(
+            collection(db, 'campaign_call_tracking'),
+            orderBy('timestamp', 'asc')
+        ));
+        
+        const allCalls = [];
+        allCallsSnapshot.forEach(doc => {
+            const data = doc.data();
+            allCalls.push({
+                id: doc.id,
+                ...data,
+                timestamp: new Date(data.timestamp)
+            });
+        });
+        
+        console.log(`✅ Loaded ${allCalls.length} total call records`);
+        
+        // Find all scheduled meetings in our date range
+        const meetingsToCheck = allCalls.filter(call => {
+            return call.timestamp >= scanStart && 
+                   call.timestamp <= scanEnd && 
+                   call.outcome?.toLowerCase().includes('scheduled-meeting');
+        });
+        
+        console.log(`\n📊 Found ${meetingsToCheck.length} scheduled meetings between 12/19 and today:\n`);
+        
+        const discrepancies = [];
+        
+        // For each meeting, calculate what the pool SHOULD have been
+        for (const meeting of meetingsToCheck) {
+            // Count qualifying calls BEFORE this meeting FOR THIS CAMPAIGN ONLY
+            let qualifyingCount = 0;
+            let lastMeetingBeforeThis = null;
+            const meetingCampaignId = meeting.campaignId;
+            
+            for (const call of allCalls) {
+                // CRITICAL: Only count calls from the SAME CAMPAIGN
+                if (call.campaignId !== meetingCampaignId) continue;
+                
+                // Stop when we reach this meeting
+                if (call.id === meeting.id) break;
+                
+                // If we find a previous meeting, reset the count
+                if (call.outcome?.toLowerCase().includes('scheduled-meeting')) {
+                    qualifyingCount = 0;
+                    lastMeetingBeforeThis = call;
+                    continue;
+                }
+                
+                // Count qualifying calls (case-insensitive matching)
+                const outcome = call.outcome || '';
+                const isQualifying = QUALIFYING_OUTCOMES.some(qo => {
+                    // Try exact match first
+                    if (outcome === qo) return true;
+                    // Then case-insensitive
+                    if (outcome.toLowerCase() === qo.toLowerCase()) return true;
+                    return false;
+                });
+                
+                if (isQualifying) {
+                    qualifyingCount++;
+                }
+            }
+            
+            // Pass meeting timestamp so meetings scheduled before the
+            // April 16, 2026 soft-cap change use the legacy formula.
+            const correctPool = calculateAchievementPool(qualifyingCount, meeting.timestamp);
+            const recordedPool = meeting.achievementPoolAwarded || 0;
+            const difference = Math.abs(correctPool - recordedPool);
+            
+            const status = difference > 0.10 ? '❌' : '✅';
+            const color = difference > 0.10 ? 'color: #ef4444; font-weight: bold;' : 'color: #10b981;';
+            
+            console.log(`${status} ${meeting.timestamp.toLocaleString()}`);
+            console.log(`   Agent: ${meeting.userName || 'Unknown'}`);
+            console.log(`   Contact: ${meeting.contactName} - ${meeting.companyName}`);
+            console.log(`   Campaign: ${meetingCampaignId || 'Unknown'}`);
+            console.log(`   Qualifying calls before this: ${qualifyingCount}`);
+            console.log(`   Correct pool: $${correctPool.toFixed(2)}`);
+            console.log(`   Recorded pool: $${recordedPool.toFixed(2)}`);
+            if (difference > 0.10) {
+                console.log(`   %cDISCREPANCY: $${difference.toFixed(2)}`, color);
+                discrepancies.push({
+                    id: meeting.id,
+                    date: meeting.timestamp,
+                    agent: meeting.userName,
+                    email: meeting.userEmail,
+                    contact: meeting.contactName,
+                    company: meeting.companyName,
+                    phone: meeting.phoneNumber,
+                    qualifyingCalls: qualifyingCount,
+                    correctPool: correctPool,
+                    recordedPool: recordedPool,
+                    difference: difference
+                });
+            }
+            console.log('');
+        }
+        
+        if (discrepancies.length > 0) {
+            console.log(`\n⚠️ FOUND ${discrepancies.length} MEETINGS WITH INCORRECT POOL AMOUNTS:\n`);
+            console.table(discrepancies.map(d => ({
+                Date: d.date.toLocaleDateString(),
+                Agent: d.agent,
+                Contact: d.contact,
+                'Qualifying Calls': d.qualifyingCalls,
+                'Should Be': `$${d.correctPool.toFixed(2)}`,
+                'Recorded': `$${d.recordedPool.toFixed(2)}`,
+                'Difference': `$${d.difference.toFixed(2)}`
+            })));
+        } else {
+            console.log('\n✅ All meetings from 12/19 to today have correct pool amounts!');
+        }
+        
+        console.log('\n---\n');
+
+        // Convert discrepancies to the format expected by the display code
+        const recordsToFix = discrepancies.map(d => ({
+            name: d.agent || 'Unknown',
+            email: d.email,
+            date: d.date.toLocaleDateString('en-US'),
+            contact: d.contact,
+            company: d.company,
+            phone: d.phone,
+            currentPool: d.recordedPool,
+            correctPool: d.correctPool,
+            qualifyingCalls: d.qualifyingCalls
+        }));
+
+        let foundRecords = [];
+
+        // Parse date string to Date object
+        function parseDate(dateStr) {
+            const [month, day, year] = dateStr.split('/');
+            return new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+        }
+
+        // Check if dates match (same day)
+        function isSameDay(date1, date2) {
+            return date1.getFullYear() === date2.getFullYear() &&
+                   date1.getMonth() === date2.getMonth() &&
+                   date1.getDate() === date2.getDate();
+        }
+
+        // Find and display records
+        async function findRecords() {
+            statusDiv.className = 'status loading';
+            statusDiv.style.display = 'block';
+            statusDiv.innerHTML = '<div class="spinner"></div> Searching for records...';
+
+            try {
+                // We already have all the data from the scan above
+                // Just need to match them to the database IDs
+                console.log('📊 Loading campaign_call_tracking...');
+                const trackingSnapshot = await getDocs(collection(db, 'campaign_call_tracking'));
+                console.log(`✅ Loaded ${trackingSnapshot.docs.length} tracking records`);
+                
+                console.log('📊 Loading phone_activities...');
+                const activitiesSnapshot = await getDocs(collection(db, 'phone_activities'));
+                console.log(`✅ Loaded ${activitiesSnapshot.docs.length} activity records`);
+                
+                for (const recordInfo of recordsToFix) {
+                    const targetDate = parseDate(recordInfo.date);
+                    console.log(`\n🔍 Searching for: ${recordInfo.name} on ${recordInfo.date}`);
+                    console.log(`   Email: ${recordInfo.email}`);
+                    console.log(`   Target date: ${targetDate.toISOString()}`);
+                    
+                    let trackingId = null;
+                    let trackingData = null;
+                    let phoneActivityId = null;
+                    let activityData = null;
+                    
+                    // Debug: Show all records for this user around this date
+                    const debugMatches = activitiesSnapshot.docs.filter(doc => {
+                        const data = doc.data();
+                        return data.completedBy === recordInfo.email;
+                    }).slice(0, 10); // Show first 10
+                    
+                    console.log(`   Found ${debugMatches.length} total activities for this user (showing first 10):`);
+                    debugMatches.forEach(doc => {
+                        const data = doc.data();
+                        let completedAt = data.completedAt;
+                        if (typeof completedAt === 'string') {
+                            completedAt = new Date(completedAt);
+                        } else if (completedAt && completedAt.toDate) {
+                            completedAt = completedAt.toDate();
+                        } else if (completedAt && completedAt.seconds) {
+                            completedAt = new Date(completedAt.seconds * 1000);
+                        }
+                        console.log(`      - ${completedAt ? completedAt.toLocaleDateString() : 'NO DATE'}: ${data.outcome || 'NO OUTCOME'} - ${data.contactName || 'NO NAME'}`);
+                    });
+                    
+                    // Search campaign_call_tracking
+                    const matchingTracking = trackingSnapshot.docs.find(doc => {
+                        const data = doc.data();
+                        
+                        // Parse timestamp
+                        let timestamp = data.timestamp;
+                        if (typeof timestamp === 'string') {
+                            timestamp = new Date(timestamp);
+                        } else if (timestamp && timestamp.toDate) {
+                            timestamp = timestamp.toDate();
+                        } else if (timestamp && timestamp.seconds) {
+                            timestamp = new Date(timestamp.seconds * 1000);
+                        }
+                        
+                        // Check criteria - MUST match all 4: email, date, outcome, AND contact
+                        const emailMatch = data.userEmail === recordInfo.email;
+                        const dateMatch = timestamp && isSameDay(timestamp, targetDate);
+                        const outcomeMatch = data.outcome && (
+                            data.outcome.toLowerCase().includes('scheduled-meeting') ||
+                            data.outcome.toLowerCase().includes('meeting')
+                        );
+                        const contactMatch = data.contactName === recordInfo.contact;
+                        
+                        if (emailMatch && dateMatch && outcomeMatch && contactMatch) {
+                            console.log(`   ✅ Found in campaign_call_tracking: ${doc.id.slice(0, 8)}...`);
+                            return true;
+                        }
+                        return false;
+                    });
+                    
+                    if (matchingTracking) {
+                        trackingId = matchingTracking.id;
+                        trackingData = matchingTracking.data();
+                        console.log(`   ✅ Found in campaign_call_tracking: ${trackingId}`);
+                        console.log(`      Full record:`, {
+                            userEmail: trackingData.userEmail,
+                            callerName: trackingData.callerName,
+                            contactName: trackingData.contactName,
+                            timestamp: trackingData.timestamp,
+                            achievementPoolAwarded: trackingData.achievementPoolAwarded,
+                            totalPayment: trackingData.totalPayment,
+                            outcome: trackingData.outcome
+                        });
+                    } else {
+                        console.log(`   ❌ Not found in campaign_call_tracking`);
+                    }
+                    
+                    // Search phone_activities (more flexible criteria)
+                    const matchingActivity = activitiesSnapshot.docs.find(doc => {
+                        const data = doc.data();
+                        
+                        // Parse completedAt
+                        let completedAt = data.completedAt;
+                        if (typeof completedAt === 'string') {
+                            completedAt = new Date(completedAt);
+                        } else if (completedAt && completedAt.toDate) {
+                            completedAt = completedAt.toDate();
+                        } else if (completedAt && completedAt.seconds) {
+                            completedAt = new Date(completedAt.seconds * 1000);
+                        }
+                        
+                        // Check criteria - MUST match all 4: email, date, outcome, AND contact
+                        const emailMatch = data.completedBy === recordInfo.email;
+                        const dateMatch = completedAt && isSameDay(completedAt, targetDate);
+                        const outcomeMatch = data.outcome && (
+                            data.outcome.toLowerCase().includes('scheduled-meeting') ||
+                            data.outcome.toLowerCase().includes('meeting')
+                        );
+                        const contactMatch = data.contactName === recordInfo.contact;
+                        
+                        if (emailMatch && dateMatch && outcomeMatch && contactMatch) {
+                            console.log(`   ✅ Found in phone_activities: ${doc.id.slice(0, 8)}...`);
+                            console.log(`      Contact: ${data.contactName}, Outcome: ${data.outcome}`);
+                            return true;
+                        }
+                        return false;
+                    });
+                    
+                    if (matchingActivity) {
+                        phoneActivityId = matchingActivity.id;
+                        activityData = matchingActivity.data();
+                    } else {
+                        console.log(`   ❌ Not found in phone_activities`);
+                    }
+                    
+                    // Add to found records if we found at least one
+                    if (trackingId || phoneActivityId) {
+                        foundRecords.push({
+                            info: recordInfo,
+                            trackingId: trackingId,
+                            trackingData: trackingData,
+                            phoneActivityId: phoneActivityId,
+                            activityData: activityData
+                        });
+                    }
+                }
+
+                console.log(`\n📊 Summary: Found ${foundRecords.length}/${recordsToFix.length} records`);
+                displayRecords();
+                statusDiv.style.display = 'none';
+
+            } catch (error) {
+                console.error('Error finding records:', error);
+                statusDiv.className = 'status error';
+                statusDiv.innerHTML = `❌ Error: ${error.message}`;
+            }
+        }
+
+        // Display found records
+        function displayRecords() {
+            let html = '';
+
+            recordsToFix.forEach((recordInfo, index) => {
+                const found = foundRecords.find(r => r.info === recordInfo);
+                const isFound = !!found;
+                
+                html += `
+                    <div class="record ${isFound ? 'found' : 'error'}">
+                        <div class="record-header">
+                            ${isFound ? '✅' : '❌'} ${recordInfo.name} - ${recordInfo.date}
+                        </div>
+                        <div class="record-details">
+                            <div class="label">Contact:</div>
+                            <div class="value">${recordInfo.contact} @ ${recordInfo.company}</div>
+                            
+                            <div class="label">Phone:</div>
+                            <div class="value">${recordInfo.phone}</div>
+                            
+                            <div class="label">Status:</div>
+                            <div class="value">
+                                ${isFound ? 
+                                    `<div>
+                                        ${found.trackingId ? `✅ campaign_call_tracking: ${found.trackingId.slice(0, 8)}...` : '❌ campaign_call_tracking: not found'}<br>
+                                        ${found.phoneActivityId ? `✅ phone_activities: ${found.phoneActivityId.slice(0, 8)}...` : '❌ phone_activities: not found'}
+                                    </div>` : 
+                                    'Not found in either collection'}
+                            </div>
+                        </div>
+                        
+                        ${isFound ? `
+                            <div class="change-box">
+                                <div class="change-row">
+                                    <span>Achievement Pool:</span>
+                                    <span>
+                                        <span class="old-value">$${recordInfo.currentPool.toFixed(2)}</span>
+                                        →
+                                        <span class="new-value">$${recordInfo.correctPool.toFixed(2)}</span>
+                                    </span>
+                                </div>
+                                <div class="change-row">
+                                    <span>Total Payment:</span>
+                                    <span>
+                                        <span class="old-value">$${(recordInfo.currentPool + 0.50).toFixed(2)}</span>
+                                        →
+                                        <span class="new-value">$${(recordInfo.correctPool + 0.50).toFixed(2)}</span>
+                                    </span>
+                                </div>
+                                <div class="change-row">
+                                    <span>Difference:</span>
+                                    <span class="new-value">+$${(recordInfo.correctPool - recordInfo.currentPool).toFixed(2)}</span>
+                                </div>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            });
+
+            recordsContainer.innerHTML = html;
+
+            // Show fix button if we found at least something for each record
+            if (foundRecords.length > 0) {
+                fixBtn.style.display = 'block';
+                if (foundRecords.length < recordsToFix.length) {
+                    fixBtn.innerHTML = `⚠️ Fix ${foundRecords.length} Found Records (${recordsToFix.length - foundRecords.length} missing)`;
+                }
+            }
+        }
+
+        // Fix all records
+        async function fixAllRecords() {
+            fixBtn.disabled = true;
+            statusDiv.className = 'status loading';
+            statusDiv.style.display = 'block';
+            statusDiv.innerHTML = '<div class="spinner"></div> Updating records...';
+
+            try {
+                let updatedCount = 0;
+                let trackingUpdated = 0;
+                let activityUpdated = 0;
+                let errors = [];
+
+                for (const record of foundRecords) {
+                    const correctPoolAmount = record.info.correctPool;
+                    const correctTotalPayment = correctPoolAmount + 0.50; // base pay
+
+                    console.log(`\n🔧 Fixing ${record.info.name} - ${record.info.date}`);
+                    console.log(`   Contact: ${record.info.contact}`);
+                    console.log(`   Current pool: $${record.info.currentPool.toFixed(2)} → Correct pool: $${correctPoolAmount.toFixed(2)}`);
+
+                    try {
+                        // Update campaign_call_tracking if found
+                        if (record.trackingId) {
+                            console.log(`   📝 Updating campaign_call_tracking doc ${record.trackingId}...`);
+                            console.log(`      Old values: achievementPoolAwarded=${record.trackingData.achievementPoolAwarded}, totalPayment=${record.trackingData.totalPayment}`);
+                            
+                            try {
+                                await updateDoc(doc(db, 'campaign_call_tracking', record.trackingId), {
+                                    achievementPoolAwarded: correctPoolAmount,
+                                    totalPayment: correctTotalPayment
+                                });
+                                
+                                // Verify the update
+                                const verifyDocRef = doc(db, 'campaign_call_tracking', record.trackingId);
+                                const verifySnap = await getDoc(verifyDocRef);
+                                const verifyData = verifySnap.data();
+                                console.log(`   ✅ Updated campaign_call_tracking: ${record.trackingId}`);
+                                console.log(`      New values: achievementPoolAwarded=${verifyData.achievementPoolAwarded}, totalPayment=${verifyData.totalPayment}`);
+                                
+                                if (verifyData.achievementPoolAwarded !== correctPoolAmount) {
+                                    console.error(`   ⚠️ WARNING: Verification failed! Expected ${correctPoolAmount} but got ${verifyData.achievementPoolAwarded}`);
+                                    errors.push(`campaign_call_tracking ${record.trackingId}: verification failed`);
+                                }
+                                
+                                trackingUpdated++;
+                            } catch (err) {
+                                console.error(`   ❌ Error updating campaign_call_tracking:`, err);
+                                errors.push(`campaign_call_tracking ${record.trackingId}: ${err.message}`);
+                            }
+                        }
+
+                    // Update phone_activities if found
+                    if (record.phoneActivityId) {
+                        console.log(`   📝 Updating phone_activities doc ${record.phoneActivityId}...`);
+                        console.log(`      Old values: achievementPoolAwarded=${record.activityData.achievementPoolAwarded}, totalPayment=${record.activityData.totalPayment}`);
+                        
+                        try {
+                            await updateDoc(doc(db, 'phone_activities', record.phoneActivityId), {
+                                achievementPoolAwarded: correctPoolAmount,
+                                totalPayment: correctTotalPayment
+                            });
+                            
+                            // Verify the update
+                            const verifyDocRef = doc(db, 'phone_activities', record.phoneActivityId);
+                            const verifySnap = await getDoc(verifyDocRef);
+                            const verifyData = verifySnap.data();
+                            console.log(`   ✅ Updated phone_activities: ${record.phoneActivityId}`);
+                            console.log(`      New values: achievementPoolAwarded=${verifyData.achievementPoolAwarded}, totalPayment=${verifyData.totalPayment}`);
+                            
+                            if (verifyData.achievementPoolAwarded !== correctPoolAmount) {
+                                console.error(`   ⚠️ WARNING: Verification failed! Expected ${correctPoolAmount} but got ${verifyData.achievementPoolAwarded}`);
+                                errors.push(`phone_activities ${record.phoneActivityId}: verification failed`);
+                            }
+                            
+                            activityUpdated++;
+                        } catch (err) {
+                            console.error(`   ❌ Error updating phone_activities:`, err);
+                            errors.push(`phone_activities ${record.phoneActivityId}: ${err.message}`);
+                        }
+                    } else {
+                        // MISSING FROM phone_activities - create a minimal record
+                        console.log(`   ⚠️ NOT FOUND in phone_activities - will create placeholder`);
+                        console.log(`      Contact: ${record.info.contact}, Email: ${record.info.email}`);
+                        
+                        // Note: We can't create phone_activities records here because we don't have all the required data
+                        // This should be manually fixed or the agent should be notified
+                        errors.push(`phone_activities missing for ${record.info.contact} - manual fix needed`);
+                    }
+
+                        updatedCount++;
+                    } catch (err) {
+                        console.error(`   ❌ Error processing record:`, err);
+                        errors.push(`${record.info.name} (${record.info.date}): ${err.message}`);
+                    }
+                }
+
+                if (errors.length > 0) {
+                    statusDiv.className = 'status error';
+                    statusDiv.innerHTML = `
+                        ⚠️ <strong>Partial Success</strong> - Updated ${updatedCount} records with ${errors.length} errors.<br>
+                        <small style="margin-top: 0.5rem; display: block;">
+                            • campaign_call_tracking: ${trackingUpdated} updated<br>
+                            • phone_activities: ${activityUpdated} updated<br>
+                            <br>
+                            Errors:<br>
+                            ${errors.map(e => `• ${e}`).join('<br>')}
+                        </small>
+                    `;
+                } else {
+                    statusDiv.className = 'status success';
+                    statusDiv.innerHTML = `
+                        ✅ <strong>Success!</strong> Updated ${updatedCount} records.<br>
+                        <small style="margin-top: 0.5rem; display: block;">
+                            • campaign_call_tracking: ${trackingUpdated} updated<br>
+                            • phone_activities: ${activityUpdated} updated<br>
+                            <br>
+                            Amounts corrected:<br>
+                            ${foundRecords.map(r => `• ${r.info.name} (${r.info.date}): $${r.info.currentPool.toFixed(2)} → $${r.info.correctPool.toFixed(2)}`).join('<br>')}
+                        </small>
+                    `;
+                }
+
+                fixBtn.textContent = '✅ Records Fixed';
+                fixBtn.className = 'btn btn-success';
+                
+                // Add refresh button
+                setTimeout(() => {
+                    statusDiv.innerHTML += '<br><br><button class="btn btn-primary" style="margin-top: 1rem;" onclick="location.reload()">🔄 Refresh Page to Verify</button>';
+                }, 500);
+
+            } catch (error) {
+                console.error('Fatal error fixing records:', error);
+                statusDiv.className = 'status error';
+                statusDiv.innerHTML = `❌ Fatal Error: ${error.message}<br><small>${error.stack}</small>`;
+                fixBtn.disabled = false;
+            }
+        }
+
+        // Initialize
+        findRecords();
+
+        // Attach event listener
+        fixBtn.addEventListener('click', async () => {
+            const confirmed = confirm(
+                'Update all 3 records with correct Achievement Pool amounts?\n\n' +
+                '• Alex: $40.00 → $56.80\n' +
+                '• Kristin (12/16): $40.00 → $173.50\n' +
+                '• Kristin (12/18): $40.00 → $101.00'
+            );
+
+            if (confirmed) {
+                await fixAllRecords();
+            }
+        });
+    </script>
+</body>
+</html>
+

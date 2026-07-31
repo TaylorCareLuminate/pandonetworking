@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Compose Email - CRM</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="../css/main.css">
+  <style>
+    :root { --primary:#1e40af; --secondary:#0ea5e9; --gray:#6b7280; --danger:#ef4444; --success:#10b981; --card-shadow:0 2px 8px rgba(0,0,0,0.08); --radius:8px; }
+    body { background:#f9fafb; }
+    .container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
+    .page-header { background:#fff; border-radius: var(--radius); box-shadow: var(--card-shadow); padding:20px; margin-bottom:20px; }
+    .page-header h1 { margin:0; font-size:1.6rem; color:var(--primary); display:flex; align-items:center; gap:10px; }
+    .compose-card { background:#fff; border-radius: var(--radius); box-shadow: var(--card-shadow); padding:30px; }
+    .form-group { margin-bottom:20px; }
+    .form-group label { display:block; margin-bottom:8px; font-weight:600; color:#374151; font-size:14px; }
+    .form-group input, .form-group select, .form-group textarea { width:100%; padding:12px; border:1px solid #d1d5db; border-radius:6px; font-family:inherit; font-size:14px; }
+    .form-group input:focus, .form-group select:focus, .form-group textarea:focus { outline:none; border-color:var(--secondary); box-shadow:0 0 0 3px rgba(14,165,233,0.1); }
+    .form-group textarea { min-height:350px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height:1.6; resize:vertical; }
+    .btn { padding:12px 20px; border:none; border-radius:6px; cursor:pointer; display:inline-flex; align-items:center; gap:8px; font-weight:600; font-size:14px; transition:all 0.2s; }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    .btn-primary { background:var(--secondary); color:#fff; }
+    .btn-secondary { background:#6b7280; color:#fff; }
+    .btn-success { background:var(--success); color:#fff; }
+    .btn-danger { background:var(--danger); color:#fff; }
+    .action-bar { display:flex; gap:12px; align-items:center; justify-content:space-between; margin-top:30px; padding-top:20px; border-top:1px solid #e5e7eb; }
+    .cc-bcc-toggle { color:var(--secondary); cursor:pointer; font-size:0.875rem; margin-left:10px; text-decoration:underline; display:inline-flex; align-items:center; gap:4px; }
+    .cc-bcc-toggle:hover { color:var(--primary); }
+    .helper-text { font-size:12px; color:var(--gray); margin-top:4px; }
+    .account-info { background:#f0f9ff; border:1px solid #bae6fd; border-radius:6px; padding:12px; margin-top:8px; font-size:13px; color:#075985; }
+    .account-info strong { color:#0c4a6e; }
+    .loading { text-align:center; padding:40px; color:var(--gray); }
+  </style>
+  <link rel="icon" type="image/png" href="../images/HealthLuminate-Bright.png">
+</head>
+<body class="crm-page">
+  <div id="header-placeholder"></div>
+  
+  <div class="container">
+    <div class="page-header">
+      <h1><i class="fas fa-paper-plane"></i> Compose Email</h1>
+      <div style="color:var(--gray); margin-top:6px;">Send emails from your connected accounts</div>
+    </div>
+
+    <div class="compose-card" id="composeCard">
+      <div class="loading">
+        <i class="fas fa-spinner fa-spin"></i> Loading email accounts...
+      </div>
+    </div>
+  </div>
+
+  <script src="../js/auth.js"></script>
+  <script src="../js/clemail-firestore-wrapper.js"></script>
+  <script src="../js/folder-protection.js"></script>
+  <script>
+    let customers = [];
+    let emailAccounts = [];
+    let selectedAccountInfo = null;
+    let cleEmailDb = null; // Store CLEmail Firestore instance for templates
+
+    document.addEventListener('DOMContentLoaded', async () => {
+      // Wait for auth and CLEmail wrapper to be ready
+      await window.firebaseReady;
+      cleEmailDb = window.clemailDb;
+      console.log('🔒 Using CLEmail secure wrapper');
+      // Best-effort auth: try to protect folder if auth is available within a short timeout
+      try {
+        const firebaseReady = window.firebaseReady;
+        const ready = await Promise.race([
+          (firebaseReady || Promise.reject(new Error('firebaseReady missing'))),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('firebase timeout')), 4000))
+        ]).then(() => true).catch(() => false);
+
+        if (ready && typeof window.protectFolder === 'function') {
+          const ok = await window.protectFolder('crm');
+          if (!ok) {
+            // Access denied UI handled by folder-protection; stop further work
+            return;
+          }
+        } else {
+          console.warn('Auth not ready in time; continuing without gating');
+        }
+      } catch (e) {
+        console.warn('Auth init non-blocking failure:', e);
+      }
+
+      // Load customers and email accounts from CLEmail Firebase
+      await loadCustomersAndAccounts();
+      
+      // Render the compose form
+      renderComposeForm();
+    });
+
+    async function loadCustomersAndAccounts() {
+      try {
+        const { collection, getDocs } = window.clemailFirestore;
+        const db = window.clemailDb;
+
+        // Load customers
+        const customersSnap = await getDocs(collection(db, 'customerList'));
+        customers = [];
+        customersSnap.docs.forEach(doc => {
+          customers.push({ id: doc.id, ...doc.data() });
+        });
+        console.log('Loaded customers:', customers.length);
+
+        // Load email accounts
+        const accountsSnap = await getDocs(collection(db, 'emailAccounts'));
+        emailAccounts = [];
+        accountsSnap.docs.forEach(doc => {
+          const data = doc.data();
+          emailAccounts.push({ 
+            id: doc.id,
+            accountId: doc.id,
+            ...data 
+          });
+        });
+        console.log('Loaded email accounts:', emailAccounts.length);
+      } catch (e) {
+        console.error('Failed to load customers/accounts:', e);
+        alert('Failed to load email accounts. Please refresh the page.');
+      }
+    }
+
+    function renderComposeForm() {
+      const card = document.getElementById('composeCard');
+      
+      if (emailAccounts.length === 0) {
+        card.innerHTML = `
+          <div class="loading">
+            <i class="fas fa-exclamation-triangle"></i>
+            <p>No email accounts available. Please configure email accounts first.</p>
+            <button class="btn btn-primary" onclick="location.reload()">
+              <i class="fas fa-sync"></i> Retry
+            </button>
+          </div>
+        `;
+        return;
+      }
+
+      // Sort active accounts first
+      const sortedAccounts = [...emailAccounts].sort((a, b) => {
+        if (a.status === 'active' && b.status !== 'active') return -1;
+        if (a.status !== 'active' && b.status === 'active') return 1;
+        return (a.email || '').localeCompare(b.email || '');
+      });
+
+      card.innerHTML = `
+        <div class="form-group">
+          <label for="fromAccount">
+            <i class="fas fa-user"></i> From Account
+          </label>
+          <select id="fromAccount" onchange="updateAccountInfo()">
+            ${sortedAccounts.map(acc => {
+              const customer = customers.find(c => c.id === acc.customerId);
+              const label = customer ? `${acc.email} (${customer.shortName || customer.name})` : acc.email;
+              const disabled = acc.status !== 'active' ? 'data-inactive="true"' : '';
+              return `<option value="${escapeHtml(acc.id)}" ${disabled}>${escapeHtml(label)}${acc.status !== 'active' ? ' (Inactive)' : ''}</option>`;
+            }).join('')}
+          </select>
+          <div id="accountInfo" class="account-info" style="display:none;"></div>
+        </div>
+
+        <div class="form-group">
+          <label for="toEmail">
+            <i class="fas fa-envelope"></i> To
+          </label>
+          <input type="text" id="toEmail" placeholder="recipient@example.com (separate multiple with commas)">
+          <span class="cc-bcc-toggle" onclick="toggleCcBcc()">
+            <i class="fas fa-plus-circle"></i> Add CC/BCC
+          </span>
+        </div>
+
+        <div class="form-group" id="ccGroup" style="display:none;">
+          <label for="ccEmail">
+            <i class="fas fa-envelope"></i> CC
+          </label>
+          <input type="text" id="ccEmail" placeholder="cc@example.com (separate multiple with commas)">
+        </div>
+
+        <div class="form-group" id="bccGroup" style="display:none;">
+          <label for="bccEmail">
+            <i class="fas fa-envelope"></i> BCC
+          </label>
+          <input type="text" id="bccEmail" placeholder="bcc@example.com (separate multiple with commas)">
+        </div>
+
+        <div class="form-group">
+          <label for="subjectEmail">
+            <i class="fas fa-heading"></i> Subject
+          </label>
+          <input type="text" id="subjectEmail" placeholder="Email subject">
+        </div>
+
+        <div class="form-group">
+          <label for="templateSelect">
+            <i class="fas fa-file-alt"></i> Email Templates
+          </label>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <select id="templateSelect" style="flex:1;" onchange="loadTemplate()">
+              <option value="">-- Select a template --</option>
+            </select>
+            <button class="btn btn-primary" style="padding:10px 16px; white-space:nowrap;" onclick="saveTemplate()">
+              <i class="fas fa-save"></i> Save as Template
+            </button>
+            <button class="btn btn-danger" style="padding:10px 16px;" onclick="deleteTemplate()" title="Delete selected template">
+              <i class="fas fa-trash"></i>
+            </button>
+          </div>
+          <div class="helper-text">
+            <i class="fas fa-info-circle"></i> Save frequently used messages as templates for quick access.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="bodyEmail">
+            <i class="fas fa-align-left"></i> Message
+          </label>
+          <textarea id="bodyEmail" placeholder="Type your message here...
+
+Your signature will be added automatically when you send the email."></textarea>
+          <div class="helper-text">
+            <i class="fas fa-info-circle"></i> Your account signature will be automatically appended when you send this email.
+          </div>
+        </div>
+
+        <div class="action-bar">
+          <div>
+            <button class="btn btn-secondary" onclick="saveDraft()">
+              <i class="fas fa-save"></i> Save Draft
+            </button>
+            <button class="btn btn-danger" onclick="clearForm()">
+              <i class="fas fa-eraser"></i> Clear
+            </button>
+          </div>
+          <div>
+            <button class="btn btn-success" onclick="sendEmail()">
+              <i class="fas fa-paper-plane"></i> Send Email
+            </button>
+          </div>
+        </div>
+      `;
+
+      // Update account info for the first selected account
+      updateAccountInfo();
+      
+      // Load templates into dropdown
+      loadTemplatesIntoDropdown();
+      
+      // Check for URL parameters to pre-fill form
+      prefillFromUrlParams();
+    }
+    
+    function prefillFromUrlParams() {
+      const urlParams = new URLSearchParams(window.location.search);
+      
+      // Pre-fill To field
+      const toEmail = urlParams.get('to');
+      if (toEmail) {
+        document.getElementById('toEmail').value = toEmail;
+      }
+      
+      // Pre-fill CC field
+      const ccEmail = urlParams.get('cc');
+      if (ccEmail) {
+        toggleCcBcc();
+        document.getElementById('ccEmail').value = ccEmail;
+      }
+      
+      // Pre-fill Subject
+      const subject = urlParams.get('subject');
+      if (subject) {
+        document.getElementById('subjectEmail').value = decodeURIComponent(subject);
+      }
+      
+      // Pre-fill Body
+      const body = urlParams.get('body');
+      if (body) {
+        document.getElementById('bodyEmail').value = decodeURIComponent(body);
+      }
+    }
+
+    function updateAccountInfo() {
+      const accountId = document.getElementById('fromAccount').value;
+      const account = emailAccounts.find(a => a.id === accountId || a.accountId === accountId);
+      const infoDiv = document.getElementById('accountInfo');
+      
+      if (!account) {
+        infoDiv.style.display = 'none';
+        return;
+      }
+
+      selectedAccountInfo = account;
+      const customer = customers.find(c => c.id === account.customerId);
+      
+      let infoHtml = `<strong>Account:</strong> ${escapeHtml(account.email)}`;
+      if (customer) {
+        infoHtml += ` | <strong>Customer:</strong> ${escapeHtml(customer.shortName || customer.name)}`;
+      }
+      if (account.signature) {
+        const sigPreview = typeof account.signature === 'string' 
+          ? account.signature.substring(0, 50) 
+          : account.signature.text?.substring(0, 50) || account.signature.html?.substring(0, 50) || '';
+        infoHtml += ` | <strong>Signature:</strong> ${escapeHtml(sigPreview)}${sigPreview.length >= 50 ? '...' : ''}`;
+      }
+      
+      infoDiv.innerHTML = `<i class="fas fa-info-circle"></i> ${infoHtml}`;
+      infoDiv.style.display = 'block';
+    }
+
+    function toggleCcBcc() {
+      const ccGroup = document.getElementById('ccGroup');
+      const bccGroup = document.getElementById('bccGroup');
+      const isVisible = ccGroup.style.display !== 'none';
+      
+      ccGroup.style.display = isVisible ? 'none' : 'block';
+      bccGroup.style.display = isVisible ? 'none' : 'block';
+    }
+
+    function clearForm() {
+      if (!confirm('Are you sure you want to clear the form? This will erase all your current inputs.')) {
+        return;
+      }
+      
+      document.getElementById('toEmail').value = '';
+      document.getElementById('ccEmail').value = '';
+      document.getElementById('bccEmail').value = '';
+      document.getElementById('subjectEmail').value = '';
+      document.getElementById('bodyEmail').value = '';
+    }
+
+    async function saveDraft() {
+      const accountId = document.getElementById('fromAccount').value;
+      const account = emailAccounts.find(a => a.id === accountId || a.accountId === accountId);
+      const to = document.getElementById('toEmail').value.trim();
+      const subject = document.getElementById('subjectEmail').value.trim();
+      const body = document.getElementById('bodyEmail').value;
+
+      if (!account || !to || !subject) {
+        alert('Please fill in From Account, To, and Subject to save draft.');
+        return;
+      }
+
+      const draft = {
+        accountId: account.id,
+        from: account.email,
+        to: to,
+        cc: document.getElementById('ccEmail').value.trim(),
+        bcc: document.getElementById('bccEmail').value.trim(),
+        subject: subject,
+        body: body,
+        savedAt: new Date().toISOString()
+      };
+
+      // Save to localStorage for now
+      const drafts = JSON.parse(localStorage.getItem('emailDrafts') || '[]');
+      drafts.push(draft);
+      localStorage.setItem('emailDrafts', JSON.stringify(drafts));
+
+      alert('✅ Draft saved successfully!\n\nYou can find your drafts in localStorage.');
+    }
+
+    async function sendEmail() {
+      const accountId = document.getElementById('fromAccount').value;
+      const account = emailAccounts.find(a => a.id === accountId || a.accountId === accountId);
+      const to = document.getElementById('toEmail').value.trim();
+      const cc = document.getElementById('ccEmail').value.trim();
+      const bcc = document.getElementById('bccEmail').value.trim();
+      const subject = document.getElementById('subjectEmail').value.trim();
+      let body = document.getElementById('bodyEmail').value.trim();
+
+      // Validation
+      if (!account) {
+        alert('Please select a valid From Account.');
+        return;
+      }
+      if (!to) {
+        alert('Please enter at least one recipient in the To field.');
+        return;
+      }
+      if (!subject) {
+        alert('Please enter a subject for your email.');
+        return;
+      }
+      if (!body) {
+        alert('Please enter a message body.');
+        return;
+      }
+
+      // Verify the account is active (only warn if explicitly inactive)
+      if (account.status && account.status !== 'active') {
+        const confirm = window.confirm(`Warning: Account "${account.email}" has status "${account.status}". Send anyway?`);
+        if (!confirm) return;
+      }
+
+      // Show confirmation
+      const confirmMsg = `Send email from: ${account.email}\nTo: ${to}\n${cc ? `CC: ${cc}\n` : ''}${bcc ? `BCC: ${bcc}\n` : ''}Subject: ${subject}`;
+      if (!window.confirm(confirmMsg)) {
+        return;
+      }
+
+      console.log('✅ Sending email from account:', {
+        accountId: account.id || account.accountId,
+        email: account.email,
+        customerId: account.customerId,
+        status: account.status
+      });
+
+      // Convert body to HTML - check if already HTML or plain text
+      const isPlainText = !body.includes('<br>') && !body.includes('<div>') && !body.includes('<p>') && !body.includes('<html>');
+      
+      if (isPlainText) {
+        // Escape HTML and convert line breaks
+        body = escapeHtml(body).replace(/\r\n/g, '<br>').replace(/\n/g, '<br>').replace(/\r/g, '<br>');
+      } else {
+        // Already has HTML, but make sure line breaks are preserved
+        body = body.replace(/\r\n/g, '<br>').replace(/\n/g, '<br>').replace(/\r/g, '<br>');
+      }
+
+      // Add signature AFTER the body if this account has one
+      let signatureHtml = '';
+      if (account.signature) {
+        if (typeof account.signature === 'object' && account.signature !== null) {
+          signatureHtml = account.signature.html || account.signature.text || '';
+        } else if (typeof account.signature === 'string') {
+          signatureHtml = escapeHtml(account.signature).replace(/\n/g, '<br>');
+        }
+      }
+
+      // Build complete email body: User's message + Signature
+      if (signatureHtml) {
+        body += `<br><br><div style="border-top: 1px solid #e5e7eb; padding-top: 10px; margin-top: 10px;">${signatureHtml}</div>`;
+      }
+
+      console.log('📧 Email body prepared:', {
+        length: body.length,
+        hasLineBreaks: body.includes('<br>'),
+        hasSignature: signatureHtml.length > 0,
+        preview: body.substring(0, 200)
+      });
+
+      // Wrap in proper HTML email structure for better compatibility
+      const htmlBody = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" type="image/png" href="../images/HealthLuminate-Bright.png">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #333; max-width: 600px; margin: 0; padding: 20px;">
+  ${body}
+</body>
+</html>`;
+
+      // Build email payload
+      const emailData = {
+        accountId: account.id || account.accountId,
+        customerId: account.customerId,
+        from: account.email,
+        fromEmail: account.email,
+        to: to,
+        subject: subject,
+        html: htmlBody,
+        // Manual / one-off send: backend returns a 72h-dedup WARNING (409) if
+        // this recipient was already emailed from this account in the last
+        // 72 hours.  We catch that warning below and let the user override.
+        isManual: true
+      };
+
+      // Also include plain text version (strip HTML tags for plain text clients)
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = body;
+      emailData.text = tempDiv.textContent || tempDiv.innerText || body;
+
+      // Add CC if provided
+      if (cc) {
+        emailData.cc = cc;
+      }
+
+      // Add BCC if provided
+      if (bcc) {
+        emailData.bcc = bcc;
+      }
+
+      console.log('📨 Email payload being sent to backend:', {
+        accountId: emailData.accountId,
+        from: emailData.from,
+        to: emailData.to,
+        cc: emailData.cc,
+        bcc: emailData.bcc,
+        subject: emailData.subject
+      });
+
+      try {
+        // Disable send button
+        const sendBtn = event.target;
+        const originalText = sendBtn.innerHTML;
+        sendBtn.disabled = true;
+        sendBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending...';
+
+        console.log('🚀 Sending POST request to /send-email...');
+        const result = await sendEmailWithDedupGuard(emailData);
+        console.log('✅ Email sent successfully! Backend response:', result);
+
+        if (result.from && result.from !== account.email) {
+          alert(`⚠️ WARNING: Email was sent from "${result.from}" instead of "${account.email}".\n\nThe email was delivered, but from the wrong account.`);
+        } else {
+          alert(`✅ Email sent successfully!\n\nFrom: ${account.email}\nTo: ${to}\nMessage ID: ${result.messageId || 'N/A'}`);
+        }
+
+        clearForm();
+
+        sendBtn.disabled = false;
+        sendBtn.innerHTML = originalText;
+
+      } catch (error) {
+        if (error && error.userCancelled) {
+          const sendBtn = document.querySelector('.btn-success');
+          if (sendBtn) {
+            sendBtn.disabled = false;
+            sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Send Email';
+          }
+          return;
+        }
+        console.error('❌ Send email error:', error);
+        alert(`Failed to send email: ${error.message}`);
+
+        const sendBtn = document.querySelector('.btn-success');
+        if (sendBtn) {
+          sendBtn.disabled = false;
+          sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Send Email';
+        }
+      }
+    }
+
+    // POSTs to /send-email and transparently handles the 72-hour-dedup
+    // warning returned for one-off (manual) sends.  If the backend says the
+    // recipient was emailed from this account within 72 h, prompt the user;
+    // on confirm, retry with bypassDedup: true.  Throws on any other failure.
+    async function sendEmailWithDedupGuard(payload) {
+      const url = 'https://railwayclemail-production.up.railway.app/send-email';
+      const post = (body) => fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      let response = await post(payload);
+
+      if (response.status === 409) {
+        const data = await response.json().catch(() => ({}));
+        if (data.code === 'DEDUP_72H_WARNING' && data.recentSend) {
+          const r = data.recentSend;
+          const when = r.sentAt ? new Date(r.sentAt).toLocaleString() : 'recently';
+          const ok = window.confirm(
+            `⚠️  This recipient was emailed from this account ${r.hoursAgo}h ago` +
+            (r.subject ? ` (subject: "${r.subject}")` : '') +
+            `\nLast send: ${when}\n\nSend anyway?`
+          );
+          if (!ok) {
+            const e = new Error('User cancelled after dedup warning');
+            e.userCancelled = true;
+            throw e;
+          }
+          response = await post({ ...payload, bypassDedup: true });
+        } else if (data.code === 'DEDUP_72H_BLOCK' && data.recentSend) {
+          const r = data.recentSend;
+          throw new Error(
+            `Blocked: recipient was emailed from this account ${r.hoursAgo}h ago. ` +
+            `Automated sends cannot send within 72 h.`
+          );
+        }
+      }
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(errText || `Send failed: ${response.status}`);
+      }
+
+      return response.json();
+    }
+
+    function escapeHtml(str) {
+      return String(str).replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[s]));
+    }
+
+    // ========== EMAIL TEMPLATE FUNCTIONS ==========
+    
+    async function loadTemplatesIntoDropdown() {
+      const select = document.getElementById('templateSelect');
+      
+      if (!select) {
+        console.warn('⚠️ Template select element not found!');
+        return;
+      }
+      
+      if (!cleEmailDb) {
+        console.warn('⚠️ CLEmail database not initialized yet');
+        return;
+      }
+      
+      try {
+        const { collection, getDocs, query, orderBy } = window.clemailFirestore;
+        
+        // Load templates from Firebase
+        const templatesQuery = query(collection(cleEmailDb, 'emailTemplates'), orderBy('name'));
+        const templatesSnap = await getDocs(templatesQuery);
+        
+        // Clear existing options except the first one
+        select.innerHTML = '<option value="">-- Select a template --</option>';
+        
+        let count = 0;
+        templatesSnap.docs.forEach(docSnap => {
+          const template = docSnap.data();
+          const option = document.createElement('option');
+          option.value = docSnap.id; // Use Firebase document ID
+          option.textContent = template.name;
+          select.appendChild(option);
+          count++;
+        });
+        
+        console.log(`✅ Loaded ${count} email templates from Firebase`);
+        
+      } catch (e) {
+        console.error('❌ Failed to load templates:', e);
+        select.innerHTML = '<option value="">-- Error loading templates --</option>';
+      }
+    }
+
+    async function saveTemplate() {
+      const subject = document.getElementById('subjectEmail').value.trim();
+      const body = document.getElementById('bodyEmail').value.trim();
+      
+      if (!subject && !body) {
+        alert('Please enter a subject and/or message body before saving as a template.');
+        return;
+      }
+      
+      if (!cleEmailDb) {
+        alert('Database not ready. Please try again in a moment.');
+        return;
+      }
+      
+      // Prompt for template name
+      const templateName = prompt('Enter a name for this template:');
+      
+      if (!templateName || !templateName.trim()) {
+        return; // User cancelled or entered empty name
+      }
+      
+      try {
+        const { collection, getDocs, addDoc, updateDoc, doc, query, where } = window.clemailFirestore;
+        
+        // Check if template name already exists
+        const templatesQuery = query(collection(cleEmailDb, 'emailTemplates'), where('name', '==', templateName.trim()));
+        const existingSnap = await getDocs(templatesQuery);
+        
+        const templateData = {
+          name: templateName.trim(),
+          subject: subject,
+          body: body,
+          updatedAt: new Date().toISOString()
+        };
+        
+        if (!existingSnap.empty) {
+          const overwrite = confirm(`A template named "${templateName}" already exists. Do you want to overwrite it?`);
+          if (overwrite) {
+            // Update existing template
+            const existingDoc = existingSnap.docs[0];
+            await updateDoc(doc(cleEmailDb, 'emailTemplates', existingDoc.id), templateData);
+            console.log('✅ Template updated:', existingDoc.id);
+          } else {
+            return;
+          }
+        } else {
+          // Add new template
+          templateData.createdAt = new Date().toISOString();
+          const newDocRef = await addDoc(collection(cleEmailDb, 'emailTemplates'), templateData);
+          console.log('✅ Template created:', newDocRef.id);
+        }
+        
+        // Reload dropdown
+        await loadTemplatesIntoDropdown();
+        
+        alert(`✅ Template "${templateName}" saved successfully!`);
+        
+      } catch (e) {
+        console.error('❌ Failed to save template:', e);
+        alert(`Failed to save template: ${e.message}`);
+      }
+    }
+
+    async function loadTemplate() {
+      const select = document.getElementById('templateSelect');
+      const templateId = select.value;
+      
+      if (templateId === '') {
+        return; // No template selected
+      }
+      
+      if (!cleEmailDb) {
+        alert('Database not ready. Please try again in a moment.');
+        return;
+      }
+      
+      try {
+        const { doc, getDoc } = window.clemailFirestore;
+        
+        const templateDoc = await getDoc(doc(cleEmailDb, 'emailTemplates', templateId));
+        
+        if (!templateDoc.exists) {
+          alert('Template not found.');
+          return;
+        }
+        
+        const template = templateDoc.data();
+        
+        // Ask for confirmation if form already has content
+        const currentSubject = document.getElementById('subjectEmail').value.trim();
+        const currentBody = document.getElementById('bodyEmail').value.trim();
+        
+        if (currentSubject || currentBody) {
+          const confirm = window.confirm('This will replace your current message. Continue?');
+          if (!confirm) {
+            select.value = ''; // Reset dropdown
+            return;
+          }
+        }
+        
+        // Load template into form
+        document.getElementById('subjectEmail').value = template.subject || '';
+        document.getElementById('bodyEmail').value = template.body || '';
+        
+        console.log(`✅ Loaded template: ${template.name}`);
+        
+      } catch (e) {
+        console.error('❌ Failed to load template:', e);
+        alert(`Failed to load template: ${e.message}`);
+      }
+    }
+
+    async function deleteTemplate() {
+      const select = document.getElementById('templateSelect');
+      const templateId = select.value;
+      
+      if (templateId === '') {
+        alert('Please select a template to delete.');
+        return;
+      }
+      
+      if (!cleEmailDb) {
+        alert('Database not ready. Please try again in a moment.');
+        return;
+      }
+      
+      try {
+        const { doc, getDoc, deleteDoc } = window.clemailFirestore;
+        
+        const templateDoc = await getDoc(doc(cleEmailDb, 'emailTemplates', templateId));
+        
+        if (!templateDoc.exists) {
+          alert('Template not found.');
+          return;
+        }
+        
+        const template = templateDoc.data();
+        
+        // Confirm deletion
+        const confirmDelete = confirm(`Are you sure you want to delete the template "${template.name}"?\n\nThis action cannot be undone and will affect all users.`);
+        
+        if (!confirmDelete) {
+          return;
+        }
+        
+        // Delete from Firebase
+        await deleteDoc(doc(cleEmailDb, 'emailTemplates', templateId));
+        console.log('✅ Template deleted:', templateId);
+        
+        // Reload dropdown
+        await loadTemplatesIntoDropdown();
+        
+        alert(`✅ Template "${template.name}" deleted successfully.`);
+        
+      } catch (e) {
+        console.error('❌ Failed to delete template:', e);
+        alert(`Failed to delete template: ${e.message}`);
+      }
+    }
+  </script>
+</body>
+</html>
+
+

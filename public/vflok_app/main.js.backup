@@ -1,0 +1,458 @@
+// ============================================================================
+// vFlok Hospital Dashboard - Main Process (Backend)
+// ============================================================================
+// This is the Electron main process that handles:
+// - Window creation and management
+// - SQLite database connection and queries
+// - IPC communication with renderer process
+// - Auto-updates
+// ============================================================================
+
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const path = require('path');
+const Database = require('better-sqlite3');
+const { autoUpdater } = require('electron-updater');
+
+let mainWindow;
+let db;
+
+// ============================================================================
+// DATABASE SETUP
+// ============================================================================
+
+function initializeDatabase() {
+  try {
+    // Database path - in development vs production
+    let dbPath;
+    
+    if (app.isPackaged) {
+      // Production: database is in resources/database
+      dbPath = path.join(process.resourcesPath, 'database', 'vflok_hospitals.db');
+    } else {
+      // Development: database is in project directory
+      dbPath = path.join(__dirname, 'database', 'vflok_hospitals.db');
+    }
+
+    console.log('📂 Database path:', dbPath);
+
+    // Open database connection
+    db = new Database(dbPath, { 
+      readonly: true,  // Read-only for safety
+      fileMustExist: true 
+    });
+
+    // Enable performance optimizations
+    db.pragma('journal_mode = WAL');  // Write-Ahead Logging
+    db.pragma('synchronous = NORMAL');
+    db.pragma('cache_size = -64000');  // 64MB cache
+    db.pragma('temp_store = MEMORY');
+
+    console.log('✅ Database connected successfully');
+
+    // Get database stats
+    const recordCount = db.prepare('SELECT COUNT(*) as count FROM hospitals').get();
+    console.log(`📊 Total hospital records: ${recordCount.count}`);
+
+    return true;
+  } catch (error) {
+    console.error('❌ Database initialization error:', error);
+    console.error('Attempted database path:', dbPath);
+    console.error('Current directory:', __dirname);
+    console.error('Is packaged:', app.isPackaged);
+    
+    dialog.showErrorBox(
+      'Database Error',
+      `Failed to open database: ${error.message}\n\nDatabase path: ${dbPath}\n\nPlease ensure the database file exists at this location.`
+    );
+    return false;
+  }
+}
+
+// ============================================================================
+// WINDOW CREATION
+// ============================================================================
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1600,
+    height: 1000,
+    minWidth: 1200,
+    minHeight: 800,
+    title: 'vFlok Hospital Dashboard',
+    icon: path.join(__dirname, 'build', 'icon.png'),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    },
+    backgroundColor: '#f9fafb',
+    show: false  // Don't show until ready
+  });
+
+  // Load the HTML file
+  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  // Show window when ready
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
+    console.log('✅ Window shown');
+  });
+
+  // Open DevTools in development mode
+  if (!app.isPackaged) {
+    mainWindow.webContents.openDevTools();
+  }
+  
+  // Log any console messages from renderer
+  mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
+    console.log(`Renderer: ${message}`);
+  });
+
+  // Handle window close
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+// ============================================================================
+// IPC HANDLERS - Database Queries
+// ============================================================================
+
+// Get all hospitals with pagination and filtering
+ipcMain.handle('db:query-hospitals', async (event, options) => {
+  try {
+    const {
+      page = 1,
+      pageSize = 20,
+      search = '',
+      filters = {},
+      sortBy = 'hospital_name',
+      sortDirection = 'ASC'
+    } = options;
+
+    // Build WHERE clause
+    const whereClauses = [];
+    const params = {};
+
+    // Search across multiple fields
+    if (search) {
+      whereClauses.push(`(
+        hospital_name LIKE @search OR
+        vflok_health_system LIKE @search OR
+        facility_id LIKE @search OR
+        hospital_city LIKE @search OR
+        hospital_state LIKE @search
+      )`);
+      params.search = `%${search}%`;
+    }
+
+    // Add filters
+    Object.entries(filters).forEach(([field, value]) => {
+      if (value && value !== 'all') {
+        if (value === '(NA/Unknown)') {
+          whereClauses.push(`(${field} IS NULL OR ${field} = '' OR ${field} = 'N/A')`);
+        } else if (value === 'other' && field === 'hospital_state') {
+          whereClauses.push(`${field} NOT IN ('TX','CA','FL','IL','OH','NY','PA','LA','GA','IN')`);
+        } else {
+          whereClauses.push(`${field} = @${field}`);
+          params[field] = value;
+        }
+      }
+    });
+
+    const whereSQL = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    // Get total count
+    const countQuery = `SELECT COUNT(*) as count FROM hospitals ${whereSQL}`;
+    const countStmt = db.prepare(countQuery);
+    const { count: totalRecords } = countStmt.get(params);
+
+    // Get paginated results
+    const offset = (page - 1) * pageSize;
+    const dataQuery = `
+      SELECT * FROM hospitals 
+      ${whereSQL}
+      ORDER BY ${sortBy} ${sortDirection}
+      LIMIT @limit OFFSET @offset
+    `;
+    
+    const dataStmt = db.prepare(dataQuery);
+    const records = dataStmt.all({
+      ...params,
+      limit: pageSize,
+      offset: offset
+    });
+
+    return {
+      success: true,
+      data: records,
+      totalRecords,
+      totalPages: Math.ceil(totalRecords / pageSize),
+      currentPage: page
+    };
+
+  } catch (error) {
+    console.error('Query error:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+});
+
+// Get all data for filtering (cached in renderer)
+ipcMain.handle('db:get-all-hospitals', async () => {
+  try {
+    const query = 'SELECT * FROM hospitals ORDER BY hospital_name';
+    const stmt = db.prepare(query);
+    const records = stmt.all();
+
+    return {
+      success: true,
+      data: records
+    };
+  } catch (error) {
+    console.error('Get all hospitals error:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+});
+
+// Get unique values for filter dropdowns
+ipcMain.handle('db:get-unique-values', async (event, field) => {
+  try {
+    const query = `
+      SELECT DISTINCT ${field} as value 
+      FROM hospitals 
+      WHERE ${field} IS NOT NULL AND ${field} != ''
+      ORDER BY ${field}
+    `;
+    const stmt = db.prepare(query);
+    const results = stmt.all();
+
+    return {
+      success: true,
+      data: results.map(r => r.value)
+    };
+  } catch (error) {
+    console.error('Get unique values error:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+});
+
+// Get statistics
+ipcMain.handle('db:get-stats', async () => {
+  try {
+    const stats = {
+      totalHospitals: db.prepare('SELECT COUNT(*) as count FROM hospitals').get().count,
+      uniqueStates: db.prepare('SELECT COUNT(DISTINCT hospital_state) as count FROM hospitals WHERE hospital_state IS NOT NULL').get().count,
+      uniqueHealthSystems: db.prepare('SELECT COUNT(DISTINCT vflok_health_system) as count FROM hospitals WHERE vflok_health_system IS NOT NULL').get().count,
+      uniqueEHRs: db.prepare('SELECT COUNT(DISTINCT ehr) as count FROM hospitals WHERE ehr IS NOT NULL').get().count
+    };
+
+    return {
+      success: true,
+      data: stats
+    };
+  } catch (error) {
+    console.error('Get stats error:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+});
+
+// Export data to CSV
+ipcMain.handle('db:export-csv', async (event, options) => {
+  try {
+    const { filters = {}, search = '' } = options;
+
+    // Build WHERE clause (same as query-hospitals)
+    const whereClauses = [];
+    const params = {};
+
+    if (search) {
+      whereClauses.push(`(
+        hospital_name LIKE @search OR
+        vflok_health_system LIKE @search OR
+        facility_id LIKE @search OR
+        hospital_city LIKE @search OR
+        hospital_state LIKE @search
+      )`);
+      params.search = `%${search}%`;
+    }
+
+    Object.entries(filters).forEach(([field, value]) => {
+      if (value && value !== 'all') {
+        if (value === '(NA/Unknown)') {
+          whereClauses.push(`(${field} IS NULL OR ${field} = '' OR ${field} = 'N/A')`);
+        } else {
+          whereClauses.push(`${field} = @${field}`);
+          params[field] = value;
+        }
+      }
+    });
+
+    const whereSQL = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const query = `SELECT * FROM hospitals ${whereSQL}`;
+    const stmt = db.prepare(query);
+    const records = stmt.all(params);
+
+    return {
+      success: true,
+      data: records
+    };
+  } catch (error) {
+    console.error('Export CSV error:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+});
+
+// ============================================================================
+// AUTO-UPDATER
+// ============================================================================
+
+function setupAutoUpdater() {
+  // Don't check for updates in development
+  if (!app.isPackaged) {
+    console.log('⚠️  Auto-updater disabled in development mode');
+    return;
+  }
+
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('checking-for-update', () => {
+    console.log('🔍 Checking for updates...');
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    console.log('✨ Update available:', info.version);
+    
+    dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      title: 'Update Available',
+      message: `A new version (${info.version}) is available!`,
+      detail: 'Would you like to download and install it?',
+      buttons: ['Download', 'Later'],
+      defaultId: 0
+    }).then(result => {
+      if (result.response === 0) {
+        autoUpdater.downloadUpdate();
+      }
+    });
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    console.log('✅ App is up to date');
+  });
+
+  autoUpdater.on('error', (err) => {
+    console.error('❌ Update error:', err);
+  });
+
+  autoUpdater.on('download-progress', (progressObj) => {
+    const msg = `Download speed: ${progressObj.bytesPerSecond} - Downloaded ${progressObj.percent}%`;
+    console.log(msg);
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    console.log('✅ Update downloaded');
+    
+    dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      title: 'Update Ready',
+      message: 'Update downloaded. Restart to install?',
+      buttons: ['Restart Now', 'Later'],
+      defaultId: 0
+    }).then(result => {
+      if (result.response === 0) {
+        autoUpdater.quitAndInstall();
+      }
+    });
+  });
+
+  // Check for updates on startup (after 3 seconds)
+  setTimeout(() => {
+    autoUpdater.checkForUpdates();
+  }, 3000);
+}
+
+// Manual update check
+ipcMain.handle('app:check-for-updates', async () => {
+  if (app.isPackaged) {
+    autoUpdater.checkForUpdates();
+  }
+  return { success: true };
+});
+
+// Get app version
+ipcMain.handle('app:get-version', async () => {
+  return { 
+    success: true, 
+    version: app.getVersion() 
+  };
+});
+
+// ============================================================================
+// APP LIFECYCLE
+// ============================================================================
+
+app.whenReady().then(() => {
+  console.log('🚀 vFlok Hospital Dashboard starting...');
+  console.log(`📦 Version: ${app.getVersion()}`);
+  console.log(`🏠 App path: ${app.getAppPath()}`);
+  
+  // Initialize database
+  const dbSuccess = initializeDatabase();
+  if (!dbSuccess) {
+    app.quit();
+    return;
+  }
+
+  // Create window
+  createWindow();
+
+  // Setup auto-updater
+  setupAutoUpdater();
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    if (db) {
+      db.close();
+      console.log('✅ Database connection closed');
+    }
+    app.quit();
+  }
+});
+
+app.on('before-quit', () => {
+  if (db) {
+    db.close();
+    console.log('✅ Database connection closed');
+  }
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught exception:', error);
+  dialog.showErrorBox('Application Error', error.message);
+});

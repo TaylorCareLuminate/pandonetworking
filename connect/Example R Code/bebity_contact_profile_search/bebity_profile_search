@@ -1,0 +1,402 @@
+################################################################################
+##
+## Bebity Profile Search Function
+## 
+## Reliably extracts LinkedIn profile data using the bebity/linkedin-premium-actor
+##
+## Returns: first_name, last_name, name, current_title, current_company,
+##          headline, about, experience_paragraph, education_paragraph, location
+##
+################################################################################
+
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(stringr)
+library(purrr)
+
+################################################################################
+## HELPER FUNCTIONS - Extract Text from Nested Profile Data
+################################################################################
+
+# Extract text-like columns from any data frame (and nested data.frame columns)
+extract_text <- function(df) {
+  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) return(character())
+  
+  # Character columns
+  chars <- df %>%
+    dplyr::select(where(is.character)) %>%
+    unlist(use.names = FALSE)
+  
+  # If there are data.frame subcolumns, recurse into them
+  df_cols <- df[vapply(df, is.data.frame, logical(1L))]
+  nested <- if (length(df_cols)) {
+    unlist(lapply(df_cols, extract_text), use.names = FALSE)
+  } else {
+    character()
+  }
+  
+  c(chars, nested)
+}
+
+# Recursive flattening of child lists
+flatten_children <- function(child_list) {
+  if (is.null(child_list)) return(character())
+  
+  purrr::map(child_list, function(x) {
+    if (is.null(x) || !is.data.frame(x)) return(character())
+    
+    txt <- extract_text(x)
+    kids <- if ("child" %in% names(x)) flatten_children(x$child) else character()
+    c(txt, kids)
+  }) |> unlist(use.names = FALSE)
+}
+
+# Main function for one list-column (e.g., ABOUT, EXPERIENCE, EDUCATION)
+flatten_section <- function(section_list) {
+  purrr::map_chr(section_list, function(entry) {
+    if (is.null(entry) || !is.data.frame(entry)) return(NA_character_)
+    
+    top  <- extract_text(entry)
+    kids <- if ("child" %in% names(entry)) flatten_children(entry$child) else character()
+    all_text <- c(top, kids)
+    
+    if (length(all_text) == 0) return(NA_character_)
+    
+    # Join with newline for better readability
+    paste(all_text, collapse = "\n")
+  })
+}
+
+# Helper function to clean organization name
+clean_org_name <- function(org_text) {
+  if (is.na(org_text) || !nzchar(as.character(org_text))) return(NA_character_)
+  org_text <- as.character(org_text)
+  org_text <- gsub("\\s*·\\s*(Full-time|Part-time|Contract|Freelance|Self-employed|Internship|Seasonal|Temporary).*$", "", org_text, ignore.case = TRUE)
+  return(trimws(org_text))
+}
+
+# Function to extract current employment from EXPERIENCE data frame
+extract_current_employment <- function(experience_df) {
+  current_org <- NA_character_
+  current_title <- NA_character_
+  time_in_role <- NA_character_
+  
+  if (is.null(experience_df) || !is.data.frame(experience_df) || nrow(experience_df) == 0) {
+    return(list(organization = current_org, title = current_title, time = time_in_role))
+  }
+  
+  # Get first row (current job)
+  caption_val <- if ("caption" %in% names(experience_df)) experience_df$caption[1] else NA
+  title_val <- if ("title" %in% names(experience_df)) experience_df$title[1] else NA
+  subtitle_val <- if ("subtitle" %in% names(experience_df)) experience_df$subtitle[1] else NA
+  
+  # Convert to character and check for NA/empty
+  caption_val <- if (!is.na(caption_val) && nzchar(as.character(caption_val))) as.character(caption_val) else NA_character_
+  title_val <- if (!is.na(title_val) && nzchar(as.character(title_val))) as.character(title_val) else NA_character_
+  subtitle_val <- if (!is.na(subtitle_val) && nzchar(as.character(subtitle_val))) as.character(subtitle_val) else NA_character_
+  
+  if (!is.na(caption_val)) {
+    # CASE 1: caption is NOT blank (single role at company)
+    current_org <- clean_org_name(subtitle_val)
+    current_title <- title_val
+    time_in_role <- caption_val
+  } else {
+    # CASE 2: caption IS blank (multiple roles at company)
+    current_org <- title_val
+    
+    if ("child" %in% names(experience_df)) {
+      child_col <- experience_df$child
+      if (is.list(child_col) && length(child_col) >= 1) {
+        child_data <- child_col[[1]]
+        if (is.data.frame(child_data) && nrow(child_data) > 0) {
+          if ("title" %in% names(child_data)) {
+            current_title <- as.character(child_data$title[1])
+          }
+          if ("caption" %in% names(child_data)) {
+            time_in_role <- as.character(child_data$caption[1])
+          }
+        }
+      }
+    }
+  }
+  
+  return(list(organization = current_org, title = current_title, time = time_in_role))
+}
+
+################################################################################
+## MAIN FUNCTION - Bebity Profile Search
+################################################################################
+
+#' Search LinkedIn Profiles Using Bebity Actor
+#' 
+#' @param linkedin_urls Character vector of LinkedIn profile URLs
+#' @param batch_size Number of profiles to process per batch (default: 400, max: 500)
+#' @param apify_token Your Apify API token (defaults to APIFY_API_KEY env var)
+#' 
+#' @return Data frame with columns:
+#'   - linkedin_url: Input LinkedIn URL
+#'   - first_name: First name
+#'   - last_name: Last name
+#'   - name: Full name
+#'   - current_title: Current job title
+#'   - current_company: Current company/organization
+#'   - headline: LinkedIn headline
+#'   - about: About section text
+#'   - experience_paragraph: Experience section as paragraph
+#'   - education_paragraph: Education section as paragraph
+#'   - location: Location
+#'   - open_profile: Whether profile is open
+#'   - premium: Whether they have premium
+#' 
+#' @examples
+#' \dontrun{
+#' urls <- c("https://www.linkedin.com/in/example1", "https://www.linkedin.com/in/example2")
+#' profiles <- bebity_profile_search(urls)
+#' }
+bebity_profile_search <- function(linkedin_urls, batch_size = 400, apify_token = NULL) {
+  
+  # Validate inputs
+  if (length(linkedin_urls) == 0) {
+    stop("❌ No LinkedIn URLs provided")
+  }
+  
+  # Remove NA and empty URLs
+  linkedin_urls <- linkedin_urls[!is.na(linkedin_urls) & nzchar(linkedin_urls)]
+  linkedin_urls <- unique(linkedin_urls)
+  
+  if (length(linkedin_urls) == 0) {
+    stop("❌ No valid LinkedIn URLs after filtering")
+  }
+  
+  # Get API token
+  if (is.null(apify_token)) {
+    apify_token <- Sys.getenv("APIFY_API_KEY", unset = NA)
+    if (is.na(apify_token) || apify_token == "") {
+      stop("❌ APIFY_API_KEY not set. Please set it or pass apify_token parameter.")
+    }
+  }
+  
+  # Ensure batch size is reasonable
+  if (batch_size > 500) {
+    warning("⚠️  Batch size > 500 may cause issues. Setting to 500.")
+    batch_size <- 500
+  }
+  
+  message(sprintf("\n🔍 Searching %d LinkedIn profiles using bebity/linkedin-premium-actor", length(linkedin_urls)))
+  
+  # Split URLs into batches
+  num_batches <- ceiling(length(linkedin_urls) / batch_size)
+  message(sprintf("📦 Splitting into %d batch%s of up to %d profiles each\n", 
+                  num_batches, ifelse(num_batches > 1, "es", ""), batch_size))
+  
+  all_profile_data <- list()
+  
+  for (batch_num in 1:num_batches) {
+    start_idx <- (batch_num - 1) * batch_size + 1
+    end_idx <- min(batch_num * batch_size, length(linkedin_urls))
+    batch_urls <- linkedin_urls[start_idx:end_idx]
+    
+    message(sprintf("\n--- Batch %d/%d: Processing %d profiles (URLs %d-%d) ---", 
+                    batch_num, num_batches, length(batch_urls), start_idx, end_idx))
+    
+    tryCatch({
+      # Prepare actor input
+      actor_input <- list(
+        action = "get-profiles",
+        keywords = as.list(batch_urls),
+        isUrl = TRUE,
+        limit = 1
+      )
+      
+      message("  ⏳ Starting Apify actor run...")
+      
+      # Start actor run
+      run_response <- request("https://api.apify.com/v2/acts/bebity~linkedin-premium-actor/runs") %>%
+        req_method("POST") %>%
+        req_url_query(token = apify_token) %>%
+        req_body_json(actor_input) %>%
+        req_timeout(600) %>%
+        req_perform()
+      
+      run_data <- resp_body_json(run_response)
+      run_id <- run_data$data$id
+      
+      message(sprintf("  ✓ Started run: %s", run_id))
+      
+      # Poll for completion
+      wait_interval <- 10  # seconds
+      max_wait_mins <- 30
+      max_checks <- (max_wait_mins * 60) / wait_interval
+      
+      for (check in 1:max_checks) {
+        Sys.sleep(wait_interval)
+        
+        status_response <- request(sprintf("https://api.apify.com/v2/acts/bebity~linkedin-premium-actor/runs/%s", run_id)) %>%
+          req_url_query(token = apify_token) %>%
+          req_perform()
+        
+        status_data <- resp_body_json(status_response)
+        run_status <- status_data$data$status
+        
+        if (run_status %in% c("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT")) {
+          break
+        }
+        
+        if (check %% 3 == 0) {  # Update every 30 seconds
+          message(sprintf("  ⏳ Still running... (status: %s, %d seconds elapsed)", run_status, check * wait_interval))
+        }
+      }
+      
+      if (run_status != "SUCCEEDED") {
+        message(sprintf("  ❌ Batch %d failed with status: %s", batch_num, run_status))
+        next
+      }
+      
+      message(sprintf("  ✓ Batch %d completed!", batch_num))
+      
+      # Get results
+      dataset_id <- status_data$data$defaultDatasetId
+      results_response <- request(sprintf("https://api.apify.com/v2/datasets/%s/items", dataset_id)) %>%
+        req_url_query(token = apify_token, format = "json") %>%
+        req_perform()
+      
+      batch_data <- resp_body_json(results_response, simplifyVector = TRUE)
+      
+      if (is.data.frame(batch_data) && nrow(batch_data) > 0) {
+        message(sprintf("  ✓ Retrieved %d profiles from batch %d", nrow(batch_data), batch_num))
+        all_profile_data[[batch_num]] <- batch_data
+      } else {
+        message(sprintf("  ⚠️  No data returned from batch %d", batch_num))
+      }
+      
+    }, error = function(e) {
+      message(sprintf("  ❌ Error in batch %d: %s", batch_num, e$message))
+    })
+    
+    # Small delay between batches to avoid rate limiting
+    if (batch_num < num_batches) {
+      message("  💤 Waiting 10 seconds before next batch...")
+      Sys.sleep(10)
+    }
+  }
+  
+  # Combine all batch results
+  message("\n--- Combining all batch results ---")
+  
+  profile_data <- data.frame()
+  if (length(all_profile_data) > 0) {
+    valid_batches <- all_profile_data[sapply(all_profile_data, function(x) is.data.frame(x) && nrow(x) > 0)]
+    
+    if (length(valid_batches) > 0) {
+      profile_data <- bind_rows(valid_batches)
+      message(sprintf("✓ Combined %d batch%s into %d total profiles", 
+                      length(valid_batches), 
+                      ifelse(length(valid_batches) > 1, "es", ""), 
+                      nrow(profile_data)))
+    }
+  }
+  
+  if (nrow(profile_data) == 0) {
+    warning("⚠️  No profile data retrieved")
+    return(data.frame())
+  }
+  
+  # Extract and format data
+  message("\n--- Extracting profile fields ---")
+  
+  # Initialize result data frame
+  result <- data.frame(
+    linkedin_url = character(nrow(profile_data)),
+    first_name = character(nrow(profile_data)),
+    last_name = character(nrow(profile_data)),
+    name = character(nrow(profile_data)),
+    current_title = character(nrow(profile_data)),
+    current_company = character(nrow(profile_data)),
+    headline = character(nrow(profile_data)),
+    about = character(nrow(profile_data)),
+    experience_paragraph = character(nrow(profile_data)),
+    education_paragraph = character(nrow(profile_data)),
+    location = character(nrow(profile_data)),
+    open_profile = logical(nrow(profile_data)),
+    premium = logical(nrow(profile_data)),
+    stringsAsFactors = FALSE
+  )
+  
+  # Extract basic fields
+  result$linkedin_url <- if ("url" %in% names(profile_data)) profile_data$url else NA_character_
+  result$first_name <- if ("firstName" %in% names(profile_data)) profile_data$firstName else NA_character_
+  result$last_name <- if ("lastName" %in% names(profile_data)) profile_data$lastName else NA_character_
+  result$name <- if ("name" %in% names(profile_data)) profile_data$name else NA_character_
+  result$headline <- if ("headline" %in% names(profile_data)) profile_data$headline else NA_character_
+  result$location <- if ("location" %in% names(profile_data)) profile_data$location else NA_character_
+  result$open_profile <- if ("openProfile" %in% names(profile_data)) profile_data$openProfile else NA
+  result$premium <- if ("premium" %in% names(profile_data)) profile_data$premium else NA
+  
+  # If name is missing but we have firstName/lastName, combine them
+  for (i in 1:nrow(result)) {
+    if (is.na(result$name[i]) || !nzchar(result$name[i])) {
+      if (!is.na(result$first_name[i]) && !is.na(result$last_name[i])) {
+        result$name[i] <- paste(result$first_name[i], result$last_name[i])
+      }
+    }
+    
+    # If first/last missing but we have name, try to split
+    if ((is.na(result$first_name[i]) || !nzchar(result$first_name[i])) && 
+        !is.na(result$name[i]) && nzchar(result$name[i])) {
+      name_parts <- strsplit(result$name[i], " ")[[1]]
+      if (length(name_parts) >= 2) {
+        result$first_name[i] <- name_parts[1]
+        result$last_name[i] <- paste(name_parts[2:length(name_parts)], collapse = " ")
+      } else if (length(name_parts) == 1) {
+        result$first_name[i] <- name_parts[1]
+      }
+    }
+  }
+  
+  # Extract current employment
+  message("  📋 Extracting current employment...")
+  for (i in 1:nrow(profile_data)) {
+    if ("EXPERIENCE" %in% names(profile_data)) {
+      experience_df <- profile_data$EXPERIENCE[[i]]
+      employment <- extract_current_employment(experience_df)
+      result$current_title[i] <- employment$title
+      result$current_company[i] <- employment$organization
+    }
+  }
+  
+  # Extract about section
+  message("  📝 Extracting about section...")
+  if ("ABOUT" %in% names(profile_data) && is.list(profile_data$ABOUT)) {
+    result$about <- flatten_section(profile_data$ABOUT)
+  }
+  
+  # Extract experience paragraph
+  message("  💼 Extracting experience section...")
+  if ("EXPERIENCE" %in% names(profile_data) && is.list(profile_data$EXPERIENCE)) {
+    result$experience_paragraph <- flatten_section(profile_data$EXPERIENCE)
+  }
+  
+  # Extract education paragraph
+  message("  🎓 Extracting education section...")
+  if ("EDUCATION" %in% names(profile_data) && is.list(profile_data$EDUCATION)) {
+    result$education_paragraph <- flatten_section(profile_data$EDUCATION)
+  }
+  
+  # Report extraction stats
+  message("\n--- Extraction Summary ---")
+  message(sprintf("  Total profiles: %d", nrow(result)))
+  message(sprintf("  With name: %d (%.1f%%)", sum(!is.na(result$name) & nzchar(result$name)), 100 * mean(!is.na(result$name) & nzchar(result$name))))
+  message(sprintf("  With title: %d (%.1f%%)", sum(!is.na(result$current_title) & nzchar(result$current_title)), 100 * mean(!is.na(result$current_title) & nzchar(result$current_title))))
+  message(sprintf("  With company: %d (%.1f%%)", sum(!is.na(result$current_company) & nzchar(result$current_company)), 100 * mean(!is.na(result$current_company) & nzchar(result$current_company))))
+  message(sprintf("  With headline: %d (%.1f%%)", sum(!is.na(result$headline) & nzchar(result$headline)), 100 * mean(!is.na(result$headline) & nzchar(result$headline))))
+  message(sprintf("  With about: %d (%.1f%%)", sum(!is.na(result$about) & nzchar(result$about)), 100 * mean(!is.na(result$about) & nzchar(result$about))))
+  message(sprintf("  With experience: %d (%.1f%%)", sum(!is.na(result$experience_paragraph) & nzchar(result$experience_paragraph)), 100 * mean(!is.na(result$experience_paragraph) & nzchar(result$experience_paragraph))))
+  message(sprintf("  With education: %d (%.1f%%)", sum(!is.na(result$education_paragraph) & nzchar(result$education_paragraph)), 100 * mean(!is.na(result$education_paragraph) & nzchar(result$education_paragraph))))
+  message(sprintf("  With location: %d (%.1f%%)", sum(!is.na(result$location) & nzchar(result$location)), 100 * mean(!is.na(result$location) & nzchar(result$location))))
+  
+  message("\n✅ Profile search complete!\n")
+  
+  return(result)
+}
+
