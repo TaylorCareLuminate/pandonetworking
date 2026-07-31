@@ -17,9 +17,9 @@ console.log('🎨 HealthConnect Header loading...');
 
 // Configuration with dropdown sections
 const HEALTHCONNECT_CONFIG = {
-    brandName: 'HealthConnect',
-    brandColor: '#0077b5', // LinkedIn blue
-    accentColor: '#8b5cf6', // Purple accent
+    brandName: 'PandoConnect',
+    brandColor: '#0F2D4D', // Deep Navy
+    accentColor: '#C9973D', // Aspen Gold
     navSections: [
         {
             label: 'Me',
@@ -462,9 +462,9 @@ function injectHeaderStyles() {
     if (document.getElementById(styleId)) return;
     
     const styles = `
-        /* HealthConnect Header Styles */
+        /* PandoConnect Header Styles */
         .healthconnect-header {
-            background: linear-gradient(135deg, #0077b5 0%, #8b5cf6 100%);
+            background: linear-gradient(135deg, #0F2D4D 0%, #5E7C5B 100%);
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
             position: sticky;
             top: 0;
@@ -659,7 +659,7 @@ function injectHeaderStyles() {
         .healthconnect-nav-dropdown-item i {
             width: 20px;
             text-align: center;
-            color: var(--primary, #0077b5);
+            color: var(--primary, #0F2D4D);
         }
 
         /* Dropdown Divider */
@@ -700,7 +700,7 @@ function injectHeaderStyles() {
 
         .healthconnect-login-btn {
             background: white;
-            color: var(--primary, #0077b5);
+            color: var(--primary, #0F2D4D);
             padding: 0.65rem 1.5rem;
             border-radius: 8px;
             text-decoration: none;
@@ -742,7 +742,7 @@ function injectHeaderStyles() {
             width: 36px;
             height: 36px;
             border-radius: 50%;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #5E7C5B 0%, #0F2D4D 100%);
             color: white;
             display: flex;
             align-items: center;
@@ -817,7 +817,7 @@ function injectHeaderStyles() {
         .healthconnect-dropdown-item i {
             width: 20px;
             text-align: center;
-            color: var(--primary, #0077b5);
+            color: var(--primary, #0F2D4D);
         }
 
         .healthconnect-dropdown-item.logout {
@@ -925,14 +925,14 @@ function getUserDisplayName(user) {
 // Get avatar color
 function getAvatarColor(user) {
     const colors = [
-        { bg: '#44A1C4', text: '#ffffff' },
-        { bg: '#DBA660', text: '#ffffff' },
-        { bg: '#2D6B83', text: '#ffffff' },
-        { bg: '#68C2A2', text: '#ffffff' },
-        { bg: '#8B5A96', text: '#ffffff' },
-        { bg: '#D67E7E', text: '#ffffff' },
-        { bg: '#5B9BD5', text: '#ffffff' },
-        { bg: '#70AD47', text: '#ffffff' }
+        { bg: '#0F2D4D', text: '#ffffff' }, // Deep Navy
+        { bg: '#5E7C5B', text: '#ffffff' }, // Pando Green
+        { bg: '#C9973D', text: '#ffffff' }, // Aspen Gold
+        { bg: '#6B7280', text: '#ffffff' }, // Slate Gray
+        { bg: '#8A6B2E', text: '#ffffff' }, // Dark Gold
+        { bg: '#3D5A80', text: '#ffffff' }, // Steel Blue
+        { bg: '#7A9471', text: '#ffffff' }, // Light Sage
+        { bg: '#9C6B4E', text: '#ffffff' }  // Aspen Bark
     ];
     
     const email = user.email || user.displayName || 'default';
@@ -1003,7 +1003,7 @@ function createHeaderHTML(user = null, bdrCount = 1) {
         <header class="healthconnect-header">
             <div class="healthconnect-header-content">
                 <a href="index.html" class="healthconnect-brand">
-                    <img src="../images/HealthLuminate-Bright.png" alt="HealthConnect" class="healthconnect-logo">
+                    <img src="../images/pando_logo_transparent.png" alt="PandoConnect" class="healthconnect-logo">
                     <div class="healthconnect-brand-text">
                         <h1 class="healthconnect-brand-name">${HEALTHCONNECT_CONFIG.brandName}</h1>
                         <div class="healthconnect-brand-tagline">LinkedIn Connection Management</div>

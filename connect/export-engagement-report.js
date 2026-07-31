@@ -32,7 +32,7 @@ window.exportEngagementReportEnhanced = async function(context) {
     // Load logo from server at runtime
     let logoDataUrl = null;
     try {
-        const resp = await fetch('../images/HealthLuminate-Bright.png');
+        const resp = await fetch('../images/pando_logo_transparent.png');
         const blob = await resp.blob();
         logoDataUrl = await new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -54,7 +54,7 @@ window.exportEngagementReportEnhanced = async function(context) {
         }
     }
 
-    // Color palette - HealthLuminate brand colors
+    // Color palette - Pando Executive Networking brand colors
     const colors = {
         primary: [13, 59, 102],      // Dark blue (from logo)
         secondary: [219, 122, 60],   // Orange (from logo)
