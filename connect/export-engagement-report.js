@@ -56,8 +56,8 @@ window.exportEngagementReportEnhanced = async function(context) {
 
     // Color palette - Pando Executive Networking brand colors
     const colors = {
-        primary: [13, 59, 102],      // Dark blue (from logo)
-        secondary: [219, 122, 60],   // Orange (from logo)
+        primary: [15, 45, 77],       // Deep Navy (from logo)
+        secondary: [201, 151, 61],   // Aspen Gold (from logo)
         accent: [16, 185, 129],      // Green accent
         warning: [245, 158, 11],     // Warning orange
         text: [0, 0, 0],
