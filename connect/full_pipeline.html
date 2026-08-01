@@ -406,6 +406,13 @@
                     </label>
                     <div class="form-help">Uses the same rules configured in <a href="final_ai_review.html" target="_blank">Final AI Review</a> (shared via this browser), fed the actual profile / news / post data used to build each message.</div>
                 </div>
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" id="fpProfileMsgFallback" checked style="width: auto;">
+                        <span><i class="fas fa-user-pen"></i> Profile Message fallback (last resort)</span>
+                    </label>
+                    <div class="form-help">When a contact has no worthy posts, no About Me match, and no usable news story, write a message from their profile itself — the same last-resort flow Full AI Generate uses on Generate Messages. Without this, those contacts get no message at all.</div>
+                </div>
             </div>
         </div>
 
@@ -1484,6 +1491,233 @@
         };
 
         // ════════════════════════════════════════════════════════════════════
+        // FROM generate_messages.html — Profile Message fallback (verbatim):
+        // processProfileData, flattenSection, generateOpeningMessage,
+        // maverickCheck, generateOpeningMessageWithMaverickCheck
+        // ════════════════════════════════════════════════════════════════════
+        function processProfileData(profile) {
+            // _format is written by buildCacheDoc; _source === 'dev_fusion' is set by
+            // normalizeDevFusionProfiles on Railway for freshly-fetched profiles.
+            // Fall back to field-presence heuristics only when neither tag is set
+            // (e.g. very old cache docs written before _format existed).
+            const isDevFusion = profile._format === 'dev_fusion'
+                || profile._source === 'dev_fusion'
+                || (profile._format !== 'bebity' && (
+                    Array.isArray(profile.experiences)
+                    || typeof profile.fullName === 'string'
+                    || typeof profile.isPremium === 'boolean'
+                ));
+
+            const result = {
+                linkedinUrl:         profile.linkedinUrl || profile.linkedinPublicUrl || profile.url || '',
+                firstName:           profile.firstName   || '',
+                lastName:            profile.lastName    || '',
+                name:                profile.fullName    || profile.name || '',
+                headline:            profile.headline    || '',
+                about:               '',
+                experienceParagraph: '',
+                educationParagraph:  '',
+                currentTitle:        '',
+                currentCompany:      '',
+                location:            profile.addressWithoutCountry || profile.addressWithCountry || profile.location || '',
+                openProfile:         profile.openConnection ?? profile.openProfile ?? false,
+                premium:             profile.isPremium   ?? profile.premium ?? false,
+            };
+
+            // Combine name if still missing
+            if (!result.name && result.firstName && result.lastName) {
+                result.name = `${result.firstName} ${result.lastName}`;
+            }
+
+            if (isDevFusion) {
+                // ── Dev fusion flat format ─────────────────────────────────────
+                result.about         = typeof profile.about === 'string' ? (profile.about || '') : '';
+                result.currentTitle  = profile.jobTitle   || '';
+                result.currentCompany = profile.companyName || '';
+
+                // Build experience paragraph from flat experiences[]
+                if (Array.isArray(profile.experiences) && profile.experiences.length > 0) {
+                    if (!result.currentTitle)   result.currentTitle   = profile.experiences[0].title       || '';
+                    if (!result.currentCompany) result.currentCompany = profile.experiences[0].companyName || '';
+
+                    result.experienceParagraph = profile.experiences.map(e => {
+                        const parts = [e.title, e.companyName].filter(Boolean);
+                        if (e.jobStartedOn) {
+                            const end = e.jobEndedOn || (e.jobStillWorking ? 'Present' : '');
+                            parts.push(e.jobStartedOn + (end ? ' – ' + end : ''));
+                        }
+                        if (e.jobLocation) parts.push(e.jobLocation);
+                        return parts.join(' | ');
+                    }).filter(Boolean).join('\n');
+                }
+
+                // Build education paragraph from flat educations[]
+                if (Array.isArray(profile.educations) && profile.educations.length > 0) {
+                    result.educationParagraph = profile.educations.map(e => {
+                        const parts = [e.title, e.subtitle].filter(Boolean);
+                        if (e.period?.startedOn?.year) {
+                            const end = e.period.endedOn?.year || '';
+                            parts.push(e.period.startedOn.year + (end ? ' – ' + end : ''));
+                        }
+                        return parts.join(' | ');
+                    }).filter(Boolean).join('\n');
+                }
+
+            } else {
+                // ── Old Bebity nested format (fallback) ────────────────────────
+                if (profile.EXPERIENCE && profile.EXPERIENCE.length > 0) {
+                    const firstExp = profile.EXPERIENCE[0];
+                    if (firstExp.child && firstExp.child.length > 0 && firstExp.child[0].title) {
+                        result.currentCompany = firstExp.title || '';
+                        result.currentTitle   = firstExp.child[0].title || '';
+                    } else {
+                        result.currentTitle = firstExp.title || '';
+                        if (firstExp.subtitle) {
+                            result.currentCompany = firstExp.subtitle
+                                .replace(/\s*·\s*(Full-time|Part-time|Contract).*$/i, '').trim();
+                        }
+                    }
+                }
+
+                result.about               = flattenSection(profile.ABOUT);
+                result.experienceParagraph = flattenSection(profile.EXPERIENCE);
+                result.educationParagraph  = flattenSection(profile.EDUCATION);
+            }
+
+            return result;
+        }
+
+        function flattenSection(sectionList) {
+            if (!sectionList || !Array.isArray(sectionList)) return '';
+
+            const texts = [];
+            for (const entry of sectionList) {
+                if (!entry || typeof entry !== 'object') continue;
+
+                const extractText = (obj) => {
+                    if (!obj) return [];
+                    let result = [];
+
+                    ['text', 'title', 'subtitle', 'caption', 'meta'].forEach(field => {
+                        if (obj[field] && typeof obj[field] === 'string') {
+                            result.push(obj[field]);
+                        }
+                    });
+
+                    if (obj.child && Array.isArray(obj.child)) {
+                        obj.child.forEach(child => {
+                            result = result.concat(extractText(child));
+                        });
+                    }
+
+                    return result;
+                };
+
+                texts.push(...extractText(entry));
+            }
+
+            return texts.join('\n');
+        }
+
+        const MAX_OPENING_LENGTH = 120;
+        async function generateOpeningMessage(profile, logFn, avoidHint) {
+            const MAX_ATTEMPTS = 3;
+            let shortestMessage = null;
+
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+                const requestBody = { profile };
+                if (avoidHint) requestBody.avoidHint = avoidHint;
+                if (attempt > 1) {
+                    // Tell the API the previous message was too long so it generates a shorter one
+                    requestBody.maxLength = MAX_OPENING_LENGTH;
+                    requestBody.retry = true;
+                    requestBody.attempt = attempt;
+                    requestBody.previousMessage = shortestMessage;
+                    logFn(`   🔄 Attempt ${attempt}/${MAX_ATTEMPTS}: Requesting shorter message (previous was ${shortestMessage.length} chars)...`, 'info');
+                }
+
+                const response = await fetch(`${RAILWAY_API}/api/linkedin-profile/generate-message`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(requestBody)
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Message generation failed: ${response.status}`);
+                }
+
+                const data = await response.json();
+                const msg = (data.message || '').trim();
+
+                // Track the shortest result across attempts
+                if (!shortestMessage || msg.length < shortestMessage.length) {
+                    shortestMessage = msg;
+                }
+
+                if (msg.length <= MAX_OPENING_LENGTH) {
+                    if (attempt > 1) {
+                        logFn(`   ✅ Shorter message generated (${msg.length} chars)`, 'success');
+                    }
+                    return msg;
+                }
+
+                logFn(`   ⚠️ Message too long (${msg.length} chars, max ${MAX_OPENING_LENGTH}) — retrying...`, 'warning');
+            }
+
+            // After all attempts, use the shortest version we got
+            logFn(`   ⚠️ Using shortest result after ${MAX_ATTEMPTS} attempts (${shortestMessage.length} chars — still over limit, but best available)`, 'warning');
+            return shortestMessage;
+        }
+
+        // Maverick Check — validates the generated message shows genuine research
+        // Returns { passed: boolean, reason: string }
+        async function maverickCheck(message, profile, logFn) {
+            try {
+                const r = await fetch(`${RAILWAY_API}/api/connect/maverick-check`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message,
+                        currentTitle:         profile.currentTitle         || '',
+                        currentCompany:       profile.currentCompany       || '',
+                        experienceParagraph:  profile.experienceParagraph  || ''
+                    })
+                });
+                const d = await r.json();
+                return { passed: d.passed !== false, reason: d.reason || '' };
+            } catch (e) {
+                if (logFn) logFn(`   ⚠️ Maverick check unavailable (${e.message}) — defaulting to pass`, 'warning');
+                return { passed: true, reason: 'unavailable' };
+            }
+        }
+
+        // generateOpeningMessageWithMaverickCheck — generates up to MAX_MAVERICK_ATTEMPTS times,
+        // re-generating with an avoidHint if the Maverick check fails.
+        // Returns { message: string, skipped: boolean, skipReason: string }
+        const MAX_MAVERICK_ATTEMPTS = 3;
+        async function generateOpeningMessageWithMaverickCheck(profile, logFn) {
+            let lastReason = '';
+            for (let mAttempt = 1; mAttempt <= MAX_MAVERICK_ATTEMPTS; mAttempt++) {
+                const hint   = mAttempt > 1 ? lastReason : undefined;
+                const opening = await generateOpeningMessage(profile, logFn, hint);
+                if (!opening) return { message: '', skipped: true, skipReason: 'generation returned empty' };
+
+                logFn(`   🔍 Maverick check (attempt ${mAttempt}/${MAX_MAVERICK_ATTEMPTS})…`, 'info');
+                const check = await maverickCheck(opening, profile, logFn);
+                if (check.passed) {
+                    if (mAttempt > 1) logFn(`   ✅ Maverick check passed on attempt ${mAttempt}`, 'success');
+                    return { message: opening, skipped: false, skipReason: '' };
+                }
+                lastReason = check.reason;
+                logFn(`   ❌ Maverick check failed: ${check.reason}`, 'warning');
+                if (mAttempt < MAX_MAVERICK_ATTEMPTS) {
+                    logFn(`   ♻️ Regenerating with guidance to avoid that issue…`, 'info');
+                }
+            }
+            return { message: '', skipped: true, skipReason: `Maverick check failed after ${MAX_MAVERICK_ATTEMPTS} attempts: ${lastReason}` };
+        }
+
+        // ════════════════════════════════════════════════════════════════════
         // PIPELINE ENGINE
         // ════════════════════════════════════════════════════════════════════
 
@@ -1830,6 +2064,7 @@
             const crossBdrEnabled = document.getElementById('fpCrossBdrEnabled').checked;
             const finalReviewEnabled = document.getElementById('fpFinalReviewEnabled').checked;
             const finalReviewRules = finalReviewEnabled ? loadFinalAiReviewRules().filter(r => r.enabled) : [];
+            const profileMsgFallbackOn = document.getElementById('fpProfileMsgFallback').checked;
 
             const targetInstr   = document.getElementById('fpTargetInstructions').value;
             const reviewInstr   = document.getElementById('fpReviewInstructions').value;
@@ -1886,7 +2121,7 @@
                 models: { buildModel, opusModel },
                 settings: {
                     routingMode, connectionFilterEnabled: connFilterOn, minConnectionCount: connFilterMin,
-                    opusExcludeMode, crossBdrEnabled, finalReviewEnabled,
+                    opusExcludeMode, crossBdrEnabled, finalReviewEnabled, profileMsgFallback: profileMsgFallbackOn,
                     scanCriteria, secondScan: secondScanConfig,
                     costGuard: { costPerMessage, apifyPerMessageLimit, minSpendBeforeEnforcing: costMinSpend }
                 },
