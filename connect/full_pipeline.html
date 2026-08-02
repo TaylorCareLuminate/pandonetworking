@@ -201,6 +201,11 @@
                     </label>
                 </div>
                 <div id="fpScanNameStatus" style="font-size: 12.5px; font-weight: 600; margin-top: 6px;"></div>
+                <div style="margin-top: 6px;">
+                    <a href="#" onclick="fpRepairScanLabelsFromReport(); return false;" style="font-size: 11.5px; color: var(--gray-400);">
+                        <i class="fas fa-wrench"></i> Repair scan labels from a previous run (fixes organizations that were mistakenly marked "already scanned" after an error, e.g. an expired-session run)
+                    </a>
+                </div>
             </div>
 
             <div class="stat-tiles">
@@ -1421,6 +1426,79 @@
             return org.last_scan_label ? [org.last_scan_label] : [];
         }
 
+        // Record that this scan name has been fully applied to an organization — ONLY call
+        // this once the org's processing for this run has reached a legitimate stopping point
+        // (no contacts, no matches, no eligible prospects, or the prospect loop finished).
+        // Deliberately NOT called when the org's try block throws (401s, scan failures, etc.)
+        // so a mid-run auth/token error doesn't permanently hide that org from future re-runs
+        // of the same scan name before it ever actually got messages generated.
+        // One-time repair tool for runs affected by the "stamped scanned before message
+        // generation actually ran" bug (e.g. runs where the auth token expired partway
+        // through and everything after that point failed with 401s, but those orgs still
+        // got tagged as scanned under this run's scan name). Reads a saved full_pipeline_runs
+        // report and, for every organization that ended in a real error (not a legitimate
+        // stop like "no contacts" / "no matches" / "no eligible prospects" / DNC), removes
+        // that run's scan name from the organization's scan_labels so a re-run will pick it
+        // back up instead of skipping it.
+        window.fpRepairScanLabelsFromReport = async function() {
+            const reportId = prompt('Report ID to repair (from the "📊 Report saved: full_pipeline_runs/<id>" line at the end of the run log):');
+            if (!reportId) return;
+            const LEGITIMATE_STOPS = new Set([null, undefined, 'dnc_match', 'no_contacts', 'no_matches', 'no_eligible_prospects']);
+            try {
+                const snap = await getDoc(doc(db, 'full_pipeline_runs', reportId.trim()));
+                if (!snap.exists()) { alert(`No report found with ID "${reportId}".`); return; }
+                const report = snap.data();
+                const scanName = report.settings?.scanName;
+                if (!scanName) { alert('This report has no scan name recorded — nothing to repair.'); return; }
+                const toRepair = (report.orgs || []).filter(o => o.orgId && !LEGITIMATE_STOPS.has(o.error));
+                if (toRepair.length === 0) { alert(`No organizations in this report ended in a real error — nothing to repair for scan "${scanName}".`); return; }
+                if (!confirm(`This will remove the scan name "${scanName}" from ${toRepair.length} organization(s) that errored out during this run (so a re-run will retry them instead of skipping them). Continue?`)) return;
+
+                let repaired = 0, failed = 0;
+                for (const o of toRepair) {
+                    try {
+                        const orgSnap = await getDoc(doc(db, 'prospect_organizations', o.orgId));
+                        if (!orgSnap.exists()) continue;
+                        const orgData = orgSnap.data();
+                        const existingLabels = fpOrgScanLabels(orgData);
+                        if (!existingLabels.includes(scanName)) continue; // never actually got stamped — nothing to undo
+                        const updatedLabels = existingLabels.filter(l => l !== scanName);
+                        const updatedDates = { ...(orgData.scan_label_dates || {}) };
+                        delete updatedDates[scanName];
+                        const update = { scan_labels: updatedLabels, scan_label_dates: updatedDates };
+                        if (orgData.last_scan_label === scanName) {
+                            update.last_scan_label = updatedLabels.length ? updatedLabels[updatedLabels.length - 1] : null;
+                        }
+                        await updateDoc(doc(db, 'prospect_organizations', o.orgId), update);
+                        repaired++;
+                    } catch (e) {
+                        console.warn('[Repair scan labels] failed for org', o.orgId, e);
+                        failed++;
+                    }
+                }
+                alert(`Repair complete: ${repaired} organization(s) un-marked for scan "${scanName}"${failed ? ` (${failed} failed — see console)` : ''}. You can now re-run the "${scanName}" scan and these will be retried.`);
+            } catch (e) {
+                alert(`Repair failed: ${e.message}`);
+            }
+        };
+
+        async function fpStampScanLabel(org, scanName) {
+            try {
+                const nowIso = new Date().toISOString();
+                const existingLabels = fpOrgScanLabels(org);
+                const updatedLabels = existingLabels.includes(scanName) ? existingLabels : [...existingLabels, scanName];
+                const scanLabelDates = { ...(org.scan_label_dates || {}), [scanName]: nowIso };
+                await updateDoc(doc(db, 'prospect_organizations', org.id), {
+                    last_scan_label: scanName,
+                    scan_labels: updatedLabels,
+                    scan_label_dates: scanLabelDates
+                });
+                org.scan_labels = updatedLabels;
+                org.last_scan_label = scanName;
+                org.scan_label_dates = scanLabelDates;
+            } catch (_) {}
+        }
+
         function fpRenderGroupOrgsTable() {
             const tbody = document.getElementById('fpOrgTableBody');
             const currentName = (document.getElementById('fpScanName')?.value || '').trim();
@@ -2273,6 +2351,7 @@
             addLog(`🧠 Models: build = ${buildModel}, Opus review = ${opusModel}`);
 
             let token = await auth.currentUser.getIdToken();
+            let lastTokenRefreshAt = Date.now();
             let orgPointer = 0;
 
             // ── DNC list — loaded once, filtered per BDR context inside the loop ──
@@ -2322,6 +2401,18 @@
                     while (plan.generated < plan.target && orgPointer < fpRunOrgs.length) {
                         if (window.fpStopRequested) break;
                         const org = fpRunOrgs[orgPointer++];
+
+                        // Proactively refresh the auth token before EVERY organization. A run
+                        // over hundreds of organizations can easily span the ID token's ~1 hour
+                        // lifetime; relying only on the per-20-prospect refresh below fails for
+                        // orgs with fewer than 20 matched contacts (the common case), which is
+                        // what caused every org after ~1hr into a run to fail with 401s.
+                        if (Date.now() - lastTokenRefreshAt > 40 * 60 * 1000) {
+                            try {
+                                if (auth.currentUser) { token = await auth.currentUser.getIdToken(true); lastTokenRefreshAt = Date.now(); }
+                            } catch (tokenErr) { addLog(`   ⚠️ Token refresh failed: ${tokenErr.message}`, 'warning'); }
+                        }
+
                         fpStats.orgs++;
                         fpRenderStats();
                         fpSetProgress(Math.round((orgPointer / fpRunOrgs.length) * 100), `Org ${orgPointer}/${fpRunOrgs.length} — ${org.company_name}`);
@@ -2394,24 +2485,17 @@
                             fpStats.scanned += orgReport.contactsScanned;
                             addLog(`   ✅ Scan complete: ${job.results?.employees_found || 0} employees found, ${orgReport.contactsScanned} contacts saved.`, 'success');
 
-                            // Stamp the org doc's scan metadata (same fields the admin page tracks),
-                            // recording this run's scan name in the org's scan history so future
-                            // runs (and Prospect Organizations Admin) know this exact scan was done.
+                            // Stamp the org doc's scan metadata (same fields the admin page tracks).
+                            // NOTE: the scan-name label itself (scan_labels / last_scan_label) is
+                            // stamped later, via fpStampScanLabel(), only once this org reaches a
+                            // legitimate stopping point — not here — so a later failure (e.g. an
+                            // expired auth token on full-ai-init) doesn't mark this org "done" for
+                            // this scan name before any messages were actually generated.
                             try {
-                                const nowIso = new Date().toISOString();
-                                const existingLabels = fpOrgScanLabels(org);
-                                const updatedLabels = existingLabels.includes(scanName) ? existingLabels : [...existingLabels, scanName];
-                                const scanLabelDates = { ...(org.scan_label_dates || {}), [scanName]: nowIso };
                                 await updateDoc(doc(db, 'prospect_organizations', org.id), {
-                                    last_scanned_at: nowIso,
-                                    last_scan_label: scanName,
-                                    last_scan_job_id: jobId,
-                                    scan_labels: updatedLabels,
-                                    scan_label_dates: scanLabelDates
+                                    last_scanned_at: new Date().toISOString(),
+                                    last_scan_job_id: jobId
                                 });
-                                org.scan_labels = updatedLabels;
-                                org.last_scan_label = scanName;
-                                org.scan_label_dates = scanLabelDates;
                             } catch (_) {}
 
                             // Actual Apify cost for this job from the run ledger
@@ -2453,6 +2537,7 @@
                             if (scannedContacts.length === 0) {
                                 addLog('   ℹ️ No contacts to work with at this organization — moving on.', 'dim');
                                 orgReport.error = 'no_contacts';
+                                await fpStampScanLabel(org, scanName);
                                 report.orgs.push(orgReport);
                                 await saveReport();
                                 continue;
@@ -2472,6 +2557,7 @@
 
                             if (kept.length === 0) {
                                 orgReport.error = 'no_matches';
+                                await fpStampScanLabel(org, scanName);
                                 report.orgs.push(orgReport);
                                 await saveReport();
                                 continue;
@@ -2489,19 +2575,32 @@
                                 .filter(Boolean);
                             const remaining = plan.target - plan.generated;
 
-                            const initRes = await fetchWithRetry(`${RAILWAY_API}/api/connect/full-ai-init`, {
+                            const buildInitBody = () => JSON.stringify({
+                                bdrEmail,
+                                count: Math.min(remaining, kept.length),
+                                connectionFilterEnabled: connFilterOn,
+                                minConnectionCount: connFilterMin,
+                                hypothesisGroupUrls: matchedUrls,
+                                hypothesisGroupName: groupName,
+                                hypothesisGroupId: groupId
+                            });
+                            let initRes = await fetchWithRetry(`${RAILWAY_API}/api/connect/full-ai-init`, {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                                body: JSON.stringify({
-                                    bdrEmail,
-                                    count: Math.min(remaining, kept.length),
-                                    connectionFilterEnabled: connFilterOn,
-                                    minConnectionCount: connFilterMin,
-                                    hypothesisGroupUrls: matchedUrls,
-                                    hypothesisGroupName: groupName,
-                                    hypothesisGroupId: groupId
-                                })
+                                body: buildInitBody()
                             }, { addLog, label: 'Full AI init' });
+                            if (initRes.status === 401) {
+                                // Auth token expired mid-run — refresh once and retry before giving up.
+                                addLog('   🔄 Auth token expired — refreshing and retrying…', 'warning');
+                                try {
+                                    if (auth.currentUser) { token = await auth.currentUser.getIdToken(true); lastTokenRefreshAt = Date.now(); }
+                                } catch (_te) {}
+                                initRes = await fetchWithRetry(`${RAILWAY_API}/api/connect/full-ai-init`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                                    body: buildInitBody()
+                                }, { addLog, label: 'Full AI init (retry after token refresh)' });
+                            }
                             if (!initRes.ok) {
                                 const errText = await initRes.text().catch(() => '');
                                 throw new Error(`full-ai-init failed: ${initRes.status} — ${errText.substring(0, 200)}`);
@@ -2514,6 +2613,7 @@
                             if (!prospectList || prospectList.length === 0) {
                                 addLog('   ℹ️ No eligible prospects after exclusions/dedupe — moving on.', 'dim');
                                 orgReport.error = 'no_eligible_prospects';
+                                await fpStampScanLabel(org, scanName);
                                 report.orgs.push(orgReport);
                                 await saveReport();
                                 continue;
@@ -2908,6 +3008,10 @@
                                 // Brief pause between prospects to avoid hammering the server
                                 await new Promise(r => setTimeout(r, 1000));
                             }
+
+                            // Reached the end of this org's prospect loop without an unhandled
+                            // error — this scan name has now been fully applied to this org.
+                            await fpStampScanLabel(org, scanName);
 
                         } catch (orgErr) {
                             orgReport.error = orgErr.message;
