@@ -1450,10 +1450,8 @@ console.log('📋 Auth script loaded, waiting for initialization...');
 // Function (see functions/index.js). See sso-bridge.html on the
 // HealthLuminate side for the other half of this flow.
 (function initSsoBridge() {
-  const BRIDGE_ORIGIN = 'https://healthluminate.com';
-  const BRIDGE_URL = BRIDGE_ORIGIN + '/sso-bridge.html';
+  const BRIDGE_URL = 'https://healthluminate.com/sso-bridge.html';
   const ATTEMPT_FLAG = 'pandoSsoBridgeAttempted';
-  const BRIDGE_TIMEOUT_MS = 7000;
 
   // Only relevant on the new Pando domain — never run this on healthluminate.com itself.
   const host = window.location.hostname;
@@ -1463,10 +1461,60 @@ console.log('📋 Auth script loaded, waiting for initialization...');
     return;
   }
 
+  // Uses a real top-level (same-tab) redirect through healthluminate.com and
+  // back, rather than a hidden iframe. A hidden iframe can't reliably read
+  // another site's login session in modern browsers — Safari ITP, Firefox
+  // ETP, and Chrome's storage partitioning all block third-party iframes
+  // from accessing another origin's storage by default. A real top-level
+  // navigation to healthluminate.com is treated as first-party, so it has
+  // full access to any existing session there.
+
+  function extractSsoToken() {
+    const hash = window.location.hash || '';
+    const match = hash.match(/[#&]ssoToken=([^&]+)/);
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+
+  function stripSsoTokenFromUrl() {
+    const remaining = (window.location.hash || '')
+      .replace(/^#/, '')
+      .split('&')
+      .filter(part => part && !part.startsWith('ssoToken='))
+      .join('&');
+    const cleanUrl = window.location.pathname + window.location.search + (remaining ? '#' + remaining : '');
+    history.replaceState(null, '', cleanUrl);
+  }
+
+  function markAttempted() {
+    try { sessionStorage.setItem(ATTEMPT_FLAG, '1'); } catch (e) { /* no-op */ }
+  }
+
+  async function consumeReturnedToken() {
+    const token = extractSsoToken();
+    if (!token) return false;
+
+    stripSsoTokenFromUrl();
+    markAttempted();
+
+    try {
+      await window.firebaseReady;
+      if (auth && !auth.currentUser) {
+        const { signInWithCustomToken } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
+        await signInWithCustomToken(auth, token);
+        console.log('✅ [SSO Bridge] Signed in via existing HealthLuminate session');
+      } else {
+        console.log('ℹ️ [SSO Bridge] Already signed in locally by the time the token arrived — ignoring.');
+      }
+    } catch (error) {
+      console.warn('⚠️ [SSO Bridge] signInWithCustomToken failed:', error.message);
+    }
+    return true;
+  }
+
   function attemptBridge() {
     try {
       if (sessionStorage.getItem(ATTEMPT_FLAG)) {
-        console.log('ℹ️ [SSO Bridge] Already attempted this tab session, skipping. Clear sessionStorage or open a new tab to retry.');
+        console.log('ℹ️ [SSO Bridge] Already attempted this tab session, skipping. Open a new tab to retry.');
         return;
       }
       sessionStorage.setItem(ATTEMPT_FLAG, '1');
@@ -1475,61 +1523,18 @@ console.log('📋 Auth script loaded, waiting for initialization...');
       return; // No sessionStorage access — skip rather than retry every navigation
     }
 
-    console.log('🔄 [SSO Bridge] Not signed in locally — checking for an existing HealthLuminate session via', BRIDGE_URL);
-
-    const iframe = document.createElement('iframe');
-    iframe.style.cssText = 'display:none;width:0;height:0;border:0;position:absolute;';
-    iframe.setAttribute('aria-hidden', 'true');
-    iframe.title = 'Session bridge';
-
-    let settled = false;
-    const cleanup = (reason) => {
-      if (settled) return;
-      settled = true;
-      if (reason) console.log('ℹ️ [SSO Bridge] ' + reason);
-      window.removeEventListener('message', onMessage);
-      if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
-    };
-
-    const timeoutId = setTimeout(() => cleanup('Timed out after ' + BRIDGE_TIMEOUT_MS + 'ms waiting for bridge response (no message received from ' + BRIDGE_ORIGIN + ' — check that sso-bridge.html loaded and isn\'t blocked by a browser storage/tracking-prevention setting).'), BRIDGE_TIMEOUT_MS);
-
-    async function onMessage(event) {
-      if (event.origin !== BRIDGE_ORIGIN) {
-        console.log('ℹ️ [SSO Bridge] Ignoring message from unexpected origin:', event.origin);
-        return;
-      }
-      if (settled) return;
-      const data = event.data;
-      if (!data || data.type !== 'PANDO_SSO_TOKEN') return;
-      clearTimeout(timeoutId);
-
-      if (!data.token) {
-        cleanup('Bridge responded: no HealthLuminate session found (visitor is not logged in there, or the browser blocked the bridge from reading that session).');
-        return;
-      }
-
-      console.log('✅ [SSO Bridge] Received a token from HealthLuminate — signing in...');
-      if (auth && !auth.currentUser) {
-        try {
-          const { signInWithCustomToken } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
-          await signInWithCustomToken(auth, data.token);
-          console.log('✅ [SSO Bridge] Signed in via existing HealthLuminate session');
-        } catch (error) {
-          console.warn('⚠️ [SSO Bridge] signInWithCustomToken failed:', error.message);
-        }
-      } else {
-        console.log('ℹ️ [SSO Bridge] Already signed in locally by the time the token arrived — ignoring.');
-      }
-      cleanup();
-    }
-
-    window.addEventListener('message', onMessage);
-    iframe.src = BRIDGE_URL;
-    document.body.appendChild(iframe);
+    const returnUrl = window.location.href;
+    const bridgeUrl = BRIDGE_URL + '?return=' + encodeURIComponent(returnUrl);
+    console.log('🔄 [SSO Bridge] Not signed in locally — redirecting through HealthLuminate to check for an existing session...');
+    window.location.assign(bridgeUrl);
   }
 
   (async () => {
     try {
+      // First: did we just come back from the bridge with a token?
+      const consumed = await consumeReturnedToken();
+      if (consumed) return;
+
       await window.firebaseReady;
       // Already signed in on this domain — nothing to bridge.
       if (auth && auth.currentUser) {
