@@ -114,6 +114,9 @@
                 <button class="btn" onclick="addRow()"><i class="fas fa-plus"></i> Add Model</button>
                 <button class="btn" onclick="seedDefaults()"><i class="fas fa-seedling"></i> Add Missing Built-in Models</button>
                 <button class="btn" onclick="loadCatalog()"><i class="fas fa-rotate"></i> Reload</button>
+                <span style="width: 1px; height: 22px; background: var(--gray-200);"></span>
+                <button class="btn" onclick="downloadCatalogJson()"><i class="fas fa-download"></i> Download JSON</button>
+                <button class="btn" onclick="openImportModal()"><i class="fas fa-upload"></i> Upload / Paste JSON</button>
                 <span class="status-msg" id="statusMsg"></span>
                 <span style="flex: 1;"></span>
                 <span class="pill" id="countPill">0 models</span>
@@ -149,6 +152,38 @@
                 company research) also reads this catalog. The model marked <strong>Default</strong> is what the
                 meeting-date scanner uses when no model is picked. If the catalog can't be loaded, pages fall back to the
                 built-in list, so a bad save can never take the dropdowns down completely.
+            </div>
+        </div>
+    </div>
+
+    <!-- ══════════ Import JSON modal ══════════ -->
+    <div id="importModalOverlay" style="display:none; position: fixed; inset: 0; background: rgba(17,24,39,0.55); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: white; border-radius: 12px; width: min(720px, 92vw); max-height: 86vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.3);">
+            <div style="padding: 18px 22px; border-bottom: 1px solid var(--gray-200); display: flex; align-items: center; justify-content: space-between;">
+                <div style="font-weight: 800; font-size: 16px;"><i class="fas fa-upload" style="color: var(--primary);"></i> Upload / Paste Model List (JSON)</div>
+                <button class="btn" style="border: none; padding: 4px 8px;" onclick="closeImportModal()"><i class="fas fa-xmark"></i></button>
+            </div>
+            <div style="padding: 18px 22px; overflow-y: auto; flex: 1;">
+                <div class="usage-note" style="margin-bottom: 10px;">
+                    Paste a JSON array like the one you'd ask ChatGPT for — a list of objects with
+                    <code>Order</code>, <code>Label</code>, <code>Slug (OpenRouter)</code>, <code>Cost Group</code>
+                    (<code>💚 Low Cost</code> / <code>🎯 Medium Cost</code> / <code>🧠 High Cost</code>), <code>Note (shown next to dropdowns)</code>,
+                    <code>Default</code>, and <code>Active</code>. This <strong>replaces the entire table below</strong> — click
+                    <strong>Save Catalog</strong> afterward to actually persist it to Firestore (nothing is saved until then).
+                </div>
+                <div style="margin-bottom: 10px;">
+                    <label class="btn" style="cursor: pointer;">
+                        <i class="fas fa-file-arrow-up"></i> Choose .json file…
+                        <input type="file" id="importFileInput" accept=".json,application/json" style="display:none;" onchange="handleImportFile(event)">
+                    </label>
+                    <span style="font-size: 12.5px; color: var(--gray-500); margin-left: 8px;">— or paste directly into the box below</span>
+                </div>
+                <textarea id="importJsonText" style="width: 100%; min-height: 320px; font-family: 'SF Mono', Consolas, monospace; font-size: 12px;" placeholder="Paste the JSON array here…"></textarea>
+                <div class="status-msg" id="importStatusMsg" style="margin-top: 8px;"></div>
+            </div>
+            <div style="padding: 14px 22px; border-top: 1px solid var(--gray-200); display: flex; justify-content: flex-end; gap: 10px;">
+                <button class="btn" onclick="closeImportModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="applyImportedJson()"><i class="fas fa-check"></i> Load Into Table</button>
             </div>
         </div>
     </div>
@@ -241,6 +276,127 @@
             }
             render();
             setStatus(added > 0 ? `Added ${added} built-in model(s) — click Save Catalog to persist.` : 'All built-in models are already in the list.');
+        };
+
+        // ── JSON import / export ──────────────────────────────────────────
+        // Mirrors the exact column names shown in the table, so a round trip
+        // through ChatGPT ("here's my model list, add X and re-sort it") pastes
+        // straight back in without any reformatting.
+        const GROUP_LABEL_FOR_EXPORT = { low: '💚 Low Cost', medium: '🎯 Medium Cost', high: '🧠 High Cost', other: 'Other' };
+        function groupLabelToInternal(label) {
+            const s = String(label || '').toLowerCase();
+            if (s.includes('low'))    return 'low';
+            if (s.includes('medium')) return 'medium';
+            if (s.includes('high'))   return 'high';
+            return 'other';
+        }
+
+        window.downloadCatalogJson = () => {
+            const json = JSON.stringify(rows.map((r, i) => ({
+                'Order': i + 1,
+                'Label': r.label || r.slug,
+                'Slug (OpenRouter)': r.slug,
+                'Cost Group': GROUP_LABEL_FOR_EXPORT[r.group] || GROUP_LABEL_FOR_EXPORT.other,
+                'Note (shown next to dropdowns)': r.note || '',
+                'Default': !!r.isDefault,
+                'Active': r.active !== false
+            })), null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `ai-model-catalog-${new Date().toISOString().slice(0, 10)}.json`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+            setStatus(`Downloaded ${rows.length} model(s) as JSON.`);
+        };
+
+        window.openImportModal = () => {
+            document.getElementById('importJsonText').value = '';
+            document.getElementById('importStatusMsg').textContent = '';
+            document.getElementById('importModalOverlay').style.display = 'flex';
+        };
+        window.closeImportModal = () => {
+            document.getElementById('importModalOverlay').style.display = 'none';
+        };
+        window.handleImportFile = (event) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => { document.getElementById('importJsonText').value = reader.result; };
+            reader.onerror = () => { document.getElementById('importStatusMsg').innerHTML = '<span class="status-err">Could not read that file.</span>'; };
+            reader.readAsText(file);
+            event.target.value = ''; // allow re-choosing the same file later
+        };
+
+        // Parses the pasted/uploaded JSON (array of objects using the same column
+        // names as the table / export) and replaces the whole working table with
+        // it. Nothing is written to Firestore here — Save Catalog still applies.
+        window.applyImportedJson = () => {
+            const statusEl = document.getElementById('importStatusMsg');
+            const raw = document.getElementById('importJsonText').value.trim();
+            if (!raw) { statusEl.innerHTML = '<span class="status-err">Paste or upload some JSON first.</span>'; return; }
+            let parsed;
+            try {
+                parsed = JSON.parse(raw);
+            } catch (e) {
+                statusEl.innerHTML = `<span class="status-err">Invalid JSON: ${escHtml(e.message)}</span>`;
+                return;
+            }
+            if (!Array.isArray(parsed)) {
+                statusEl.innerHTML = '<span class="status-err">Expected a JSON array of model objects (e.g. <code>[ { "Label": ... }, ... ]</code>).</span>';
+                return;
+            }
+            if (parsed.length === 0) { statusEl.innerHTML = '<span class="status-err">That array is empty — nothing to load.</span>'; return; }
+
+            const getField = (obj, ...keys) => {
+                for (const k of keys) if (obj[k] !== undefined) return obj[k];
+                return undefined;
+            };
+            const missingSlug = [];
+            const imported = parsed.map((m, i) => {
+                const slug = String(getField(m, 'Slug (OpenRouter)', 'slug', 'Slug') || '').trim();
+                if (!slug) missingSlug.push(getField(m, 'Label', 'label') || `row ${i + 1}`);
+                return {
+                    slug,
+                    label: String(getField(m, 'Label', 'label') || slug || '').trim(),
+                    group: groupLabelToInternal(getField(m, 'Cost Group', 'group', 'Group')),
+                    note: String(getField(m, 'Note (shown next to dropdowns)', 'note', 'Note') || '').trim(),
+                    active: getField(m, 'Active', 'active') !== false,
+                    isDefault: !!getField(m, 'Default', 'isDefault'),
+                    _order: Number(getField(m, 'Order', 'order')) || (i + 1)
+                };
+            });
+            if (missingSlug.length > 0) {
+                statusEl.innerHTML = `<span class="status-err">Missing "Slug (OpenRouter)" for: ${escHtml(missingSlug.join(', '))}. Fix the JSON and try again.</span>`;
+                return;
+            }
+            const slugs = imported.map(m => m.slug);
+            const dupes = [...new Set(slugs.filter((s, i) => slugs.indexOf(s) !== i))];
+            if (dupes.length > 0) {
+                statusEl.innerHTML = `<span class="status-err">Duplicate slug(s) in the pasted JSON: ${escHtml(dupes.join(', '))}.</span>`;
+                return;
+            }
+
+            imported.sort((a, b) => a._order - b._order);
+            // Exactly one Default — if the JSON marked none (or more than one), keep
+            // the first marked one and fall back to the current default, then the
+            // first active row, so Save Catalog's "needs a Default" check still passes.
+            if (!imported.some(m => m.isDefault)) {
+                const prevDefaultSlug = rows.find(r => r.isDefault)?.slug;
+                const fallback = imported.find(m => m.slug === prevDefaultSlug) || imported.find(m => m.active !== false) || imported[0];
+                if (fallback) fallback.isDefault = true;
+            } else {
+                let seenDefault = false;
+                imported.forEach(m => { if (m.isDefault) { if (seenDefault) m.isDefault = false; seenDefault = true; } });
+            }
+
+            rows = imported.map(({ _order, ...m }) => m);
+            render();
+            closeImportModal();
+            setStatus(`Loaded ${rows.length} model(s) from JSON — review below, then click Save Catalog to persist.`);
         };
 
         window.loadCatalog = async () => {
