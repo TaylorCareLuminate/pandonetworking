@@ -1458,15 +1458,24 @@ console.log('📋 Auth script loaded, waiting for initialization...');
   // Only relevant on the new Pando domain — never run this on healthluminate.com itself.
   const host = window.location.hostname;
   const isPandoHost = host === 'pandonetworking.com' || host === 'www.pandonetworking.com';
-  if (!isPandoHost) return;
+  if (!isPandoHost) {
+    console.log('ℹ️ [SSO Bridge] Not on Pando host, skipping (host: ' + host + ')');
+    return;
+  }
 
   function attemptBridge() {
     try {
-      if (sessionStorage.getItem(ATTEMPT_FLAG)) return;
+      if (sessionStorage.getItem(ATTEMPT_FLAG)) {
+        console.log('ℹ️ [SSO Bridge] Already attempted this tab session, skipping. Clear sessionStorage or open a new tab to retry.');
+        return;
+      }
       sessionStorage.setItem(ATTEMPT_FLAG, '1');
     } catch (e) {
+      console.warn('⚠️ [SSO Bridge] No sessionStorage access, skipping:', e.message);
       return; // No sessionStorage access — skip rather than retry every navigation
     }
+
+    console.log('🔄 [SSO Bridge] Not signed in locally — checking for an existing HealthLuminate session via', BRIDGE_URL);
 
     const iframe = document.createElement('iframe');
     iframe.style.cssText = 'display:none;width:0;height:0;border:0;position:absolute;';
@@ -1474,22 +1483,33 @@ console.log('📋 Auth script loaded, waiting for initialization...');
     iframe.title = 'Session bridge';
 
     let settled = false;
-    const cleanup = () => {
+    const cleanup = (reason) => {
       if (settled) return;
       settled = true;
+      if (reason) console.log('ℹ️ [SSO Bridge] ' + reason);
       window.removeEventListener('message', onMessage);
       if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
     };
 
-    const timeoutId = setTimeout(cleanup, BRIDGE_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => cleanup('Timed out after ' + BRIDGE_TIMEOUT_MS + 'ms waiting for bridge response (no message received from ' + BRIDGE_ORIGIN + ' — check that sso-bridge.html loaded and isn\'t blocked by a browser storage/tracking-prevention setting).'), BRIDGE_TIMEOUT_MS);
 
     async function onMessage(event) {
-      if (event.origin !== BRIDGE_ORIGIN || settled) return;
+      if (event.origin !== BRIDGE_ORIGIN) {
+        console.log('ℹ️ [SSO Bridge] Ignoring message from unexpected origin:', event.origin);
+        return;
+      }
+      if (settled) return;
       const data = event.data;
       if (!data || data.type !== 'PANDO_SSO_TOKEN') return;
       clearTimeout(timeoutId);
 
-      if (data.token && auth && !auth.currentUser) {
+      if (!data.token) {
+        cleanup('Bridge responded: no HealthLuminate session found (visitor is not logged in there, or the browser blocked the bridge from reading that session).');
+        return;
+      }
+
+      console.log('✅ [SSO Bridge] Received a token from HealthLuminate — signing in...');
+      if (auth && !auth.currentUser) {
         try {
           const { signInWithCustomToken } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
           await signInWithCustomToken(auth, data.token);
@@ -1497,6 +1517,8 @@ console.log('📋 Auth script loaded, waiting for initialization...');
         } catch (error) {
           console.warn('⚠️ [SSO Bridge] signInWithCustomToken failed:', error.message);
         }
+      } else {
+        console.log('ℹ️ [SSO Bridge] Already signed in locally by the time the token arrived — ignoring.');
       }
       cleanup();
     }
@@ -1510,7 +1532,10 @@ console.log('📋 Auth script loaded, waiting for initialization...');
     try {
       await window.firebaseReady;
       // Already signed in on this domain — nothing to bridge.
-      if (auth && auth.currentUser) return;
+      if (auth && auth.currentUser) {
+        console.log('ℹ️ [SSO Bridge] Already signed in on pandonetworking.com, skipping bridge.');
+        return;
+      }
       attemptBridge();
     } catch (error) {
       console.warn('⚠️ [SSO Bridge] Skipped:', error.message);
