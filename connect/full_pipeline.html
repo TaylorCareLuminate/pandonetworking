@@ -2045,8 +2045,17 @@
             not_in_contact_pool: 'not found in this BDR\'s contact pool (possible data lag)',
             eligible:            'eligible but not selected this round'
         };
+        // Accumulates diag.tally across every org processed this run so the final summary
+        // (and the saved full_pipeline_runs report) can show one aggregate breakdown instead
+        // of forcing the user to add up dozens of per-org log lines by hand.
+        let fpRunHypTally = null;
         function fpLogHypothesisDiagnostics(diag, urlCount) {
             if (!diag || !diag.tally || !urlCount) return;
+            if (fpRunHypTally) {
+                for (const [reason, count] of Object.entries(diag.tally)) {
+                    fpRunHypTally[reason] = (fpRunHypTally[reason] || 0) + count;
+                }
+            }
             const nonEligible = Object.entries(diag.tally).filter(([reason]) => reason !== 'eligible');
             if (nonEligible.length === 0) return;
             const parts = nonEligible
@@ -2057,6 +2066,19 @@
                     return `${count} ${label}${examples.length ? ` (e.g. ${examples.map(escHtml).join(', ')})` : ''}`;
                 });
             addLog(`   🔍 Why ${urlCount - (diag.tally.eligible || 0)}/${urlCount} matched contact(s) didn't reach the queue this round: ${parts.join('; ')}.`, 'dim');
+        }
+
+        // One-line, whole-run breakdown of fpRunHypTally, e.g.
+        // "142 already have a message queued; 8 below the connection-count floor; 61 eligible".
+        function fpSummarizeHypTally(tally) {
+            if (!tally) return '';
+            const entries = Object.entries(tally).filter(([, count]) => count > 0);
+            if (entries.length === 0) return '';
+            const total = entries.reduce((s, [, c]) => s + c, 0);
+            const parts = entries
+                .sort((a, b) => b[1] - a[1])
+                .map(([reason, count]) => `${count} ${HYP_DIAG_LABELS[reason] || reason}`);
+            return `${total} matched contact(s) evaluated this run — ${parts.join('; ')}.`;
         }
 
         // LinkedIn account lookup for job metadata — same as prospect_organizations_admin.html
@@ -2410,6 +2432,7 @@
             window.fpStopRequested = false;
             Object.keys(fpStats).forEach(k => fpStats[k] = 0);
             fpRenderStats();
+            fpRunHypTally = { already_messaged: 0, excluded: 0, already_connected: 0, low_connections: 0, not_in_contact_pool: 0, eligible: 0 };
             document.getElementById('fpProgressSection').style.display = 'block';
             document.getElementById('fpProgressLog').innerHTML = '';
             document.getElementById('fpReportLink').innerHTML = '';
@@ -2445,7 +2468,7 @@
                 aiCostTracking: 'call_counts_only',
                 aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0 },
                 orgs: [],
-                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0 }
+                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, hypothesisTally: null }
             };
             const saveReport = async () => {
                 try { await setDoc(doc(db, 'full_pipeline_runs', runId), report); }
@@ -3197,12 +3220,20 @@
                 report.finishedAt = new Date().toISOString();
                 report.bdrPlan = bdrPlan.map(b => ({ bdrEmail: b.bdrEmail, target: b.target, generated: b.generated }));
                 if (costLimitHit) report.costGuardResult = costLimitHit;
+                report.totals.hypothesisTally = fpRunHypTally;
                 await saveReport();
 
                 const totalGen = bdrPlan.reduce((s, b) => s + b.generated, 0);
                 addLog(`\n${report.status === 'completed' ? '✅' : 'ℹ️'} Run ${report.status}: ${totalGen} message(s) generated across ${report.orgs.length} organization(s). Apify cost ≈ $${fpStats.apifyCost.toFixed(2)}. Messages are waiting in Fast Connect Review.`, report.status === 'completed' ? 'success' : 'info');
                 if (fpStats.dncSkipped > 0 || fpStats.alreadyConnected > 0) {
                     addLog(`🚫 Compliance: ${fpStats.dncSkipped} organization(s) skipped for DNC, ${fpStats.alreadyConnected} contact(s) dropped as already connected.`);
+                }
+                const hypSummary = fpSummarizeHypTally(fpRunHypTally);
+                if (hypSummary) {
+                    addLog(`🔍 Whole-run reason breakdown for matched-but-not-queued contacts: ${hypSummary}`, 'dim');
+                    if ((fpRunHypTally.already_messaged || 0) > totalGen * 3 && (fpRunHypTally.already_messaged || 0) > 10) {
+                        addLog(`   💡 Most of this run's matched decision-makers already have a message queued from earlier work on this hypothesis group/BDR — that's very likely why the message count looks low. This is the pipeline correctly avoiding duplicate outreach, not a bug. If you want fresh volume, check how many older messages for this group are still sitting unreviewed in Fast Connect Review, or point this run at a hypothesis group/territory that hasn't been worked as heavily yet.`, 'warning');
+                    }
                 }
                 if (costLimitHit) {
                     addLog(`💸 Shut down by the Step 6 cost guard — Apify averaged ${costLimitHit.messages > 0 ? '$' + costLimitHit.avgPerMessage.toFixed(2) : 'more than the limit'} per generated message (limit $${costLimitHit.limitPerMessage.toFixed(2)}). Adjust the Step 4 scan rules before rerunning.`, 'error');
