@@ -548,6 +548,69 @@ exports.updateUserEmail = functions.https.onRequest(async (req, res) => {
     }
 });
 
+// ============================================================================
+// CROSS-DOMAIN SSO BRIDGE (HealthLuminate -> Pando Executive Networking)
+// ============================================================================
+
+/**
+ * Mints a short-lived Firebase custom token for the SAME user who calls this
+ * endpoint, so that a session on one origin (healthluminate.com) can be
+ * silently re-established on another origin (pandonetworking.com) that
+ * shares this Firebase Auth project (healthcareitdatabase).
+ *
+ * This does NOT let anyone log in as someone else: the caller must already
+ * present a valid Firebase ID token (proof they are currently signed in),
+ * and the custom token this returns is only ever minted for that same uid.
+ *
+ * Flow:
+ *   1. healthluminate.com/sso-bridge.html (loaded in a hidden iframe by
+ *      pandonetworking.com) checks its own Firebase Auth session.
+ *   2. If signed in, it POSTs its ID token here with `Authorization: Bearer <idToken>`.
+ *   3. This function verifies that ID token and mints a custom token for the
+ *      same uid, returned as `{ token }`.
+ *   4. The bridge page postMessages the custom token back to
+ *      pandonetworking.com, which calls signInWithCustomToken().
+ *
+ * IMPORTANT: This must be deployed to the `healthcareitdatabase` Firebase
+ * project (the project that actually owns these users), NOT `clemail`:
+ *   firebase deploy --only functions:mintSsoToken --project healthcareitdatabase
+ */
+exports.mintSsoToken = functions.https.onRequest(async (req, res) => {
+    // ── CORS: only the legacy site is allowed to call this ──────────────────
+    const allowedOrigins = [
+        'https://healthluminate.com',
+        'https://www.healthluminate.com'
+    ];
+    const origin = req.headers.origin || '';
+    const originAllowed = allowedOrigins.includes(origin) || origin.startsWith('http://localhost');
+
+    res.set('Access-Control-Allow-Origin', originAllowed ? origin : allowedOrigins[0]);
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.set('Access-Control-Max-Age', '3600');
+    res.set('Vary', 'Origin');
+
+    if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+    if (req.method !== 'POST')    { res.status(405).json({ error: 'Method Not Allowed' }); return; }
+    if (!originAllowed)           { res.status(403).json({ error: 'Origin not allowed.' }); return; }
+
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Bearer ')) {
+        res.status(401).json({ error: 'Missing or invalid Authorization header.' });
+        return;
+    }
+
+    try {
+        const decoded = await admin.auth().verifyIdToken(authHeader.slice(7));
+        const customToken = await admin.auth().createCustomToken(decoded.uid);
+        console.log(`✅ Minted SSO bridge token for ${decoded.email || decoded.uid}`);
+        res.status(200).json({ token: customToken });
+    } catch (error) {
+        console.error('❌ mintSsoToken error:', error.message);
+        res.status(401).json({ error: 'Invalid ID token.' });
+    }
+});
+
 /**
  * Health check endpoint
  * 

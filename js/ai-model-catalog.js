@@ -56,6 +56,7 @@
         { slug: 'qwen/qwen3.6-max-preview',        label: 'Qwen 3.6 Max',           group: 'medium', note: 'Strong frontier contender — Qwen\'s most capable model.' },
         { slug: 'x-ai/grok-4.3',                   label: 'Grok 4.3',               group: 'medium', note: 'Very good reasoning — solid mid-tier option from xAI.' },
         { slug: 'z-ai/glm-5.2',                    label: 'GLM-5.2',                group: 'medium', note: 'High-performing newer GLM — improved over GLM-5.1.' },
+        { slug: 'moonshotai/kimi-k3',               label: 'Kimi K3',                group: 'medium', note: 'Moonshot\'s newest flagship — 2.8T-parameter MoE with native vision and a 1M-token context; excellent at long-horizon reasoning and research synthesis.' },
         // ── High cost ──
         { slug: 'openai/gpt-5.5',                  label: 'GPT-5.5',                group: 'high',   note: 'Top-tier reasoning — OpenAI\'s best for complex, nuanced classification.' },
         { slug: 'openai/gpt-5.5-pro',              label: 'GPT-5.5 Pro',            group: 'high',   note: 'Maximum capability — best possible accuracy, highest cost.' },

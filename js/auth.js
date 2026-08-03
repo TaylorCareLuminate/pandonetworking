@@ -1435,3 +1435,85 @@ if (document.readyState === 'loading') {
 }
 
 console.log('📋 Auth script loaded, waiting for initialization...');
+
+// ============================================================
+// CROSS-DOMAIN SSO BRIDGE (HealthLuminate -> Pando)
+// ============================================================
+// Same Firebase Auth project (healthcareitdatabase) backs both
+// healthluminate.com and pandonetworking.com, so the two sites share one set
+// of accounts — but browser session storage is scoped per-origin, so simply
+// being logged into HealthLuminate doesn't automatically show up here.
+//
+// This silently checks (once per browser tab session) whether the visitor
+// already has a HealthLuminate session, and if so, signs them into Pando
+// too via a short-lived custom token minted by the mintSsoToken Cloud
+// Function (see functions/index.js). See sso-bridge.html on the
+// HealthLuminate side for the other half of this flow.
+(function initSsoBridge() {
+  const BRIDGE_ORIGIN = 'https://healthluminate.com';
+  const BRIDGE_URL = BRIDGE_ORIGIN + '/sso-bridge.html';
+  const ATTEMPT_FLAG = 'pandoSsoBridgeAttempted';
+  const BRIDGE_TIMEOUT_MS = 7000;
+
+  // Only relevant on the new Pando domain — never run this on healthluminate.com itself.
+  const host = window.location.hostname;
+  const isPandoHost = host === 'pandonetworking.com' || host === 'www.pandonetworking.com';
+  if (!isPandoHost) return;
+
+  function attemptBridge() {
+    try {
+      if (sessionStorage.getItem(ATTEMPT_FLAG)) return;
+      sessionStorage.setItem(ATTEMPT_FLAG, '1');
+    } catch (e) {
+      return; // No sessionStorage access — skip rather than retry every navigation
+    }
+
+    const iframe = document.createElement('iframe');
+    iframe.style.cssText = 'display:none;width:0;height:0;border:0;position:absolute;';
+    iframe.setAttribute('aria-hidden', 'true');
+    iframe.title = 'Session bridge';
+
+    let settled = false;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('message', onMessage);
+      if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+    };
+
+    const timeoutId = setTimeout(cleanup, BRIDGE_TIMEOUT_MS);
+
+    async function onMessage(event) {
+      if (event.origin !== BRIDGE_ORIGIN || settled) return;
+      const data = event.data;
+      if (!data || data.type !== 'PANDO_SSO_TOKEN') return;
+      clearTimeout(timeoutId);
+
+      if (data.token && auth && !auth.currentUser) {
+        try {
+          const { signInWithCustomToken } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
+          await signInWithCustomToken(auth, data.token);
+          console.log('✅ [SSO Bridge] Signed in via existing HealthLuminate session');
+        } catch (error) {
+          console.warn('⚠️ [SSO Bridge] signInWithCustomToken failed:', error.message);
+        }
+      }
+      cleanup();
+    }
+
+    window.addEventListener('message', onMessage);
+    iframe.src = BRIDGE_URL;
+    document.body.appendChild(iframe);
+  }
+
+  (async () => {
+    try {
+      await window.firebaseReady;
+      // Already signed in on this domain — nothing to bridge.
+      if (auth && auth.currentUser) return;
+      attemptBridge();
+    } catch (error) {
+      console.warn('⚠️ [SSO Bridge] Skipped:', error.message);
+    }
+  })();
+})();
