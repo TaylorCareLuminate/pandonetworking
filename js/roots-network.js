@@ -72,13 +72,19 @@
     return Math.max(document.documentElement.scrollHeight, h * 2);
   }
 
+  // Different pages name their top banner section differently
+  // (.hero, .connect-hero, .accelerate-hero, ...) — find whichever exists.
+  function findHeroEl() {
+    return document.querySelector('.hero, .connect-hero, .accelerate-hero, [class$="-hero"]');
+  }
+
   function buildNetwork() {
     const rand = mulberry32(2024);
     roots = [];
     bridges = [];
 
     builtPageH = pageHeight();
-    const hero = document.querySelector('.hero');
+    const hero = findHeroEl();
     startY = hero ? hero.offsetHeight - 30 : Math.min(h * 0.9, 720);
     const endY = builtPageH - 30;
 
@@ -340,7 +346,7 @@
       ctx.clearRect(0, 0, w, h);
 
       const scrollY = window.scrollY;
-      const hero = document.querySelector('.hero');
+      const hero = findHeroEl();
       const heroH = hero ? hero.offsetHeight : h;
 
       if (scrollY > heroH * 0.2) canvas.classList.add('visible');

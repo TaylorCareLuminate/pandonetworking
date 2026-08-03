@@ -196,11 +196,14 @@
                 <datalist id="fpScanNameHistory"></datalist>
                 <div class="form-help">
                     Every organization scanned this run is tagged with this name, so you can tell scans apart later and know exactly which rules were used on which organizations.
+                    Scan names are also tied to Step 4's rules for this hypothesis group — picking a name you've used before reloads the exact same rules, and running the
+                    pipeline saves whatever rules are in Step 4 back to this name, so the same scan name always means the same rules.
                     <label style="display: inline-flex; align-items: center; gap: 6px; margin-left: 4px; font-weight: 600; color: var(--gray-600);">
                         <input type="checkbox" id="fpSkipAlreadyScanned" checked onchange="fpUpdateScanNameStatus()" style="width: auto;"> Skip organizations already scanned under this name
                     </label>
                 </div>
                 <div id="fpScanNameStatus" style="font-size: 12.5px; font-weight: 600; margin-top: 6px;"></div>
+                <div id="fpScanRulesPresetStatus" style="font-size: 12.5px; font-weight: 600; margin-top: 4px;"></div>
                 <div style="margin-top: 6px;">
                     <a href="#" onclick="fpRepairScanLabelsFromReport(); return false;" style="font-size: 11.5px; color: var(--gray-400);">
                         <i class="fas fa-wrench"></i> Repair scan labels from a previous run (fixes organizations that were mistakenly marked "already scanned" after an error, e.g. an expired-session run)
@@ -523,6 +526,8 @@
         let fpGroups = [];           // hypothesis_groups docs
         let fpBdrs = [];             // bdr_leaders docs
         let fpGroupOrgs = [];        // prospect_organizations for the selected group (priority order)
+        let fpCurrentGroupScanPresets = {}; // { [scanName]: { criteria, secondScan, updatedAt } } — from the selected group's hypothesis_groups doc
+        let fpLastAppliedPresetName = null; // avoids re-clobbering Step 4 fields on every keystroke once a preset has loaded
         let fpRunning = false;
         window.fpStopRequested = false;
 
@@ -1316,10 +1321,13 @@
         function fpResetGroupDependentUi() {
             document.getElementById('fpInstructionsBlock').style.display = 'none';
             fpGroupOrgs = [];
+            fpCurrentGroupScanPresets = {};
+            fpLastAppliedPresetName = null;
             document.getElementById('fpOrgTableBody').innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--gray-400); padding: 20px;">Select a hypothesis group above.</td></tr>';
             ['fpOrgCountTotal','fpOrgCountWithUrl','fpOrgCountScanned','fpOrgCountThisName'].forEach(id => document.getElementById(id).textContent = '–');
             document.getElementById('fpScanName').value = '';
             document.getElementById('fpScanNameStatus').textContent = '';
+            document.getElementById('fpScanRulesPresetStatus').textContent = '';
             document.getElementById('fpScanNameHistory').innerHTML = '';
             document.getElementById('fpGroupStats').innerHTML = '';
             document.getElementById('fpBdrList').innerHTML = '<span style="color: var(--gray-500); font-size: 13px;">Select a client and hypothesis group above.</span>';
@@ -1533,6 +1541,7 @@
             const name = (document.getElementById('fpScanName').value || '').trim();
             const statusEl = document.getElementById('fpScanNameStatus');
             const countEl = document.getElementById('fpOrgCountThisName');
+            fpTryLoadScanNamePreset(name);
             if (!fpGroupOrgs.length) { statusEl.textContent = ''; countEl.textContent = '–'; return; }
 
             if (!name) {
@@ -1566,7 +1575,12 @@
             document.getElementById('fpInstructionsBlock').style.display = 'block';
             document.getElementById('fpGroupStats').innerHTML = `<i class="fas fa-flask" style="color: var(--primary);"></i> <strong>${escHtml(group.name || groupId)}</strong> <span style="color: var(--gray-500);">— ${fpGroupBdrEmails(group).length} linked BDR(s)</span>`;
             fpRenderBdrList(group);
+            // Per-group Scan Name → Step 4 rules presets, keyed by exact scan name.
+            fpCurrentGroupScanPresets = group.scanNamePresets || {};
+            fpLastAppliedPresetName = null;
+            document.getElementById('fpScanRulesPresetStatus').textContent = '';
             await fpLoadGroupOrgs(groupId);
+            fpTryLoadScanNamePreset((document.getElementById('fpScanName').value || '').trim());
             fpUpdateRunButton();
         });
 
@@ -1951,6 +1965,72 @@
             };
         }
 
+        // Writes a `criteria` object (same shape fpBuildScanCriteria returns) back onto
+        // the Step 4 form fields — the inverse of fpBuildScanCriteria. Used to reload a
+        // saved Scan Name preset.
+        function fpApplyScanCriteria(criteria, prefix) {
+            if (!criteria) return;
+            const fnSel = document.getElementById(prefix === '2' ? 'fpScan2Functions' : 'fpScanFunctions');
+            const fnIds = new Set((criteria.function_ids || []).map(String));
+            [...fnSel.options].forEach(o => o.selected = fnIds.size > 0 && fnIds.has(o.value));
+            const snSel = document.getElementById(prefix === '2' ? 'fpScan2Seniority' : 'fpScanSeniority');
+            const snIds = new Set((criteria.seniority_level_ids || []).map(String));
+            [...snSel.options].forEach(o => o.selected = snIds.size > 0 && snIds.has(o.value));
+            document.getElementById(prefix === '2' ? 'fpScan2Max' : 'fpScanMax').value = criteria.max_employees || 25;
+            document.getElementById(prefix === '2' ? 'fpScan2Locations' : 'fpScanLocations').value = (criteria.locations || []).join(', ');
+            document.getElementById(prefix === '2' ? 'fpScan2Query' : 'fpScanQuery').value = criteria.search_query || '';
+            document.getElementById(prefix === '2' ? 'fpScan2Titles' : 'fpScanTitles').value = (criteria.job_titles || []).join('\n');
+            document.getElementById(prefix === '2' ? 'fpScan2FilterPrompt' : 'fpScanFilterPrompt').value = criteria.filter_prompt || '';
+        }
+
+        // Loads a saved Scan Name preset (Step 4 rules previously used under this exact
+        // name, for this hypothesis group) onto the form, including the fallback second
+        // scan if one was saved. No-op if this exact name has no saved preset, or if it's
+        // already the one currently applied (so typing further into an already-matched
+        // name doesn't keep clobbering in-progress edits).
+        function fpTryLoadScanNamePreset(name) {
+            const statusEl = document.getElementById('fpScanRulesPresetStatus');
+            if (!statusEl) return;
+            if (!name) { statusEl.textContent = ''; fpLastAppliedPresetName = null; return; }
+            const preset = fpCurrentGroupScanPresets[name];
+            if (!preset) {
+                fpLastAppliedPresetName = null;
+                statusEl.innerHTML = `<span style="color: var(--gray-500);"><i class="fas fa-circle-info"></i> New scan name — the Step 4 rules you run with will be saved under this name for reuse next time.</span>`;
+                return;
+            }
+            if (fpLastAppliedPresetName === name) return; // already loaded, don't re-clobber edits
+            fpApplyScanCriteria(preset.criteria, '');
+            const hasSecondScan = !!preset.secondScan;
+            document.getElementById('fpSecondScanEnabled').checked = hasSecondScan;
+            document.getElementById('fpScan2Body').style.display = hasSecondScan ? 'block' : 'none';
+            if (hasSecondScan) {
+                document.getElementById('fpSecondScanThreshold').value = preset.secondScan.threshold || 5;
+                fpApplyScanCriteria(preset.secondScan.criteria, '2');
+            }
+            fpLastAppliedPresetName = name;
+            const when = preset.updatedAt ? new Date(preset.updatedAt).toLocaleDateString() : '';
+            statusEl.innerHTML = `<span style="color: var(--success);"><i class="fas fa-wand-magic-sparkles"></i> Loaded the saved Step 4 rules for "${escHtml(name)}"${when ? ` (last used ${when})` : ''}.</span>`;
+        }
+
+        // Saves the current Step 4 rules as the preset for this Scan Name, on this
+        // hypothesis group's doc — called right before a run starts, so the same name
+        // always maps to whatever rules it was actually run with.
+        async function fpSaveScanNamePreset(groupId, scanName, criteria, secondScanConfig) {
+            try {
+                const updatedPresets = {
+                    ...fpCurrentGroupScanPresets,
+                    [scanName]: { criteria, secondScan: secondScanConfig, updatedAt: new Date().toISOString() }
+                };
+                await updateDoc(doc(db, 'hypothesis_groups', groupId), { scanNamePresets: updatedPresets });
+                fpCurrentGroupScanPresets = updatedPresets;
+                fpLastAppliedPresetName = scanName;
+                const g = fpGroups.find(g => g.id === groupId);
+                if (g) g.scanNamePresets = updatedPresets;
+            } catch (e) {
+                console.warn('[Scan Name preset] failed to save:', e);
+            }
+        }
+
         // LinkedIn account lookup for job metadata — same as prospect_organizations_admin.html
         async function fpLookupLinkedInAccount(bdrEmail) {
             let customerId = null, linkedInAccountId = null, accountName = null;
@@ -2274,6 +2354,10 @@
             const secondScanConfig = document.getElementById('fpSecondScanEnabled').checked
                 ? { threshold: parseInt(document.getElementById('fpSecondScanThreshold').value) || 5, criteria: fpBuildScanCriteria('2') }
                 : null;
+
+            // Keep this Scan Name's Step 4 rules in sync — whatever rules this run actually
+            // uses become "the" rules for this name, so picking it again later reloads them.
+            await fpSaveScanNamePreset(groupId, scanName, scanCriteria, secondScanConfig);
 
             // ── Step 6: cost shut-down rates ──
             // Of the target cost per message, ~$0.03 is AI and ~$0.02 is post scrapes;
