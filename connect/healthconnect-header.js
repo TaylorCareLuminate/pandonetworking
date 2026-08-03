@@ -464,7 +464,7 @@ function injectHeaderStyles() {
     const styles = `
         /* PandoConnect Header Styles */
         .healthconnect-header {
-            background: linear-gradient(135deg, #0F2D4D 0%, #5E7C5B 100%);
+            background: linear-gradient(135deg, #5E7C5B 0%, #C9973D 100%);
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
             position: sticky;
             top: 0;
@@ -501,9 +501,8 @@ function injectHeaderStyles() {
             height: 50px;
             width: auto;
             object-fit: contain;
-            filter: brightness(1.05);
             border-radius: 6px;
-            background: rgba(255, 255, 255, 0.15);
+            background: #ffffff;
             padding: 6px 10px;
         }
 
