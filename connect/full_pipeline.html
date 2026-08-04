@@ -392,10 +392,10 @@
                 <div class="form-group">
                     <label for="fpRoutingMode"><i class="fas fa-route"></i> Message Routing</label>
                     <select id="fpRoutingMode">
-                        <option value="both" selected>Try Both (About Me first, then Internet Search)</option>
-                        <option value="smart">Smart (classify → About Me / Internet Search)</option>
+                        <option value="smart" selected>Smart (classify → About Me / Internet Search)</option>
+                        <option value="both">Try Both (About Me first, then Internet Search)</option>
                     </select>
-                    <div class="form-help">Default is About Me first — it has the best hit rate. The org news we prefetch is only used to write an Internet Search message as a <strong>fallback</strong> when About Me finds no commonalities (or when this BDR has no About Me statements set up). "Smart" instead sends senior/large-org contacts straight to Internet Search first — pick that only if you specifically want news-led outreach for your highest-value contacts.</div>
+                    <div class="form-help">"Smart" sends senior/large-org contacts to Internet Search first (falling back to About Me), and everyone else to About Me first (falling back to Internet Search). To avoid repeating the same org news story, each org's verified stories are matched per-contact by AI and capped at 7 uses each before rotating to another story or falling back to About Me.</div>
                 </div>
                 <div class="form-group">
                     <label><i class="fas fa-network-wired"></i> Connection Filter</label>
@@ -2415,6 +2415,80 @@
             }
         }
 
+        // ── Story diversity / reuse cap ──────────────────────────────────────
+        // Without this, every contact at an org gets the same #1-rated verified story
+        // (step6_generateMessages always uses verifiedItems[0]), so once a BDR gets more
+        // than a handful of messages from the same org they all read the same. Instead:
+        // (1) when an org has >1 verified story, ask AI once per org which story best fits
+        //     each individual contact's title/role, (2) track how many times each distinct
+        //     story (by URL) has actually been used to generate a message across the WHOLE
+        //     run, and (3) once a story hits the cap, stop offering it — fall back to the
+        //     next best-fitting story still under the cap, or to no org story at all (which
+        //     lets About Me / contact-specific search take over) if every story is maxed out.
+        const FP_STORY_MAX_USES = 7;
+        let fpStoryUsageByUrl = null; // Map<storyKey, useCount> — reset once per run in fpRunPipeline
+
+        function fpStoryKey(story) {
+            return (story && (story.url || story.headline)) || JSON.stringify(story || {});
+        }
+
+        // One batch AI call per organization (not per contact) — cheap relative to the
+        // rest of the pipeline, and lets multiple different contacts at a large org get
+        // stories that actually fit their role instead of pure round-robin.
+        async function fpMatchStoriesToContacts({ token, contacts, orgNewsItems }) {
+            const byId = new Map();
+            if (!orgNewsItems || orgNewsItems.length <= 1) {
+                // 0 stories = nothing to match; 1 story = only one possible answer either way.
+                contacts.forEach(c => byId.set(c.id, orgNewsItems && orgNewsItems.length === 1 ? 0 : null));
+                return byId;
+            }
+            try {
+                const resp = await fetchWithRetry(`${RAILWAY_API}/api/connect/match-stories-to-contacts`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({
+                        contacts: contacts.map(c => ({ id: c.id, title: c.title || '', company: c.company || c.companyName || '' })),
+                        stories: orgNewsItems.map((s, idx) => ({ index: idx, headline: s.headline || '', content: s.content || '' }))
+                    })
+                }, { addLog, label: 'Match stories to contacts', retries: 1 });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.ok && data.success && Array.isArray(data.matches)) {
+                    data.matches.forEach(m => byId.set(m.id, m.storyIndex));
+                    addLog(`   🧩 Matched ${data.matches.length} contact(s) to ${orgNewsItems.length} news stories by relevance.`, 'dim');
+                    return byId;
+                }
+                addLog(`   ⚠️ Story matching failed (${data.error || `HTTP ${resp.status}`}) — defaulting everyone to the top story.`, 'warning');
+            } catch (e) {
+                addLog(`   ⚠️ Story matching error: ${e.message} — defaulting everyone to the top story.`, 'warning');
+            }
+            contacts.forEach(c => byId.set(c.id, 0));
+            return byId;
+        }
+
+        // Picks the best available story for one contact, respecting the whole-run reuse cap.
+        // Tries the AI-preferred story first, then falls through the rest (best-rated first,
+        // since orgNewsItems is already sorted by rating descending) looking for one still
+        // under the cap. Returns null if every story for this org is maxed out.
+        function fpPickStoryForContact(preferredIndex, orgNewsItems) {
+            if (!orgNewsItems || orgNewsItems.length === 0) return null;
+            const order = [];
+            if (Number.isInteger(preferredIndex) && preferredIndex >= 0 && preferredIndex < orgNewsItems.length) {
+                order.push(preferredIndex);
+            }
+            for (let i = 0; i < orgNewsItems.length; i++) {
+                if (!order.includes(i)) order.push(i);
+            }
+            for (const idx of order) {
+                const story = orgNewsItems[idx];
+                const key = fpStoryKey(story);
+                const uses = fpStoryUsageByUrl.get(key) || 0;
+                if (uses < FP_STORY_MAX_USES) {
+                    return { story, key, uses };
+                }
+            }
+            return null; // every story for this org has hit the reuse cap
+        }
+
         // Query the Apify run ledger for this scan job's actual recorded cost.
         async function fpLedgerCostForJob(jobId) {
             try {
@@ -2522,6 +2596,7 @@
             Object.keys(fpStats).forEach(k => fpStats[k] = 0);
             fpRenderStats();
             fpRunHypTally = { already_messaged: 0, excluded: 0, already_connected: 0, low_connections: 0, not_in_contact_pool: 0, eligible: 0 };
+            fpStoryUsageByUrl = new Map();
             document.getElementById('fpProgressSection').style.display = 'block';
             document.getElementById('fpProgressLog').innerHTML = '';
             document.getElementById('fpReportLink').innerHTML = '';
@@ -2851,6 +2926,10 @@
                                 continue;
                             }
 
+                            // Match each final prospect to the org news story that best fits their
+                            // role (only meaningful when there's more than one story to choose from).
+                            const orgStoryMatches = await fpMatchStoriesToContacts({ token, contacts: prospectList, orgNewsItems });
+
                             // ── 7. Per-prospect loop — same flow as generate_messages Full AI Generate ──
                             const queueDb = window.clemailDb;
                             for (let i = 0; i < prospectList.length; i++) {
@@ -2943,6 +3022,21 @@
                                     }
 
                                     // ── Core Railway call — with once-per-org news + model override ──
+                                    // Pick ONE story for this contact (AI-matched, capped at FP_STORY_MAX_USES
+                                    // reuses) instead of handing every contact the full list, which always
+                                    // collapses to the same #1-rated story server-side.
+                                    let assignedStory = null, assignedStoryKey = null;
+                                    if (orgNewsItems !== null && orgNewsItems.length > 0) {
+                                        const preferredIdx = orgStoryMatches.get(prospect.id);
+                                        const picked = fpPickStoryForContact(preferredIdx, orgNewsItems);
+                                        if (picked) {
+                                            assignedStory = picked.story;
+                                            assignedStoryKey = picked.key;
+                                            addLog(`   📰 Story: "${(assignedStory.headline || '').substring(0, 70)}" (used ${picked.uses}/${FP_STORY_MAX_USES} so far)`, 'dim');
+                                        } else {
+                                            addLog(`   📰 All ${orgNewsItems.length} org stor${orgNewsItems.length === 1 ? 'y has' : 'ies have'} hit the ${FP_STORY_MAX_USES}-use cap — falling back to About Me / contact-specific search for this contact.`, 'dim');
+                                        }
+                                    }
                                     report.aiCallCounts.generate++;
                                     const _singleBody = JSON.stringify({
                                         bdrEmail,
@@ -2952,7 +3046,7 @@
                                         connectionFilterEnabled: connFilterOn,
                                         minConnectionCount: connFilterMin,
                                         existingProfileData,
-                                        ...(orgNewsItems !== null ? { orgPreVerifiedItems: orgNewsItems } : {}),
+                                        ...(orgNewsItems !== null ? { orgPreVerifiedItems: assignedStory ? [assignedStory] : [] } : {}),
                                         messageModel: buildModel
                                     });
                                     let singleRes;
@@ -3129,6 +3223,12 @@
 
                                     // ── Save message(s) — same doc shape as generate_messages ──
                                     const src = singleData.messageSource || '';
+                                    // Only count this story as "used" if it actually won the Internet Search
+                                    // race (org story beats the parallel contact-specific search since it's
+                                    // concatenated first) — About Me / Contact Search don't touch org news at all.
+                                    if (assignedStoryKey && src === 'Internet Search') {
+                                        fpStoryUsageByUrl.set(assignedStoryKey, (fpStoryUsageByUrl.get(assignedStoryKey) || 0) + 1);
+                                    }
                                     const bdrLinkedInEmail = (bdrContext.bdrLinkedInEmail || bdrEmail).toLowerCase();
                                     const bdrNameVal       = bdrContext.bdrName || '';
                                     const pd               = singleData.profileData || {};
@@ -3239,6 +3339,16 @@
 
                                 // Brief pause between prospects to avoid hammering the server
                                 await new Promise(r => setTimeout(r, 1000));
+                            }
+
+                            // Record how many times each of this org's news stories actually got
+                            // used this run, for the saved report / future tuning of the reuse cap.
+                            if (orgNewsItems && orgNewsItems.length) {
+                                orgReport.newsStoryUsage = orgNewsItems.map(s => ({
+                                    headline: s.headline || '',
+                                    url: s.url || '',
+                                    timesUsedThisRun: fpStoryUsageByUrl.get(fpStoryKey(s)) || 0
+                                }));
                             }
 
                             // Reached the end of this org's prospect loop without an unhandled
