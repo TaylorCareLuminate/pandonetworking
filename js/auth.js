@@ -1485,8 +1485,25 @@ console.log('📋 Auth script loaded, waiting for initialization...');
     history.replaceState(null, '', cleanUrl);
   }
 
+  // The attempt flag stores a timestamp and expires, so a transient failure
+  // (network hiccup, Cloud Function error) self-heals on a later navigation
+  // instead of leaving the tab permanently signed out.
+  const ATTEMPT_TTL_MS = 30 * 60 * 1000; // retry at most every 30 minutes per tab
+
   function markAttempted() {
-    try { sessionStorage.setItem(ATTEMPT_FLAG, '1'); } catch (e) { /* no-op */ }
+    try { sessionStorage.setItem(ATTEMPT_FLAG, Date.now().toString()); } catch (e) { /* no-op */ }
+  }
+
+  function recentlyAttempted() {
+    try {
+      const raw = sessionStorage.getItem(ATTEMPT_FLAG);
+      if (!raw) return false;
+      const at = parseInt(raw, 10);
+      if (isNaN(at)) return true; // legacy '1' value — treat as attempted
+      return (Date.now() - at) < ATTEMPT_TTL_MS;
+    } catch (e) {
+      return true; // no sessionStorage access — don't redirect-loop
+    }
   }
 
   async function consumeReturnedToken() {
@@ -1512,12 +1529,12 @@ console.log('📋 Auth script loaded, waiting for initialization...');
   }
 
   function attemptBridge() {
+    if (recentlyAttempted()) {
+      console.log('ℹ️ [SSO Bridge] Already attempted recently in this tab, skipping. Retries automatically after 30 minutes, or open a new tab.');
+      return;
+    }
     try {
-      if (sessionStorage.getItem(ATTEMPT_FLAG)) {
-        console.log('ℹ️ [SSO Bridge] Already attempted this tab session, skipping. Open a new tab to retry.');
-        return;
-      }
-      sessionStorage.setItem(ATTEMPT_FLAG, '1');
+      markAttempted();
     } catch (e) {
       console.warn('⚠️ [SSO Bridge] No sessionStorage access, skipping:', e.message);
       return; // No sessionStorage access — skip rather than retry every navigation
