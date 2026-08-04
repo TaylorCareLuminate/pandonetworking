@@ -19,6 +19,8 @@
     <script src="../js/clemail-firestore-wrapper.js"></script>
     <!-- Shared Message Filtering Logic -->
     <script src="message-filter-logic.js?v=1.4"></script>
+    <!-- Workspace routing helpers (sentinels, optgroups, merged workspace lookup) -->
+    <script src="workspace-routing.js?v=3"></script>
     
     <style>
         :root {
@@ -3155,8 +3157,54 @@
                     <div class="form-help">Messages will be generated for this BDR's prospects</div>
                 </div>
 
+                <!-- Contact Source: BDR prospect list vs Workspace pull -->
+                <div style="margin-top: 20px; padding: 16px; background: #ecfdf5; border: 1px solid #6ee7b7; border-radius: 8px;">
+                    <label style="font-weight: 600; color: var(--gray-700); margin-bottom: 10px; display: flex; align-items: center; gap: 8px;">
+                        <i class="fas fa-folder-open" style="color: #0d9488;"></i> Contact Source
+                    </label>
+                    <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:12px;">
+                        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:14px;">
+                            <input type="radio" name="fullAiContactSource" value="bdr" id="fullAiSourceBdr" checked
+                                style="accent-color:#0d9488;width:15px;height:15px;margin-top:2px;cursor:pointer;flex-shrink:0;"
+                                onchange="toggleFullAiContactSource()">
+                            <span><strong>BDR prospect list</strong> — use contacts already assigned to this BDR (optionally filtered by batch / hypothesis group below)</span>
+                        </label>
+                        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:14px;">
+                            <input type="radio" name="fullAiContactSource" value="workspace" id="fullAiSourceWorkspace"
+                                style="accent-color:#0d9488;width:15px;height:15px;margin-top:2px;cursor:pointer;flex-shrink:0;"
+                                onchange="toggleFullAiContactSource()">
+                            <span><strong>Pull from Workspace</strong> — take contacts from a research workspace, skip already-connected / already-reached-out / already-pulled, add survivors to this BDR's prospect list, then generate messages</span>
+                        </label>
+                    </div>
+
+                    <div id="fullAiWorkspaceSourcePanel" style="display:none; padding-top:12px; border-top:1px solid #a7f3d0;">
+                        <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px; flex-wrap:wrap;">
+                            <label for="fullAiWorkspaceSelect" style="font-size:13px; font-weight:600; color:var(--gray-700); display:flex; align-items:center; gap:5px; margin:0;">
+                                <i class="fas fa-briefcase" style="color:#0d9488;"></i> Workspace
+                            </label>
+                            <button type="button" class="btn btn-secondary" style="font-size:12px; padding:4px 10px;"
+                                onclick="loadFullAiWorkspaces()">
+                                <i class="fas fa-sync"></i> Load Workspaces
+                            </button>
+                        </div>
+                        <select id="fullAiWorkspaceSelect" style="width:100%; padding:8px 12px; border:1px solid #6ee7b7; border-radius:6px; font-size:14px; margin-bottom:8px;">
+                            <option value="">— Load workspaces first —</option>
+                        </select>
+                        <div id="fullAiWorkspaceMemoryNote" style="font-size:12px; color:#065f46; margin-bottom:8px; display:none;"></div>
+                        <div class="form-help" style="margin-top:0; color:#065f46;">
+                            Pulls the top N workspace contacts by <strong>most LinkedIn connections first</strong>, after skipping:
+                            (1) contacts already pulled from this workspace (workspace memory),
+                            (2) contacts already connected to this BDR,
+                            (3) contacts already in this BDR's prospect list / queue,
+                            (4) contacts another BDR in the selected Hypothesis Group has already reached out to.
+                            Survivors are copied into the BDR's prospect list, remembered on the workspace, then run through Full AI Generate.
+                            <strong>Select a Hypothesis Group below</strong> so the group outreach check can run.
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Batch Filter -->
-                <div style="margin-top: 20px; padding: 16px; background: #f0f4ff; border: 1px solid #c7d7fe; border-radius: 8px;">
+                <div id="fullAiBatchFiltersPanel" style="margin-top: 20px; padding: 16px; background: #f0f4ff; border: 1px solid #c7d7fe; border-radius: 8px;">
                     <label style="font-weight: 600; color: var(--gray-700); margin-bottom: 10px; display: flex; align-items: center; gap: 8px;">
                         <i class="fas fa-layer-group" style="color: var(--primary);"></i> Batch Filters <span style="font-size: 12px; font-weight: 400; color: var(--gray-500);">(optional — leave blank to use all contacts)</span>
                     </label>
@@ -3369,7 +3417,7 @@
                             onchange="saveSortByConnectionsSetting()">
                         <span>Sort prospects by <strong>most connections first</strong></span>
                     </label>
-                    <div class="form-help" style="margin-top:4px;">When enabled, prospects with profile enrichment data are prioritised and sorted by LinkedIn connection count (highest first) before generation begins. Prospects without any stored connection count are processed last.</div>
+                    <div class="form-help" style="margin-top:4px;">When enabled, prospects with profile enrichment data are prioritised and sorted by LinkedIn connection count (highest first) before generation begins. Prospects without any stored connection count are processed last. <strong>Always on</strong> for Pull from Workspace (contacts are selected and processed most connections → least).</div>
                 </div>
             </div>
 
@@ -14597,6 +14645,477 @@
             return { flagged: concerns.length > 0, concerns };
         }
 
+        // ── Full AI Generate: Workspace contact pull ─────────────────────────────
+        // Contact source can be the BDR's existing prospect list (default) or a
+        // research workspace. Workspace mode: filter → copy into the BDR → remember
+        // on the workspace → then run the normal Full AI pipeline on that batch.
+
+        function isFullAiWorkspaceSource() {
+            return !!document.getElementById('fullAiSourceWorkspace')?.checked;
+        }
+
+        window.toggleFullAiContactSource = function() {
+            const wsMode = isFullAiWorkspaceSource();
+            const wsPanel = document.getElementById('fullAiWorkspaceSourcePanel');
+            if (wsPanel) wsPanel.style.display = wsMode ? 'block' : 'none';
+
+            // Import / move / group batch filters only apply when reading the BDR's own list.
+            // Hypothesis Group + Opus Review stay enabled — workspace pulls use the group for
+            // the teammate-outreach check and optional Opus review.
+            const batchOnlyIds = [
+                'fullAiBatchSelect', 'fullAiMoveBatchSelect', 'fullAiGroupBatchSelect'
+            ];
+            batchOnlyIds.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) {
+                    el.disabled = wsMode;
+                    el.style.opacity = wsMode ? '0.5' : '1';
+                }
+            });
+            const batchPanel = document.getElementById('fullAiBatchFiltersPanel');
+            if (batchPanel) {
+                batchPanel.querySelectorAll('button').forEach(btn => {
+                    const oc = btn.getAttribute('onclick') || '';
+                    if (oc.includes('loadBatchesForSelect') ||
+                        oc.includes('loadMoveBatchesForSelect') ||
+                        oc.includes('loadGroupBatchesForSelect')) {
+                        btn.disabled = wsMode;
+                        btn.style.opacity = wsMode ? '0.5' : '1';
+                    }
+                });
+            }
+
+            // Workspace pulls always prefer most-connections-first ordering
+            if (wsMode) {
+                const sortCb = document.getElementById('sortByConnectionsEnabled');
+                if (sortCb && !sortCb.checked) {
+                    sortCb.checked = true;
+                    saveSortByConnectionsSetting();
+                }
+            }
+            // Refresh memory note if a workspace is already selected
+            updateFullAiWorkspaceMemoryNote();
+        };
+
+        async function loadFullAiWorkspaces() {
+            const sel = document.getElementById('fullAiWorkspaceSelect');
+            if (!sel) return;
+            sel.innerHTML = '<option value="">Loading workspaces…</option>';
+            try {
+                const WR = window.WorkspaceRouting;
+                if (!WR) throw new Error('WorkspaceRouting helper not loaded');
+                const snap = await getDocs(collection(db, 'workspaces'));
+                const workspaces = [];
+                snap.forEach(d => workspaces.push({ id: d.id, ...d.data() }));
+                const active = WR.filterActiveWorkspaces(workspaces)
+                    .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+                sel.innerHTML = '<option value="">— Select a workspace —</option>';
+                if (!active.length) {
+                    const o = document.createElement('option');
+                    o.disabled = true;
+                    o.textContent = '— No workspaces found —';
+                    sel.appendChild(o);
+                    return;
+                }
+                const customerMap = await WR.loadCustomerMap(db, { getDocs, collection });
+                WR.appendWorkspaceOptgroups(sel, active, {
+                    customerMap,
+                    // Store bare workspace doc id (not __ws__: sentinel) as the option value
+                    value: ws => ws.id,
+                    label: ws => {
+                        const pulled = Array.isArray(ws.fullAiPulledUrls) ? ws.fullAiPulledUrls.length
+                            : (ws.fullAiPulledContacts ? Object.keys(ws.fullAiPulledContacts).length : 0);
+                        const pulledNote = pulled > 0 ? ` · ${pulled.toLocaleString()} pulled` : '';
+                        const creatorTag = ws.createdBy ? ` [${ws.createdBy.split('@')[0]}]` : '';
+                        return `${WR.optionLabel(ws)}${creatorTag}${pulledNote}`;
+                    }
+                });
+                // Stash pulled counts for the memory note
+                sel._fullAiWsPulledCounts = Object.fromEntries(
+                    active.map(ws => {
+                        const n = Array.isArray(ws.fullAiPulledUrls) ? ws.fullAiPulledUrls.length
+                            : (ws.fullAiPulledContacts ? Object.keys(ws.fullAiPulledContacts).length : 0);
+                        return [ws.id, n];
+                    })
+                );
+                updateFullAiWorkspaceMemoryNote();
+            } catch (err) {
+                console.error('loadFullAiWorkspaces error:', err);
+                sel.innerHTML = `<option value="">— Error: ${err.message} —</option>`;
+            }
+        }
+        window.loadFullAiWorkspaces = loadFullAiWorkspaces;
+
+        function updateFullAiWorkspaceMemoryNote() {
+            const note = document.getElementById('fullAiWorkspaceMemoryNote');
+            const sel = document.getElementById('fullAiWorkspaceSelect');
+            if (!note || !sel) return;
+            const wsId = sel.value;
+            if (!wsId) { note.style.display = 'none'; return; }
+            const n = sel._fullAiWsPulledCounts?.[wsId] ?? 0;
+            note.style.display = 'block';
+            note.innerHTML = n > 0
+                ? `<i class="fas fa-history"></i> Workspace memory: <strong>${n.toLocaleString()}</strong> contact(s) already pulled previously — they will be skipped.`
+                : `<i class="fas fa-history"></i> Workspace memory: no contacts pulled yet.`;
+        }
+        document.getElementById('fullAiWorkspaceSelect')?.addEventListener('change', updateFullAiWorkspaceMemoryNote);
+
+        function fullAiParseConnectionCount(c) {
+            const raw = c?.linkedInConnectionCount ?? c?.connectionCount ?? c?.connectionsCount ?? null;
+            if (raw == null || raw === '') return null;
+            const n = Number(String(raw).replace(/[^0-9]/g, ''));
+            return Number.isFinite(n) ? n : null;
+        }
+
+        /** Sort contacts most-connections-first; unknown counts last; enriched-unknown before never-enriched. */
+        function fullAiSortContactsByConnections(contacts) {
+            return [...contacts].sort((a, b) => {
+                const connA = fullAiParseConnectionCount(a);
+                const connB = fullAiParseConnectionCount(b);
+                if (connA !== null && connB === null) return -1;
+                if (connA === null && connB !== null) return 1;
+                if (connA === null && connB === null) {
+                    const enrichA = a.enrichedAt ? 1 : 0;
+                    const enrichB = b.enrichedAt ? 1 : 0;
+                    return enrichB - enrichA;
+                }
+                return connB - connA;
+            });
+        }
+
+        /**
+         * Build a Set of normalised LinkedIn URLs that ANY other BDR in the hypothesis
+         * group has already reached out to (connect_queue entries). Used so workspace
+         * pulls don't hand a contact to this BDR if a teammate already messaged them.
+         */
+        async function fullAiLoadHypothesisGroupOutreachUrls(hypothesisGroupId, excludeBdrEmail, addLog) {
+            const reached = new Set();
+            if (!hypothesisGroupId) return reached;
+
+            let groupData = null;
+            try {
+                const snap = await getDoc(doc(db, 'hypothesis_groups', hypothesisGroupId));
+                const exists = snap && (snap.exists || snap.exists?.());
+                if (!exists) return reached;
+                groupData = snap.data();
+            } catch (e) {
+                addLog?.(`   ⚠️ Could not load hypothesis group for outreach check: ${e.message}`, 'warning');
+                return reached;
+            }
+
+            const memberEmails = [
+                ...(Array.isArray(groupData.bdrEmails) ? groupData.bdrEmails : []),
+                ...(groupData.bdrEmail ? [groupData.bdrEmail] : [])
+            ].filter(Boolean);
+            const others = [...new Set(memberEmails.map(e => String(e).toLowerCase()))]
+                .filter(e => e !== String(excludeBdrEmail || '').toLowerCase());
+
+            if (!others.length) {
+                addLog?.('   ℹ️ Hypothesis group has no other BDRs — skipping group-outreach check.', 'info');
+                return reached;
+            }
+
+            addLog?.(`   🔬 Checking connect_queue outreach for ${others.length} other hypothesis-group BDR(s)...`, 'info');
+            const { collection: col, query: q, where: wh, getDocs: gd, getAllDocs: gad } = window.clemailFirestore;
+            const fetchFn = gad || gd;
+
+            for (const email of others) {
+                const linkedInEmail = (typeof linkedInEmailMap !== 'undefined' && linkedInEmailMap.get)
+                    ? (linkedInEmailMap.get(email) || email)
+                    : email;
+                const emailCandidates = [...new Set([email, linkedInEmail].filter(Boolean))];
+                for (const em of emailCandidates) {
+                    for (const field of ['bdr_email', 'account_email', 'bdr_primary_email', 'bdr_auth_email']) {
+                        try {
+                            const snap = await fetchFn(
+                                q(col(db, 'connect_queue'), wh(field, '==', em)),
+                                { pageSize: 2000, timeoutMs: 60000, maxRetries: 2 }
+                            );
+                            snap.forEach(d => {
+                                const data = d.data();
+                                if (data.deleted) return;
+                                const u = normalizeLinkedInUrl(
+                                    data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || ''
+                                );
+                                if (u) reached.add(u);
+                            });
+                        } catch (_) { /* field may not be indexed for every account — keep going */ }
+                    }
+                }
+            }
+            addLog?.(`   🔬 Hypothesis-group outreach: ${reached.size.toLocaleString()} unique contact URL(s) already reached by teammates.`, 'info');
+            return reached;
+        }
+
+        /**
+         * Pull eligible contacts from a workspace into the BDR's prospect list.
+         * Returns { moveBatchId, pulled, stats } where `pulled` are the new prospect_contacts docs.
+         */
+        async function fullAiPullContactsFromWorkspace({ workspaceId, bdrEmail, count, hypothesisGroupId, addLog }) {
+            const WR = window.WorkspaceRouting;
+            if (!WR) throw new Error('WorkspaceRouting helper not loaded');
+            if (!workspaceId) throw new Error('No workspace selected');
+            if (!bdrEmail) throw new Error('No BDR selected');
+
+            const { collection: col, query: q, where: wh, getDocs: gd, getAllDocs: gad,
+                    addDoc: ad, updateDoc: ud, doc: docFn, getDoc: gdoc } = window.clemailFirestore;
+            const fetchFn = gad || gd;
+
+            addLog(`📂 Loading workspace contacts...`, 'info');
+
+            // 1. Workspace doc + pull memory
+            const wsRef = docFn(db, 'workspaces', workspaceId);
+            const wsSnap = await gdoc(wsRef);
+            const wsExists = wsSnap && (wsSnap.exists || wsSnap.exists?.());
+            if (!wsExists) throw new Error('Workspace not found');
+            const wsData = wsSnap.data() || {};
+            const wsName = wsData.name || workspaceId;
+
+            const pulledMemory = new Set();
+            if (Array.isArray(wsData.fullAiPulledUrls)) {
+                wsData.fullAiPulledUrls.forEach(u => {
+                    const n = normalizeLinkedInUrl(u);
+                    if (n) pulledMemory.add(n);
+                });
+            }
+            if (wsData.fullAiPulledContacts && typeof wsData.fullAiPulledContacts === 'object') {
+                Object.keys(wsData.fullAiPulledContacts).forEach(u => {
+                    const n = normalizeLinkedInUrl(u);
+                    if (n) pulledMemory.add(n);
+                });
+            }
+            addLog(`   🧠 Workspace "${wsName}" memory: ${pulledMemory.size.toLocaleString()} previously pulled contact(s)`, 'info');
+
+            // 2. Load workspace contacts via routing sentinels (handles merged workspaces)
+            const routingIds = await WR.getRoutingWorkspaceIds(db, gdoc, docFn, workspaceId);
+            const sentinels = routingIds.map(id => WR.WS_PREFIX + id);
+            const fsApi = { getDocs: gd, getAllDocs: gad, query: q, where: wh, collection: col };
+            let wsContacts = await WR.queryUnionByField(db, 'prospect_contacts', 'userEmail', sentinels, fsApi);
+            // Also match bdrEmail field in case older rows used that
+            const byBdrEmail = await WR.queryUnionByField(db, 'prospect_contacts', 'bdrEmail', sentinels, fsApi);
+            const byId = new Map(wsContacts.map(c => [c.id, c]));
+            byBdrEmail.forEach(c => { if (!byId.has(c.id)) byId.set(c.id, c); });
+            wsContacts = [...byId.values()];
+            addLog(`   📋 Found ${wsContacts.length.toLocaleString()} contact(s) in workspace`, 'info');
+
+            // 3. Exclusion sets
+            addLog(`   🤝 Loading already-connected URLs for ${bdrEmail}...`, 'info');
+            const connectedUrls = await fpmLoadExistingConnectionUrls(bdrEmail);
+
+            addLog(`   📋 Loading this BDR's existing prospect list + queue...`, 'info');
+            const existingProspectUrls = new Set();
+            const existingQueueUrls = new Set();
+            try {
+                const prospectSnap = await fetchFn(
+                    q(col(db, 'prospect_contacts'), wh('userEmail', '==', bdrEmail)),
+                    { pageSize: 2000, timeoutMs: 60000, maxRetries: 2 }
+                );
+                prospectSnap.forEach(d => {
+                    const u = normalizeLinkedInUrl(d.data().linkedInUrl || d.data().li_url || '');
+                    if (u) existingProspectUrls.add(u);
+                });
+            } catch (e) {
+                addLog(`   ⚠️ Could not load BDR prospect list: ${e.message}`, 'warning');
+            }
+            try {
+                const linkedInEmail = linkedInEmailMap.get(bdrEmail) || bdrEmail;
+                for (const [field, email] of [
+                    ['account_email', linkedInEmail],
+                    ['bdr_email', bdrEmail],
+                    ['bdr_primary_email', bdrEmail]
+                ]) {
+                    try {
+                        const snap = await fetchFn(
+                            q(col(db, 'connect_queue'), wh(field, '==', email)),
+                            { pageSize: 2000, timeoutMs: 60000, maxRetries: 2 }
+                        );
+                        snap.forEach(d => {
+                            const data = d.data();
+                            if (data.deleted) return;
+                            const u = normalizeLinkedInUrl(
+                                data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || ''
+                            );
+                            if (u) existingQueueUrls.add(u);
+                        });
+                    } catch (_) {}
+                }
+            } catch (e) {
+                addLog(`   ⚠️ Could not load BDR queue: ${e.message}`, 'warning');
+            }
+
+            let groupOutreachUrls = new Set();
+            if (hypothesisGroupId) {
+                groupOutreachUrls = await fullAiLoadHypothesisGroupOutreachUrls(hypothesisGroupId, bdrEmail, addLog);
+            } else {
+                addLog(`   ⚠️ No Hypothesis Group selected — skipping "teammate already reached out" check.`, 'warning');
+            }
+
+            // 4. Filter + sort (most connections first)
+            let skippedNoUrl = 0, skippedMemory = 0, skippedConnected = 0;
+            let skippedAlreadyOnBdr = 0, skippedQueued = 0, skippedGroupOutreach = 0;
+            let skippedHarvest = 0, skippedConnCount = 0;
+            const connFilterOn = typeof isConnectionFilterEnabled === 'function' && isConnectionFilterEnabled();
+            const minConn = typeof getConnectionFilterMin === 'function' ? getConnectionFilterMin() : 250;
+
+            const eligible = [];
+            const seen = new Set();
+            for (const c of wsContacts) {
+                if (c.movedToHarvest) { skippedHarvest++; continue; }
+                const url = normalizeLinkedInUrl(c.linkedInUrl || c.li_url || '');
+                if (!url) { skippedNoUrl++; continue; }
+                if (seen.has(url)) continue;
+                seen.add(url);
+                if (pulledMemory.has(url)) { skippedMemory++; continue; }
+                if (connectedUrls.has(url)) { skippedConnected++; continue; }
+                if (existingProspectUrls.has(url)) { skippedAlreadyOnBdr++; continue; }
+                if (existingQueueUrls.has(url)) { skippedQueued++; continue; }
+                if (groupOutreachUrls.has(url)) { skippedGroupOutreach++; continue; }
+                const connCount = fullAiParseConnectionCount(c);
+                if (connFilterOn && minConn > 0) {
+                    if (c.connectionCountNA === true || (connCount != null && connCount < minConn)) {
+                        skippedConnCount++;
+                        continue;
+                    }
+                }
+                eligible.push({
+                    ...c,
+                    _normUrl: url,
+                    linkedInConnectionCount: connCount ?? c.linkedInConnectionCount
+                });
+            }
+
+            // Always order workspace pulls most-connections → least before taking the top N
+            const sorted = fullAiSortContactsByConnections(eligible);
+            const toPull = sorted.slice(0, count);
+
+            if (toPull.length) {
+                const top = fullAiParseConnectionCount(toPull[0]);
+                const bottom = fullAiParseConnectionCount(toPull[toPull.length - 1]);
+                addLog(
+                    `   📶 Sorted by connections (most → least)` +
+                    (top != null || bottom != null
+                        ? ` — range in this pull: ${top ?? '?'} → ${bottom ?? '?'}`
+                        : ` — some contacts lack stored connection counts and were placed last`),
+                    'info'
+                );
+            }
+
+            addLog(
+                `   ✅ Eligible after filters: ${eligible.length.toLocaleString()} ` +
+                `(skipped: ${skippedMemory} memory, ${skippedConnected} connected, ` +
+                `${skippedAlreadyOnBdr} already on BDR, ${skippedQueued} queued, ` +
+                `${skippedGroupOutreach} group outreach` +
+                (skippedConnCount ? `, ${skippedConnCount} below ${minConn} connections` : '') +
+                (skippedNoUrl ? `, ${skippedNoUrl} no URL` : '') +
+                (skippedHarvest ? `, ${skippedHarvest} harvest` : '') +
+                `) — pulling top ${toPull.length} by most connections`,
+                'success'
+            );
+
+            if (!toPull.length) {
+                return {
+                    moveBatchId: null,
+                    pulled: [],
+                    stats: {
+                        workspaceName: wsName,
+                        eligible: 0,
+                        pulled: 0,
+                        skippedMemory, skippedConnected, skippedAlreadyOnBdr,
+                        skippedQueued, skippedGroupOutreach
+                    }
+                };
+            }
+
+            // 5. Copy into BDR prospect list
+            const moveBatchId = `fullai-ws-pull-${Date.now()}`;
+            const moveBatchLabel = `Full AI pull from workspace "${wsName}"`;
+            const nowIso = new Date().toISOString();
+            const pulledBy = window.auth?.currentUser?.email || 'unknown';
+            const pulled = [];
+            const newMemoryEntries = {};
+
+            addLog(`   📥 Copying ${toPull.length} contact(s) into ${bdrEmail}'s prospect list...`, 'info');
+            for (const contact of toPull) {
+                const { id: _srcId, _normUrl, ...contactData } = contact;
+                const connCount = fullAiParseConnectionCount(contact);
+                const newDoc = {
+                    ...contactData,
+                    userEmail: bdrEmail,
+                    bdrEmail: bdrEmail,
+                    linkedInAccountEmail: contactData.linkedInAccountEmail || bdrEmail,
+                    copiedFromId: _srcId || null,
+                    copiedAt: nowIso,
+                    copiedFrom: WR.WS_PREFIX + workspaceId,
+                    source: 'full_ai_workspace_pull',
+                    sourceWorkspaceId: workspaceId,
+                    sourceWorkspaceName: wsName,
+                    moveBatchId,
+                    moveBatchLabel,
+                    uploadedAt: nowIso,
+                    uploadedBy: pulledBy,
+                    ...(connCount != null ? { linkedInConnectionCount: connCount } : {})
+                };
+                // Avoid carrying over workspace-only ownership fields that could confuse filters
+                delete newDoc.movedToHarvest;
+                try {
+                    const ref = await ad(col(db, 'prospect_contacts'), newDoc);
+                    pulled.push({ id: ref.id, ...newDoc, _normUrl });
+                    newMemoryEntries[_normUrl] = {
+                        pulledAt: nowIso,
+                        pulledToBdr: bdrEmail,
+                        pulledBy,
+                        moveBatchId,
+                        hypothesisGroupId: hypothesisGroupId || null,
+                        firstName: contact.firstName || contactData.firstName || '',
+                        lastName: contact.lastName || contactData.lastName || '',
+                        company: contact.company || contactData.company || '',
+                        linkedInConnectionCount: connCount
+                    };
+                } catch (e) {
+                    addLog(`   ⚠️ Failed to copy ${contact.firstName || ''} ${contact.lastName || ''} (${_normUrl}): ${e.message}`, 'warning');
+                }
+            }
+
+            // 6. Persist workspace memory
+            if (Object.keys(newMemoryEntries).length) {
+                const mergedMemory = { ...(wsData.fullAiPulledContacts || {}), ...newMemoryEntries };
+                const mergedUrls = [...new Set([
+                    ...(Array.isArray(wsData.fullAiPulledUrls) ? wsData.fullAiPulledUrls : []),
+                    ...Object.keys(newMemoryEntries)
+                ])];
+                await ud(wsRef, {
+                    fullAiPulledContacts: mergedMemory,
+                    fullAiPulledUrls: mergedUrls,
+                    fullAiPulledCount: mergedUrls.length,
+                    fullAiLastPullAt: nowIso,
+                    fullAiLastPullBy: pulledBy,
+                    fullAiLastPullToBdr: bdrEmail,
+                    lastActivity: nowIso
+                });
+                // Keep UI note in sync
+                const sel = document.getElementById('fullAiWorkspaceSelect');
+                if (sel) {
+                    sel._fullAiWsPulledCounts = sel._fullAiWsPulledCounts || {};
+                    sel._fullAiWsPulledCounts[workspaceId] = mergedUrls.length;
+                    updateFullAiWorkspaceMemoryNote();
+                }
+                addLog(`   🧠 Workspace memory updated (+${Object.keys(newMemoryEntries).length} → ${mergedUrls.length} total)`, 'success');
+            }
+
+            addLog(`   ✅ Pulled ${pulled.length} contact(s) from "${wsName}" → ${bdrEmail} (batch ${moveBatchId})`, 'success');
+            return {
+                moveBatchId,
+                pulled,
+                stats: {
+                    workspaceName: wsName,
+                    eligible: eligible.length,
+                    pulled: pulled.length,
+                    skippedMemory, skippedConnected, skippedAlreadyOnBdr,
+                    skippedQueued, skippedGroupOutreach
+                }
+            };
+        }
+
         // Populate Full AI BDR select — called from loadBDRs() and the main auth listener
         function populateFullAiBdrSelect() {
             const sel = document.getElementById('fullAiBdrSelect');
@@ -14673,6 +15192,13 @@
             }
             document.getElementById('fullAiStrategyMissingWarn').style.display = 'none';
 
+            const workspaceSource = isFullAiWorkspaceSource();
+            const workspaceId = document.getElementById('fullAiWorkspaceSelect')?.value || '';
+            if (workspaceSource && !workspaceId) {
+                alert('Pull from Workspace is selected, but no workspace is chosen.\n\nClick "Load Workspaces", pick a workspace, then try again.');
+                return;
+            }
+
             // Opus Review is only useful with actual Message Review Instructions to grade
             // against — catch the case where the checkbox is on but the textarea is empty
             // (e.g. hypothesis group has no Review Instructions saved yet) before we start.
@@ -14703,8 +15229,25 @@
             }
 
             const count = parseInt(document.getElementById('fullAiProspectCount').value) || 10;
+            const preHypGroupId = document.getElementById('fullAiHypothesisSelect')?.value || '';
+            if (workspaceSource && !preHypGroupId) {
+                const proceedNoHg = confirm(
+                    'Pull from Workspace works best with a Hypothesis Group selected so teammates\' prior outreach can be skipped.\n\n' +
+                    'No Hypothesis Group is selected — the "someone else in the group already reached out" check will be skipped.\n\nContinue anyway?'
+                );
+                if (!proceedNoHg) return;
+            }
 
-            if (!confirm(`Start Full AI Smart Generation for ${count} prospects for ${bdrEmail}?\n\nThis runs through Post Reply → classify → About Me Connect / Internet Search for each contact. Each prospect may take 30–90 seconds.`)) {
+            const wsNameForConfirm = workspaceSource
+                ? (document.getElementById('fullAiWorkspaceSelect')?.selectedOptions?.[0]?.textContent || workspaceId)
+                : '';
+            const confirmMsg = workspaceSource
+                ? `Start Full AI Smart Generation for up to ${count} prospects for ${bdrEmail}?\n\n` +
+                  `Contact source: Workspace "${wsNameForConfirm.trim()}"\n` +
+                  `Flow: filter workspace contacts (memory / connected / group outreach) → copy top ${count} by most connections into this BDR's prospect list → generate messages.\n\n` +
+                  `Each prospect may take 30–90 seconds.`
+                : `Start Full AI Smart Generation for ${count} prospects for ${bdrEmail}?\n\nThis runs through Post Reply → classify → About Me Connect / Internet Search for each contact. Each prospect may take 30–90 seconds.`;
+            if (!confirm(confirmMsg)) {
                 return;
             }
 
@@ -14745,15 +15288,66 @@
             }
 
                 addLog(`🚀 Starting Full AI Smart Generate for ${count} prospects (${bdrEmail})...`);
+                if (workspaceSource) {
+                    addLog(`📂 Contact source: Workspace pull`, 'info');
+                }
 
             try {
                 // ── Step 1: Init — BDR context + prospect list (one fast server call) ──
                 addLog('📋 Loading BDR context and prospects from server...');
                 let token = await window.auth.currentUser.getIdToken();
 
-                const scanJobId    = document.getElementById('fullAiBatchSelect')?.value || '';
-                const moveBatchId  = document.getElementById('fullAiMoveBatchSelect')?.value || '';
-                const groupBatchId = document.getElementById('fullAiGroupBatchSelect')?.value || '';
+                let scanJobId    = document.getElementById('fullAiBatchSelect')?.value || '';
+                let moveBatchId  = document.getElementById('fullAiMoveBatchSelect')?.value || '';
+                let groupBatchId = document.getElementById('fullAiGroupBatchSelect')?.value || '';
+
+                const fullAiHypGroupId = document.getElementById('fullAiHypothesisSelect')?.value || '';
+                let fullAiHypUrlSet = null;
+                let fullAiHypGroupName = '';
+                if (fullAiHypGroupId) {
+                    fullAiHypGroupName = document.getElementById('fullAiHypothesisSelect')?.selectedOptions[0]?.text || fullAiHypGroupId;
+                }
+
+                // ── Optional: Pull contacts from a workspace into this BDR first ──
+                // Creates a moveBatchId so full-ai-init only processes the just-pulled set.
+                // Ordering is most-connections-first; survivors are remembered on the workspace.
+                let workspacePullResult = null;
+                if (workspaceSource) {
+                    // Force most-connections-first for workspace pulls (UI also auto-checks the toggle)
+                    const sortCb = document.getElementById('sortByConnectionsEnabled');
+                    if (sortCb) { sortCb.checked = true; saveSortByConnectionsSetting(); }
+
+                    workspacePullResult = await fullAiPullContactsFromWorkspace({
+                        workspaceId,
+                        bdrEmail,
+                        count,
+                        hypothesisGroupId: fullAiHypGroupId,
+                        addLog
+                    });
+                    if (!workspacePullResult.pulled.length) {
+                        addLog('⚠️ No eligible workspace contacts to pull after filters. Nothing to generate.', 'warning');
+                        document.getElementById('fullAiProgressLabel').textContent = 'No prospects';
+                        document.getElementById('fullAiStopBtn').style.display = 'none';
+                        this.disabled = false;
+                        this.innerHTML = '<i class="fas fa-robot"></i> Start Full AI Smart Generate';
+                        return;
+                    }
+                    // Scope the rest of the run to only the contacts we just copied over
+                    moveBatchId = workspacePullResult.moveBatchId;
+                    scanJobId = '';
+                    groupBatchId = '';
+                    // Do NOT pass hypothesisGroupUrls membership filter — workspace pulls already
+                    // applied the teammate-outreach check. Membership filtering would wrongly drop
+                    // brand-new workspace contacts that aren't already tagged on the group.
+                } else if (fullAiHypGroupId) {
+                    // BDR-list mode: load hypothesis group URLs BEFORE the server call so the
+                    // server can filter before applying the count cap.
+                    addLog(`🔬 Loading hypothesis group URLs: ${fullAiHypGroupName}...`, 'info');
+                    fullAiHypUrlSet = await getHypothesisGroupUrls(fullAiHypGroupId);
+                    if (fullAiHypUrlSet) {
+                        addLog(`🔬 Hypothesis group loaded: ${fullAiHypUrlSet.size} contacts — passing to server for pre-filter`, 'info');
+                    }
+                }
 
                 // Resolve import-batch time window from the selected option's data attributes
                 // (same pattern as the About Me tab — lets the server filter by upload time)
@@ -14762,20 +15356,6 @@
                     const batchOpt = document.getElementById('fullAiBatchSelect')?.selectedOptions[0];
                     importBatchStartTime = batchOpt?.dataset?.submittedAt ? new Date(batchOpt.dataset.submittedAt).getTime() : null;
                     importBatchEndTime   = batchOpt?.dataset?.completedAt ? new Date(batchOpt.dataset.completedAt).getTime() + 86400000 : null;
-                }
-
-                // Load hypothesis group URLs BEFORE the server call so the server can
-                // filter before applying the count cap (fixes: filter applied post-slice)
-                const fullAiHypGroupId = document.getElementById('fullAiHypothesisSelect')?.value || '';
-                let fullAiHypUrlSet = null;
-                let fullAiHypGroupName = '';
-                if (fullAiHypGroupId) {
-                    fullAiHypGroupName = document.getElementById('fullAiHypothesisSelect')?.selectedOptions[0]?.text || fullAiHypGroupId;
-                    addLog(`🔬 Loading hypothesis group URLs: ${fullAiHypGroupName}...`, 'info');
-                    fullAiHypUrlSet = await getHypothesisGroupUrls(fullAiHypGroupId);
-                    if (fullAiHypUrlSet) {
-                        addLog(`🔬 Hypothesis group loaded: ${fullAiHypUrlSet.size} contacts — passing to server for pre-filter`, 'info');
-                    }
                 }
 
                 // Opus Review now runs on each message individually, immediately after it's
@@ -14897,8 +15477,26 @@
                 const { bdrContext, prospects: prospectList, stats } = initData;
                 addLog(`✅ ${stats.skipSummary}`, 'success');
 
-                // Sort by most connections first (enriched profiles prioritised)
-                if (isSortByConnectionsEnabled()) {
+                // Sort by most connections first (enriched profiles prioritised).
+                // For workspace pulls, prefer the exact order from the pull step (already
+                // sorted most → least) so Railway's shuffle in full-ai-init can't reorder them.
+                if (workspacePullResult?.pulled?.length) {
+                    const pullOrder = new Map(
+                        workspacePullResult.pulled.map((p, i) => [
+                            normalizeLinkedInUrl(p._normUrl || p.linkedInUrl || p.li_url || ''),
+                            i
+                        ])
+                    );
+                    prospectList.sort((a, b) => {
+                        const ia = pullOrder.get(normalizeLinkedInUrl(a.linkedInUrl || a.li_url || ''));
+                        const ib = pullOrder.get(normalizeLinkedInUrl(b.linkedInUrl || b.li_url || ''));
+                        if (ia != null && ib != null) return ia - ib;
+                        if (ia != null) return -1;
+                        if (ib != null) return 1;
+                        return 0;
+                    });
+                    addLog(`📶 Kept workspace-pull order: ${prospectList.length} prospects (most connections → least)`, 'info');
+                } else if (isSortByConnectionsEnabled()) {
                     prospectList.sort((a, b) => {
                         const connA = (a.linkedInConnectionCount != null && a.linkedInConnectionCount !== '')
                             ? Number(String(a.linkedInConnectionCount).replace(/[^0-9]/g, '')) : null;
