@@ -91,7 +91,6 @@
     '  roughly 47,000 aspen trees in central Utah that are all <strong>one single living' +
     '  organism</strong>, sharing one vast root system. It&rsquo;s the largest and heaviest' +
     '  living thing on Earth &mdash; and it&rsquo;s right in our backyard.' +
-    '  Its ability to stay connected is what inspires everything we do.' +
     '</p>' +
     '<a class="dyk-link" href="https://en.wikipedia.org/wiki/Pando_(tree)" target="_blank" rel="noopener">' +
     '  Read more about Pando &rarr;</a>';
