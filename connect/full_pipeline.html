@@ -474,7 +474,7 @@
             <button class="btn btn-primary btn-large" id="fpRunBtn" disabled onclick="fpRunPipeline()">
                 <i class="fas fa-rocket"></i> Run Full Pipeline
             </button>
-            <button class="btn btn-danger btn-large" id="fpStopBtn" style="display:none;" onclick="window.fpStopRequested = true; this.disabled = true; this.innerHTML = '<i class=&quot;fas fa-spinner fa-spin&quot;></i> Stopping after current step…';">
+            <button class="btn btn-danger btn-large" id="fpStopBtn" style="display:none;" onclick="fpRequestStop(); this.disabled = true; this.innerHTML = '<i class=&quot;fas fa-spinner fa-spin&quot;></i> Stopping after current step…';">
                 <i class="fas fa-stop"></i> Stop
             </button>
             <div id="fpRunHint" style="font-size: 12.5px; color: var(--gray-500); margin-top: 8px;">Select a hypothesis group and at least one BDR with a message count to enable.</div>
@@ -492,7 +492,7 @@
                 <div class="stat-tile"><div class="num" id="fpStatExcluded">0</div><div class="lbl">Opus Excluded</div></div>
                 <div class="stat-tile"><div class="num" id="fpStatDnc" style="color:#dc2626;">0</div><div class="lbl">DNC Orgs Skipped</div></div>
                 <div class="stat-tile"><div class="num" id="fpStatConnected">0</div><div class="lbl">Already Connected</div></div>
-                <div class="stat-tile"><div class="num" id="fpStatApifyCost">$0.00</div><div class="lbl">Apify Cost</div></div>
+                <div class="stat-tile" title="Running total Apify contact-search spend for this whole run so far — NOT a per-message rate. Compare it against Step 6's computed per-message limit, not the raw dollar amount you typed there."><div class="num" id="fpStatApifyCost">$0.00</div><div class="lbl">Apify Cost (run total)</div></div>
             </div>
             <div style="display:flex; align-items:center; gap: 12px; margin-bottom: 8px;">
                 <div class="progress-track" style="flex:1;"><div class="progress-fill" id="fpProgressBar"></div></div>
@@ -1910,6 +1910,15 @@
         // PIPELINE ENGINE
         // ════════════════════════════════════════════════════════════════════
 
+        // Named handler (instead of setting window.fpStopRequested inline from the button)
+        // so a stop always leaves an explicit, unmistakable line in the log — the run's own
+        // checkpoints intentionally break out silently (no distinct log line) once the flag
+        // is set, which previously made a manual stop look identical to some mystery hang.
+        function fpRequestStop() {
+            window.fpStopRequested = true;
+            addLog('\n⛔ Stop requested from the button — finishing the current step, then stopping. Nothing is lost: every organization completed so far is saved, and re-running with the same Scan Name will pick up where this left off (already-scanned orgs are skipped/pushed to the back of the queue).', 'warning');
+        }
+
         function addLog(msg, type = 'info') {
             const el = document.createElement('div');
             el.className = `log-entry ${type}`;
@@ -2435,13 +2444,14 @@
         // One batch AI call per organization (not per contact) — cheap relative to the
         // rest of the pipeline, and lets multiple different contacts at a large org get
         // stories that actually fit their role instead of pure round-robin.
-        async function fpMatchStoriesToContacts({ token, contacts, orgNewsItems }) {
+        async function fpMatchStoriesToContacts({ token, contacts, orgNewsItems, onApiCall }) {
             const byId = new Map();
             if (!orgNewsItems || orgNewsItems.length <= 1) {
                 // 0 stories = nothing to match; 1 story = only one possible answer either way.
                 contacts.forEach(c => byId.set(c.id, orgNewsItems && orgNewsItems.length === 1 ? 0 : null));
                 return byId;
             }
+            if (typeof onApiCall === 'function') onApiCall();
             try {
                 const resp = await fetchWithRetry(`${RAILWAY_API}/api/connect/match-stories-to-contacts`, {
                     method: 'POST',
@@ -2500,6 +2510,69 @@
                 console.warn('Ledger query failed:', e.message);
                 return { totalUsd: 0, runs: 0 };
             }
+        }
+
+        // ── Real, complete Apify cost breakdown for the whole run ──────────────
+        // The live "$X.XX" shown during the run (fpStats.apifyCost) only ever summed the
+        // Employee Contact Scanner (contact-search) job per organization — it never included
+        // the LinkedIn profile/post scrapes that happen per-contact during message generation
+        // (Post Reply classification, and About Me's own bigger post fetch). Those DO get
+        // recorded to apify_run_ledger (server.js now tags them with bdrEmail + a source label
+        // — see runFullAiGenerateSingleCore / about-me-connect-generate), so this pulls the
+        // TRUE total straight from the ledger for every BDR in this run, bucketed by source.
+        async function fpFetchRealApifyCosts({ bdrEmails, sinceIso }) {
+            const buckets = { contactSearch: 0, profileScrape: 0, postScrape: 0, other: 0 };
+            let runs = 0;
+            for (const bdrEmail of [...new Set(bdrEmails)]) {
+                try {
+                    const snap = await getDocs(query(
+                        collection(db, 'apify_run_ledger'),
+                        where('bdrEmail', '==', bdrEmail),
+                        where('recordedAt', '>=', sinceIso)
+                    ));
+                    snap.docs.forEach(d => {
+                        const v = d.data();
+                        const usd = typeof v.usageTotalUsd === 'number' ? v.usageTotalUsd : 0;
+                        if (usd === 0) return;
+                        runs++;
+                        const src = v.source || '';
+                        if (src === 'contact_search_job') buckets.contactSearch += usd;
+                        else if (/profile/i.test(src)) buckets.profileScrape += usd;
+                        else if (/post/i.test(src)) buckets.postScrape += usd;
+                        else buckets.other += usd;
+                    });
+                } catch (e) {
+                    console.warn(`Real Apify cost query failed for ${bdrEmail}:`, e.message);
+                }
+            }
+            const totalUsd = buckets.contactSearch + buckets.profileScrape + buckets.postScrape + buckets.other;
+            return { ...buckets, totalUsd, runs };
+        }
+
+        // ── AI/LLM cost estimate ────────────────────────────────────────────────
+        // No endpoint in this system returns token usage or $ cost for OpenRouter/Claude/
+        // Llama calls, so there is no way to *measure* this — only estimate it from known
+        // call counts (report.aiCallCounts) × a flat per-call figure. These figures assume
+        // the models this pipeline actually uses day-to-day (Llama Maverick for routing/
+        // classification, Claude/Kimi for writing+review) — treat this as a budgeting
+        // number, not an invoice-accurate one.
+        const FP_AI_COST_PER_CALL_ESTIMATE = {
+            generate:    0.03,  // full-ai-generate-single: routing + Post Reply/About Me/Internet Search writing
+            opusReview:  0.01,  // per-message Opus review/cleanup pass
+            finalReview: 0.01,  // per-message final AI review pass
+            ruleClassify: 0.02, // batched (up to 50 contacts) Target Contact / Exclude Rules classification
+            storyMatch:  0.01   // batched (per org) story-to-contact relevance matching
+        };
+        function fpEstimateAiCost(aiCallCounts) {
+            const byType = {};
+            let totalUsd = 0;
+            for (const [type, rate] of Object.entries(FP_AI_COST_PER_CALL_ESTIMATE)) {
+                const calls = aiCallCounts[type] || 0;
+                const usd = calls * rate;
+                byType[type] = { calls, usd };
+                totalUsd += usd;
+            }
+            return { byType, totalUsd };
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -2630,9 +2703,16 @@
                 // AI review/Opus token costs are not exposed by the endpoints — record call
                 // counts so per-model cost can be estimated later.
                 aiCostTracking: 'call_counts_only',
-                aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0 },
+                aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0, storyMatch: 0 },
                 orgs: [],
-                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, hypothesisTally: null }
+                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, hypothesisTally: null,
+                    // Filled in once at the end of the run — see fpFetchRealApifyCosts(). apifyUsd
+                    // above only ever reflected the contact-search (scan) job; realCostBreakdown is
+                    // the actual apify_run_ledger total across EVERY Apify call this run triggered
+                    // (contact search + LinkedIn profile scrapes + LinkedIn post scrapes), plus a
+                    // clearly-labeled AI cost *estimate* (LLM calls aren't metered anywhere in this
+                    // system, so this is call-count × a flat per-call estimate, not a measurement).
+                    realCostBreakdown: null }
             };
             const saveReport = async () => {
                 try { await setDoc(doc(db, 'full_pipeline_runs', runId), report); }
@@ -2928,7 +3008,10 @@
 
                             // Match each final prospect to the org news story that best fits their
                             // role (only meaningful when there's more than one story to choose from).
-                            const orgStoryMatches = await fpMatchStoriesToContacts({ token, contacts: prospectList, orgNewsItems });
+                            const orgStoryMatches = await fpMatchStoriesToContacts({
+                                token, contacts: prospectList, orgNewsItems,
+                                onApiCall: () => { report.aiCallCounts.storyMatch++; }
+                            });
 
                             // ── 7. Per-prospect loop — same flow as generate_messages Full AI Generate ──
                             const queueDb = window.clemailDb;
@@ -3427,10 +3510,33 @@
                 report.bdrPlan = bdrPlan.map(b => ({ bdrEmail: b.bdrEmail, target: b.target, generated: b.generated }));
                 if (costLimitHit) report.costGuardResult = costLimitHit;
                 report.totals.hypothesisTally = fpRunHypTally;
-                await saveReport();
 
                 const totalGen = bdrPlan.reduce((s, b) => s + b.generated, 0);
-                addLog(`\n${report.status === 'completed' ? '✅' : 'ℹ️'} Run ${report.status}: ${totalGen} message(s) generated across ${report.orgs.length} organization(s). Apify cost ≈ $${fpStats.apifyCost.toFixed(2)}. Messages are waiting in Fast Connect Review.`, report.status === 'completed' ? 'success' : 'info');
+
+                // Real, complete cost breakdown — pulled from the ledger now that every Apify
+                // call this run made (scan + profile scrapes + post scrapes) is attributed to
+                // these BDRs, plus a clearly-labeled AI cost estimate from call counts.
+                addLog('\n💰 Computing full cost breakdown from the Apify ledger…', 'dim');
+                const realApify = await fpFetchRealApifyCosts({ bdrEmails: bdrPlan.map(b => b.bdrEmail), sinceIso: report.startedAt });
+                const aiEstimate = fpEstimateAiCost(report.aiCallCounts);
+                report.totals.realCostBreakdown = { apify: realApify, aiEstimate, grandTotalUsd: realApify.totalUsd + aiEstimate.totalUsd };
+                await saveReport();
+
+                addLog(
+                    `💰 Full cost breakdown for this run (${realApify.runs} Apify run(s)):\n` +
+                    `   • Apify — contact search (Employee Contact Scanner): $${realApify.contactSearch.toFixed(2)}\n` +
+                    `   • Apify — LinkedIn profile scrapes: $${realApify.profileScrape.toFixed(2)}\n` +
+                    `   • Apify — LinkedIn post scrapes (Post Reply classify + About Me): $${realApify.postScrape.toFixed(2)}\n` +
+                    (realApify.other > 0 ? `   • Apify — other: $${realApify.other.toFixed(2)}\n` : '') +
+                    `   • Apify total (measured): $${realApify.totalUsd.toFixed(2)}\n` +
+                    `   • AI/LLM total (ESTIMATED — not metered by this system): $${aiEstimate.totalUsd.toFixed(2)} ` +
+                    `(${Object.entries(aiEstimate.byType).filter(([,v]) => v.calls > 0).map(([k, v]) => `${k}: ${v.calls}×$${FP_AI_COST_PER_CALL_ESTIMATE[k]}`).join(', ') || 'no AI calls'})\n` +
+                    `   • Grand total: $${(realApify.totalUsd + aiEstimate.totalUsd).toFixed(2)}` +
+                    (totalGen > 0 ? ` — $${((realApify.totalUsd + aiEstimate.totalUsd) / totalGen).toFixed(3)}/message` : ''),
+                    'success'
+                );
+
+                addLog(`\n${report.status === 'completed' ? '✅' : 'ℹ️'} Run ${report.status}: ${totalGen} message(s) generated across ${report.orgs.length} organization(s). Messages are waiting in Fast Connect Review.`, report.status === 'completed' ? 'success' : 'info');
                 if (fpStats.dncSkipped > 0 || fpStats.alreadyConnected > 0) {
                     addLog(`🚫 Compliance: ${fpStats.dncSkipped} organization(s) skipped for DNC, ${fpStats.alreadyConnected} contact(s) dropped as already connected.`);
                 }
