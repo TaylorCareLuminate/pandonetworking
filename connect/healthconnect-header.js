@@ -507,6 +507,16 @@ function injectHeaderStyles() {
             padding: 6px 10px;
         }
 
+        /* Transparent Pando logos on dark page heroes need a white plate */
+        .page-header img[src*="pando_logo"],
+        .hero-section img[src*="pando_logo"],
+        .dashboard-header img[src*="pando_logo"] {
+            background: #ffffff !important;
+            padding: 6px 10px !important;
+            border-radius: 8px !important;
+            box-sizing: content-box;
+        }
+
         .healthconnect-brand-text {
             display: flex;
             flex-direction: column;

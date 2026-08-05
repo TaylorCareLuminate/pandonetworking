@@ -12,7 +12,7 @@
     <!-- UPDATED: 2026-02-10 - Fixed auto-push endpoint to /api/connect-queue/auto-push -->
     
     <!-- Load PandoConnect Header and Auth with cache-busting -->
-    <script src="healthconnect-header.js?v=3.1"></script>
+    <script src="healthconnect-header.js?v=3.2"></script>
     <script src="../js/auth.js?v=2.1"></script>
     <script src="../js/folder-protection.js?v=2.1"></script>
     <!-- CLEmail Secure API Wrapper -->
@@ -13511,6 +13511,13 @@
 
         async function generateOpeningMessage(profile, logFn, avoidHint) {
             const MAX_ATTEMPTS = 3;
+            // Tracks the best NON-EMPTY message seen across attempts. This must never be
+            // overwritten by an empty response — the backend occasionally returns '' when
+            // asked to shorten a message (a generation failure, not a "0 chars, therefore
+            // short enough" success). The old code compared raw .length, so an empty string
+            // (length 0) always won that comparison and got returned as if it were a valid
+            // short message, silently discarding a perfectly good longer message from an
+            // earlier attempt and causing the contact to be skipped entirely downstream.
             let shortestMessage = null;
 
             for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -13522,7 +13529,7 @@
                     requestBody.retry = true;
                     requestBody.attempt = attempt;
                     requestBody.previousMessage = shortestMessage;
-                    logFn(`   🔄 Attempt ${attempt}/${MAX_ATTEMPTS}: Requesting shorter message (previous was ${shortestMessage.length} chars)...`, 'info');
+                    logFn(`   🔄 Attempt ${attempt}/${MAX_ATTEMPTS}: Requesting shorter message (previous was ${shortestMessage ? shortestMessage.length : 0} chars)...`, 'info');
                 }
 
                 const response = await fetch('https://railwayclemail-production.up.railway.app/api/linkedin-profile/generate-message', {
@@ -13538,7 +13545,14 @@
                 const data = await response.json();
                 const msg = (data.message || '').trim();
 
-                // Track the shortest result across attempts
+                if (!msg) {
+                    // Empty generation is a failed attempt, not a "short enough" success —
+                    // retry rather than accepting it or letting it poison shortestMessage.
+                    logFn(`   ⚠️ Attempt ${attempt}/${MAX_ATTEMPTS} returned an empty message — retrying...`, 'warning');
+                    continue;
+                }
+
+                // Track the shortest NON-EMPTY result across attempts
                 if (!shortestMessage || msg.length < shortestMessage.length) {
                     shortestMessage = msg;
                 }
@@ -13553,7 +13567,11 @@
                 logFn(`   ⚠️ Message too long (${msg.length} chars, max ${MAX_OPENING_LENGTH}) — retrying...`, 'warning');
             }
 
-            // After all attempts, use the shortest version we got
+            if (!shortestMessage) {
+                logFn(`   ⚠️ All ${MAX_ATTEMPTS} attempts returned an empty message — nothing usable`, 'warning');
+                return '';
+            }
+            // After all attempts, use the shortest non-empty version we got
             logFn(`   ⚠️ Using shortest result after ${MAX_ATTEMPTS} attempts (${shortestMessage.length} chars — still over limit, but best available)`, 'warning');
             return shortestMessage;
         }
@@ -15628,6 +15646,35 @@
                                 existingProfileData = await getOrFetchProfile(prospect.linkedInUrl, (msg) => addLog(msg));
                             } catch (profileErr) {
                                 addLog('   ⚠️ Profile fetch warning: ' + profileErr.message);
+                            }
+                        }
+
+                        // ── Employer-drift safety net ─────────────────────────────────────
+                        // The Pre-Step gate above only forces a full re-enrichment (and write-back
+                        // to prospect_contacts) once every 60 days, for cost/perf reasons. But the
+                        // cache-first fetch just above is on its OWN, independent freshness cycle
+                        // (linkedin_profile_cache, up to 90 days, plus a few unconditional
+                        // invalidation triggers) — so it can return a more current employer than
+                        // what's stored even when the 60-day gate said "skip". Without this check,
+                        // the AI/Opus review (which uses this same profile data) correctly sees the
+                        // new employer, while prospect_contacts — and every card that reads from it
+                        // — keeps showing the stale one until the 60-day cycle happens to fire.
+                        if (!needsReEnrichment && existingProfileData && prospect.id) {
+                            const _freshEmployerCheck = extractFreshEmployer(existingProfileData);
+                            if (_freshEmployerCheck) {
+                                const _storedEmployerCheck = prospect.company || prospect.companyName || '';
+                                const _normalizeCheck = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+                                if (_normalizeCheck(_freshEmployerCheck) !== _normalizeCheck(_storedEmployerCheck)) {
+                                    addLog(`   🏢 Company drift detected outside the 60-day cycle: "${_storedEmployerCheck || '(none)'}" → "${_freshEmployerCheck}" — syncing now`, 'warning');
+                                    prospect.company     = _freshEmployerCheck;
+                                    prospect.companyName = _freshEmployerCheck;
+                                    try {
+                                        await writeBackEnrichedProfile(prospect, existingProfileData);
+                                        addLog(`   💾 Employer drift synced to prospect record`, 'dim');
+                                    } catch (driftErr) {
+                                        addLog(`   ⚠️ Employer drift sync failed: ${driftErr.message}`, 'warning');
+                                    }
+                                }
                             }
                         }
 

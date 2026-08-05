@@ -10,7 +10,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
     <!-- Load PandoConnect Header and Auth with cache-busting -->
-    <script src="healthconnect-header.js?v=3.1"></script>
+    <script src="healthconnect-header.js?v=3.2"></script>
     <script src="../js/auth.js?v=2.1"></script>
     <script src="../js/folder-protection.js?v=2.1"></script>
     <!-- CLEmail Secure API Wrapper -->
@@ -135,6 +135,7 @@
             One page that runs the entire flow: organization URL research → Apify employee contact scan (with cost tracking) →
             target-rule filtering → organization news (fetched once per org) → Full AI Generate → Opus Review → Final AI Reviews.
             Finished messages land in <strong>Fast Connect Review</strong> exactly like today.
+            See <a href="full_pipeline_dashboard.html" target="_blank">Full Pipeline Dashboard</a> for a breakdown of every past run (why contacts were dropped, cost, conversion rate).
         </div>
 
         <!-- ══════════ STEP 1: Client & Hypothesis Group ══════════ -->
@@ -207,6 +208,11 @@
                 <div style="margin-top: 6px;">
                     <a href="#" onclick="fpRepairScanLabelsFromReport(); return false;" style="font-size: 11.5px; color: var(--gray-400);">
                         <i class="fas fa-wrench"></i> Repair scan labels from a previous run (fixes organizations that were mistakenly marked "already scanned" after an error, e.g. an expired-session run)
+                    </a>
+                </div>
+                <div style="margin-top: 4px;">
+                    <a href="#" onclick="fpCheckApifyLedgerNow(); return false;" style="font-size: 11.5px; color: var(--gray-400);">
+                        <i class="fas fa-search-dollar"></i> Check Apify cost ledger now (diagnostic — shows what's really recorded, no run required)
                     </a>
                 </div>
             </div>
@@ -1491,6 +1497,69 @@
             }
         };
 
+        // Diagnostic: query the Apify cost ledger (apify_run_ledger) directly via the backend's
+        // /api/apify-ledger/summary — no pipeline run required. This is the fastest way to tell
+        // apart the two very different reasons the run log's cost breakdown can show $0:
+        //   (a) nothing is being recorded to the ledger at all (attribution/deploy problem), vs
+        //   (b) runs ARE recorded but Apify's API isn't returning usageTotalUsd for them
+        //       (can happen for marketplace/Pay-Per-Result actors depending on API token scope).
+        window.fpCheckApifyLedgerNow = async function() {
+            document.getElementById('fpProgressSection').style.display = 'block';
+            addLog('\n🔍 Checking the Apify cost ledger (apify_run_ledger, last 30 days, all BDRs/sources)…', 'dim');
+            try {
+                const token = await currentUser.getIdToken();
+                const sinceIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+                // Reconcile first: pulls the account-wide runs list straight from Apify (the
+                // same data behind https://console.apify.com/actors/runs, which always has
+                // cost + is what you're looking at) and backfills/creates ledger docs from it.
+                // This is the real fix for cost fields that are null because our own inline
+                // capture asked Apify before it had finished computing the final $ — Apify's
+                // account-wide list is settled by the time we call it here.
+                addLog('   ↳ Reconciling against Apify\'s own account-wide runs list first…', 'dim');
+                try {
+                    const reconcileResp = await fetch(`${RAILWAY_API}/api/apify-ledger/reconcile`, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sinceIso })
+                    });
+                    const reconcileData = await reconcileResp.json();
+                    if (reconcileResp.ok && reconcileData.success) {
+                        addLog(`   ↳ Reconciled: ${reconcileData.apifyRunsFetched} run(s) fetched from Apify, ${reconcileData.matched} matched our ledger (${reconcileData.backfilled} backfilled with a real cost, ${reconcileData.alreadyGood} already had one), ${reconcileData.created} unattributed run(s) added that we'd never recorded at all. Apify-side total for this window: $${reconcileData.totalUsdFromApify.toFixed(2)}.`, 'dim');
+                        if (reconcileData.byActor?.length) {
+                            addLog('   ↳ Apify-side by actor: ' + reconcileData.byActor.map(a => `${a.actorId} — ${a.runs} run(s), $${a.totalUsd.toFixed(2)}`).join(' | '), 'dim');
+                        }
+                    } else {
+                        addLog(`   ↳ ⚠️ Reconcile step failed (${reconcileData.error || reconcileResp.status}) — showing whatever was already in the ledger instead.`, 'warning');
+                    }
+                } catch (reconcileErr) {
+                    addLog(`   ↳ ⚠️ Reconcile step errored (${reconcileErr.message}) — showing whatever was already in the ledger instead.`, 'warning');
+                }
+
+                const resp = await fetch(`${RAILWAY_API}/api/apify-ledger/summary?since=${encodeURIComponent(sinceIso)}`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data.success) {
+                    addLog(`❌ Ledger check failed (HTTP ${resp.status}): ${data.error || 'unknown error'}`, 'error');
+                    return;
+                }
+                addLog(`✅ Ledger has ${data.totalRuns} run(s) recorded since ${new Date(data.since).toLocaleDateString()}, totaling $${data.totalUsd.toFixed(2)}` +
+                    (data.unattributedRuns > 0 ? ` (${data.unattributedRuns} unattributed to any BDR, $${data.unattributedUsd.toFixed(2)})` : ''),
+                    data.totalRuns > 0 ? 'success' : 'warning');
+                if (data.byActor.length) addLog('   By actor: ' + data.byActor.map(a => `${a.actorId} — ${a.runs} run(s), $${a.totalUsd.toFixed(2)}`).join(' | '));
+                if (data.bySource.length) addLog('   By source: ' + data.bySource.map(s => `${s.source} — ${s.runs} run(s), $${s.totalUsd.toFixed(2)}`).join(' | '));
+                if (data.byBdr.length) addLog('   By BDR: ' + data.byBdr.slice(0, 10).map(b => `${b.bdrEmail} — ${b.runs} run(s), $${b.totalUsd.toFixed(2)}`).join(' | '));
+                if (data.totalRuns === 0) {
+                    addLog('⚠️ Zero ledger entries exist at all in the last 30 days. This means Apify runs are not being recorded to apify_run_ledger — not that costs are genuinely $0. Most likely the backend deploy with ledger wiring isn\'t live yet, or APIFY_API_KEY is missing on Railway.', 'warning');
+                } else if (data.totalUsd === 0) {
+                    addLog('⚠️ Runs ARE being recorded, but every single one has $0 cost. This means Apify\'s API is not returning usageTotalUsd for these runs — it happens for marketplace/Pay-Per-Result actors depending on how the API token is scoped. The Employee Contact Scanner cost you see elsewhere in this app is a formula-based estimate, not a number measured from Apify.', 'warning');
+                }
+            } catch (e) {
+                addLog(`❌ Ledger check error: ${e.message}`, 'error');
+            }
+        };
+
         async function fpStampScanLabel(org, scanName) {
             try {
                 const nowIso = new Date().toISOString();
@@ -1506,6 +1575,44 @@
                 org.last_scan_label = scanName;
                 org.scan_label_dates = scanLabelDates;
             } catch (_) {}
+        }
+
+        // ── "Why didn't this contact get a message?" structured tracking ──────
+        // Every matched contact that doesn't end up with a queued message gets a single
+        // canonical reason bucket + a per-contact detail row, both on the org report and
+        // rolled up into the run-level report. This is what backs the dashboard's
+        // "no message generated" breakdown (previously only visible as free-text log lines).
+        function fpNoMsgReasonBucket(rawReason) {
+            const r = (rawReason || '').toLowerCase();
+            if (!r) return 'unknown';
+            if (r.includes('empty message') || r.includes('generation returned empty')) return 'profile_message_generation_empty';
+            if (r.includes('maverick check failed')) return 'maverick_check_failed';
+            if (r.includes('below') && r.includes('connection')) return 'below_connection_floor';
+            if (r.includes('already') && (r.includes('connect') || r.includes('queue'))) return 'already_connected_or_queued';
+            if (r.includes('campaign settings not found')) return 'campaign_settings_missing';
+            if (r.includes('failed to fetch') || r.includes('network')) return 'network_error';
+            if (r.includes('no profile data')) return 'no_profile_data';
+            if (r.includes('profile message error')) return 'profile_message_exception';
+            if (r.includes('no message generated')) return 'no_fallback_available';
+            return 'other';
+        }
+        function fpTallyNoMessage(orgReport, prospect, rawReason, detail) {
+            const bucket = fpNoMsgReasonBucket(rawReason);
+            orgReport.noMessageReasons = orgReport.noMessageReasons || {};
+            orgReport.noMessageReasons[bucket] = (orgReport.noMessageReasons[bucket] || 0) + 1;
+            orgReport.noMessageContacts = orgReport.noMessageContacts || [];
+            orgReport.noMessageContacts.push({
+                name: prospect ? [prospect.firstName, prospect.lastName].filter(Boolean).join(' ') : '',
+                linkedInUrl: prospect ? (prospect.linkedInUrl || '') : '',
+                title: prospect ? (prospect.title || '') : '',
+                company: prospect ? (prospect.company || prospect.companyName || '') : '',
+                reasonBucket: bucket,
+                reasonRaw: rawReason || '',
+                detail: detail || ''
+            });
+            if (window.fpRunNoMsgTally) {
+                window.fpRunNoMsgTally[bucket] = (window.fpRunNoMsgTally[bucket] || 0) + 1;
+            }
         }
 
         function fpRenderGroupOrgsTable() {
@@ -1811,6 +1918,13 @@
         const MAX_OPENING_LENGTH = 120;
         async function generateOpeningMessage(profile, logFn, avoidHint) {
             const MAX_ATTEMPTS = 3;
+            // Tracks the best NON-EMPTY message seen across attempts. This must never be
+            // overwritten by an empty response — the backend occasionally returns '' when
+            // asked to shorten a message (a generation failure, not a "0 chars, therefore
+            // short enough" success). The old code compared raw .length, so an empty string
+            // (length 0) always won that comparison and got returned as if it were a valid
+            // short message, silently discarding a perfectly good longer message from an
+            // earlier attempt and causing the contact to be skipped entirely downstream.
             let shortestMessage = null;
 
             for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -1822,7 +1936,7 @@
                     requestBody.retry = true;
                     requestBody.attempt = attempt;
                     requestBody.previousMessage = shortestMessage;
-                    logFn(`   🔄 Attempt ${attempt}/${MAX_ATTEMPTS}: Requesting shorter message (previous was ${shortestMessage.length} chars)...`, 'info');
+                    logFn(`   🔄 Attempt ${attempt}/${MAX_ATTEMPTS}: Requesting shorter message (previous was ${shortestMessage ? shortestMessage.length : 0} chars)...`, 'info');
                 }
 
                 const response = await fetch(`${RAILWAY_API}/api/linkedin-profile/generate-message`, {
@@ -1838,7 +1952,14 @@
                 const data = await response.json();
                 const msg = (data.message || '').trim();
 
-                // Track the shortest result across attempts
+                if (!msg) {
+                    // Empty generation is a failed attempt, not a "short enough" success —
+                    // retry rather than accepting it or letting it poison shortestMessage.
+                    logFn(`   ⚠️ Attempt ${attempt}/${MAX_ATTEMPTS} returned an empty message — retrying...`, 'warning');
+                    continue;
+                }
+
+                // Track the shortest NON-EMPTY result across attempts
                 if (!shortestMessage || msg.length < shortestMessage.length) {
                     shortestMessage = msg;
                 }
@@ -1853,7 +1974,11 @@
                 logFn(`   ⚠️ Message too long (${msg.length} chars, max ${MAX_OPENING_LENGTH}) — retrying...`, 'warning');
             }
 
-            // After all attempts, use the shortest version we got
+            if (!shortestMessage) {
+                logFn(`   ⚠️ All ${MAX_ATTEMPTS} attempts returned an empty message — nothing usable`, 'warning');
+                return '';
+            }
+            // After all attempts, use the shortest non-empty version we got
             logFn(`   ⚠️ Using shortest result after ${MAX_ATTEMPTS} attempts (${shortestMessage.length} chars — still over limit, but best available)`, 'warning');
             return shortestMessage;
         }
@@ -2388,6 +2513,40 @@
             addLogHtml(html, 'dim');
         }
 
+        // Renders the "processed but never got a message" table for one organization —
+        // the counterpart to fpRenderDroppedByRulesTable, but for contacts that made it
+        // past the rules filter and hypothesis matching and still ended up with zero
+        // queued message. Backed by fpTallyNoMessage() calls in the per-contact loop.
+        function fpRenderNoMessageTable(orgName, noMessageContacts) {
+            if (!noMessageContacts || noMessageContacts.length === 0) return;
+            const rows = noMessageContacts.map(d => {
+                const name = escHtml(d.name || '(name unknown)');
+                const roleCell = escHtml([d.title, d.company].filter(Boolean).join(' @ '));
+                const urlCell = d.linkedInUrl ? `<a href="${escHtml(d.linkedInUrl)}" target="_blank" rel="noopener" style="color:#94a3b8;">↗</a>` : '';
+                return `<tr style="border-top: 1px solid rgba(255,255,255,0.08);">
+                    <td style="padding:3px 8px; white-space:nowrap; color:#e2e8f0;">${name} ${urlCell}</td>
+                    <td style="padding:3px 8px; color:#94a3b8;">${roleCell}</td>
+                    <td style="padding:3px 8px; color:#f87171;">${escHtml(d.reasonBucket || '')}</td>
+                    <td style="padding:3px 8px; color:#94a3b8; max-width:320px;">${escHtml((d.reasonRaw || '').substring(0, 160))}</td>
+                </tr>`;
+            }).join('');
+            const html = `<details style="margin-left: 12px;">
+                <summary style="cursor:pointer; color: #f87171; font-size: 12.5px;">✉️ View all ${noMessageContacts.length} contact(s) processed but NOT messaged at "${escHtml(orgName || '')}"</summary>
+                <div style="max-height: 260px; overflow:auto; margin: 6px 0 4px 4px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;">
+                    <table style="width:100%; font-size:12px; border-collapse:collapse;">
+                        <thead><tr style="background:rgba(255,255,255,0.06);">
+                            <th style="text-align:left; padding:3px 8px; color:#e2e8f0;">Contact</th>
+                            <th style="text-align:left; padding:3px 8px; color:#e2e8f0;">Title / Company</th>
+                            <th style="text-align:left; padding:3px 8px; color:#e2e8f0;">Reason (bucket)</th>
+                            <th style="text-align:left; padding:3px 8px; color:#e2e8f0;">Detail</th>
+                        </tr></thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            </details>`;
+            addLogHtml(html, 'dim');
+        }
+
         // Summarize dropped titles for the run report (title -> count + example reason)
         function fpSummarizeDroppedTitles(dropped) {
             const map = new Map();
@@ -2681,6 +2840,7 @@
             fpRenderStats();
             fpRunHypTally = { already_messaged: 0, excluded: 0, already_connected: 0, low_connections: 0, not_in_contact_pool: 0, eligible: 0 };
             fpStoryUsageByUrl = new Map();
+            window.fpRunNoMsgTally = {};
             document.getElementById('fpProgressSection').style.display = 'block';
             document.getElementById('fpProgressLog').innerHTML = '';
             document.getElementById('fpReportLink').innerHTML = '';
@@ -2716,7 +2876,7 @@
                 aiCostTracking: 'call_counts_only',
                 aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0, storyMatch: 0 },
                 orgs: [],
-                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, hypothesisTally: null,
+                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, hypothesisTally: null, noMessageTally: null,
                     // Filled in once at the end of the run — see fpFetchRealApifyCosts(). apifyUsd
                     // above only ever reflected the contact-search (scan) job; realCostBreakdown is
                     // the actual apify_run_ledger total across EVERY Apify call this run triggered
@@ -2814,6 +2974,7 @@
                             dncMatch: null, alreadyConnected: 0,
                             contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0,
                             droppedTitles: [], newsStories: null, messagesGenerated: 0,
+                            noMessageReasons: {}, noMessageContacts: [],
                             opus: { approved: 0, needsAttention: 0, excluded: 0 },
                             finalReview: { approved: 0, flagged: 0 },
                             costs: { scanJobHarvestUsd: 0, scanJobBebityUsd: 0, apifyLedgerUsd: 0, ledgerRuns: 0 },
@@ -3100,6 +3261,34 @@
                                         }
                                     }
 
+                                    // ── Employer-drift safety net ─────────────────────────────
+                                    // The enrichment gate above only forces a full re-enrichment
+                                    // (and write-back to prospect_contacts) once every 60 days. The
+                                    // cache-first fetch just above is on its OWN, independent
+                                    // freshness cycle, so it can return a more current employer
+                                    // than what's stored even when the 60-day gate said "skip".
+                                    // Without this, Opus/the AI (which uses this same profile data)
+                                    // sees the new employer while prospect_contacts — and every card
+                                    // that reads from it — keeps showing the stale one.
+                                    if (!needsReEnrichment && existingProfileData && prospect.id) {
+                                        const _freshEmployerCheck = extractFreshEmployer(existingProfileData);
+                                        if (_freshEmployerCheck) {
+                                            const _storedEmployerCheck = prospect.company || prospect.companyName || '';
+                                            const _normalizeCheck = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+                                            if (_normalizeCheck(_freshEmployerCheck) !== _normalizeCheck(_storedEmployerCheck)) {
+                                                addLog(`   🏢 Company drift detected outside the 60-day cycle: "${_storedEmployerCheck || '(none)'}" → "${_freshEmployerCheck}" — syncing now`, 'warning');
+                                                prospect.company     = _freshEmployerCheck;
+                                                prospect.companyName = _freshEmployerCheck;
+                                                try {
+                                                    await writeBackEnrichedProfile(prospect, existingProfileData);
+                                                    addLog(`   💾 Employer drift synced to prospect record`, 'dim');
+                                                } catch (driftErr) {
+                                                    addLog(`   ⚠️ Employer drift sync failed: ${driftErr.message}`, 'warning');
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // Browser-side connection count check (skip below threshold)
                                     if (existingProfileData && connFilterOn) {
                                         const connRaw = existingProfileData.connections;
@@ -3110,6 +3299,7 @@
                                                 : Number(connStr.replace(/,/g, ''));
                                             if (!isNaN(connNum) && connNum < connFilterMin) {
                                                 addLog(`   ⛔ Below ${connFilterMin} connections (${connNum}) — skipping`);
+                                                fpTallyNoMessage(orgReport, prospect, 'below connection floor (client-side check)', `${connNum} < ${connFilterMin}`);
                                                 continue;
                                             }
                                         }
@@ -3177,7 +3367,11 @@
                                         singleData.logs.forEach(l => addLog('   ' + l));
                                     }
                                     if (!singleData.success) throw new Error(singleData.error || 'Generation failed');
-                                    if (singleData.skipped) { addLog('   ⏭️ Skipped: ' + (singleData.skipReason || '')); continue; }
+                                    if (singleData.skipped) {
+                                        addLog('   ⏭️ Skipped: ' + (singleData.skipReason || ''));
+                                        fpTallyNoMessage(orgReport, prospect, singleData.skipReason || 'backend skipped (no reason given)', 'full-ai-generate-single returned skipped=true');
+                                        continue;
+                                    }
                                     if (!singleData.messages || singleData.messages.length === 0) {
                                         // Profile Message: last-resort fallback — uses the exact same
                                         // generateOpeningMessageWithMaverickCheck() call as generate_messages.html's
@@ -3185,6 +3379,10 @@
                                         // still get a message instead of being dropped.
                                         const fallbackProfileData = existingProfileData || singleData.profileData;
                                         let profileMsgGenerated = false;
+                                        // Default reason if nothing below overwrites it — About Me / Internet Search /
+                                        // Post Reply all came back empty for this contact (normal — see server logs above
+                                        // for which routes were tried), and the Profile Message fallback hasn't run yet.
+                                        let noMsgReason = 'no message source succeeded (About Me / Internet Search / Post Reply all came up empty)';
                                         if (fallbackProfileData && profileMsgFallbackOn) {
                                             addLog('   👤 Trying Profile Message (last resort)...', 'info');
                                             try {
@@ -3303,14 +3501,21 @@
                                                     }
                                                 } else {
                                                     addLog(`   ⚠️ Profile Message skipped — ${pmResult.skipReason || 'empty'}`, 'warning');
+                                                    noMsgReason = pmResult.skipReason || 'Profile Message generation returned empty';
                                                 }
                                             } catch (pmErr) {
                                                 addLog(`   ⚠️ Profile Message error: ${pmErr.message}`, 'warning');
+                                                noMsgReason = `Profile Message error: ${pmErr.message}`;
                                             }
+                                        } else if (!fallbackProfileData) {
+                                            noMsgReason = 'no message generated (no profile data available for Profile Message fallback)';
+                                        } else if (!profileMsgFallbackOn) {
+                                            noMsgReason = 'no message generated (Profile Message fallback is disabled in Step 5)';
                                         }
 
                                         if (!profileMsgGenerated) {
                                             addLog('   No message generated - skipping');
+                                            fpTallyNoMessage(orgReport, prospect, noMsgReason, `messageSource attempts empty; fallbackEnabled=${profileMsgFallbackOn}; hadFallbackProfile=${!!fallbackProfileData}`);
                                         }
                                         continue;
                                     }
@@ -3429,6 +3634,7 @@
                                 } catch (prospectErr) {
                                     addLog(`   ❌ Error: ${prospectErr.message}`, 'error');
                                     console.error('[Full Pipeline] prospect error:', prospectErr);
+                                    fpTallyNoMessage(orgReport, prospect, prospectErr.message || 'unhandled exception', 'threw before a message could be saved — see console for stack trace');
                                 }
 
                                 // Brief pause between prospects to avoid hammering the server
@@ -3443,6 +3649,13 @@
                                     url: s.url || '',
                                     timesUsedThisRun: fpStoryUsageByUrl.get(fpStoryKey(s)) || 0
                                 }));
+                            }
+
+                            // Show exactly which matched contacts at this org never got a message,
+                            // and the canonical reason bucket for each — the per-org counterpart
+                            // to the run-level "no message" breakdown logged at the end.
+                            if (orgReport.noMessageContacts && orgReport.noMessageContacts.length) {
+                                fpRenderNoMessageTable(org.company_name, orgReport.noMessageContacts);
                             }
 
                             // Reached the end of this org's prospect loop without an unhandled
@@ -3522,6 +3735,7 @@
                 report.bdrPlan = bdrPlan.map(b => ({ bdrEmail: b.bdrEmail, target: b.target, generated: b.generated }));
                 if (costLimitHit) report.costGuardResult = costLimitHit;
                 report.totals.hypothesisTally = fpRunHypTally;
+                report.totals.noMessageTally = window.fpRunNoMsgTally || {};
 
                 const totalGen = bdrPlan.reduce((s, b) => s + b.generated, 0);
 
@@ -3582,10 +3796,21 @@
                         addLog(`   💡 Most of this run's matched decision-makers already have a message queued from earlier work on this hypothesis group/BDR — that's very likely why the message count looks low. This is the pipeline correctly avoiding duplicate outreach, not a bug. If you want fresh volume, check how many older messages for this group are still sitting unreviewed in Fast Connect Review, or point this run at a hypothesis group/territory that hasn't been worked as heavily yet.`, 'warning');
                     }
                 }
+                // "Made it into the per-contact loop but still got zero message" breakdown —
+                // this is the number the user actually cares about when messages generated
+                // looks low compared to contacts matched (see fpTallyNoMessage above).
+                const noMsgTallyEntries = Object.entries(window.fpRunNoMsgTally || {}).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+                if (noMsgTallyEntries.length) {
+                    const noMsgTotal = noMsgTallyEntries.reduce((s, [, v]) => s + v, 0);
+                    addLog(`✉️ Whole-run reason breakdown for contacts processed but NOT messaged (${noMsgTotal} total): ${noMsgTallyEntries.map(([k, v]) => `${k}: ${v}`).join(' | ')}`, noMsgTotal > totalGen ? 'warning' : 'dim');
+                    if ((window.fpRunNoMsgTally.profile_message_generation_empty || 0) > 0) {
+                        addLog(`   💡 "profile_message_generation_empty" means the AI returned a blank message when asked to shorten a too-long draft. This is now retried instead of accepted as a false "success" — rerun to see the improvement.`, 'dim');
+                    }
+                }
                 if (costLimitHit) {
                     addLog(`💸 Shut down by the Step 6 cost guard — Apify averaged ${costLimitHit.messages > 0 ? '$' + costLimitHit.avgPerMessage.toFixed(2) : 'more than the limit'} per generated message (limit $${costLimitHit.limitPerMessage.toFixed(2)}). Adjust the Step 4 scan rules before rerunning.`, 'error');
                 }
-                addLog(`📊 Report saved: full_pipeline_runs/${runId}`);
+                addLogHtml(`[${new Date().toLocaleTimeString()}] 📊 Report saved: full_pipeline_runs/${runId} — view it in the <a href="full_pipeline_dashboard.html" target="_blank" style="color:#60a5fa;">Full Pipeline Dashboard</a>.`, 'info');
                 fpSetProgress(100, report.status === 'completed' ? 'Done' : report.status);
 
                 fpRunning = false;
