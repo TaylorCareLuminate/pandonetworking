@@ -10,7 +10,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
     <!-- Load PandoConnect Header and Auth with cache-busting -->
-    <script src="healthconnect-header.js?v=3.0"></script>
+    <script src="healthconnect-header.js?v=3.1"></script>
     <script src="../js/auth.js?v=2.1"></script>
     <script src="../js/folder-protection.js?v=2.1"></script>
     <!-- CLEmail Secure API Wrapper -->
@@ -2522,7 +2522,16 @@
         // TRUE total straight from the ledger for every BDR in this run, bucketed by source.
         async function fpFetchRealApifyCosts({ bdrEmails, sinceIso }) {
             const buckets = { contactSearch: 0, profileScrape: 0, postScrape: 0, other: 0 };
-            let runs = 0;
+            // These extra counters exist specifically to distinguish two very different
+            // failure modes that both used to render as a silent "$0.00": (a) the ledger
+            // query genuinely found no docs at all (attribution/wiring problem, or the
+            // account this ran on hasn't picked up the backend deploy that tags these calls
+            // with bdrEmail yet), vs (b) docs WERE found and attributed correctly, but Apify's
+            // own actor-run API didn't report usageTotalUsd for them (e.g. some actor/plan
+            // combos don't populate cost on the run-status response). Surfacing both here so
+            // the run log itself tells you which one it is instead of guessing.
+            let docsFound = 0, docsWithCost = 0, docsWithNullCost = 0;
+            const errors = [];
             for (const bdrEmail of [...new Set(bdrEmails)]) {
                 try {
                     const snap = await getDocs(query(
@@ -2530,11 +2539,12 @@
                         where('bdrEmail', '==', bdrEmail),
                         where('recordedAt', '>=', sinceIso)
                     ));
+                    docsFound += snap.docs.length;
                     snap.docs.forEach(d => {
                         const v = d.data();
-                        const usd = typeof v.usageTotalUsd === 'number' ? v.usageTotalUsd : 0;
-                        if (usd === 0) return;
-                        runs++;
+                        const usd = typeof v.usageTotalUsd === 'number' ? v.usageTotalUsd : null;
+                        if (usd === null) { docsWithNullCost++; return; }
+                        docsWithCost++;
                         const src = v.source || '';
                         if (src === 'contact_search_job') buckets.contactSearch += usd;
                         else if (/profile/i.test(src)) buckets.profileScrape += usd;
@@ -2543,10 +2553,11 @@
                     });
                 } catch (e) {
                     console.warn(`Real Apify cost query failed for ${bdrEmail}:`, e.message);
+                    errors.push(`${bdrEmail}: ${e.message}`);
                 }
             }
             const totalUsd = buckets.contactSearch + buckets.profileScrape + buckets.postScrape + buckets.other;
-            return { ...buckets, totalUsd, runs };
+            return { ...buckets, totalUsd, runs: docsWithCost, docsFound, docsWithCost, docsWithNullCost, errors };
         }
 
         // ── AI/LLM cost estimate ────────────────────────────────────────────────
@@ -2705,7 +2716,7 @@
                 aiCostTracking: 'call_counts_only',
                 aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0, storyMatch: 0 },
                 orgs: [],
-                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, hypothesisTally: null,
+                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, hypothesisTally: null,
                     // Filled in once at the end of the run — see fpFetchRealApifyCosts(). apifyUsd
                     // above only ever reflected the contact-search (scan) job; realCostBreakdown is
                     // the actual apify_run_ledger total across EVERY Apify call this run triggered
@@ -3457,6 +3468,7 @@
                         report.totals.finalReviewFlagged += orgReport.finalReview.flagged;
                         report.totals.apifyUsd         += orgReport.costs.apifyLedgerUsd;
                         report.totals.scanJobHarvestUsd += orgReport.costs.scanJobHarvestUsd;
+                        report.totals.scanJobBebityUsd += orgReport.costs.scanJobBebityUsd;
                         report.totals.alreadyConnected += orgReport.alreadyConnected;
                         report.bdrPlan = bdrPlan.map(b => ({ bdrEmail: b.bdrEmail, target: b.target, generated: b.generated }));
                         await saveReport();
@@ -3519,20 +3531,43 @@
                 addLog('\n💰 Computing full cost breakdown from the Apify ledger…', 'dim');
                 const realApify = await fpFetchRealApifyCosts({ bdrEmails: bdrPlan.map(b => b.bdrEmail), sinceIso: report.startedAt });
                 const aiEstimate = fpEstimateAiCost(report.aiCallCounts);
-                report.totals.realCostBreakdown = { apify: realApify, aiEstimate, grandTotalUsd: realApify.totalUsd + aiEstimate.totalUsd };
+
+                // Fallback for the contact-search bucket only: the Employee Contact Scanner job
+                // itself always computes a formula-based cost (contacts found × Harvest's published
+                // per-1000-contacts rate) independent of whether Apify's actor-run API reported
+                // usageTotalUsd — see linkedin_contact_search_job_processor.js. Use it whenever the
+                // ledger came back with $0 measured for contact search, so the total shown here is
+                // never a flat, misleading $0 for the single biggest cost driver in this pipeline.
+                const contactSearchFallbackUsd = report.totals.scanJobHarvestUsd + report.totals.scanJobBebityUsd;
+                const contactSearchUsedFallback = realApify.contactSearch <= 0 && contactSearchFallbackUsd > 0;
+                const contactSearchDisplayUsd = contactSearchUsedFallback ? contactSearchFallbackUsd : realApify.contactSearch;
+                const grandTotalUsd = contactSearchDisplayUsd + realApify.profileScrape + realApify.postScrape + realApify.other + aiEstimate.totalUsd;
+
+                report.totals.realCostBreakdown = { apify: realApify, contactSearchFallbackUsd, contactSearchUsedFallback, aiEstimate, grandTotalUsd };
                 await saveReport();
 
+                if (realApify.errors.length > 0) {
+                    addLog(`⚠️ Apify ledger query error(s) — cost numbers below may be incomplete: ${realApify.errors.join('; ')}`, 'warning');
+                }
+                if (realApify.docsFound === 0) {
+                    addLog(`⚠️ No Apify ledger entries at all were found for these BDR(s) in this run's time window. Either this environment hasn't picked up the backend deploy that tags scan/profile/post-scrape calls with bdrEmail yet, or nothing in apify_run_ledger matched. Falling back to the scan job's own formula-based cost estimate below.`, 'warning');
+                } else if (realApify.docsWithNullCost > 0 && realApify.docsWithCost === 0) {
+                    addLog(`⚠️ Found ${realApify.docsFound} Apify run(s) attributed to these BDR(s), but none of them had a cost value from Apify's own API (usageTotalUsd was empty) — the runs happened, but Apify isn't reporting $ back for them. Falling back to the scan job's own formula-based cost estimate below.`, 'warning');
+                } else if (realApify.docsWithNullCost > 0) {
+                    addLog(`ℹ️ ${realApify.docsWithNullCost} of ${realApify.docsFound} attributed Apify run(s) had no cost reported by Apify's API and were excluded from the measured total below.`, 'dim');
+                }
+
                 addLog(
-                    `💰 Full cost breakdown for this run (${realApify.runs} Apify run(s)):\n` +
-                    `   • Apify — contact search (Employee Contact Scanner): $${realApify.contactSearch.toFixed(2)}\n` +
-                    `   • Apify — LinkedIn profile scrapes: $${realApify.profileScrape.toFixed(2)}\n` +
-                    `   • Apify — LinkedIn post scrapes (Post Reply classify + About Me): $${realApify.postScrape.toFixed(2)}\n` +
-                    (realApify.other > 0 ? `   • Apify — other: $${realApify.other.toFixed(2)}\n` : '') +
-                    `   • Apify total (measured): $${realApify.totalUsd.toFixed(2)}\n` +
+                    `💰 Full cost breakdown for this run (${realApify.docsFound} Apify run(s) attributed, ${realApify.docsWithCost} with a measured cost):\n` +
+                    `   • Apify — contact search (Employee Contact Scanner): $${contactSearchDisplayUsd.toFixed(2)}${contactSearchUsedFallback ? ' (formula-estimated — ledger measured $0)' : ' (measured)'}\n` +
+                    `   • Apify — LinkedIn profile scrapes: $${realApify.profileScrape.toFixed(2)} (measured)\n` +
+                    `   • Apify — LinkedIn post scrapes (Post Reply classify + About Me): $${realApify.postScrape.toFixed(2)} (measured)\n` +
+                    (realApify.other > 0 ? `   • Apify — other: $${realApify.other.toFixed(2)} (measured)\n` : '') +
+                    `   • Apify total: $${(contactSearchDisplayUsd + realApify.profileScrape + realApify.postScrape + realApify.other).toFixed(2)}\n` +
                     `   • AI/LLM total (ESTIMATED — not metered by this system): $${aiEstimate.totalUsd.toFixed(2)} ` +
                     `(${Object.entries(aiEstimate.byType).filter(([,v]) => v.calls > 0).map(([k, v]) => `${k}: ${v.calls}×$${FP_AI_COST_PER_CALL_ESTIMATE[k]}`).join(', ') || 'no AI calls'})\n` +
-                    `   • Grand total: $${(realApify.totalUsd + aiEstimate.totalUsd).toFixed(2)}` +
-                    (totalGen > 0 ? ` — $${((realApify.totalUsd + aiEstimate.totalUsd) / totalGen).toFixed(3)}/message` : ''),
+                    `   • Grand total: $${grandTotalUsd.toFixed(2)}` +
+                    (totalGen > 0 ? ` — $${(grandTotalUsd / totalGen).toFixed(3)}/message` : ''),
                     'success'
                 );
 

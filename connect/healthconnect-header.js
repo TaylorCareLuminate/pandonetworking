@@ -18,8 +18,8 @@ console.log('🎨 HealthConnect Header loading...');
 // Configuration with dropdown sections
 const HEALTHCONNECT_CONFIG = {
     brandName: 'PandoConnect',
-    brandColor: '#0F2D4D', // Deep Navy
-    accentColor: '#C9973D', // Aspen Gold
+    brandColor: '#12314C', // Navy
+    accentColor: '#94AD82', // New leaf
     navSections: [
         {
             label: 'Me',
@@ -462,10 +462,11 @@ function injectHeaderStyles() {
     if (document.getElementById(styleId)) return;
     
     const styles = `
-        /* PandoConnect Header Styles */
+        /* PandoConnect Header Styles — Option 3: solid navy, two greens, gold as metal only */
         .healthconnect-header {
-            background: linear-gradient(135deg, #5E7C5B 0%, #C9973D 100%);
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            background: #12314C;
+            border-bottom: 1px solid #B9A77E;
+            box-shadow: 0 4px 16px rgba(18, 49, 76, 0.28);
             position: sticky;
             top: 0;
             z-index: 1000;
@@ -522,8 +523,9 @@ function injectHeaderStyles() {
 
         .healthconnect-brand-tagline {
             font-size: 0.85rem;
-            color: rgba(255, 255, 255, 0.85);
+            color: #94AD82;
             margin-top: 4px;
+            letter-spacing: 0.04em;
         }
 
         .healthconnect-nav {
@@ -552,16 +554,17 @@ function injectHeaderStyles() {
             align-items: center;
             gap: 0.5rem;
             white-space: nowrap;
-            background: rgba(255, 255, 255, 0.1);
+            background: rgba(148, 173, 130, 0.12);
             cursor: pointer;
-            border: none;
+            border: 1px solid transparent;
         }
 
         .healthconnect-nav-section-btn:hover,
         .healthconnect-nav-section.active .healthconnect-nav-section-btn {
-            background: rgba(255, 255, 255, 0.2);
-            transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+            background: rgba(148, 173, 130, 0.22);
+            border-color: rgba(185, 167, 126, 0.45);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.18);
         }
 
         .healthconnect-nav-section-btn i:first-child {
@@ -651,14 +654,14 @@ function injectHeaderStyles() {
         }
 
         .healthconnect-nav-dropdown-item.active {
-            background: #e0f2fe;
+            background: rgba(148, 173, 130, 0.18);
             font-weight: 600;
         }
 
         .healthconnect-nav-dropdown-item i {
             width: 20px;
             text-align: center;
-            color: var(--primary, #0F2D4D);
+            color: var(--primary, #4E6E4A);
         }
 
         /* Dropdown Divider */
@@ -698,8 +701,8 @@ function injectHeaderStyles() {
         }
 
         .healthconnect-login-btn {
-            background: white;
-            color: var(--primary, #0F2D4D);
+            background: #94AD82;
+            color: #12314C;
             padding: 0.65rem 1.5rem;
             border-radius: 8px;
             text-decoration: none;
@@ -713,9 +716,9 @@ function injectHeaderStyles() {
         }
 
         .healthconnect-login-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-            background: #f8f9fa;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
+            background: #a7bd97;
         }
 
         .healthconnect-user-menu {
@@ -741,14 +744,14 @@ function injectHeaderStyles() {
             width: 36px;
             height: 36px;
             border-radius: 50%;
-            background: linear-gradient(135deg, #5E7C5B 0%, #0F2D4D 100%);
+            background: #4E6E4A;
             color: white;
             display: flex;
             align-items: center;
             justify-content: center;
             font-weight: 700;
             font-size: 0.9rem;
-            border: 2px solid rgba(255, 255, 255, 0.3);
+            border: 2px solid rgba(185, 167, 126, 0.55);
         }
 
         .healthconnect-user-name {
@@ -816,7 +819,7 @@ function injectHeaderStyles() {
         .healthconnect-dropdown-item i {
             width: 20px;
             text-align: center;
-            color: var(--primary, #0F2D4D);
+            color: var(--primary, #12314C);
         }
 
         .healthconnect-dropdown-item.logout {
@@ -924,9 +927,9 @@ function getUserDisplayName(user) {
 // Get avatar color
 function getAvatarColor(user) {
     const colors = [
-        { bg: '#0F2D4D', text: '#ffffff' }, // Deep Navy
-        { bg: '#5E7C5B', text: '#ffffff' }, // Pando Green
-        { bg: '#C9973D', text: '#ffffff' }, // Aspen Gold
+        { bg: '#12314C', text: '#ffffff' }, // Navy
+        { bg: '#4E6E4A', text: '#ffffff' }, // Grove
+        { bg: '#94AD82', text: '#12314C' }, // New leaf
         { bg: '#6B7280', text: '#ffffff' }, // Slate Gray
         { bg: '#8A6B2E', text: '#ffffff' }, // Dark Gold
         { bg: '#3D5A80', text: '#ffffff' }, // Steel Blue

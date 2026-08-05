@@ -32,19 +32,19 @@
   const connectedAt = {};      // connection id -> timestamp of first completion (gold pulse)
 
   // ── Palette ────────────────────────────────────────────────────────────
-  const NAVY_EDGE   = 'rgba(15, 45, 77, 0.48)';
-  const BARK_MARK   = 'rgba(15, 45, 77, 0.38)';
+  const NAVY_EDGE   = 'rgba(18, 49, 76, 0.48)';
+  const BARK_MARK   = 'rgba(18, 49, 76, 0.38)';
   const TRUNK_TOP   = '#F8F5EC';
   const TRUNK_BOT   = '#E0D5BC';
   const SAPLING_A   = '#E3DCC6';
   const SAPLING_B   = '#F6F3E8';
   const SAPLING_EDGE = 'rgba(94, 124, 91, 0.45)';
-  const GREENS      = ['#6B8A67', '#7FA377', '#93B08B', '#5E7C5B'];
-  const LEAF_COLORS = ['#7FA377', '#93B08B', '#C9973D', '#B98F45', '#A9B183'];
+  const GREENS      = ['#4E6E4A', '#6B8A67', '#94AD82', '#7FA377'];
+  const LEAF_COLORS = ['#7FA377', '#94AD82', '#B9A77E', '#A9B183', '#6B8A67'];
   const ROOT_FILL   = '#D0BFA3';
   const ROOT_DEEP   = '#BDA987';
   const ROOT_EDGE   = 'rgba(140, 124, 94, 0.42)';
-  const GOLD        = '#C9973D';
+  const GOLD        = '#B9A77E';
 
   // ── Small utilities ────────────────────────────────────────────────────
   function mulberry32(a) {
