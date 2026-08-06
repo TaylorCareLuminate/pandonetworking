@@ -1585,6 +1585,7 @@
         function fpNoMsgReasonBucket(rawReason) {
             const r = (rawReason || '').toLowerCase();
             if (!r) return 'unknown';
+            if (r.includes('build model returned empty text')) return 'build_message_empty_text';
             if (r.includes('empty message') || r.includes('generation returned empty')) return 'profile_message_generation_empty';
             if (r.includes('maverick check failed')) return 'maverick_check_failed';
             if (r.includes('below') && r.includes('connection')) return 'below_connection_floor';
@@ -2693,13 +2694,33 @@
             const errors = [];
             for (const bdrEmail of [...new Set(bdrEmails)]) {
                 try {
-                    const snap = await getDocs(query(
-                        collection(db, 'apify_run_ledger'),
-                        where('bdrEmail', '==', bdrEmail),
-                        where('recordedAt', '>=', sinceIso)
-                    ));
-                    docsFound += snap.docs.length;
-                    snap.docs.forEach(d => {
+                    let ledgerDocs;
+                    try {
+                        // Preferred: equality + range in one query. Firestore needs a composite
+                        // index (bdrEmail ASC, recordedAt ASC) for this combination.
+                        const snap = await getDocs(query(
+                            collection(db, 'apify_run_ledger'),
+                            where('bdrEmail', '==', bdrEmail),
+                            where('recordedAt', '>=', sinceIso)
+                        ));
+                        ledgerDocs = snap.docs;
+                    } catch (idxErr) {
+                        // Missing composite index ("Query requires an index") — fall back to the
+                        // equality-only query (never needs an index) and apply the time-window
+                        // filter client-side so cost numbers stay complete instead of silently $0.
+                        if (!/index/i.test(idxErr.message || '')) throw idxErr;
+                        console.warn(`apify_run_ledger composite index missing — falling back to client-side date filter for ${bdrEmail}`);
+                        const snap = await getDocs(query(
+                            collection(db, 'apify_run_ledger'),
+                            where('bdrEmail', '==', bdrEmail)
+                        ));
+                        ledgerDocs = snap.docs.filter(d => {
+                            const rec = d.data().recordedAt;
+                            return typeof rec === 'string' && rec >= sinceIso;
+                        });
+                    }
+                    docsFound += ledgerDocs.length;
+                    ledgerDocs.forEach(d => {
                         const v = d.data();
                         const usd = typeof v.usageTotalUsd === 'number' ? v.usageTotalUsd : null;
                         if (usd === null) { docsWithNullCost++; return; }
@@ -3522,17 +3543,12 @@
 
                                     // ── Save message(s) — same doc shape as generate_messages ──
                                     const src = singleData.messageSource || '';
-                                    // Only count this story as "used" if it actually won the Internet Search
-                                    // race (org story beats the parallel contact-specific search since it's
-                                    // concatenated first) — About Me / Contact Search don't touch org news at all.
-                                    if (assignedStoryKey && src === 'Internet Search') {
-                                        fpStoryUsageByUrl.set(assignedStoryKey, (fpStoryUsageByUrl.get(assignedStoryKey) || 0) + 1);
-                                    }
                                     const bdrLinkedInEmail = (bdrContext.bdrLinkedInEmail || bdrEmail).toLowerCase();
                                     const bdrNameVal       = bdrContext.bdrName || '';
                                     const pd               = singleData.profileData || {};
                                     const msgsToSave = src === 'About Me' ? singleData.messages : singleData.messages.slice(0, 1);
                                     const sourceKey = getFullAiMessageSourceKey(src);
+                                    let savedCount = 0;
                                     for (const msg of msgsToSave) {
                                         const msgText = typeof msg === 'string' ? msg : (msg.message || msg.text || '');
                                         if (!msgText) continue;
@@ -3572,6 +3588,7 @@
                                             ...sourceData
                                         });
                                         await saveFullAiContextExtras(msgId, { profileData: pd, recentPosts: singleData.recentPosts });
+                                        savedCount++;
                                         plan.generated++;
                                         orgReport.messagesGenerated++;
                                         fpStats.messages++;
@@ -3629,7 +3646,21 @@
                                             }
                                         }
                                     }
-                                    addLog(`   ✅ [${src}] saved to queue (${plan.generated}/${plan.target} for this BDR)`, 'success');
+                                    if (savedCount > 0) {
+                                        // Only count this story as "used" when a message was ACTUALLY saved —
+                                        // previously the usage cap was burned even when the save loop skipped
+                                        // every message, so one org story could hit 7/7 with zero real messages.
+                                        if (assignedStoryKey && src === 'Internet Search') {
+                                            fpStoryUsageByUrl.set(assignedStoryKey, (fpStoryUsageByUrl.get(assignedStoryKey) || 0) + 1);
+                                        }
+                                        addLog(`   ✅ [${src}] saved to queue (${plan.generated}/${plan.target} for this BDR)`, 'success');
+                                    } else {
+                                        // The server reported message(s) but every one came back with empty
+                                        // text — this is a generation failure, NOT a save. The old code logged
+                                        // a false "✅ saved to queue" here, which hid the failure completely.
+                                        addLog(`   ⚠️ [${src}] server reported ${msgsToSave.length} message(s) but every one had EMPTY text — NOTHING was saved for this contact`, 'warning');
+                                        fpTallyNoMessage(orgReport, prospect, 'build model returned empty text', `${src} message came back blank from the build model (${buildModel || 'default'}) — nothing saved to the queue`);
+                                    }
 
                                 } catch (prospectErr) {
                                     addLog(`   ❌ Error: ${prospectErr.message}`, 'error');

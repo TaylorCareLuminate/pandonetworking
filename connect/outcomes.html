@@ -3882,16 +3882,22 @@
                 );
                 const snap = await getDocs(q).catch(e => null);
                 if (!snap) continue;
+                let rawCount = 0, outOfWindow = 0, noUrl = 0;
                 snap.forEach(d => {
+                    rawCount++;
                     const data = d.data();
                     const scheduledAt = safeToDate(
                         data.scheduled_at || data.meeting_scheduled_date ||
                         data.created_at || data.timestamp
                     );
-                    if (!dateInWindow(scheduledAt)) return;
+                    if (!dateInWindow(scheduledAt)) { outOfWindow++; return; }
                     const url = normalizeUrl(data.contact_linkedin_url || '');
-                    if (url) scheduledUrls.add(url);
+                    if (!url) { noUrl++; return; }
+                    scheduledUrls.add(url);
                 });
+                console.log('[outcomes] loadScheduledMeetings Source 1 (activity_tracking) — raw:', rawCount,
+                    '| out of window:', outOfWindow, '| no URL:', noUrl,
+                    '| kept:', rawCount - outOfWindow - noUrl);
             }
         } catch(e) { console.warn('activity_tracking scheduled load failed:', e); }
 
@@ -3899,12 +3905,21 @@
         // by the conversation's own lastMessageAt so meetings surface in the period the
         // scheduling activity happened, not the period the connection was originally sent.
         const convIdToUrl = new Map();
+        let src2Candidates = 0, src2OutOfWindow = 0, src2Added = 0;
         inboxConversations.forEach(c => {
             if (c.conversationId && c.leadProfileUrl) convIdToUrl.set(c.conversationId, c.leadProfileUrl);
-            if (c.responseCategory === 'Scheduled' && c.leadProfileUrl && dateInWindow(c.lastMessageAt)) {
-                scheduledUrls.add(c.leadProfileUrl);
+            if (c.responseCategory === 'Scheduled' && c.leadProfileUrl) {
+                src2Candidates++;
+                if (dateInWindow(c.lastMessageAt)) {
+                    scheduledUrls.add(c.leadProfileUrl);
+                    src2Added++;
+                } else {
+                    src2OutOfWindow++;
+                }
             }
         });
+        console.log('[outcomes] loadScheduledMeetings Source 2 (heyreach_inbox) — candidates:', src2Candidates,
+            '| out of window:', src2OutOfWindow, '| added:', src2Added);
 
         // Source 3: conversation_category_overrides — used for "webhook_"-sourced
         // conversations (synthesized from heyreach_activity in company_review_replies.html),
@@ -3941,13 +3956,30 @@
 
         // Correction step: activity_tracking is append-only, so if a meeting was previously
         // scheduled but later un-scheduled (category changed in the inbox), the activity_tracking
-        // entry persists. Remove any URL whose current inbox responseCategory is explicitly set
-        // to something other than 'Scheduled'.
+        // entry persists. Only remove a URL if NONE of that contact's CURRENT inbox
+        // conversations show 'Scheduled' — checked per-URL rather than per-conversation.
+        // inboxConversations is deduped by conversationId, not by contact (see
+        // seenConvIds above), so a contact with two conversation threads (e.g. a later,
+        // unrelated Fast Prospect follow-up whose category is still blank/'Response')
+        // would otherwise have their legitimately-Scheduled meeting deleted here just
+        // because ONE of their OTHER conversations isn't marked 'Scheduled'.
+        const currentlyScheduledUrls = new Set();
         inboxConversations.forEach(conv => {
-            if (conv.leadProfileUrl && conv.responseCategory && conv.responseCategory !== 'Scheduled') {
-                scheduledUrls.delete(conv.leadProfileUrl);
+            if (conv.leadProfileUrl && conv.responseCategory === 'Scheduled') {
+                currentlyScheduledUrls.add(conv.leadProfileUrl);
             }
         });
+        let correctionRemoved = 0;
+        inboxConversations.forEach(conv => {
+            if (conv.leadProfileUrl && conv.responseCategory && conv.responseCategory !== 'Scheduled'
+                && !currentlyScheduledUrls.has(conv.leadProfileUrl)) {
+                if (scheduledUrls.delete(conv.leadProfileUrl)) correctionRemoved++;
+            }
+        });
+        console.log('[outcomes] loadScheduledMeetings — correction step removed:', correctionRemoved);
+
+        console.log('[outcomes] loadScheduledMeetings — final scheduledUrls:', scheduledUrls.size,
+            [...scheduledUrls]);
 
         return scheduledUrls;
     }
@@ -4085,6 +4117,23 @@
         // Compute grand total across ALL sent items (deduped by LinkedIn URL) to avoid double-counting
         const grandTotal = computeRow(sentItems, sentItemsAllTime);
         grandTotal.type = 'total';
+
+        // Gap-finder: which "Scheduled" contacts never matched any sent item at all?
+        // These are the ones missing from Outcomes entirely (not just miscategorized) —
+        // likely a connect_queue URL-format mismatch or a contact sent from an account/email
+        // outside this company's target BDR set.
+        (function logScheduledGap() {
+            const allSlugs = new Set();
+            (sentItemsAllTime || sentItems).forEach(item => {
+                const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
+                const slug = liSlug(raw);
+                if (slug) allSlugs.add(slug);
+                allSlugs.add(normalizeUrl(raw));
+            });
+            const unmatched = [...scheduledSlugSet].filter(s => s && !allSlugs.has(s));
+            console.log('[outcomes] Scheduled contacts with NO matching sent item (raw scheduledUrls:',
+                scheduledUrls.size, '):', unmatched.length, unmatched);
+        })();
 
         // Per-BDR breakdown
         const bdrRows = [];
