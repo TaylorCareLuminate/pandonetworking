@@ -2378,7 +2378,7 @@
             // ── Step 3: Load HeyReach inbox replies ───────────────────────────
             const step3 = setLoadingStep('Loading inbox replies…', 'active');
             const { repliedUrls: repliedUrlSet, inboxConversations, bdrReplyMessages, conversationsByUrl: convsByUrl1 } = hasFunnelEmails
-                ? await loadInboxReplies(funnelEmails, 0)
+                ? await loadInboxReplies(funnelEmails, null, null)
                 : { repliedUrls: new Set(), inboxConversations: [], bdrReplyMessages: [], conversationsByUrl: new Map() };
             _grouperConversationsByUrl = convsByUrl1 || new Map();
             updateLoadingStep(step3, `${repliedUrlSet.size} contacts replied`, 'done');
@@ -2386,7 +2386,7 @@
             // ── Step 4: Load scheduled meetings ───────────────────────────────
             const step4 = setLoadingStep('Loading scheduled meetings…', 'active');
             const rawScheduledUrls = hasFunnelEmails
-                ? await loadScheduledMeetings(funnelEmails, inboxConversations, 0)
+                ? await loadScheduledMeetings(funnelEmails, inboxConversations, null, null)
                 : new Set();
             updateLoadingStep(step4, `${rawScheduledUrls.size} scheduled meeting records found`, 'done');
 
@@ -2745,7 +2745,7 @@
     }
 
     // ── Hypothesis Group Breakdown (BDR / Company view) ──────────────────
-    async function renderHypothesisGroupBreakdown(bdrEmailSet, sentItems, acceptedUrls, repliedUrls, scheduledUrls) {
+    async function renderHypothesisGroupBreakdown(bdrEmailSet, sentItems, sentItemsAllTime, acceptedUrls, repliedUrls, scheduledUrls) {
         const card = document.getElementById('hypothesisBreakdownCard');
         const body = document.getElementById('hypothesisBreakdownBody');
         const meta = document.getElementById('hypothesisBreakdownMeta');
@@ -2803,36 +2803,48 @@
             if (norm && !sentSlugMap.has(norm)) sentSlugMap.set(norm, m);
         });
 
-        // Helper: count unique sent contacts that are in a group's target set
+        // Helper: count unique sent contacts that are in a group's target set.
+        // "sent" comes from the windowed sentItems; accepted/replied/scheduled are
+        // matched against sentItemsAllTime (the unbounded superset) since those are now
+        // scoped by their own event date rather than requiring the original connection
+        // to have been sent inside the same window (see loadInboxReplies /
+        // loadScheduledMeetings) — otherwise a contact connected before the window who
+        // replies or schedules a meeting inside it would be dropped from the group total.
         const groupFunnel = (group) => {
             const urlSet  = slugSet(group.contactLinkedInUrls || []);
             const batchSet = new Set(group.sourceBatchIds || []);
             const hasUrls  = urlSet.size > 0;
             const hasBatches = batchSet.size > 0;
-
-            const sentSlugs   = new Set();
-            const sentNorms   = new Set();
-
-            sentItems.forEach(m => {
+            const inGroupFilter = m => {
                 const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-                const inGroup = (hasUrls && urlInSet(raw, urlSet))
-                             || (hasBatches && batchSet.has(m.source_batch_id));
-                if (!inGroup) return;
-                const slug = liSlug(raw);
-                const norm = normalizeUrl(raw);
-                if (slug) sentSlugs.add(slug);
-                if (norm) sentNorms.add(norm);
-            });
+                return (hasUrls && urlInSet(raw, urlSet)) || (hasBatches && batchSet.has(m.source_batch_id));
+            };
 
-            const inSent = (u) => {
-                const s = liSlug(u); if (s && sentSlugs.has(s)) return true;
-                const n = normalizeUrl(u); return n ? sentNorms.has(n) : false;
+            const buildSlugNorms = (list) => {
+                const slugs = new Set(), norms = new Set();
+                list.forEach(m => {
+                    if (!inGroupFilter(m)) return;
+                    const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
+                    const slug = liSlug(raw);
+                    const norm = normalizeUrl(raw);
+                    if (slug) slugs.add(slug);
+                    if (norm) norms.add(norm);
+                });
+                return { slugs, norms };
+            };
+
+            const { slugs: sentSlugs, norms: sentNorms } = buildSlugNorms(sentItems);
+            const { slugs: allSlugs, norms: allNorms }    = buildSlugNorms(sentItemsAllTime || sentItems);
+
+            const inAllTimeSent = (u) => {
+                const s = liSlug(u); if (s && allSlugs.has(s)) return true;
+                const n = normalizeUrl(u); return n ? allNorms.has(n) : false;
             };
 
             const sent      = sentSlugs.size || sentNorms.size;
-            const accepted  = [...(acceptedUrls?.keys?.() || [])].filter(inSent).length;
-            const replied   = [...repliedUrls].filter(inSent).length;
-            const scheduled = [...scheduledUrls].filter(inSent).length;
+            const accepted  = [...(acceptedUrls?.keys?.() || [])].filter(inAllTimeSent).length;
+            const replied   = [...repliedUrls].filter(inAllTimeSent).length;
+            const scheduled = [...scheduledUrls].filter(inAllTimeSent).length;
             const tagged    = group._chunked ? (group._totalContactCount || (group.contactLinkedInUrls || []).length) : (group.contactLinkedInUrls || []).length;
 
             return { sent, accepted, replied, scheduled, tagged };
@@ -3232,8 +3244,6 @@
         const isAllBdrs = currentTab === 'all';
         const { since: _since, until: _until, label: _computedRangeLabel } =
             computeDateRange(document.getElementById('dateRange').value);
-        // Keep a daysBack value for legacy callers that don't yet use since/until
-        const daysBack = _since ? Math.ceil((Date.now() - _since.getTime()) / 86400000) : 0;
 
         try {
             // ── Determine which BDRs to analyze ──
@@ -3292,10 +3302,16 @@
             const allEmailsArr = Array.from(allEmails);
 
             // ── Step 2: Load connect_queue (sent messages) ──
+            // Load unbounded (all-time), then derive the windowed subset client-side.
+            // The all-time set also becomes the matching universe for Accepted/Replied/
+            // Scheduled (see buildResults / renderHypothesisGroupBreakdown): a contact
+            // connected with before the selected window who replies or schedules a
+            // meeting *inside* it must still be counted, since Accepted/Replied/Scheduled
+            // are now scoped by their OWN event date rather than by the date the original
+            // connection was sent (see loadInboxReplies / loadScheduledMeetings).
             let s2 = setLoadingStep('Loading sent messages from connect_queue…', 'active');
-            let sentItems = await loadConnectQueue(allEmailsArr, _since, _until);
-            const rawSentCount = sentItems.length;
-            updateLoadingStep(s2, `${rawSentCount} pushed messages loaded`, 'done');
+            let sentItemsAllTime = await loadConnectQueue(allEmailsArr, null, null);
+            updateLoadingStep(s2, `${sentItemsAllTime.length} pushed messages loaded (all time)`, 'done');
 
             // ── Step 2b: Filter out in-queue connections (not yet dispatched by HeyReach) ──
             // Mirrors the backend bdr_dashboard_service.js logic exactly:
@@ -3341,13 +3357,13 @@
                         return true;
                     };
 
-                    const beforeCount  = sentItems.length;
-                    sentItems          = sentItems.filter(item => !isInQueue(item));
-                    const removedCount = beforeCount - sentItems.length;
+                    const beforeCount  = sentItemsAllTime.length;
+                    sentItemsAllTime   = sentItemsAllTime.filter(item => !isInQueue(item));
+                    const removedCount = beforeCount - sentItemsAllTime.length;
 
                     console.log('[outcomes] Queue filter — pushed:', beforeCount,
                         '| removed (in-queue, ≤30d, no webhook):', removedCount,
-                        '| kept:', sentItems.length,
+                        '| kept:', sentItemsAllTime.length,
                         '| actuallySentUrls:', actuallySentUrls.size);
 
                     updateLoadingStep(s2b,
@@ -3361,6 +3377,29 @@
                         'done');
                 }
             }
+
+            // Derive the windowed "Sent" cohort from the (now queue-filtered) all-time set.
+            // This is purely a date filter on the connect_queue record's own push/created
+            // date — it does NOT gate whether a later Accepted/Replied/Scheduled event
+            // counts (that's handled per-event, against sentItemsAllTime, in buildResults).
+            function sentCreatedAt(item) {
+                return safeToDate(
+                    item.adminApprovedAt || item.customerApprovedAt ||
+                    item.pushed_at || item.created_at ||
+                    item.uploaded_date || item.generated_at || item.review_date
+                );
+            }
+            let sentItems = sentItemsAllTime;
+            if (_since || _until) {
+                sentItems = sentItemsAllTime.filter(item => {
+                    const created = sentCreatedAt(item);
+                    if (created && _since && created < _since) return false;
+                    if (created && _until && created >= _until) return false;
+                    return true;
+                });
+            }
+            console.log('[outcomes] sentItems (windowed):', sentItems.length,
+                '| sentItemsAllTime:', sentItemsAllTime.length);
 
             if (!sentItems.length) {
                 showAlert(
@@ -3382,19 +3421,25 @@
             updateLoadingStep(s3, `${acceptedUrls.size} accepted connections found`, 'done');
 
             // ── Step 4: Load HeyReach inbox (replies) ──
+            // Replied is scoped by the reply's own date (see loadInboxReplies), not by
+            // whether the original connection request falls in the same window.
             let s4 = setLoadingStep('Loading inbox replies…', 'active');
-            const { repliedUrls, inboxConversations, bdrReplyMessages, conversationsByUrl } = await loadInboxReplies(allEmailsArr, daysBack);
+            const { repliedUrls, inboxConversations, bdrReplyMessages, conversationsByUrl } = await loadInboxReplies(allEmailsArr, _since, _until);
             console.log('[outcomes] repliedUrls size:', repliedUrls.size,
                 '| sample (first 5):', [...repliedUrls].slice(0, 5));
             updateLoadingStep(s4, `${repliedUrls.size} contacts replied`, 'done');
 
             // ── Step 5: Load scheduled meetings ──
+            // Scheduled is scoped by the scheduling event's own date (see
+            // loadScheduledMeetings), matching company_review_replies.html's counting
+            // method — a contact connected before the window who schedules a meeting
+            // inside it is still counted here.
             let s5 = setLoadingStep('Loading scheduled meeting data…', 'active');
-            const scheduledUrls = await loadScheduledMeetings(allEmailsArr, inboxConversations, daysBack);
+            const scheduledUrls = await loadScheduledMeetings(allEmailsArr, inboxConversations, _since, _until);
             updateLoadingStep(s5, `${scheduledUrls.size} meetings scheduled`, 'done');
 
             // ── Build results ──
-            const results = buildResults(sentItems, acceptedUrls, repliedUrls, scheduledUrls, targetBdrs);
+            const results = buildResults(sentItems, sentItemsAllTime, acceptedUrls, repliedUrls, scheduledUrls, targetBdrs);
 
             // Stash for AI Grouper + Recent Connections rendering + Word Count
             _grouperSentItems           = sentItems;
@@ -3412,7 +3457,7 @@
             // ── Hypothesis group breakdown (BDR + Company tabs only) ──
             if (currentTab === 'bdr' || currentTab === 'company') {
                 const targetEmails = new Set(targetBdrs.map(b => (b.primaryEmail || b.id || '').toLowerCase()).filter(Boolean));
-                await renderHypothesisGroupBreakdown(targetEmails, sentItems, acceptedUrls, repliedUrls, scheduledUrls);
+                await renderHypothesisGroupBreakdown(targetEmails, sentItems, sentItemsAllTime, acceptedUrls, repliedUrls, scheduledUrls);
             }
 
             // Show save bar for any All BDRs run so the user can explicitly save to cache
@@ -3692,12 +3737,24 @@
     }
 
     // ── Load inbox replies ─────────────────────────────────────────────────
-    async function loadInboxReplies(emailArr, daysBack) {
+    // since/until (Date objects, both optional) scope repliedUrls to replies whose OWN
+    // message date falls in the window — mirrors company_review_replies.html, which
+    // filters by lastMessageAt rather than by when the original connection was sent.
+    // Pass null/null for an unbounded (all-time) load.
+    async function loadInboxReplies(emailArr, since, until) {
         const repliedUrls = new Set();
-        const inboxConversations = []; // [{conversationId, leadProfileUrl, responseCategory, ...}]
+        const inboxConversations = []; // [{conversationId, leadProfileUrl, responseCategory, lastMessageAt, ...}]
         const bdrReplyMessages   = []; // [{text, accountEmail}] — BDR-authored messages in inbox
         const conversationsByUrl = new Map(); // url → [{role, text}] full thread for AI Grouper
         const emailSet = new Set(emailArr.map(e => e.toLowerCase()));
+
+        const dateInWindow = (d) => {
+            if (!since && !until) return true;
+            if (!d) return false;
+            if (since && d < since) return false;
+            if (until && d >= until) return false;
+            return true;
+        };
 
         const inboxFields = ['accountEmail', 'bdrEmail', 'linkedInAccountEmail', 'uploadedByEmail'];
         const promises = [];
@@ -3727,9 +3784,23 @@
 
                 const leadUrl = normalizeUrl(data.leadProfileUrl || data.rawData?.correspondentProfile?.profileUrl || '');
                 const messages = data.rawData?.messages || [];
-                const hasLeadReply = messages.some(m => m.sender === 'CORRESPONDENT' || m.sender === 'lead');
+                const leadMessages = messages.filter(m => m.sender === 'CORRESPONDENT' || m.sender === 'lead');
+                const hasLeadReply = leadMessages.length > 0;
 
-                if (hasLeadReply && leadUrl) repliedUrls.add(leadUrl);
+                // Most-recent lead message date — used to decide whether this reply falls
+                // inside the selected date range (activity-date based, not send-date based).
+                let lastLeadReplyAt = null;
+                leadMessages.forEach(m => {
+                    const t = safeToDate(m.createdAt || m.timestamp);
+                    if (t && (!lastLeadReplyAt || t > lastLeadReplyAt)) lastLeadReplyAt = t;
+                });
+                const lastMsgRaw = messages.length ? messages[messages.length - 1] : null;
+                const lastMessageAt = safeToDate(data.lastMessageAt) || lastLeadReplyAt ||
+                    (lastMsgRaw ? safeToDate(lastMsgRaw.createdAt || lastMsgRaw.timestamp) : null);
+
+                if (hasLeadReply && leadUrl && dateInWindow(lastLeadReplyAt || lastMessageAt)) {
+                    repliedUrls.add(leadUrl);
+                }
 
                 // Collect BDR-authored messages for word-count (uses same sender logic as review_replies.html)
                 const convAccountEmail = (data.accountEmail || data.bdrEmail || '').toLowerCase();
@@ -3756,6 +3827,7 @@
                     responseCategory: data.responseCategory || '',
                     followUpCategory: data.followUpCategory || '',
                     hasLeadReply,
+                    lastMessageAt,
                     accountEmail: convAccountEmail
                 });
             });
@@ -3764,10 +3836,37 @@
         return { repliedUrls, inboxConversations, bdrReplyMessages, conversationsByUrl };
     }
 
+    // Parses the LinkedIn slug embedded in a synthetic "webhook_" conversation ID
+    // (format: webhook_<slug-or-name>[_<bdrEmail>] — see company_review_replies.html's
+    // webhook-conversation synthesis). Webhook-sourced conversations have no
+    // heyreach_inbox document of their own, so this is the only way to recover a
+    // contact URL for a 'Scheduled' override recorded against one of them.
+    function slugFromWebhookConvId(convId) {
+        if (!convId || typeof convId !== 'string' || !convId.startsWith('webhook_')) return null;
+        let rest = convId.slice('webhook_'.length);
+        const lastUnderscore = rest.lastIndexOf('_');
+        if (lastUnderscore > -1 && rest.slice(lastUnderscore + 1).includes('@')) {
+            rest = rest.slice(0, lastUnderscore);
+        }
+        return rest || null;
+    }
+
     // ── Load scheduled meetings ────────────────────────────────────────────
-    async function loadScheduledMeetings(emailArr, inboxConversations, daysBack) {
+    // since/until (Date objects, both optional) scope results to meetings scheduled
+    // whose OWN event date falls in the window — mirrors company_review_replies.html's
+    // activity-date filtering rather than requiring the original connection to have
+    // been sent inside the same window. Pass null/null for an unbounded (all-time) load.
+    async function loadScheduledMeetings(emailArr, inboxConversations, since, until) {
         const scheduledUrls = new Set();
         const emailSet = new Set(emailArr.map(e => e.toLowerCase()));
+
+        const dateInWindow = (d) => {
+            if (!since && !until) return true;
+            if (!d) return false;
+            if (since && d < since) return false;
+            if (until && d >= until) return false;
+            return true;
+        };
 
         // Source 1: activity_tracking (most reliable – has bdr_email + contact_linkedin_url)
         try {
@@ -3785,48 +3884,60 @@
                 if (!snap) continue;
                 snap.forEach(d => {
                     const data = d.data();
+                    const scheduledAt = safeToDate(
+                        data.scheduled_at || data.meeting_scheduled_date ||
+                        data.created_at || data.timestamp
+                    );
+                    if (!dateInWindow(scheduledAt)) return;
                     const url = normalizeUrl(data.contact_linkedin_url || '');
                     if (url) scheduledUrls.add(url);
                 });
             }
         } catch(e) { console.warn('activity_tracking scheduled load failed:', e); }
 
-        // Source 2: inbox conversations with responseCategory = 'Scheduled'
-        inboxConversations.forEach(conv => {
-            if (conv.responseCategory === 'Scheduled' && conv.leadProfileUrl) {
-                scheduledUrls.add(conv.leadProfileUrl);
+        // Source 2: inbox conversations with responseCategory = 'Scheduled' — filtered
+        // by the conversation's own lastMessageAt so meetings surface in the period the
+        // scheduling activity happened, not the period the connection was originally sent.
+        const convIdToUrl = new Map();
+        inboxConversations.forEach(c => {
+            if (c.conversationId && c.leadProfileUrl) convIdToUrl.set(c.conversationId, c.leadProfileUrl);
+            if (c.responseCategory === 'Scheduled' && c.leadProfileUrl && dateInWindow(c.lastMessageAt)) {
+                scheduledUrls.add(c.leadProfileUrl);
             }
         });
 
-        // Source 3: conversation_category_overrides
-        if (inboxConversations.length > 0) {
-            const convIds = [...new Set(inboxConversations.map(c => c.conversationId).filter(Boolean))];
-            // Build URL map from inbox
-            const convIdToUrl = new Map();
-            inboxConversations.forEach(c => {
-                if (c.conversationId && c.leadProfileUrl) convIdToUrl.set(c.conversationId, c.leadProfileUrl);
-            });
-            // Load overrides in chunks
-            const idChunks = [];
-            for (let i = 0; i < convIds.length; i += 30) idChunks.push(convIds.slice(i, i + 30));
-            for (const chunk of idChunks) {
+        // Source 3: conversation_category_overrides — used for "webhook_"-sourced
+        // conversations (synthesized from heyreach_activity in company_review_replies.html),
+        // which have no heyreach_inbox document to update directly and so store category
+        // changes here instead. Query by bdrEmail directly (rather than re-scanning the
+        // whole shared, cross-customer collection once per conversation-ID chunk with a
+        // limit(1000)) — the previous approach could silently truncate and miss this
+        // company's records once the platform-wide "Scheduled" override count passed 1000.
+        try {
+            const chunks = [];
+            for (let i = 0; i < emailArr.length; i += 30) chunks.push(emailArr.slice(i, i + 30));
+            for (const chunk of chunks) {
                 if (!chunk.length) continue;
-                try {
-                    const q = query(
-                        collection(emailDB, 'conversation_category_overrides'),
-                        where('responseCategory', '==', 'Scheduled'),
-                        limit(1000)
-                    );
-                    const snap = await getDocs(q).catch(e => null);
-                    if (!snap) continue;
-                    snap.forEach(d => {
-                        if (!chunk.includes(d.id)) return;
-                        const url = convIdToUrl.get(d.id);
-                        if (url) scheduledUrls.add(url);
-                    });
-                } catch(e) { console.warn('conversation_category_overrides load failed:', e); }
+                const q = query(
+                    collection(emailDB, 'conversation_category_overrides'),
+                    where('bdrEmail', 'in', chunk),
+                    where('responseCategory', '==', 'Scheduled'),
+                    limit(2000)
+                );
+                const snap = await getDocs(q).catch(e => null);
+                if (!snap) continue;
+                snap.forEach(d => {
+                    const data = d.data();
+                    if (!dateInWindow(safeToDate(data.updatedAt))) return;
+                    let url = convIdToUrl.get(d.id) || (data.conversationId && convIdToUrl.get(data.conversationId));
+                    if (!url) {
+                        const slug = slugFromWebhookConvId(d.id) || slugFromWebhookConvId(data.conversationId);
+                        if (slug) url = `https://www.linkedin.com/in/${slug}`;
+                    }
+                    if (url) scheduledUrls.add(normalizeUrl(url));
+                });
             }
-        }
+        } catch(e) { console.warn('conversation_category_overrides load failed:', e); }
 
         // Correction step: activity_tracking is append-only, so if a meeting was previously
         // scheduled but later un-scheduled (category changed in the inbox), the activity_tracking
@@ -3853,31 +3964,40 @@
     }
 
     // ── Build structured results ──────────────────────────────────────────
-    function buildResults(sentItems, acceptedUrls, repliedUrls, scheduledUrls, targetBdrs) {
+    // sentItemsAllTime is the unbounded (any date) superset of sentItems for the same
+    // BDRs — used as the matching universe for Accepted/Replied/Scheduled so that a
+    // contact connected before the selected window, who then replies or schedules a
+    // meeting inside it, is still attributed to the right message-type / BDR row
+    // instead of silently falling out of the totals. "Sent" counts always come from
+    // the windowed sentItems.
+    function buildResults(sentItems, sentItemsAllTime, acceptedUrls, repliedUrls, scheduledUrls, targetBdrs) {
+        const classify = (items) => {
+            const groups = { post: [], org_news: [], contact_news: [], story_search: [], recovered_post: [], news: [], profile: [], complement: [], fast_prospect: [], about_me_connect: [], other: [] };
+            items.forEach(item => {
+                const mtype = classifyMessageType(item);
+                if (groups[mtype]) {
+                    groups[mtype].push(item);
+                } else {
+                    groups.other.push(item);
+                }
+            });
+            // Always merge legacy 'news' into 'org_news' to prevent a duplicate "Organization News" row
+            // (both buckets share the same label; 'news' is only kept for old cached data compatibility).
+            groups.org_news.push(...groups.news);
+            groups.news = [];
+            // For All BDRs view: also bucket secondary categories into 'other' so only the five primary types show.
+            if (currentTab === 'all') {
+                for (const t of ['contact_news', 'story_search', 'recovered_post', 'complement']) {
+                    groups.other.push(...groups[t]);
+                    groups[t] = [];
+                }
+            }
+            return groups;
+        };
+
         // Group by message type
-        const typeGroups = { post: [], org_news: [], contact_news: [], story_search: [], recovered_post: [], news: [], profile: [], complement: [], fast_prospect: [], about_me_connect: [], other: [] };
-
-        sentItems.forEach(item => {
-            const mtype = classifyMessageType(item);
-            if (typeGroups[mtype]) {
-                typeGroups[mtype].push(item);
-            } else {
-                typeGroups.other.push(item);
-            }
-        });
-
-        // Always merge legacy 'news' into 'org_news' to prevent a duplicate "Organization News" row
-        // (both buckets share the same label; 'news' is only kept for old cached data compatibility).
-        typeGroups.org_news.push(...typeGroups.news);
-        typeGroups.news = [];
-
-        // For All BDRs view: also bucket secondary categories into 'other' so only the five primary types show.
-        if (currentTab === 'all') {
-            for (const t of ['contact_news', 'story_search', 'recovered_post', 'complement']) {
-                typeGroups.other.push(...typeGroups[t]);
-                typeGroups[t] = [];
-            }
-        }
+        const typeGroups        = classify(sentItems);
+        const typeGroupsAllTime = classify(sentItemsAllTime || sentItems);
 
         // Compute funnel for each type
         const types = ['post', 'org_news', 'contact_news', 'story_search', 'recovered_post', 'news', 'profile', 'complement', 'fast_prospect', 'about_me_connect', 'other'];
@@ -3903,8 +4023,13 @@
             '| repliedSlugSet size:', repliedSlugSet.size,
             '| scheduledSlugSet size:', scheduledSlugSet.size);
 
-        // Build per-sent-item sets for matching (slug + normalised URL, same as groups flow)
-        function computeRow(items) {
+        // Build per-sent-item slug/norm sets. `items` (windowed) determines the "sent"
+        // count; `allTimeItems` (unbounded superset) determines which contacts are
+        // eligible to match against accepted/replied/scheduled — since those are now
+        // scoped by their own event date rather than requiring the original connection
+        // to fall in the same window, this is what stops legitimate meetings from a
+        // contact connected before the window from disappearing.
+        function computeRow(items, allTimeItems) {
             const sentSlugs = new Set();
             const sentNorms = new Set();
             items.forEach(item => {
@@ -3915,20 +4040,25 @@
                 if (norm) sentNorms.add(norm);
             });
 
-            // inSent: check by slug first, then normalised URL
-            const inAccepted  = (url) => { const s = liSlug(url); return (s && acceptedSlugSet.has(s))  || acceptedSlugSet.has(normalizeUrl(url)); };
-            const inReplied   = (url) => { const s = liSlug(url); return (s && repliedSlugSet.has(s))   || repliedSlugSet.has(normalizeUrl(url)); };
-            const inScheduled = (url) => { const s = liSlug(url); return (s && scheduledSlugSet.has(s)) || scheduledSlugSet.has(normalizeUrl(url)); };
+            const allSlugs = new Set();
+            const allNorms = new Set();
+            (allTimeItems || items).forEach(item => {
+                const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
+                const slug = liSlug(raw);
+                const norm = normalizeUrl(raw);
+                if (slug) allSlugs.add(slug);
+                if (norm) allNorms.add(norm);
+            });
 
             let accepted = 0, replied = 0, scheduled = 0;
-            // Iterate unique sent slugs (plus norms for items without a slug) and match
-            sentSlugs.forEach(slug => {
+            // Iterate unique all-time slugs (plus norms for items without a slug) and match
+            allSlugs.forEach(slug => {
                 if (acceptedSlugSet.has(slug))  accepted++;
                 if (repliedSlugSet.has(slug))   replied++;
                 if (scheduledSlugSet.has(slug)) scheduled++;
             });
-            // Also check sentNorms for items whose URL had no extractable slug
-            sentNorms.forEach(norm => {
+            // Also check norms for items whose URL had no extractable slug
+            allNorms.forEach(norm => {
                 const slug = liSlug(norm);
                 if (!slug) { // only count norms not already covered by slug
                     if (acceptedSlugSet.has(norm))  accepted++;
@@ -3938,6 +4068,7 @@
             });
 
             console.log('[outcomes] computeRow — sent slugs:', sentSlugs.size,
+                '| all-time slugs:', allSlugs.size,
                 '| accepted:', accepted, '| replied:', replied, '| scheduled:', scheduled,
                 '| sample sent slugs:', [...sentSlugs].slice(0, 3));
 
@@ -3946,13 +4077,13 @@
 
         types.forEach(t => {
             if (!typeGroups[t].length) return;
-            const row = computeRow(typeGroups[t]);
+            const row = computeRow(typeGroups[t], typeGroupsAllTime[t]);
             row.type = t;
             rows.push(row);
         });
 
         // Compute grand total across ALL sent items (deduped by LinkedIn URL) to avoid double-counting
-        const grandTotal = computeRow(sentItems);
+        const grandTotal = computeRow(sentItems, sentItemsAllTime);
         grandTotal.type = 'total';
 
         // Per-BDR breakdown
@@ -3962,13 +4093,12 @@
             if (bdr.primaryEmail) bdrEmails.add(bdr.primaryEmail.toLowerCase());
             if (bdr._linkedInEmail) bdrEmails.add(bdr._linkedInEmail.toLowerCase());
 
-            const bdrItems = sentItems.filter(item => {
-                const ae = (item.account_email || '').toLowerCase();
-                return bdrEmails.has(ae);
-            });
+            const matchesBdrEmail = item => bdrEmails.has((item.account_email || '').toLowerCase());
+            const bdrItems = sentItems.filter(matchesBdrEmail);
             if (!bdrItems.length) return;
+            const bdrItemsAllTime = (sentItemsAllTime || sentItems).filter(matchesBdrEmail);
 
-            const row = computeRow(bdrItems);
+            const row = computeRow(bdrItems, bdrItemsAllTime);
             row.name = bdr.name || bdr.primaryEmail || bdr.id;
             bdrRows.push(row);
         });
