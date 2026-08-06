@@ -1243,6 +1243,10 @@
       <i class="fas fa-spinner fa-spin" id="fuSpinner" style="color:var(--secondary);font-size:1.1em;"></i>
       <span id="fuStatusMsg" style="font-weight:600;font-size:0.9em;color:var(--primary);">Starting…</span>
       <span style="margin-left:auto;font-size:0.8em;color:#6b7280;" id="fuJobCount"></span>
+      <button id="fuStopBtn" onclick="window.stopFollowupScan()"
+        style="padding:5px 14px;background:var(--danger);color:#fff;border:none;border-radius:7px;font-size:0.82em;font-weight:600;cursor:pointer;">
+        <i class="fas fa-stop"></i> Stop
+      </button>
     </div>
     <div class="fu-progress-bar-wrap">
       <div class="fu-progress-bar" id="fuProgressBar" style="width:0%"></div>
@@ -4143,9 +4147,9 @@ ${escHtml(cached.text)}
      conversations already gathered for each company.
   ============================================================ */
 
-  let fuScanResults   = [];   // raw followUp objects from all jobs
-  let fuPollTimers    = [];   // active poll timeouts
+  let fuScanResults   = [];   // followUp result objects from the last scan
   let fuComposeState  = {};   // current compose modal context
+  let fuShouldStop    = false; // set by the Stop button — halts the scan after the current company
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -4189,38 +4193,45 @@ ${escHtml(cached.text)}
     const fitThreshold    = parseInt(document.getElementById('fuThreshold').value)    || 5;
     const minDaysSince    = parseInt(document.getElementById('fuMinDays').value)      || 21;
     const testN           = parseInt(document.getElementById('fuTestN').value) || null;
+    const skipScheduled   = document.getElementById('fuSkipScheduled').value === 'true';
 
     if (!screeningPrompt || !contentPrompt) {
       showToast('Fill in both prompt fields before scanning.', 'warning'); return;
     }
 
-    // Stop any stale polls from the old approach
-    fuPollTimers.forEach(t => clearTimeout(t));
-    fuPollTimers  = [];
     fuScanResults = [];
+    fuShouldStop  = false;
 
     fuSetBtnState(true);
     document.getElementById('fuCriteriaPanel').style.display = 'none';
     document.getElementById('fuProgressPanel').style.display = 'block';
     document.getElementById('fuResultsPanel').style.display  = 'none';
     document.getElementById('fuLog').innerHTML = '';
+    document.getElementById('fuStopBtn').style.display = '';
     fuSetStatus('Preparing…', 0);
 
     // Stages that indicate the account is already a customer — skip follow-up
     const SKIP_STAGES = new Set(['active', 'building', 'paused']);
 
-    // Target: scanned companies that have at least one email or LinkedIn conversation
+    // Reusable filter: genuine person-to-person emails inside the lookback window.
+    // Marketing/automated emails are stripped BEFORE the AI sees them so they don't
+    // waste an AI call or skew the interest score.
     const cutoff = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
-    const pool   = allAccounts.filter(a => {
+    const realEmailsOf = s => (s.emails || []).filter(e =>
+      (!e.date || new Date(e.date) >= cutoff) &&
+      !isMarketingEmail({ from: e.from, subject: e.subject, to: e.to }));
+    const liMsgsOf = s => (s.linkedInMessages || []).filter(li =>
+      !li.date || new Date(li.date) >= cutoff);
+
+    // Target: scanned companies that have at least one real email or LinkedIn conversation
+    const pool = allAccounts.filter(a => {
       // Skip existing customers (Active / Building / Paused)
       const stage = (a.stage || '').toLowerCase().trim();
       if (SKIP_STAGES.has(stage)) return false;
 
       const s = scanState[a.id];
       if (!s?.lastScanDate) return false;
-      const hasEmail = (s.emails          || []).some(e => !e.date || new Date(e.date) >= cutoff);
-      const hasLI    = (s.linkedInMessages || []).some(li => !li.date || new Date(li.date) >= cutoff);
-      return hasEmail || hasLI;
+      return realEmailsOf(s).length > 0 || liMsgsOf(s).length > 0;
     });
     const targetAccounts = testN ? pool.slice(0, testN) : pool;
 
@@ -4241,14 +4252,20 @@ ${escHtml(cached.text)}
     document.getElementById('fuJobCount').textContent = `0 / ${targetAccounts.length} analyzed`;
 
     const results = [];
+    let analyzed  = 0;
 
     for (let i = 0; i < targetAccounts.length; i++) {
+      if (fuShouldStop) {
+        fuLog(`⏹ Stopped by user after ${analyzed} of ${targetAccounts.length} companies.`, 'warning');
+        break;
+      }
+
       const account = targetAccounts[i];
       const scan    = scanState[account.id];
       if (!scan) continue;
 
-      const emails = (scan.emails          || []).filter(e  => !e.date  || new Date(e.date)  >= cutoff);
-      const liMsgs = (scan.linkedInMessages || []).filter(li => !li.date || new Date(li.date) >= cutoff);
+      const emails = realEmailsOf(scan);
+      const liMsgs = liMsgsOf(scan);
       const notes  = scan.notes || [];
 
       const pct = Math.round((i / targetAccounts.length) * 90);
@@ -4256,9 +4273,10 @@ ${escHtml(cached.text)}
       fuLog(`[${account.name}] ${emails.length} email(s), ${liMsgs.length} LinkedIn conv(s)`);
 
       const analysis = await fuAnalyzeCompany(account, emails, liMsgs, notes,
-                                               screeningPrompt, contentPrompt, minDaysSince);
+                                               screeningPrompt, contentPrompt, minDaysSince, skipScheduled);
 
-      document.getElementById('fuJobCount').textContent = `${i + 1} / ${targetAccounts.length} analyzed`;
+      analyzed++;
+      document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
 
       if (!analysis) {
         fuLog(`  ⚠ AI call failed — skipped`, 'warning');
@@ -4306,27 +4324,48 @@ ${escHtml(cached.text)}
           _accountId:        account.id,
           _accountName:      account.name,
           _crmNotes:         notes,
-          _emails:           emails.filter(e => !isMarketingEmail({ from: e.from, subject: e.subject, to: e.to })),
+          _emails:           emails, // already filtered to real (non-marketing) emails above
           _liMsgs:           enrichLiMsgDates(liMsgs),
           _bdrEmail:         bdrEmail,
         });
         fuLog(`  ✓ Follow-up recommended for ${analysis.contactName} (score ${analysis.fitScore}/10, ${analysis.urgency})`, 'success');
       } else {
-        fuLog(`  — No follow-up needed (score ${analysis.fitScore || '?'}/10)`);
+        fuLog(`  — No follow-up needed (score ${analysis.fitScore || '?'}/10)${analysis.reason ? ' — ' + analysis.reason : ''}`);
       }
 
-      await sleep(1000); // 1 s between AI calls to avoid rate-limit (429)
+      if (i < targetAccounts.length - 1 && !fuShouldStop) {
+        await sleep(1000); // 1 s between AI calls to avoid rate-limit (429)
+      }
     }
 
+    document.getElementById('fuStopBtn').style.display = 'none';
     fuScanResults = results;
-    fuSetStatus(`Complete — ${results.length} follow-up opportunit${results.length === 1 ? 'y' : 'ies'}`, 100);
-    showFollowupResults(results, targetAccounts.length, results.length);
+    const stopped = fuShouldStop;
+    fuShouldStop  = false;
+    fuSetStatus(`${stopped ? 'Stopped — partial results: ' : 'Complete — '}${results.length} follow-up opportunit${results.length === 1 ? 'y' : 'ies'}`, 100);
+
+    // Last-scan note next to the scan button
+    const noteEl = document.getElementById('fuCacheNote');
+    if (noteEl) {
+      const ts = new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      noteEl.textContent = `Last scan: ${ts} · ${analyzed} compan${analyzed === 1 ? 'y' : 'ies'} analyzed · ${results.length} opportunit${results.length === 1 ? 'y' : 'ies'}${stopped ? ' (stopped early)' : ''}`;
+    }
+
+    showFollowupResults(results, analyzed, results.length);
+  };
+
+  window.stopFollowupScan = function () {
+    fuShouldStop = true;
+    fuSetStatus('Stopping after the current company finishes…');
+    const btn = document.getElementById('fuStopBtn');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Stopping…'; }
+    setTimeout(() => { if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-stop"></i> Stop'; } }, 4000);
   };
 
   // ── Per-company AI analysis ─────────────────────────────────────────────────
 
   async function fuAnalyzeCompany(account, emails, liMsgs, notes,
-                                   screeningPrompt, contentPrompt, minDaysSince) {
+                                   screeningPrompt, contentPrompt, minDaysSince, skipScheduled) {
     const today = new Date().toLocaleDateString('en-US',
       { month: 'long', day: 'numeric', year: 'numeric' });
 
@@ -4364,6 +4403,7 @@ RULES:
 - IGNORE any automated, marketing, or bulk emails (no-reply senders, newsletters, unsubscribe notices, out-of-office replies, receipts, delivery notifications, password resets). Only consider genuine person-to-person messages.
 - Do NOT recommend follow-up if the BDR's most recent outbound message was sent fewer than ${minDaysSince} days ago with no reply yet.
 - Do NOT recommend follow-up if the contact clearly declined, asked to stop, or unsubscribed.
+${skipScheduled ? '- Do NOT recommend follow-up if a meeting or call is already scheduled, or the contact said they would book a time — they are already in motion.' : ''}
 - DO recommend follow-up if a contact replied with interest and the conversation has since gone quiet, there is an unanswered question, or it has been more than ${minDaysSince} days since meaningful two-way contact and the signals are positive.
 ${screeningPrompt ? '- ADDITIONAL CRITERIA: ' + screeningPrompt : ''}
 
@@ -4382,7 +4422,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             provider:    'openrouter',
-            model:       'meta-llama/llama-4-maverick',
+            model:       'moonshotai/kimi-k3',
             prompt,
             temperature: 0.3,
             max_tokens:  700,
@@ -4448,195 +4488,48 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     return lines.join('\n');
   }
 
-  // Try to extract the contact's email address from email threads
+  // Try to extract the contact's email address from email threads.
+  // Prefers an address whose display name matches the AI-identified contact;
+  // falls back to the first external (non-team) address found.
   function fuExtractContactEmail(emails, contactName, bdrEmail) {
-    const bdr = (bdrEmail || '').toLowerCase();
+    const bdr       = (bdrEmail || '').toLowerCase();
+    const nameLower = (contactName || '').toLowerCase().trim();
+    const firstName = nameLower.split(/\s+/)[0] || '';
+    const lastName  = nameLower.split(/\s+/).slice(-1)[0] || '';
+
+    let firstExternal = '';
     for (const e of emails) {
       // Look at the non-BDR side of each thread
-      const candidates = [e.from, e.to].flatMap(f => {
+      const candidates = [e.from, e.to, e.cc].flatMap(f => {
         if (!f) return [];
         return f.split(/[,;]/).map(s => s.trim());
       });
       for (const addr of candidates) {
         const match = addr.match(/<([^>]+)>/) || addr.match(/([^\s]+@[^\s]+)/);
         const email = match?.[1]?.toLowerCase();
-        if (email && email !== bdr && !INTERNAL_DOMAINS.some(d => email.endsWith('@' + d)) && email.includes('@')) {
-          return email;
-        }
+        if (!email || !email.includes('@')) continue;
+        if (email === bdr) continue;
+        if (INTERNAL_DOMAINS.some(d => email.endsWith('@' + d))) continue;
+        if (internalBDREmails.has(email)) continue; // covers LinkedIn-login emails too
+
+        // Strong signal: display name or address local-part matches the contact's name
+        const displayName = addr.includes('<')
+          ? addr.slice(0, addr.indexOf('<')).replace(/["']/g, '').trim().toLowerCase()
+          : '';
+        const localPart = email.split('@')[0];
+        const nameHit = nameLower && (
+          (displayName && (displayName === nameLower ||
+            (firstName.length > 1 && displayName.includes(firstName) &&
+             lastName.length  > 1 && displayName.includes(lastName)))) ||
+          (firstName.length > 1 && lastName.length > 1 &&
+           localPart.includes(firstName) && localPart.includes(lastName))
+        );
+        if (nameHit) return email;
+
+        if (!firstExternal) firstExternal = email;
       }
     }
-    return '';
-  }
-
-  // Builds a compact notes context string to inject into the AI screening prompt
-  function buildNotesContext(accounts, notesMap) {
-    const lines = [];
-    accounts.forEach(a => {
-      const notes = notesMap[a.id];
-      if (!notes || notes.length === 0) return;
-      lines.push(`[${a.name}]`);
-      notes.slice(0, 5).forEach(n => {  // cap at 5 notes per company to keep prompt size sane
-        const dateStr = n.date ? new Date(n.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '';
-        const typeStr = n.type && n.type !== 'Note' ? `(${n.type}) ` : '';
-        lines.push(`  ${dateStr ? dateStr + ' — ' : ''}${typeStr}${stripHtml(n.content).slice(0, 300)}`);
-      });
-    });
-    return lines.join('\n');
-  }
-
-  // ── Job polling ─────────────────────────────────────────────────────────────
-
-  const FU_MAX_CONSECUTIVE_ERRORS = 5;   // give up on a job after this many back-to-back network errors
-  const FU_MAX_POLL_MS             = 8 * 60 * 1000; // 8-minute hard wall-clock limit per run
-  const FU_POLL_INTERVAL_MS        = 4000; // ms between poll sweeps (4 s — enough to see progress without hammering)
-
-  async function fuPollAllJobs(jobs, testN, accountNotesMap, targetAccounts) {
-    let allDone   = false;
-    const deadline = Date.now() + FU_MAX_POLL_MS;
-
-    const poll = async () => {
-      if (allDone) return;
-
-      // ── Wall-clock timeout guard ────────────────────────────────────────
-      if (Date.now() > deadline) {
-        const abandoned = jobs.filter(j => !j.done);
-        abandoned.forEach(j => {
-          j.done   = true;
-          j.failed = true;
-          j.timedOut = true;
-        });
-        fuLog(`⏱ Poll timed out after ${FU_MAX_POLL_MS / 60000} minutes. ${abandoned.length} job(s) abandoned.`, 'warning');
-        allDone = true;
-        finishFollowupScan(jobs, testN, accountNotesMap, targetAccounts);
-        return;
-      }
-
-      const pending = jobs.filter(j => !j.done);
-      if (pending.length === 0) {
-        allDone = true;
-        finishFollowupScan(jobs, testN, accountNotesMap, targetAccounts);
-        return;
-      }
-
-      let totalPct = 0;
-      for (const job of jobs) {
-        if (job.done) { totalPct += 100; continue; }
-        try {
-          const headers = await getAuthHeaders();
-          const res  = await fetch(`${RAILWAY_URL}/api/connect/generation-job/${job.jobId}`, { headers });
-          const data = await res.json();
-          const j    = data.job || data;
-          const pct  = j.progress?.percentage || 0;
-          totalPct += pct;
-
-          // Reset error streak on any successful response
-          job.errorCount = 0;
-
-          const msg = j.progress?.message || j.status || '…';
-          fuLog(`[${job.bdrEmail}] ${msg}`);
-
-          if (j.status === 'completed' || j.status === 'failed') {
-            job.done    = true;
-            job.results = j.results || null;
-            job.failed  = j.status === 'failed';
-            if (j.status === 'completed' && j.results?.followUps) {
-              fuLog(`✓ ${job.bdrEmail}: ${j.results.followUps.length} opportunities found`, 'success');
-            } else if (j.status === 'failed') {
-              fuLog(`✗ ${job.bdrEmail}: job failed`, 'error');
-            }
-            document.getElementById('fuJobCount').textContent =
-              `${jobs.filter(j=>j.done).length}/${jobs.length} jobs done`;
-          }
-        } catch (e) {
-          job.errorCount = (job.errorCount || 0) + 1;
-
-          // Only log first error in a streak to avoid console flooding
-          if (job.errorCount === 1) {
-            fuLog(`Poll error (${job.bdrEmail}): ${e.message}`, 'error');
-          }
-
-          if (job.errorCount >= FU_MAX_CONSECUTIVE_ERRORS) {
-            job.done   = true;
-            job.failed = true;
-            job.networkAbandoned = true;
-            fuLog(`✗ ${job.bdrEmail}: abandoned after ${job.errorCount} consecutive network errors`, 'error');
-            document.getElementById('fuJobCount').textContent =
-              `${jobs.filter(j=>j.done).length}/${jobs.length} jobs done`;
-          }
-        }
-      }
-
-      const overall = jobs.length > 0 ? totalPct / jobs.length : 0;
-      fuSetStatus(`Running… (${jobs.filter(j=>j.done).length}/${jobs.length} jobs done)`, overall);
-
-      if (jobs.every(j => j.done)) {
-        allDone = true;
-        finishFollowupScan(jobs, testN, accountNotesMap, targetAccounts);
-      } else {
-        const timer = setTimeout(poll, FU_POLL_INTERVAL_MS);
-        fuPollTimers.push(timer);
-      }
-    };
-
-    const timer = setTimeout(poll, 2000);
-    fuPollTimers.push(timer);
-  }
-
-  // ── Collate results ─────────────────────────────────────────────────────────
-
-  function finishFollowupScan(jobs, testN, accountNotesMap, targetAccounts) {
-    document.getElementById('fuSpinner').style.display = 'none';
-    fuPollTimers = [];
-
-    // Collect all follow-ups from all jobs
-    const all = [];
-    jobs.forEach(job => {
-      if (job.results?.followUps) {
-        job.results.followUps.forEach(fu => all.push({ ...fu, _bdrEmail: job.bdrEmail }));
-      }
-    });
-
-    // Attach CRM notes to each follow-up by matching contactCompany → account
-    const accountList = targetAccounts || allAccounts;
-    all.forEach(fu => {
-      const co = (fu.contactCompany || fu.company || '').toLowerCase();
-      const match = accountList.find(a => {
-        const an = a.name.toLowerCase();
-        return co === an || co.includes(an) || an.includes(co) || companyTokenMatch(co, an);
-      });
-      if (match && accountNotesMap?.[match.id]) {
-        fu._crmNotes   = accountNotesMap[match.id];
-        fu._accountId  = match.id;
-        fu._accountName = match.name;
-      }
-    });
-
-    // Optionally filter to target accounts
-    let filtered = all;
-    if (testN && accountList.length > 0) {
-      const coNames = new Set(accountList.map(a => a.name.toLowerCase()));
-      if (coNames.size > 0) {
-        filtered = all.filter(fu => {
-          const co = (fu.contactCompany || fu.company || '').toLowerCase();
-          return [...coNames].some(n => co.includes(n) || n.includes(co) || companyTokenMatch(co, n));
-        });
-        fuLog(`Filtered to ${filtered.length} results matching ${accountList.length} scanned companies`);
-      }
-    }
-
-    fuScanResults = filtered;
-
-    const abandoned = jobs.filter(j => j.networkAbandoned || j.timedOut);
-    if (abandoned.length) {
-      const reason = abandoned.some(j => j.timedOut) ? 'timed out' : 'network error';
-      fuLog(`⚠ ${abandoned.length} job(s) did not complete (${reason}). Results may be partial.`, 'warning');
-    }
-    fuSetStatus(`${abandoned.length ? 'Partial — ' : 'Complete — '}${filtered.length} follow-up opportunities`, 100);
-
-    const totalScanned  = jobs.reduce((s, j) => s + (j.results?.scanned  || 0), 0);
-    const totalApproved = jobs.reduce((s, j) => s + (j.results?.approved || 0), 0);
-
-    showFollowupResults(filtered, totalScanned, totalApproved);
+    return firstExternal;
   }
 
   // ── Render results ──────────────────────────────────────────────────────────
