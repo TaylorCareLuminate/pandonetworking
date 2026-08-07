@@ -253,29 +253,57 @@
             </div>
             <div class="stats-grid" id="statsGrid"></div>
 
-            <h2 style="font-size: 1.1rem; margin-top: 1.5rem;"><i class="fas fa-envelope-open-text"></i> Decline Replies Found</h2>
+            <h2 style="font-size: 1.1rem; margin-top: 1.5rem; color: var(--declined);">
+                <i class="fas fa-user-slash"></i> CRM Prospects to Decline
+            </h2>
+            <p style="color: #64748b; font-size: 0.9rem; margin-bottom: 0.75rem;">
+                Only senders that match a contact in <code>outreach_sets</code>. Instagram / newsletters / unrelated mail are excluded.
+            </p>
             <div style="overflow-x: auto;">
                 <table>
                     <thead>
                         <tr>
-                            <th>Sender</th>
+                            <th>Prospect</th>
+                            <th>Email</th>
                             <th>Date</th>
                             <th>Subject</th>
                             <th>What they said</th>
+                            <th>CRM Contacts</th>
                             <th>Detected by</th>
                         </tr>
                     </thead>
-                    <tbody id="candidatesBody"></tbody>
+                    <tbody id="prospectsBody"></tbody>
                 </table>
             </div>
-            <div class="empty-note" id="candidatesEmpty" style="display: none;">No decline replies found in this window.</div>
+            <div class="empty-note" id="prospectsEmpty" style="display: none;">No CRM prospects with decline replies in this window.</div>
 
-            <h2 style="font-size: 1.1rem; margin-top: 2rem;"><i class="fas fa-broom"></i> Per-Contact Actions</h2>
+            <details id="noiseDetails" style="margin-top: 1.5rem; display: none;">
+                <summary style="cursor: pointer; font-weight: 600; color: #64748b;">
+                    Other matches (not in CRM / noise) — <span id="noiseCount">0</span>
+                </summary>
+                <div style="overflow-x: auto; margin-top: 0.75rem;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Sender</th>
+                                <th>Date</th>
+                                <th>Subject</th>
+                                <th>What they said</th>
+                                <th>Detected by</th>
+                            </tr>
+                        </thead>
+                        <tbody id="candidatesBody"></tbody>
+                    </table>
+                </div>
+            </details>
+
+            <h2 style="font-size: 1.1rem; margin-top: 2rem;"><i class="fas fa-broom"></i> Per-Prospect Actions</h2>
             <div style="overflow-x: auto;">
                 <table>
                     <thead>
                         <tr>
                             <th>Sender</th>
+                            <th>Name(s)</th>
                             <th>Contacts</th>
                             <th>Marked Declined</th>
                             <th>Pending Emails Deleted</th>
@@ -444,23 +472,45 @@
             currentRunId = result.runId || result.id || null;
             const t = result.totals || {};
             const isDry = !!result.dryRun && !result.applied;
-            const canApply = isDry && (result.declineCandidates || []).length > 0 && currentRunId;
+            const candidates = result.declineCandidates || [];
+            const senders = result.senders || [];
+
+            // CRM prospects = candidates tied to outreach_sets (new scans), or
+            // senders with contactsFound > 0 (older runs that didn't store crm fields).
+            const crmSenderSet = new Set(
+                senders.filter(s => (s.contactsFound || 0) > 0).map(s => (s.sender || '').toLowerCase())
+            );
+            const prospectCandidates = candidates.filter(c =>
+                (c.crmContactCount || 0) > 0 || crmSenderSet.has((c.sender || '').toLowerCase())
+            );
+            // Dedupe prospects by sender (keep first / newest)
+            const prospectBySender = new Map();
+            for (const c of prospectCandidates) {
+                const key = (c.sender || '').toLowerCase();
+                if (!prospectBySender.has(key)) prospectBySender.set(key, c);
+            }
+            const prospects = [...prospectBySender.values()];
+            const noiseCandidates = candidates.filter(c =>
+                !(c.crmContactCount || 0) && !crmSenderSet.has((c.sender || '').toLowerCase())
+            );
+            const crmSenders = senders.filter(s => (s.contactsFound || 0) > 0);
+
+            const canApply = isDry && prospects.length > 0 && currentRunId;
 
             document.getElementById('resultsMode').innerHTML = result.applied || (!result.dryRun)
                 ? '<span class="badge badge-live">LIVE — changes applied</span>'
-                : '<span class="badge badge-dry">DRY RUN — preview only</span>' +
-                  (result.applied ? ' <span class="badge badge-live">Already applied</span>' : '');
+                : '<span class="badge badge-dry">DRY RUN — preview only</span>';
 
             document.getElementById('applyBar').style.display = canApply ? 'block' : 'none';
 
             const stats = [
                 { label: 'Emails Checked', value: result.emailsScanned ?? '—' },
-                { label: 'Declining Senders', value: t.sendersDeclined || (result.declineCandidates || []).length || 0, highlight: true },
+                { label: 'CRM Prospects', value: prospects.length || t.crmProspects || crmSenders.length || 0, highlight: true },
                 { label: isDry ? 'Contacts To Decline' : 'Contacts Declined', value: t.contactsDeclined || 0, highlight: true },
                 { label: 'Already Declined', value: t.contactsAlreadyDeclined || 0 },
                 { label: 'Pending Emails ' + (isDry ? 'To Delete' : 'Deleted'), value: t.pendingEmailsDeleted || 0 },
                 { label: 'Phone Activities', value: t.phoneActivitiesDeleted || 0 },
-                { label: 'LinkedIn Activities', value: t.linkedinActivitiesRemoved || 0 },
+                { label: 'Noise Skipped', value: (result.skippedNoise || 0) + (result.skippedNoCrmMatch || 0) || noiseCandidates.length },
                 { label: 'HeyReach Stopped', value: t.heyreachStopped || 0 }
             ];
             document.getElementById('statsGrid').innerHTML = stats.map(s => `
@@ -469,23 +519,44 @@
                     <div class="label">${esc(s.label)}</div>
                 </div>`).join('');
 
-            const candidates = result.declineCandidates || [];
-            document.getElementById('candidatesEmpty').style.display = candidates.length ? 'none' : 'block';
-            document.getElementById('candidatesBody').innerHTML = candidates.map(c => {
+            document.getElementById('prospectsEmpty').style.display = prospects.length ? 'none' : 'block';
+            document.getElementById('prospectsBody').innerHTML = prospects.map(c => {
                 const m = METHOD_LABELS[c.method] || { text: c.method, cls: 'badge-ai' };
+                const names = (c.crmContactNames || []).join(', ') || '—';
                 return `<tr>
-                    <td><strong>${esc(c.sender)}</strong></td>
+                    <td><strong>${esc(names)}</strong></td>
+                    <td>${esc(c.sender)}</td>
                     <td style="white-space: nowrap;">${fmtDate(c.date)}</td>
                     <td>${esc(c.subject)}</td>
                     <td class="snippet">"${esc(c.snippet)}"${c.aiReason ? `<br><small>AI: ${esc(c.aiReason)}</small>` : ''}</td>
+                    <td>${c.crmContactCount || 1}</td>
                     <td><span class="badge ${m.cls}">${esc(m.text)}</span></td>
                 </tr>`;
             }).join('');
 
-            const senders = result.senders || [];
-            document.getElementById('sendersBody').innerHTML = senders.length ? senders.map(s => `
+            const noiseEl = document.getElementById('noiseDetails');
+            if (noiseCandidates.length) {
+                noiseEl.style.display = 'block';
+                document.getElementById('noiseCount').textContent = noiseCandidates.length;
+                document.getElementById('candidatesBody').innerHTML = noiseCandidates.map(c => {
+                    const m = METHOD_LABELS[c.method] || { text: c.method, cls: 'badge-ai' };
+                    return `<tr>
+                        <td><strong>${esc(c.sender)}</strong></td>
+                        <td style="white-space: nowrap;">${fmtDate(c.date)}</td>
+                        <td>${esc(c.subject)}</td>
+                        <td class="snippet">"${esc(c.snippet)}"</td>
+                        <td><span class="badge ${m.cls}">${esc(m.text)}</span></td>
+                    </tr>`;
+                }).join('');
+            } else {
+                noiseEl.style.display = 'none';
+                document.getElementById('candidatesBody').innerHTML = '';
+            }
+
+            document.getElementById('sendersBody').innerHTML = crmSenders.length ? crmSenders.map(s => `
                 <tr>
                     <td><strong>${esc(s.sender)}</strong></td>
+                    <td>${esc((s.crmContactNames || []).join(', ') || '—')}</td>
                     <td>${s.contactsFound}</td>
                     <td>${s.contactsDeclined}${s.contactsAlreadyDeclined ? ` <small>(+${s.contactsAlreadyDeclined} already)</small>` : ''}</td>
                     <td>${(s.scheduledEmailsDeleted || 0) + (s.clemailDeleted || 0)}</td>
@@ -494,7 +565,7 @@
                     <td>${s.heyreachStopped || 0}</td>
                     <td>${(s.errors || []).length ? esc(s.errors.join('; ')) : '—'}</td>
                 </tr>`).join('')
-                : '<tr><td colspan="8" class="empty-note">No actions.</td></tr>';
+                : '<tr><td colspan="9" class="empty-note">No CRM prospects in this run.</td></tr>';
 
             document.getElementById('resultsCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
@@ -524,7 +595,7 @@
             }
             const ok = confirm(
                 'Apply this preview?\n\n' +
-                'Every sender listed below will be marked DECLINED, added to the opt-out list, ' +
+                'Only CRM prospects listed above will be marked DECLINED, added to the opt-out list, ' +
                 'and all of their pending emails / phone / LinkedIn outreach will be deleted.\n\nContinue?'
             );
             if (!ok) return;

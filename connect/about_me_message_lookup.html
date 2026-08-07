@@ -755,19 +755,53 @@
 <script type="module">
     import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
 
-    const { collection, getDocs, query, where, limit, orderBy } = window.clemailFirestore;
+    const { collection, getDocs, getDoc, doc, query, where, limit } = window.clemailFirestore;
 
     await window.firebaseReady;
 
     const auth     = window.auth;
     const db       = window.clemailDb;
     const queueRef = collection(db, 'connect_queue');
+    const RAILWAY  = 'https://railwayclemail-production.up.railway.app';
+    const AI_MODEL = 'meta-llama/llama-4-maverick';
+    const PROFILE_CACHE_COLLECTION = 'linkedin_profile_cache';
+    const CACHE_FRESH_DAYS = 90;
+
+    /** Shared context for deep lookup + Q&A */
+    let deepCtx = null;
 
     // ─── Utilities ─────────────────────────────────────────────────────────────
 
     function esc(s) {
         return (s == null ? '' : String(s))
             .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function urlVariants(liUrlRaw) {
+        const slug = liUrlRaw.match(/\/in\/([^\/\?#]+)/i)?.[1];
+        return {
+            slug,
+            variants: Array.from(new Set([
+                liUrlRaw,
+                liUrlRaw.replace(/\/$/, ''),
+                liUrlRaw.endsWith('/') ? liUrlRaw : liUrlRaw + '/',
+                slug ? `https://www.linkedin.com/in/${slug}`  : null,
+                slug ? `https://www.linkedin.com/in/${slug}/` : null,
+                slug ? `https://linkedin.com/in/${slug}`      : null,
+                slug ? `https://linkedin.com/in/${slug}/`     : null,
+                slug ? `http://www.linkedin.com/in/${slug}`   : null,
+            ].filter(Boolean)))
+        };
+    }
+
+    function profileCacheKey(url) {
+        const m = (url || '').match(/\/in\/([^\/\?#]+)/i);
+        return m ? m[1].toLowerCase() : null;
+    }
+
+    function daysSince(iso) {
+        if (!iso) return Infinity;
+        return (Date.now() - new Date(iso).getTime()) / 86400000;
     }
 
     /** Fraction of N-grams in |pasted| that appear in |stored|. */
@@ -784,6 +818,16 @@
         return hits / ng.size;
     }
 
+    function getFormState() {
+        const liUrlRaw  = document.getElementById('liUrlInput').value.trim();
+        const bdrSel    = document.getElementById('bdrSelect');
+        const bdrVal    = bdrSel.value.trim();
+        const bdrLabel  = bdrSel.options[bdrSel.selectedIndex]?.dataset.name || bdrVal;
+        const pastedMsg = document.getElementById('messageInput').value.trim();
+        const question  = document.getElementById('questionInput').value.trim();
+        return { liUrlRaw, bdrVal, bdrLabel, pastedMsg, question };
+    }
+
     // ─── BDR dropdown ──────────────────────────────────────────────────────────
 
     let bdrs = [];
@@ -794,7 +838,7 @@
             bdrs = [];
             snap.forEach(d => {
                 const data = d.data();
-                if (data.status === 'inactive') return; // skip inactive BDRs
+                if (data.status === 'inactive') return;
                 bdrs.push({ id: d.id, ...data });
             });
             bdrs.sort((a,b) => (a.name||'').localeCompare(b.name||''));
@@ -805,7 +849,6 @@
         const sel = document.getElementById('bdrSelect');
         sel.innerHTML = '<option value="">— All BDRs —</option>';
 
-        // Try to group by company via customerList
         let companyMap = new Map();
         try {
             const cSnap = await getDocs(collection(db, 'customerList'));
@@ -842,6 +885,7 @@
 
         sel.disabled = false;
         document.getElementById('searchBtn').disabled = false;
+        document.getElementById('deepBtn').disabled = false;
     }
 
     // ─── Badge helpers ─────────────────────────────────────────────────────────
@@ -971,9 +1015,13 @@
 
     // ─── Prospect profile panel ────────────────────────────────────────────────
 
-    function renderProfile(pd) {
+    function renderProfile(pd, title = 'Prospect Profile (stored at time of generation)') {
         if (!pd || typeof pd !== 'object') return '';
+        const skills = Array.isArray(pd.skills)
+            ? pd.skills.map(s => typeof s === 'string' ? s : (s.name || '')).filter(Boolean).join(', ')
+            : '';
         const rows = [
+            ['Name',        pd.name],
             ['Headline',    pd.headline],
             ['Title',       pd.currentTitle],
             ['Company',     pd.currentCompany],
@@ -981,13 +1029,14 @@
             ['About',       pd.about,            true],
             ['Experience',  pd.experienceParagraph, true],
             ['Education',   pd.educationParagraph,  true],
+            ['Skills',      skills, true],
         ].filter(([,v]) => v);
 
         if (!rows.length) return '';
 
         return `
         <div class="profile-panel">
-            <div class="panel-title"><i class="fab fa-linkedin"></i> Prospect Profile (stored at time of generation)</div>
+            <div class="panel-title"><i class="fab fa-linkedin"></i> ${esc(title)}</div>
             ${rows.map(([label, val, long]) => `
             <div class="profile-field">
                 <div class="profile-field-label">${esc(label)}</div>
@@ -996,9 +1045,313 @@
         </div>`;
     }
 
-    // ─── Posts panel ──────────────────────────────────────────────────────────
+    // ─── Profile helpers ───────────────────────────────────────────────────────
 
-    const RAILWAY = 'https://railwayclemail-production.up.railway.app';
+    function processProfileData(profile) {
+        if (!profile) return null;
+        const isDevFusion = profile._format === 'dev_fusion'
+            || profile._source === 'dev_fusion'
+            || (profile._format !== 'bebity' && (
+                Array.isArray(profile.experiences)
+                || typeof profile.fullName === 'string'
+            ));
+
+        const result = {
+            linkedinUrl: profile.linkedinUrl || profile.linkedinPublicUrl || profile.url || profile.linkedInUrl || '',
+            firstName: profile.firstName || '',
+            lastName: profile.lastName || '',
+            name: profile.fullName || profile.name || '',
+            headline: profile.headline || '',
+            about: '',
+            experienceParagraph: '',
+            educationParagraph: '',
+            currentTitle: '',
+            currentCompany: '',
+            location: profile.addressWithoutCountry || profile.addressWithCountry || profile.location || '',
+            skills: Array.isArray(profile.skills) ? profile.skills.slice(0, 20) : [],
+        };
+        if (!result.name && result.firstName && result.lastName) {
+            result.name = `${result.firstName} ${result.lastName}`;
+        }
+
+        if (isDevFusion) {
+            result.about = typeof profile.about === 'string' ? profile.about : '';
+            result.currentTitle = profile.jobTitle || '';
+            result.currentCompany = profile.companyName || '';
+            if (Array.isArray(profile.experiences) && profile.experiences.length) {
+                if (!result.currentTitle) result.currentTitle = profile.experiences[0].title || '';
+                if (!result.currentCompany) result.currentCompany = profile.experiences[0].companyName || '';
+                result.experienceParagraph = profile.experiences.map(e => {
+                    const parts = [e.title, e.companyName].filter(Boolean);
+                    if (e.jobStartedOn) {
+                        const end = e.jobEndedOn || (e.jobStillWorking ? 'Present' : '');
+                        parts.push(e.jobStartedOn + (end ? ' – ' + end : ''));
+                    }
+                    return parts.join(' | ');
+                }).filter(Boolean).join('\n');
+            }
+            if (Array.isArray(profile.educations) && profile.educations.length) {
+                result.educationParagraph = profile.educations.map(e => {
+                    const parts = [e.title, e.subtitle].filter(Boolean);
+                    return parts.join(' | ');
+                }).filter(Boolean).join('\n');
+            }
+        } else {
+            const flatten = (sectionList) => {
+                if (!Array.isArray(sectionList)) return '';
+                const texts = [];
+                for (const entry of sectionList) {
+                    if (!entry || typeof entry !== 'object') continue;
+                    const bits = [entry.title, entry.subtitle, entry.description, entry.text]
+                        .filter(Boolean).map(String);
+                    if (bits.length) texts.push(bits.join(' | '));
+                    if (Array.isArray(entry.child)) {
+                        for (const c of entry.child) {
+                            const cb = [c.title, c.subtitle, c.description].filter(Boolean).map(String);
+                            if (cb.length) texts.push('  ' + cb.join(' | '));
+                        }
+                    }
+                }
+                return texts.join('\n');
+            };
+            if (Array.isArray(profile.EXPERIENCE) && profile.EXPERIENCE.length) {
+                const firstExp = profile.EXPERIENCE[0];
+                if (firstExp.child && firstExp.child[0]?.title) {
+                    result.currentCompany = firstExp.title || '';
+                    result.currentTitle = firstExp.child[0].title || '';
+                } else {
+                    result.currentTitle = firstExp.title || '';
+                }
+            }
+            result.about = flatten(profile.ABOUT) || (typeof profile.about === 'string' ? profile.about : '');
+            result.experienceParagraph = flatten(profile.EXPERIENCE);
+            result.educationParagraph = flatten(profile.EDUCATION);
+        }
+        return result;
+    }
+
+    async function getOrFetchProfile(linkedInUrl, onStatus) {
+        const key = profileCacheKey(linkedInUrl);
+        let cached = null;
+        if (key) {
+            try {
+                const snap = await getDoc(doc(db, PROFILE_CACHE_COLLECTION, key));
+                if (snap.exists) cached = snap.data();
+            } catch (err) {
+                console.warn('Profile cache read error:', err.message);
+            }
+        }
+        if (cached) {
+            const age = daysSince(cached.fetchedAt);
+            if (age <= CACHE_FRESH_DAYS) {
+                onStatus?.(`Profile from cache (${Math.round(age)}d old)`);
+                return cached;
+            }
+            onStatus?.(`Cached profile is ${Math.round(age)}d old — refreshing from LinkedIn…`);
+        } else {
+            onStatus?.('No cached profile — scraping LinkedIn…');
+        }
+
+        const resp = await fetch(`${RAILWAY}/api/apify/scrape-profiles`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ keywords: [linkedInUrl] })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || data.message || `HTTP ${resp.status}`);
+        const profiles = Array.isArray(data) ? data : (data.profiles || []);
+        const raw = profiles[0] || null;
+        if (!raw) throw new Error('No profile returned from scrape');
+        onStatus?.('Live profile scraped');
+        return raw;
+    }
+
+    async function fetchProspectPosts(liUrl, limitN = 10) {
+        const resp = await fetch(`${RAILWAY}/api/connect/fetch-prospect-posts`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prospectLinkedInUrl: liUrl, limit: limitN })
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
+        return data.posts || [];
+    }
+
+    async function fetchOrgNews(bdrEmail, organizationName, sampleTitle = '') {
+        if (!bdrEmail || !organizationName) return [];
+        const token = await auth.currentUser.getIdToken();
+        const resp = await fetch(`${RAILWAY}/api/connect/org-news-prefetch`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({ bdrEmail, organizationName, sampleTitle })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
+        return data.verifiedItems || [];
+    }
+
+    async function loadBdrAboutMe(bdrEmail) {
+        if (!bdrEmail) return null;
+        const snap = await getDoc(doc(db, 'contact_profiles', bdrEmail.toLowerCase()));
+        if (!snap.exists) return null;
+        const data = snap.data();
+        return {
+            statements: data.statements || data.iStatements || {},
+            weStatements: data.weStatements || [],
+            name: data.name || ''
+        };
+    }
+
+    async function fetchAnyQueueDocs(liUrlRaw) {
+        const { slug, variants } = urlVariants(liUrlRaw);
+        const found = [];
+        const mergeDoc = (d) => { if (!found.find(x => x.id === d.id)) found.push({ id: d.id, ...d.data() }); };
+        for (const v of variants.slice(0, 6)) {
+            const snap = await getDocs(query(queueRef, where('prospect_li_url', '==', v), limit(25)));
+            snap.forEach(mergeDoc);
+        }
+        if (!found.length && slug) {
+            const rangeSnap = await getDocs(query(
+                queueRef,
+                where('prospect_li_url', '>=', `https://www.linkedin.com/in/${slug}`),
+                where('prospect_li_url', '<=', `https://www.linkedin.com/in/${slug}\uf8ff`),
+                limit(50)
+            ));
+            rangeSnap.forEach(mergeDoc);
+        }
+        return found;
+    }
+
+    async function callAi(prompt, maxTokens = 2500) {
+        const resp = await fetch(`${RAILWAY}/api/ai-profile-eval`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                provider: 'openrouter',
+                model: AI_MODEL,
+                prompt,
+                temperature: 0.2,
+                max_tokens: maxTokens
+            })
+        });
+        if (!resp.ok) throw new Error(`AI request failed (HTTP ${resp.status})`);
+        const data = await resp.json();
+        const text = (data.message || data.response || data.rawResponse || '').trim();
+        if (!text) throw new Error('Empty AI response');
+        return text;
+    }
+
+    function buildSourceBundle(ctx) {
+        const p = ctx.profile || {};
+        const postsBlock = (ctx.posts || []).map((post, i) => {
+            const dateStr = post.date ? new Date(post.date).toLocaleDateString('en-US') : 'unknown date';
+            return `[POST ${i + 1} | ${dateStr}]\n${post.text || ''}`;
+        }).join('\n\n') || '(no posts retrieved)';
+
+        const newsBlock = (ctx.news || []).map((n, i) => {
+            return `[NEWS ${i + 1}] ${n.headline || '(no headline)'}\nDate: ${n.date || 'n/a'}\nURL: ${n.url || 'n/a'}\n${n.content || n.summary || ''}`;
+        }).join('\n\n') || '(no company news retrieved)';
+
+        let bdrBlock = '(no BDR About Me profile loaded)';
+        if (ctx.bdrAboutMe) {
+            const parts = [];
+            const stmts = ctx.bdrAboutMe.statements || {};
+            Object.keys(stmts).forEach(cat => {
+                const arr = Array.isArray(stmts[cat]) ? stmts[cat] : [];
+                arr.forEach(s => parts.push(`[I-STATEMENT / ${cat}] ${typeof s === 'string' ? s : (s.text || JSON.stringify(s))}`));
+            });
+            (ctx.bdrAboutMe.weStatements || []).forEach(s => {
+                parts.push(`[WE-STATEMENT] ${typeof s === 'string' ? s : (s.text || JSON.stringify(s))}`);
+            });
+            bdrBlock = parts.length ? parts.join('\n') : '(BDR About Me exists but has no statements)';
+        }
+
+        const queueFindings = (ctx.queueDocs || [])
+            .filter(d => d.about_me_findings || d.news_data || d.ai_company_news || d.message_to_contact)
+            .slice(0, 5)
+            .map(d => {
+                const bits = [
+                    `Source: ${d.source || d.generated_via || 'unknown'}`,
+                    d.message_to_contact ? `Message: ${d.message_to_contact}` : '',
+                    d.about_me_findings ? `About Me findings: ${JSON.stringify(d.about_me_findings)}` : '',
+                    d.news_data ? `Stored news_data: ${JSON.stringify(d.news_data).slice(0, 2000)}` : '',
+                    d.ai_company_news ? `ai_company_news: ${JSON.stringify(d.ai_company_news).slice(0, 1500)}` : '',
+                ].filter(Boolean);
+                return bits.join('\n');
+            }).join('\n\n---\n\n') || '(no queue context)';
+
+        return `
+=== PROSPECT PROFILE ===
+Name: ${p.name || ''}
+Headline: ${p.headline || ''}
+Title: ${p.currentTitle || ''}
+Company: ${p.currentCompany || ''}
+Location: ${p.location || ''}
+About:
+${p.about || '(empty)'}
+
+Experience:
+${p.experienceParagraph || '(empty)'}
+
+Education:
+${p.educationParagraph || '(empty)'}
+
+Skills: ${(p.skills || []).map(s => typeof s === 'string' ? s : (s.name || '')).filter(Boolean).join(', ') || '(none)'}
+
+=== LAST 10 LINKEDIN POSTS ===
+${postsBlock}
+
+=== COMPANY NEWS ===
+${newsBlock}
+
+=== BDR ABOUT ME STATEMENTS ===
+${bdrBlock}
+
+=== ANY STORED QUEUE RECORDS FOR THIS CONTACT ===
+${queueFindings}
+`.trim();
+    }
+
+    function parseJsonFromAi(text) {
+        const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+        try { return JSON.parse(cleaned); } catch (_) {}
+        const m = cleaned.match(/\{[\s\S]*\}/);
+        if (m) {
+            try { return JSON.parse(m[0]); } catch (_) {}
+        }
+        return null;
+    }
+
+    // ─── Posts panel (per stored AMC record) ───────────────────────────────────
+
+    function renderPostsHtml(posts, idPrefix) {
+        if (!posts.length) {
+            return '<div style="font-size:0.8rem;color:#6b7280;padding:0.4rem 0;"><i class="fas fa-info-circle"></i> No posts found for this profile.</div>';
+        }
+        return `<div class="posts-list">
+            ${posts.map((p, idx) => {
+                const dateStr = p.date ? new Date(p.date).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) : '';
+                const pid = `${idPrefix}-${p.index ?? idx}`;
+                const shortText = (p.text || '').length > 280;
+                return `<div class="post-item">
+                    <div class="post-item-header">
+                        <span><i class="fas fa-hashtag"></i> Post ${esc(String(p.index != null ? p.index : idx + 1))}</span>
+                        ${dateStr ? `<span><i class="fas fa-calendar"></i> ${esc(dateStr)}</span>` : ''}
+                        ${p.postUrl ? `<a href="${esc(p.postUrl)}" target="_blank" style="color:#0F2D4D;text-decoration:none;margin-left:auto;"><i class="fab fa-linkedin"></i> View</a>` : ''}
+                    </div>
+                    <div id="${pid}" class="post-item-text">${esc(p.text || '')}</div>
+                    ${shortText ? `<button class="post-expand-btn" onclick="
+                        var el=document.getElementById('${pid}');
+                        var expanded=el.classList.toggle('expanded');
+                        this.textContent=expanded?'Show less':'Show full post';
+                    ">Show full post</button>` : ''}
+                </div>`;
+            }).join('')}
+        </div>`;
+    }
 
     window.loadPostsForRecord = async function loadPostsForRecord(docId, liUrl) {
         const panel  = document.getElementById(`posts-panel-${docId}`);
@@ -1010,44 +1363,14 @@
         panel.innerHTML = '<div style="font-size:0.8rem;color:#0369a1;padding:0.5rem 0;">Fetching posts via Apify — this takes 20–60 seconds…</div>';
 
         try {
-            const resp = await fetch(`${RAILWAY}/api/connect/fetch-prospect-posts`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ prospectLinkedInUrl: liUrl, limit: 30 })
-            });
-            const data = await resp.json();
-            if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
-
-            const posts = data.posts || [];
+            const posts = await fetchProspectPosts(liUrl, 30);
             if (!posts.length) {
                 panel.innerHTML = '<div style="font-size:0.8rem;color:#6b7280;padding:0.4rem 0;"><i class="fas fa-info-circle"></i> No posts found for this profile.</div>';
                 btn.innerHTML = '<i class="fas fa-rss"></i> No Posts Found';
                 return;
             }
-
             btn.innerHTML = `<i class="fas fa-check"></i> ${posts.length} Posts Loaded`;
-
-            panel.innerHTML = `<div class="posts-list">
-                ${posts.map(p => {
-                    const dateStr = p.date ? new Date(p.date).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) : '';
-                    const pid = `post-${docId}-${p.index}`;
-                    const shortText = p.text.length > 280;
-                    return `<div class="post-item">
-                        <div class="post-item-header">
-                            <span><i class="fas fa-hashtag"></i> Post ${p.index}</span>
-                            ${dateStr ? `<span><i class="fas fa-calendar"></i> ${esc(dateStr)}</span>` : ''}
-                            ${p.postUrl ? `<a href="${esc(p.postUrl)}" target="_blank" style="color:#0F2D4D;text-decoration:none;margin-left:auto;"><i class="fab fa-linkedin"></i> View</a>` : ''}
-                        </div>
-                        <div id="${pid}" class="post-item-text">${esc(p.text)}</div>
-                        ${shortText ? `<button class="post-expand-btn" onclick="
-                            var el=document.getElementById('${pid}');
-                            var expanded=el.classList.toggle('expanded');
-                            this.textContent=expanded?'Show less':'Show full post';
-                        ">Show full post</button>` : ''}
-                    </div>`;
-                }).join('')}
-            </div>`;
-
+            panel.innerHTML = renderPostsHtml(posts, `post-${docId}`);
         } catch (err) {
             panel.innerHTML = `<div class="posts-error"><i class="fas fa-exclamation-triangle"></i> <strong>Error:</strong> ${esc(err.message)}</div>`;
             btn.disabled = false;
@@ -1141,14 +1464,429 @@
         </div>`;
     }
 
+    // ─── Deep investigation UI ─────────────────────────────────────────────────
+
+    function setProgress(id, state, label) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const icons = {
+            pending: '<i class="fas fa-circle-notch fa-spin"></i>',
+            done: '<i class="fas fa-check-circle"></i>',
+            fail: '<i class="fas fa-times-circle"></i>',
+            skip: '<i class="fas fa-minus-circle"></i>',
+        };
+        el.className = `deep-progress-item ${state === 'done' ? 'done' : state === 'fail' ? 'fail' : state === 'skip' ? 'skip' : ''}`;
+        el.innerHTML = `${icons[state] || icons.pending} ${esc(label)}`;
+    }
+
+    function renderBdrAboutMePanel(am) {
+        if (!am) {
+            return `<div class="bdr-am-panel">
+                <div class="panel-title"><i class="fas fa-user-friends"></i> BDR About Me Statements</div>
+                <p style="font-size:0.82rem;color:var(--gray);">No About Me profile loaded. Select a BDR and re-run deep lookup.</p>
+            </div>`;
+        }
+        const stmts = am.statements || {};
+        const cats = Object.keys(stmts).filter(c => Array.isArray(stmts[c]) && stmts[c].length);
+        const we = am.weStatements || [];
+        if (!cats.length && !we.length) {
+            return `<div class="bdr-am-panel">
+                <div class="panel-title"><i class="fas fa-user-friends"></i> BDR About Me Statements</div>
+                <p style="font-size:0.82rem;color:var(--gray);">Profile exists but has no statements yet.</p>
+            </div>`;
+        }
+        return `<div class="bdr-am-panel">
+            <div class="panel-title"><i class="fas fa-user-friends"></i> BDR About Me Statements</div>
+            ${cats.map(cat => `
+                <div class="stmt-cat">${esc(cat)}</div>
+                ${stmts[cat].map(s => `<span class="stmt-chip">${esc(typeof s === 'string' ? s : (s.text || JSON.stringify(s)))}</span>`).join('')}
+            `).join('')}
+            ${we.length ? `
+                <div class="stmt-cat">We Statements</div>
+                ${we.map(s => `<span class="stmt-chip">${esc(typeof s === 'string' ? s : (s.text || JSON.stringify(s)))}</span>`).join('')}
+            ` : ''}
+        </div>`;
+    }
+
+    function renderNewsPanel(news) {
+        if (!news.length) {
+            return `<div class="news-panel">
+                <div class="panel-title"><i class="fas fa-newspaper"></i> Company News</div>
+                <p style="font-size:0.82rem;color:#92400e;">No verified company news found (or BDR/company missing).</p>
+            </div>`;
+        }
+        return `<div class="news-panel">
+            <div class="panel-title"><i class="fas fa-newspaper"></i> Company News (${news.length})</div>
+            ${news.slice(0, 12).map(n => `
+                <div class="news-item">
+                    <div>${n.url ? `<a href="${esc(n.url)}" target="_blank">${esc(n.headline || n.url)}</a>` : `<strong>${esc(n.headline || 'Story')}</strong>`}</div>
+                    ${n.date ? `<div style="font-size:0.72rem;color:#a16207;margin:0.2rem 0;">${esc(n.date)}</div>` : ''}
+                    ${(n.content || n.summary) ? `<div style="margin-top:0.3rem;color:#78350f;white-space:pre-wrap;">${esc(String(n.content || n.summary).slice(0, 600))}</div>` : ''}
+                </div>
+            `).join('')}
+        </div>`;
+    }
+
+    function renderAttributionPanel(attr) {
+        if (!attr) return '';
+        if (typeof attr === 'string') {
+            return `<div class="attr-panel">
+                <div class="panel-title"><i class="fas fa-link"></i> Message Claim Attribution</div>
+                <div class="qa-answer">${esc(attr)}</div>
+            </div>`;
+        }
+        const claims = attr.claims || [];
+        const srcClass = (t) => {
+            const x = (t || '').toLowerCase();
+            if (x.includes('profile')) return 'src-profile';
+            if (x.includes('post')) return 'src-post';
+            if (x.includes('news')) return 'src-news';
+            if (x.includes('bdr') || x.includes('about')) return 'src-bdr';
+            if (x.includes('queue') || x.includes('finding')) return 'src-queue';
+            if (x.includes('unsourced') || x.includes('unknown')) return 'src-unsourced';
+            return 'src-queue';
+        };
+        const confClass = (c) => {
+            const x = (c || '').toLowerCase();
+            if (x === 'high') return 'conf-high';
+            if (x === 'medium') return 'conf-medium';
+            return 'conf-low';
+        };
+        return `<div class="attr-panel">
+            <div class="panel-title"><i class="fas fa-link"></i> Message Claim Attribution</div>
+            ${attr.summary ? `<p style="font-size:0.84rem;color:#065f46;margin-bottom:0.35rem;">${esc(attr.summary)}</p>` : ''}
+            ${claims.length ? claims.map(c => {
+                const unsourced = /unsourced|unknown|not found|hallucin/i.test(c.source_type || '') || /unsourced|not found/i.test(c.evidence || '');
+                return `<div class="claim-row ${unsourced ? 'unsourced' : ''}">
+                    <div class="claim-text">${esc(c.claim || '')}</div>
+                    <div class="claim-meta">
+                        <span class="src-badge ${srcClass(c.source_type)}">${esc(c.source_type || 'unknown')}</span>
+                        ${c.confidence ? `<span class="src-badge ${confClass(c.confidence)}">${esc(c.confidence)} confidence</span>` : ''}
+                    </div>
+                    ${c.evidence ? `<div class="claim-evidence">${esc(c.evidence)}</div>` : ''}
+                </div>`;
+            }).join('') : '<p style="font-size:0.82rem;color:var(--gray);">No structured claims returned.</p>'}
+        </div>`;
+    }
+
+    function renderDeepShell() {
+        return `
+        <div class="deep-card" id="deepCard">
+            <div class="deep-card-header">
+                <h2><i class="fas fa-microscope"></i> Deep Source Investigation</h2>
+                <p>Pulling everything that could have gone into this message — enriched profile, last 10 posts, company news, and BDR About Me — then tracing each claim.</p>
+            </div>
+            <div class="deep-card-body">
+                <div class="deep-progress" id="deepProgress">
+                    <div class="deep-progress-item" id="prog-queue"><i class="fas fa-circle-notch fa-spin"></i> Checking any queue records…</div>
+                    <div class="deep-progress-item" id="prog-profile"><i class="fas fa-circle" style="opacity:0.35;"></i> Enriched profile</div>
+                    <div class="deep-progress-item" id="prog-posts"><i class="fas fa-circle" style="opacity:0.35;"></i> Last 10 LinkedIn posts</div>
+                    <div class="deep-progress-item" id="prog-news"><i class="fas fa-circle" style="opacity:0.35;"></i> Company news</div>
+                    <div class="deep-progress-item" id="prog-bdr"><i class="fas fa-circle" style="opacity:0.35;"></i> BDR About Me statements</div>
+                    <div class="deep-progress-item" id="prog-ai"><i class="fas fa-circle" style="opacity:0.35;"></i> AI claim attribution</div>
+                </div>
+                <div id="deepOtherMsgs"></div>
+                <div id="deepProfile"></div>
+                <div id="deepPosts"></div>
+                <div id="deepNews"></div>
+                <div id="deepBdrAm"></div>
+                <div id="deepAttr"></div>
+                <div class="qa-panel" id="qaPanel">
+                    <div class="panel-title"><i class="fas fa-comments"></i> Ask Where Something Came From</div>
+                    <p style="font-size:0.8rem;color:#9a3412;margin-bottom:0.65rem;">
+                        Client pushback example: <em>"I don't see anything about hockey or golf"</em> — ask that here and we'll search every source above.
+                    </p>
+                    <textarea id="deepQuestionBox" style="width:100%;min-height:70px;padding:0.6rem 0.8rem;border:2px solid #fdba74;border-radius:8px;font-family:inherit;font-size:0.9rem;"
+                        placeholder='e.g. "Where did hockey or golf come from in this message?"'></textarea>
+                    <div class="btn-row" style="margin-top:0.65rem;">
+                        <button id="askQuestionBtn" class="btn btn-ask" disabled>
+                            <i class="fas fa-search"></i> Answer from Sources
+                        </button>
+                    </div>
+                    <div id="qaAnswer"></div>
+                </div>
+            </div>
+        </div>`;
+    }
+
+    async function runAttribution(ctx) {
+        const message = ctx.message || '';
+        if (!message) return null;
+        const bundle = buildSourceBundle(ctx);
+        const prompt = `You investigate LinkedIn outreach message provenance. Map every specific claim/hook in the MESSAGE to the SOURCE DATA.
+
+MESSAGE:
+"""
+${message}
+"""
+
+SOURCE DATA:
+${bundle}
+
+Return ONLY valid JSON (no markdown) with this shape:
+{
+  "summary": "1-2 sentence overview of where the message came from",
+  "claims": [
+    {
+      "claim": "short quote or paraphrase of the claim from the message",
+      "source_type": "profile|post|news|bdr_about_me|queue_findings|unsourced",
+      "evidence": "exact quote from the source data that supports this claim, or explanation if unsourced",
+      "confidence": "high|medium|low"
+    }
+  ]
+}
+
+Rules:
+- Break the message into concrete claims (sports, schools, hometowns, career facts, news hooks, shared interests, etc.).
+- Prefer exact quotes in evidence.
+- If a claim is not supported by any source, source_type must be "unsourced".
+- Do not invent sources.`;
+        const raw = await callAi(prompt, 2800);
+        return parseJsonFromAi(raw) || raw;
+    }
+
+    async function answerQuestion(question) {
+        if (!deepCtx) throw new Error('Run Deep Source Lookup first so sources are loaded.');
+        if (!question.trim()) throw new Error('Enter a question first.');
+        const bundle = buildSourceBundle(deepCtx);
+        const msg = deepCtx.message || '(no message pasted)';
+        const prompt = `You are investigating a client question about a LinkedIn outreach message.
+
+CLIENT QUESTION:
+"""
+${question.trim()}
+"""
+
+THE MESSAGE:
+"""
+${msg}
+"""
+
+ALL AVAILABLE SOURCE DATA THAT COULD HAVE BEEN USED TO WRITE THE MESSAGE:
+${bundle}
+
+Answer the question by searching every source above. Quote exact passages that support your answer.
+If the thing the client is asking about appears in a BDR About Me statement, a prospect post, the prospect About/experience section, company news, or stored queue findings — say exactly which and quote it.
+If it appears nowhere in the source data, say clearly that it is UNSOURCED / not present in retrieved materials (possible hallucination, older data, or a source we did not retrieve).
+Be direct and specific. Plain text, no JSON.`;
+        return callAi(prompt, 2000);
+    }
+
+    async function runDeepLookup({ append = false } = {}) {
+        const { liUrlRaw, bdrVal, pastedMsg, question } = getFormState();
+        if (!liUrlRaw) {
+            alert('Please enter the prospect\'s LinkedIn URL.');
+            document.getElementById('liUrlInput').focus();
+            return;
+        }
+
+        const results = document.getElementById('resultsArea');
+        const searchBtn = document.getElementById('searchBtn');
+        const deepBtn = document.getElementById('deepBtn');
+        searchBtn.disabled = true;
+        deepBtn.disabled = true;
+
+        if (!append) {
+            // Keep any existing AMC results above; if empty, start fresh
+            if (!results.querySelector('.result-card') && !results.querySelector('.deep-card')) {
+                results.innerHTML = '';
+            }
+            // Remove previous deep card if re-running
+            results.querySelector('#deepCard')?.remove();
+            results.insertAdjacentHTML('beforeend', renderDeepShell());
+        } else if (!document.getElementById('deepCard')) {
+            results.insertAdjacentHTML('beforeend', renderDeepShell());
+        }
+
+        const qBox = document.getElementById('deepQuestionBox');
+        if (qBox && question) qBox.value = question;
+
+        deepCtx = {
+            liUrl: liUrlRaw,
+            bdrEmail: bdrVal || '',
+            message: pastedMsg || '',
+            profile: null,
+            posts: [],
+            news: [],
+            bdrAboutMe: null,
+            queueDocs: [],
+            attribution: null,
+        };
+
+        try {
+            // 1) Any queue docs
+            setProgress('prog-queue', 'pending', 'Checking any queue records…');
+            const queueDocs = await fetchAnyQueueDocs(liUrlRaw);
+            deepCtx.queueDocs = queueDocs;
+            setProgress('prog-queue', 'done', `Found ${queueDocs.length} queue record(s) (any source)`);
+
+            // Prefer a message from queue if none pasted
+            if (!deepCtx.message) {
+                const withMsg = queueDocs
+                    .filter(d => d.message_to_contact)
+                    .sort((a, b) => (b.uploaded_date || '').localeCompare(a.uploaded_date || ''));
+                if (withMsg.length) deepCtx.message = withMsg[0].message_to_contact;
+            }
+            // Prefer BDR from queue if none selected
+            if (!deepCtx.bdrEmail && queueDocs.length) {
+                deepCtx.bdrEmail = queueDocs[0].bdr_primary_email || queueDocs[0].bdr_auth_email || queueDocs[0].account_email || '';
+            }
+
+            const otherHtml = queueDocs.length ? `
+                <div class="profile-panel">
+                    <div class="panel-title"><i class="fas fa-inbox"></i> Other Queue Records for this URL (${queueDocs.length})</div>
+                    ${queueDocs.slice(0, 8).map(d => `
+                        <div class="other-msg-card">
+                            <div style="font-size:0.8rem;font-weight:700;color:#334155;">
+                                ${esc(d.source || d.generated_via || 'unknown source')}
+                                ${d.bdr_name ? ` · ${esc(d.bdr_name)}` : ''}
+                                ${d.uploaded_date ? ` · ${esc(new Date(d.uploaded_date).toLocaleDateString())}` : ''}
+                            </div>
+                            ${d.message_to_contact ? `<div class="msg-box" style="margin-top:0.45rem;max-height:120px;">${esc(d.message_to_contact)}</div>` : '<div style="font-size:0.78rem;color:var(--gray);margin-top:0.3rem;">No message text</div>'}
+                        </div>
+                    `).join('')}
+                </div>` : '';
+            document.getElementById('deepOtherMsgs').innerHTML = otherHtml;
+
+            // 2) Profile
+            setProgress('prog-profile', 'pending', 'Loading enriched profile…');
+            try {
+                const raw = await getOrFetchProfile(liUrlRaw, (msg) => setProgress('prog-profile', 'pending', msg));
+                deepCtx.profile = processProfileData(raw);
+                // If queue had profile_data and scrape failed fields, fill gaps
+                const storedPd = queueDocs.find(d => d.profile_data)?.profile_data;
+                if (storedPd && deepCtx.profile) {
+                    for (const k of ['about', 'experienceParagraph', 'educationParagraph', 'headline', 'currentTitle', 'currentCompany', 'location']) {
+                        if (!deepCtx.profile[k] && storedPd[k]) deepCtx.profile[k] = storedPd[k];
+                    }
+                }
+                document.getElementById('deepProfile').innerHTML = renderProfile(deepCtx.profile, 'Full Enriched Prospect Profile')
+                    || `<div class="profile-panel"><div class="panel-title"><i class="fab fa-linkedin"></i> Prospect Profile</div><p style="font-size:0.82rem;color:var(--gray);">Profile fetched but no displayable fields.</p></div>`;
+                setProgress('prog-profile', 'done', `Profile loaded${deepCtx.profile?.currentCompany ? ` · ${deepCtx.profile.currentCompany}` : ''}`);
+            } catch (err) {
+                setProgress('prog-profile', 'fail', `Profile failed: ${err.message}`);
+                document.getElementById('deepProfile').innerHTML = `<div class="posts-error"><strong>Profile error:</strong> ${esc(err.message)}</div>`;
+                const storedPd = queueDocs.find(d => d.profile_data)?.profile_data;
+                if (storedPd) {
+                    deepCtx.profile = storedPd;
+                    document.getElementById('deepProfile').innerHTML = renderProfile(storedPd, 'Prospect Profile (from queue — live scrape failed)');
+                }
+            }
+
+            // 3) Posts (last 10)
+            setProgress('prog-posts', 'pending', 'Fetching last 10 LinkedIn posts (20–60s)…');
+            try {
+                deepCtx.posts = await fetchProspectPosts(liUrlRaw, 10);
+                document.getElementById('deepPosts').innerHTML = `
+                    <div class="posts-panel">
+                        <div class="panel-title"><i class="fab fa-linkedin"></i> Last ${deepCtx.posts.length} LinkedIn Posts</div>
+                        ${renderPostsHtml(deepCtx.posts, 'deep-post')}
+                    </div>`;
+                setProgress('prog-posts', 'done', `${deepCtx.posts.length} posts loaded`);
+            } catch (err) {
+                setProgress('prog-posts', 'fail', `Posts failed: ${err.message}`);
+                document.getElementById('deepPosts').innerHTML = `<div class="posts-error"><strong>Posts error:</strong> ${esc(err.message)}</div>`;
+            }
+
+            // 4) Company news
+            const company = deepCtx.profile?.currentCompany
+                || queueDocs.find(d => d.contactCompany || d.prospect_company)?.contactCompany
+                || queueDocs.find(d => d.prospect_company)?.prospect_company
+                || '';
+            const title = deepCtx.profile?.currentTitle || '';
+            if (!deepCtx.bdrEmail || !company) {
+                setProgress('prog-news', 'skip', !deepCtx.bdrEmail
+                    ? 'Company news skipped — select a BDR to enable'
+                    : 'Company news skipped — no company name on profile');
+                document.getElementById('deepNews').innerHTML = renderNewsPanel([]);
+            } else {
+                setProgress('prog-news', 'pending', `Searching news for ${company}…`);
+                try {
+                    // Also harvest any news already stored on queue docs
+                    const storedNews = [];
+                    queueDocs.forEach(d => {
+                        const nd = d.news_data || d.ai_company_news;
+                        if (Array.isArray(nd)) storedNews.push(...nd);
+                        else if (nd && typeof nd === 'object') storedNews.push(nd);
+                    });
+                    deepCtx.news = await fetchOrgNews(deepCtx.bdrEmail, company, title);
+                    if (!deepCtx.news.length && storedNews.length) deepCtx.news = storedNews;
+                    document.getElementById('deepNews').innerHTML = renderNewsPanel(deepCtx.news);
+                    setProgress('prog-news', 'done', `${deepCtx.news.length} news item(s) for ${company}`);
+                } catch (err) {
+                    setProgress('prog-news', 'fail', `News failed: ${err.message}`);
+                    document.getElementById('deepNews').innerHTML = `<div class="posts-error"><strong>News error:</strong> ${esc(err.message)}</div>`;
+                }
+            }
+
+            // 5) BDR About Me
+            if (!deepCtx.bdrEmail) {
+                setProgress('prog-bdr', 'skip', 'BDR About Me skipped — select a BDR');
+                document.getElementById('deepBdrAm').innerHTML = renderBdrAboutMePanel(null);
+            } else {
+                setProgress('prog-bdr', 'pending', 'Loading BDR About Me…');
+                try {
+                    deepCtx.bdrAboutMe = await loadBdrAboutMe(deepCtx.bdrEmail);
+                    document.getElementById('deepBdrAm').innerHTML = renderBdrAboutMePanel(deepCtx.bdrAboutMe);
+                    setProgress('prog-bdr', deepCtx.bdrAboutMe ? 'done' : 'skip',
+                        deepCtx.bdrAboutMe ? `About Me loaded for ${deepCtx.bdrEmail}` : `No About Me for ${deepCtx.bdrEmail}`);
+                } catch (err) {
+                    setProgress('prog-bdr', 'fail', `About Me failed: ${err.message}`);
+                }
+            }
+
+            // 6) AI attribution
+            const askBtn = document.getElementById('askQuestionBtn');
+            if (askBtn) {
+                askBtn.disabled = false;
+                askBtn.onclick = async () => {
+                    const q = document.getElementById('deepQuestionBox').value.trim();
+                    const out = document.getElementById('qaAnswer');
+                    askBtn.disabled = true;
+                    askBtn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Searching sources…';
+                    out.innerHTML = '';
+                    try {
+                        const answer = await answerQuestion(q);
+                        out.innerHTML = `<div class="qa-answer">${esc(answer)}</div>`;
+                    } catch (err) {
+                        out.innerHTML = `<div class="posts-error"><strong>Error:</strong> ${esc(err.message)}</div>`;
+                    }
+                    askBtn.disabled = false;
+                    askBtn.innerHTML = '<i class="fas fa-search"></i> Answer from Sources';
+                };
+            }
+
+            if (deepCtx.message) {
+                setProgress('prog-ai', 'pending', 'AI mapping message claims → sources…');
+                try {
+                    deepCtx.attribution = await runAttribution(deepCtx);
+                    document.getElementById('deepAttr').innerHTML = renderAttributionPanel(deepCtx.attribution);
+                    setProgress('prog-ai', 'done', 'Claim attribution complete');
+                } catch (err) {
+                    setProgress('prog-ai', 'fail', `Attribution failed: ${err.message}`);
+                    document.getElementById('deepAttr').innerHTML = `<div class="posts-error"><strong>Attribution error:</strong> ${esc(err.message)}</div>`;
+                }
+            } else {
+                setProgress('prog-ai', 'skip', 'Attribution skipped — paste the message to map claims');
+            }
+
+            // Auto-answer form question if provided
+            if (question && document.getElementById('askQuestionBtn')) {
+                document.getElementById('deepQuestionBox').value = question;
+                document.getElementById('askQuestionBtn').click();
+            }
+
+            document.getElementById('deepCard')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        } finally {
+            searchBtn.disabled = false;
+            deepBtn.disabled = false;
+        }
+    }
+
     // ─── Search ─────────────────────────────────────────────────────────────────
 
     async function runSearch() {
-        const liUrlRaw  = document.getElementById('liUrlInput').value.trim();
-        const bdrSel    = document.getElementById('bdrSelect');
-        const bdrVal    = bdrSel.value.trim();           // primaryEmail or ''
-        const bdrLabel  = bdrSel.options[bdrSel.selectedIndex]?.dataset.name || bdrVal;
-        const pastedMsg = document.getElementById('messageInput').value.trim();
+        const { liUrlRaw, bdrVal, bdrLabel, pastedMsg } = getFormState();
 
         if (!liUrlRaw) {
             alert('Please enter the prospect\'s LinkedIn URL.');
@@ -1157,39 +1895,28 @@
         }
 
         const btn     = document.getElementById('searchBtn');
+        const deepBtn = document.getElementById('deepBtn');
         const spinner = document.getElementById('spinner');
         const msgEl   = document.getElementById('spinnerMsg');
         const results = document.getElementById('resultsArea');
 
-        btn.disabled          = true;
+        btn.disabled = true;
+        deepBtn.disabled = true;
         spinner.style.display = 'block';
-        results.innerHTML     = '';
+        results.innerHTML = '';
 
         const found = [];
 
         try {
-            const slug = liUrlRaw.match(/\/in\/([^\/\?#]+)/i)?.[1];
-            const urlVariants = Array.from(new Set([
-                liUrlRaw,
-                liUrlRaw.replace(/\/$/, ''),
-                liUrlRaw.endsWith('/') ? liUrlRaw : liUrlRaw + '/',
-                slug ? `https://www.linkedin.com/in/${slug}`  : null,
-                slug ? `https://www.linkedin.com/in/${slug}/` : null,
-                slug ? `https://linkedin.com/in/${slug}`      : null,
-                slug ? `https://linkedin.com/in/${slug}/`     : null,
-                slug ? `http://www.linkedin.com/in/${slug}`   : null,
-            ].filter(Boolean)));
-
+            const { slug, variants } = urlVariants(liUrlRaw);
             const mergeDoc = (d) => { if (!found.find(x => x.id === d.id)) found.push({ id: d.id, ...d.data() }); };
 
-            // Pass 1 — exact URL + source filter
-            msgEl.textContent = `Searching ${urlVariants.length} URL variants for About Me Connect records…`;
-            for (const v of urlVariants) {
+            msgEl.textContent = `Searching ${variants.length} URL variants for About Me Connect records…`;
+            for (const v of variants) {
                 const snap = await getDocs(query(queueRef, where('prospect_li_url','==',v), where('source','==','About Me Connect')));
                 snap.forEach(mergeDoc);
             }
 
-            // Pass 2 — slug range query if nothing yet
             if (!found.length && slug) {
                 msgEl.textContent = 'Trying slug range query…';
                 const rangeSnap = await getDocs(query(
@@ -1202,10 +1929,9 @@
                 rangeSnap.forEach(mergeDoc);
             }
 
-            // Pass 3 — broaden: drop source filter, keep URL, accept any record with about_me_findings
             if (!found.length) {
                 msgEl.textContent = 'Still nothing — broadening search…';
-                for (const v of urlVariants.slice(0,4)) {
+                for (const v of variants.slice(0,4)) {
                     const snap = await getDocs(query(queueRef, where('prospect_li_url','==',v)));
                     snap.forEach(d => {
                         const dat = d.data();
@@ -1222,13 +1948,14 @@
             </div>`;
             spinner.style.display = 'none';
             btn.disabled = false;
+            deepBtn.disabled = false;
             return;
         }
 
         spinner.style.display = 'none';
         btn.disabled = false;
+        deepBtn.disabled = false;
 
-        // Filter by selected BDR
         let filtered = found;
         if (bdrVal) {
             filtered = found.filter(r => {
@@ -1245,14 +1972,17 @@
                     <i class="fas fa-ghost"></i>
                     <strong>No About Me Connect records found</strong>
                     <p>${hiddenByBdr
-                        ? `Found ${found.length} record(s) but none match BDR <strong>${esc(bdrLabel)}</strong>. Try "All BDRs".`
-                        : `Nothing in <code>connect_queue</code> with source "About Me Connect" for this URL. The message may be under a slightly different URL, or may have been generated on a system that didn't save findings.`}
+                        ? `Found ${found.length} record(s) but none match BDR <strong>${esc(bdrLabel)}</strong>. Try "All BDRs", or run Deep Source Lookup below.`
+                        : `Nothing in <code>connect_queue</code> with source "About Me Connect" for this URL. Running a deep source investigation next — profile, posts, company news, and BDR About Me.`}
                     </p>
                 </div>`;
+            // Auto-run deep lookup when stored findings are missing
+            if (!hiddenByBdr) {
+                await runDeepLookup({ append: true });
+            }
             return;
         }
 
-        // Score against pasted message, sort best-match first then by date
         filtered.forEach(r => {
             r._score = pastedMsg ? messageSimilarity(pastedMsg, r.message_to_contact||'') : 0;
         });
@@ -1269,20 +1999,29 @@
                 Found <strong>${filtered.length}</strong> About Me Connect record${filtered.length!==1?'s':''} for this prospect
                 ${pastedMsg && hasGoodMatch  ? `<span style="color:var(--amc);"> — best match highlighted <i class="fas fa-star" style="color:#f59e0b;"></i></span>` : ''}
                 ${pastedMsg && !hasGoodMatch ? `<span style="color:var(--gray);"> (no strong text match — showing most recent first)</span>` : ''}
+                <span style="color:var(--gray);font-weight:400;"> — use <strong>Deep Source Lookup</strong> to also pull live profile/posts/news and ask follow-up questions.</span>
             </div>
             ${filtered.map((r,i) => renderRecord(r.id, r, pastedMsg ? (i===0 && hasGoodMatch) : false)).join('')}`;
+
+        // If user already typed a question, go straight into deep lookup
+        if (getFormState().question) {
+            await runDeepLookup({ append: true });
+        }
     }
 
     // ─── Wiring ─────────────────────────────────────────────────────────────────
 
     document.getElementById('searchBtn').addEventListener('click', runSearch);
+    document.getElementById('deepBtn').addEventListener('click', () => runDeepLookup({ append: false }));
     document.getElementById('liUrlInput').addEventListener('keydown', e => { if (e.key==='Enter') runSearch(); });
 
     document.getElementById('clearBtn').addEventListener('click', () => {
         document.getElementById('liUrlInput').value   = '';
         document.getElementById('messageInput').value = '';
+        document.getElementById('questionInput').value = '';
         document.getElementById('bdrSelect').value    = '';
         document.getElementById('resultsArea').innerHTML = '';
+        deepCtx = null;
     });
 
     // ─── Auth + init ─────────────────────────────────────────────────────────────
