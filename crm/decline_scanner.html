@@ -245,6 +245,12 @@
 
         <div class="card" id="resultsCard" style="display: none;">
             <h2><i class="fas fa-clipboard-list"></i> Results <span id="resultsMode"></span></h2>
+            <div id="applyBar" style="display: none; margin-bottom: 1.25rem;">
+                <button class="btn btn-run" id="applyBtn" onclick="applyCurrentPreview()">
+                    <i class="fas fa-ban"></i> Mark All These as Declined
+                </button>
+                <span style="margin-left: 0.75rem; color: #64748b; font-size: 0.9rem;">Applies the preview below — marks contacts declined and deletes their pending outreach.</span>
+            </div>
             <div class="stats-grid" id="statsGrid"></div>
 
             <h2 style="font-size: 1.1rem; margin-top: 1.5rem;"><i class="fas fa-envelope-open-text"></i> Decline Replies Found</h2>
@@ -303,6 +309,7 @@
                             <th>Contacts Declined</th>
                             <th>Pending Emails Deleted</th>
                             <th>Errors</th>
+                            <th>Actions</th>
                         </tr>
                     </thead>
                     <tbody id="runsBody"></tbody>
@@ -316,11 +323,13 @@
     <script>
         const BACKEND_API_URL = 'https://railwayclemail-production.up.railway.app';
         let pollTimer = null;
+        let currentRunId = null; // run currently shown in Results (for Apply)
 
         const METHOD_LABELS = {
             inbox_ai_flag: { text: 'Inbox AI flag', cls: 'badge-flag' },
             optout_phrase: { text: 'Opt-out phrase', cls: 'badge-phrase' },
-            ai_classification: { text: 'AI classified', cls: 'badge-ai' }
+            ai_classification: { text: 'AI classified', cls: 'badge-ai' },
+            apply_preview: { text: 'Applied from preview', cls: 'badge-live' }
         };
 
         function esc(s) {
@@ -345,6 +354,8 @@
         function setButtonsDisabled(disabled) {
             document.getElementById('previewBtn').disabled = disabled;
             document.getElementById('runBtn').disabled = disabled;
+            const applyBtn = document.getElementById('applyBtn');
+            if (applyBtn) applyBtn.disabled = disabled;
         }
 
         async function startScan(dryRun) {
@@ -357,14 +368,14 @@
                     `• Add them to the global opt-out list (no future emails)\n` +
                     `• Permanently DELETE all pending emails, phone calls, and LinkedIn activities\n` +
                     `• Stop their HeyReach lead\n\n` +
-                    `Run the Preview first if you haven't. Continue?`
+                    `Tip: you can also Preview first, then use "Mark All These as Declined" on the saved results.\n\nContinue?`
                 );
                 if (!ok) return;
             }
 
             setButtonsDisabled(true);
             document.getElementById('resultsCard').style.display = 'none';
-            setBanner('running', 'Starting scan...');
+            setBanner('running', 'Starting scan (full date window, no 5K cap)...');
 
             try {
                 const resp = await fetch(`${BACKEND_API_URL}/scan-declines`, {
@@ -393,8 +404,9 @@
 
                     if (job.running) {
                         const p = job.progress || {};
+                        const verb = job.source === 'apply_preview' ? 'Applying declines' : 'Scanning';
                         setBanner('running',
-                            `Scanning... ${p.scanned || 0} emails checked, ${p.candidates || 0} decline replies found` +
+                            `${verb}... ${p.scanned || 0} emails checked, ${p.candidates || 0} decline replies` +
                             (p.sendersProcessed ? `, ${p.sendersProcessed} senders processed` : ''));
                         pollStatus();
                         return;
@@ -408,10 +420,13 @@
                     }
                     if (job.result) {
                         const t = job.result.totals || {};
+                        const isApply = job.source === 'apply_preview' || job.result.source === 'apply_preview';
                         setBanner('done',
-                            `${job.result.dryRun ? 'Preview' : 'Scan'} complete — ` +
-                            `${job.result.emailsScanned} emails checked, ${t.sendersDeclined || 0} declining sender(s)` +
-                            (job.result.dryRun ? ' (nothing was changed)' : ''));
+                            `${isApply ? 'Apply' : (job.result.dryRun ? 'Preview' : 'Scan')} complete — ` +
+                            `${job.result.emailsScanned || t.sendersDeclined || 0} ` +
+                            `${isApply ? 'sender(s) processed' : 'emails checked'}, ` +
+                            `${t.sendersDeclined || 0} declining sender(s)` +
+                            (job.result.dryRun ? ' (nothing was changed yet — use Apply below)' : ''));
                         renderResults(job.result);
                         loadRuns();
                     } else {
@@ -426,18 +441,24 @@
 
         function renderResults(result) {
             document.getElementById('resultsCard').style.display = 'block';
+            currentRunId = result.runId || result.id || null;
             const t = result.totals || {};
+            const isDry = !!result.dryRun && !result.applied;
+            const canApply = isDry && (result.declineCandidates || []).length > 0 && currentRunId;
 
-            document.getElementById('resultsMode').innerHTML = result.dryRun
-                ? '<span class="badge badge-dry">DRY RUN — preview only</span>'
-                : '<span class="badge badge-live">LIVE — changes applied</span>';
+            document.getElementById('resultsMode').innerHTML = result.applied || (!result.dryRun)
+                ? '<span class="badge badge-live">LIVE — changes applied</span>'
+                : '<span class="badge badge-dry">DRY RUN — preview only</span>' +
+                  (result.applied ? ' <span class="badge badge-live">Already applied</span>' : '');
+
+            document.getElementById('applyBar').style.display = canApply ? 'block' : 'none';
 
             const stats = [
-                { label: 'Emails Checked', value: result.emailsScanned },
-                { label: 'Declining Senders', value: t.sendersDeclined || 0, highlight: true },
-                { label: result.dryRun ? 'Contacts To Decline' : 'Contacts Declined', value: t.contactsDeclined || 0, highlight: true },
+                { label: 'Emails Checked', value: result.emailsScanned ?? '—' },
+                { label: 'Declining Senders', value: t.sendersDeclined || (result.declineCandidates || []).length || 0, highlight: true },
+                { label: isDry ? 'Contacts To Decline' : 'Contacts Declined', value: t.contactsDeclined || 0, highlight: true },
                 { label: 'Already Declined', value: t.contactsAlreadyDeclined || 0 },
-                { label: 'Pending Emails ' + (result.dryRun ? 'To Delete' : 'Deleted'), value: t.pendingEmailsDeleted || 0 },
+                { label: 'Pending Emails ' + (isDry ? 'To Delete' : 'Deleted'), value: t.pendingEmailsDeleted || 0 },
                 { label: 'Phone Activities', value: t.phoneActivitiesDeleted || 0 },
                 { label: 'LinkedIn Activities', value: t.linkedinActivitiesRemoved || 0 },
                 { label: 'HeyReach Stopped', value: t.heyreachStopped || 0 }
@@ -474,6 +495,58 @@
                     <td>${(s.errors || []).length ? esc(s.errors.join('; ')) : '—'}</td>
                 </tr>`).join('')
                 : '<tr><td colspan="8" class="empty-note">No actions.</td></tr>';
+
+            document.getElementById('resultsCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        async function viewRun(runId) {
+            try {
+                setBanner('running', 'Loading saved results...');
+                const resp = await fetch(`${BACKEND_API_URL}/scan-declines/runs/${encodeURIComponent(runId)}`);
+                const data = await resp.json();
+                if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
+                const run = data.run;
+                run.runId = run.id;
+                renderResults(run);
+                const count = (run.declineCandidates || []).length;
+                setBanner('done',
+                    `Loaded ${run.dryRun ? 'preview' : 'run'} from ${fmtDate(run.startedAt)} — ${count} declining sender(s)` +
+                    (run.dryRun && !run.applied ? '. Use "Mark All These as Declined" to apply.' : ''));
+            } catch (err) {
+                setBanner('error', 'Failed to load run: ' + err.message);
+            }
+        }
+
+        async function applyCurrentPreview() {
+            if (!currentRunId) {
+                setBanner('error', 'No saved preview selected to apply.');
+                return;
+            }
+            const ok = confirm(
+                'Apply this preview?\n\n' +
+                'Every sender listed below will be marked DECLINED, added to the opt-out list, ' +
+                'and all of their pending emails / phone / LinkedIn outreach will be deleted.\n\nContinue?'
+            );
+            if (!ok) return;
+
+            setButtonsDisabled(true);
+            setBanner('running', 'Applying declines from preview...');
+
+            try {
+                const resp = await fetch(`${BACKEND_API_URL}/scan-declines/apply`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ runId: currentRunId })
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data.success) {
+                    throw new Error(data.error || `HTTP ${resp.status}`);
+                }
+                pollStatus();
+            } catch (err) {
+                setBanner('error', 'Failed to apply: ' + err.message);
+                setButtonsDisabled(false);
+            }
         }
 
         async function loadRuns() {
@@ -484,28 +557,49 @@
                 document.getElementById('runsEmpty').style.display = runs.length ? 'none' : 'block';
                 document.getElementById('runsBody').innerHTML = runs.map(r => {
                     const t = r.totals || {};
-                    const typeBadge = r.source === 'daily_cron'
-                        ? '<span class="badge badge-cron">Auto (daily)</span>'
-                        : (r.dryRun ? '<span class="badge badge-dry">Preview</span>' : '<span class="badge badge-live">Manual (live)</span>');
+                    let typeBadge;
+                    if (r.source === 'daily_cron') {
+                        typeBadge = '<span class="badge badge-cron">Auto (daily)</span>';
+                    } else if (r.source === 'apply_preview') {
+                        typeBadge = '<span class="badge badge-live">Applied preview</span>';
+                    } else if (r.dryRun) {
+                        typeBadge = r.applied
+                            ? '<span class="badge badge-dry">Preview</span> <span class="badge badge-live">Applied</span>'
+                            : '<span class="badge badge-dry">Preview</span>';
+                    } else {
+                        typeBadge = '<span class="badge badge-live">Manual (live)</span>';
+                    }
+                    const canApply = r.dryRun && !r.applied && (r.candidateCount || t.sendersDeclined || 0) > 0;
                     return `<tr>
                         <td style="white-space: nowrap;">${fmtDate(r.startedAt)}</td>
                         <td>${typeBadge}</td>
                         <td style="white-space: nowrap;">${fmtDate(r.sinceDate)}</td>
                         <td>${r.emailsScanned ?? '—'}</td>
-                        <td>${t.sendersDeclined || 0}</td>
+                        <td>${t.sendersDeclined || r.candidateCount || 0}</td>
                         <td>${t.contactsDeclined || 0}</td>
                         <td>${t.pendingEmailsDeleted || 0}</td>
                         <td>${(r.errors || []).length || '—'}</td>
+                        <td style="white-space: nowrap;">
+                            <button class="btn btn-refresh" style="font-size: 0.8rem; padding: 0.3rem 0.65rem;" onclick="viewRun('${esc(r.id)}')">
+                                <i class="fas fa-eye"></i> View
+                            </button>
+                            ${canApply ? `<button class="btn btn-run" style="font-size: 0.8rem; padding: 0.3rem 0.65rem; margin-left: 0.35rem;" onclick="viewRun('${esc(r.id)}').then(() => applyCurrentPreview())">
+                                <i class="fas fa-ban"></i> Apply
+                            </button>` : ''}
+                        </td>
                     </tr>`;
                 }).join('');
+                return runs;
             } catch (err) {
                 console.error('Failed to load runs:', err);
+                return [];
             }
         }
 
-        // On load: show status of any in-flight/last scan and run history
+        // On load: restore the most recent unapplied preview (so leaving the page doesn't lose it),
+        // and resume polling if a job is in flight.
         (async function init() {
-            loadRuns();
+            const runs = await loadRuns();
             try {
                 const resp = await fetch(`${BACKEND_API_URL}/scan-declines/status`);
                 const data = await resp.json();
@@ -513,8 +607,20 @@
                     setButtonsDisabled(true);
                     setBanner('running', 'A scan is already in progress...');
                     pollStatus();
+                    return;
+                }
+                if (data.job && data.job.result && data.job.result.dryRun && !data.job.result.applied) {
+                    renderResults(data.job.result);
+                    setBanner('done', 'Restored latest preview from this server session.');
+                    return;
                 }
             } catch (_) { /* backend not reachable yet */ }
+
+            // Fall back to the most recent unapplied dry-run saved in history
+            const preview = (runs || []).find(r => r.dryRun && !r.applied && (r.candidateCount || 0) > 0);
+            if (preview) {
+                await viewRun(preview.id);
+            }
         })();
     </script>
 </body>
