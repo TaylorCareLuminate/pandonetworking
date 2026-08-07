@@ -249,8 +249,8 @@
     <button class="btn btn-danger" id="stopBtn" onclick="window.stopDomainScan()" style="display:none;">
       <i class="fas fa-stop"></i> Stop
     </button>
-    <label class="ctrl-label">Msgs / mailbox
-      <input class="ctrl-input" id="msgLimit" type="number" min="20" max="300" value="80" style="width:70px;margin-left:6px;">
+    <label class="ctrl-label" title="Max messages to pull per mailbox (INBOX + SENT combined). API pages in batches of 50.">Msgs / mailbox
+      <input class="ctrl-input" id="msgLimit" type="number" min="50" max="50000" value="5000" step="50" style="width:90px;margin-left:6px;">
     </label>
     <button class="btn btn-success" id="addWatchBtn" onclick="window.addAllRecommended()" disabled>
       <i class="fas fa-user-plus"></i> Add All Recommended
@@ -579,7 +579,9 @@
       await waitForWrapper();
       const { collection, getDocs, doc, getDoc } = window.clemailFirestore;
       const metaSnap = await getDoc(doc(window.clemailDb, 'prospect_domain_scans', '_meta'));
-      if (metaSnap.exists()) {
+      // CLEMail wrapper exposes exists as a boolean getter (not Firestore's exists())
+      const metaExists = typeof metaSnap.exists === 'function' ? metaSnap.exists() : !!metaSnap.exists;
+      if (metaExists) {
         const meta = metaSnap.data();
         setVal('scan', meta.lastScanDate ? fmtDate(meta.lastScanDate) : '—');
         setDot('scan', meta.lastScanDate ? 'green' : 'yellow');
@@ -683,7 +685,9 @@
     document.getElementById('scanBtn').disabled = true;
     document.getElementById('aiBtn').disabled = true;
     document.getElementById('stopBtn').style.display = '';
-    const limit = Math.max(20, Math.min(300, parseInt(document.getElementById('msgLimit').value, 10) || 80));
+    // Target total messages per mailbox (across folders). Backend returns ≤50/page.
+    const mailboxCap = Math.max(50, Math.min(50000, parseInt(document.getElementById('msgLimit').value, 10) || 5000));
+    const PAGE_SIZE = 50;
 
     // Keep prior AI / status for domains we already know
     const prior = new Map(domainMap);
@@ -698,39 +702,65 @@
         if (shouldStop) break;
         const isMicrosoft = (oauthAcc.provider || '').toLowerCase() === 'microsoft'
           || oauthAcc.accountId?.startsWith('microsoft_');
-        const folders = isMicrosoft ? ['inbox', 'SentItems'] : ['INBOX', 'SENT'];
-        setProgress(Math.round((done / mailboxes.length) * 100), `Scanning ${oauthAcc.email}…`);
+        // API maps INBOX/SENT for both providers (case-insensitive)
+        const folders = ['INBOX', 'SENT'];
+        let mailboxPulled = 0;
+        setProgress(
+          Math.round((done / mailboxes.length) * 100),
+          `Scanning ${oauthAcc.email}… (0 / ${mailboxCap})`
+        );
 
         for (const folder of folders) {
-          if (shouldStop) break;
+          if (shouldStop || mailboxPulled >= mailboxCap) break;
+          let pageToken = null;
+          let page = 0;
           try {
-            const params = new URLSearchParams({
-              accountId: oauthAcc.accountId,
-              folder,
-              limit: String(limit),
-            });
-            const headers = await getAuthHeaders();
-            const res = await fetch(`${RAILWAY_URL}/oauth/test/inbox?${params}`, { headers });
-            if (!res.ok) {
-              console.warn('Inbox fetch failed', oauthAcc.email, folder, res.status);
-              continue;
-            }
-            const data = await res.json();
-            const messages = data.messages || data.emails || data.value || [];
-            for (const msg of messages) {
-              if (isMarketingEmail({
-                from: normalizeEmailField(msg.from || msg.sender),
-                subject: msg.subject,
-                to: normalizeEmailField(msg.to || msg.toRecipients),
-              })) continue;
-              upsertDomainFromMessage({
-                from: normalizeEmailField(msg.from || msg.sender),
-                to: normalizeEmailField(msg.to || msg.toRecipients),
-                cc: normalizeEmailField(msg.cc || msg.ccRecipients),
-                subject: msg.subject,
-                date: msg.date || msg.receivedDateTime || msg.internalDate,
-              }, oauthAcc.email);
-              pulled++;
+            while (!shouldStop && mailboxPulled < mailboxCap) {
+              page++;
+              const remaining = mailboxCap - mailboxPulled;
+              const params = new URLSearchParams({
+                accountId: oauthAcc.accountId,
+                folder,
+                limit: String(Math.min(PAGE_SIZE, remaining)),
+              });
+              if (pageToken) params.set('pageToken', pageToken);
+              const headers = await getAuthHeaders();
+              const res = await fetch(`${RAILWAY_URL}/oauth/test/inbox?${params}`, { headers });
+              if (!res.ok) {
+                console.warn('Inbox fetch failed', oauthAcc.email, folder, res.status);
+                break;
+              }
+              const data = await res.json();
+              const messages = data.messages || data.emails || data.value || [];
+              if (!messages.length) break;
+
+              for (const msg of messages) {
+                pulled++;
+                mailboxPulled++;
+                if (!isMarketingEmail({
+                  from: normalizeEmailField(msg.from || msg.sender),
+                  subject: msg.subject,
+                  to: normalizeEmailField(msg.to || msg.toRecipients),
+                })) {
+                  upsertDomainFromMessage({
+                    from: normalizeEmailField(msg.from || msg.sender),
+                    to: normalizeEmailField(msg.to || msg.toRecipients),
+                    cc: normalizeEmailField(msg.cc || msg.ccRecipients),
+                    subject: msg.subject,
+                    date: msg.date || msg.receivedDateTime || msg.internalDate,
+                  }, oauthAcc.email);
+                }
+                if (mailboxPulled >= mailboxCap) break;
+              }
+
+              setProgress(
+                Math.round(((done + mailboxPulled / mailboxCap) / mailboxes.length) * 100),
+                `Scanning ${oauthAcc.email} · ${folder} · page ${page} (${mailboxPulled} / ${mailboxCap})`
+              );
+
+              pageToken = data.nextPageToken || null;
+              if (!pageToken) break;
+              await sleep(isMicrosoft ? 450 : 200);
             }
           } catch (err) {
             console.warn('Mailbox error', oauthAcc.email, folder, err.message);
