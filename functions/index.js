@@ -987,6 +987,266 @@ exports.manualReserveQueueTopUp = functions
         }
     });
 
+// ============================================================================
+// CLIENT DASHBOARD — nightly revenue-per-client calculation
+// ============================================================================
+//
+// Powers the "Client Dashboard" section on connect/index_admin.html (below the
+// BDR Dashboard). That page tracks two things per client:
+//   1. Satisfaction (red/yellow/green) — a plain manually-edited field, no
+//      calculation needed, written straight to Firestore from the page.
+//   2. Billing pace — how much revenue has actually been *earned* this month
+//      (via the same per-activity billing formula as cost_revenue_tracking.html)
+//      compared to what the client paid for the month.
+//
+// Earned-revenue-this-month requires scanning heyreach_activity +
+// activity_tracking across every BDR, which is exactly the kind of scan that
+// shouldn't run on every page load. So it's calculated once nightly here and
+// cached to settings/client_dashboard_cache; the page combines that cached
+// number with the always-current "days elapsed / days in month" math and the
+// live paid-amount field to show pace instantly.
+
+const CLIENT_DASHBOARD_DEFAULT_COSTS = {
+    connection_request_sent: 1.60,  // CONNECTION_REQUEST_SENT (HeyReach)
+    heyreach_message_sent:   1.60,  // MESSAGE_SENT / INMAIL_SENT (HeyReach)
+    successful_connection:   1.00,  // CONNECTION_REQUEST_ACCEPTED (HeyReach)
+    meeting_scheduled:       10.00, // activity_tracking
+    follow_up_message:       1.60   // activity_tracking (written by review_replies.html)
+};
+
+const CLIENT_DASHBOARD_HEYREACH_EVENT_TO_TYPE = {
+    CONNECTION_REQUEST_SENT: 'connection_request_sent',
+    MESSAGE_SENT: 'heyreach_message_sent',
+    INMAIL_SENT: 'heyreach_message_sent',
+    CONNECTION_REQUEST_ACCEPTED: 'successful_connection'
+};
+
+/**
+ * Core nightly/manual calculation: revenue earned this month, per client company.
+ * Mirrors the billing formula in connect/cost_revenue_tracking.html but runs
+ * across ALL BDRs at once (that page is scoped to one BDR/company at a time).
+ */
+async function calculateClientDashboardHelper() {
+    console.log('📊 Starting: Client Dashboard nightly calculation');
+    const startTime = Date.now();
+
+    // ── 1. Cost settings (live rates, same doc cost_revenue_tracking.html uses) ──
+    let costSettings = CLIENT_DASHBOARD_DEFAULT_COSTS;
+    try {
+        const settingsDoc = await db.collection('settings').doc('cost_revenue_tracking').get();
+        if (settingsDoc.exists && settingsDoc.data().costs) {
+            costSettings = { ...CLIENT_DASHBOARD_DEFAULT_COSTS, ...settingsDoc.data().costs };
+        }
+    } catch (e) {
+        console.warn('⚠️ Could not load cost_revenue_tracking settings, using defaults:', e.message);
+    }
+
+    // ── 2. Company + BDR attribution maps (customerList, bdr_leaders, linkedin_accounts, linkedin_email_associations) ──
+    const [customersSnap, bdrSnap, accountsSnap, assocSnap] = await Promise.all([
+        db.collection('customerList').get(),
+        db.collection('bdr_leaders').get(),
+        db.collection('linkedin_accounts').get(),
+        db.collection('linkedin_email_associations').get()
+    ]);
+
+    const customerNames = {}; // customerId -> display name
+    customersSnap.forEach(d => {
+        const x = d.data();
+        customerNames[d.id] = x.name || x.shortName || d.id;
+    });
+
+    const linkedInEmailToCanonical = {}; // LinkedIn/Gmail alias (lowercased) -> canonical work email
+    assocSnap.forEach(d => {
+        const x = d.data();
+        const primary = (x.authEmail || x.primaryEmail || '').toLowerCase();
+        const linkedIn = (x.linkedInEmail || '').toLowerCase();
+        if (primary && linkedIn && linkedIn !== primary) linkedInEmailToCanonical[linkedIn] = primary;
+    });
+
+    function normalizeEmail(email) {
+        if (!email) return email;
+        const lower = String(email).toLowerCase();
+        return linkedInEmailToCanonical[lower] || lower;
+    }
+
+    const bdrEmailToCustomer = {}; // canonical bdr email (lowercased) -> customerId
+    bdrSnap.forEach(d => {
+        const x = d.data();
+        if (x.status === 'inactive') return;
+        if (x.primaryEmail && x.customerId) {
+            bdrEmailToCustomer[normalizeEmail(x.primaryEmail)] = x.customerId;
+        }
+    });
+
+    const accountIdToEmail = {}; // HeyReach linkedInAccountId (string) -> canonical bdr email
+    accountsSnap.forEach(d => {
+        const x = d.data();
+        if (x.heyreachAccountId && x.bdrEmail) {
+            accountIdToEmail[String(x.heyreachAccountId)] = normalizeEmail(x.bdrEmail);
+        }
+    });
+
+    function resolveCustomerForEmail(email) {
+        if (!email) return null;
+        return bdrEmailToCustomer[normalizeEmail(email)] || null;
+    }
+
+    // ── 3. Current month's activity (scoped by date to keep the scan bounded) ──
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0);
+    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const monthStartTs = admin.firestore.Timestamp.fromDate(monthStart);
+
+    async function loadThisMonth(collectionName, field) {
+        try {
+            const snap = await db.collection(collectionName).where(field, '>=', monthStartTs).get();
+            const docs = [];
+            snap.forEach(d => docs.push(d.data()));
+            return docs;
+        } catch (e) {
+            console.warn(`⚠️ Query ${collectionName} by ${field} failed (field may not be a Timestamp on all docs):`, e.message);
+            return [];
+        }
+    }
+
+    // heyreach_activity records may use either `timestamp` or `receivedAt` — query
+    // both and dedupe (a doc only has one of the two fields as a real Timestamp).
+    const [heyreachByTimestamp, heyreachByReceivedAt] = await Promise.all([
+        loadThisMonth('heyreach_activity', 'timestamp'),
+        loadThisMonth('heyreach_activity', 'receivedAt')
+    ]);
+    const heyreachActivities = [...heyreachByTimestamp, ...heyreachByReceivedAt];
+
+    // activity_tracking (meetings + follow-ups) is written with `created_at`.
+    const activityTrackingData = await loadThisMonth('activity_tracking', 'created_at');
+
+    console.log(`📥 Loaded ${heyreachActivities.length} heyreach_activity + ${activityTrackingData.length} activity_tracking docs for ${monthKey}`);
+
+    // ── 4. Tally revenue per company using the same billing formula as cost_revenue_tracking.html ──
+    const companyRevenue = {}; // customerId -> { revenue, activities, breakdown }
+    const unattributed = { revenue: 0, activities: 0 };
+
+    function addActivity(customerId, type, cost) {
+        const bucket = customerId
+            ? (companyRevenue[customerId] || (companyRevenue[customerId] = { revenue: 0, activities: 0, breakdown: {} }))
+            : unattributed;
+        bucket.revenue += cost;
+        bucket.activities += 1;
+        if (customerId) bucket.breakdown[type] = (bucket.breakdown[type] || 0) + 1;
+    }
+
+    heyreachActivities.forEach(activity => {
+        const type = CLIENT_DASHBOARD_HEYREACH_EVENT_TO_TYPE[activity.eventType];
+        if (!type) return;
+
+        let bdrEmail = activity.bdrEmail || activity.linkedInAccountEmail ||
+                       activity.accountEmail || activity.bdr_email || null;
+        if (!bdrEmail && activity.linkedInAccountId) {
+            bdrEmail = accountIdToEmail[String(activity.linkedInAccountId)] || null;
+        }
+        if (!bdrEmail) return;
+
+        const customerId = resolveCustomerForEmail(bdrEmail);
+        const cost = costSettings[type] ?? CLIENT_DASHBOARD_DEFAULT_COSTS[type] ?? 0;
+        addActivity(customerId, type, cost);
+    });
+
+    activityTrackingData.forEach(tracking => {
+        const type = tracking.activity_type;
+        if (type !== 'meeting_scheduled' && type !== 'follow_up_message') return;
+
+        const bdrEmail = tracking.bdr_email || tracking.bdr_auth_email || '';
+        const customerId = resolveCustomerForEmail(bdrEmail);
+        const cost = costSettings[type] ?? CLIENT_DASHBOARD_DEFAULT_COSTS[type] ?? 0;
+        addActivity(customerId, type, cost);
+    });
+
+    // ── 5. Build + write the cache doc (one entry per known client company) ──
+    const companies = {};
+    Object.keys(customerNames).forEach(customerId => {
+        const rev = companyRevenue[customerId] || { revenue: 0, activities: 0, breakdown: {} };
+        companies[customerId] = {
+            name: customerNames[customerId],
+            revenueThisMonth: Math.round(rev.revenue * 100) / 100,
+            activities: rev.activities,
+            breakdown: rev.breakdown
+        };
+    });
+
+    await db.collection('settings').doc('client_dashboard_cache').set({
+        month: monthKey,
+        monthStart: monthStartTs,
+        calculatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        companies,
+        unattributedRevenue: Math.round(unattributed.revenue * 100) / 100,
+        unattributedActivities: unattributed.activities
+    });
+
+    const duration = Date.now() - startTime;
+    console.log(`✅ Client dashboard calculated for ${Object.keys(companies).length} companies in ${duration}ms`);
+
+    return {
+        success: true,
+        month: monthKey,
+        companies: Object.keys(companies).length,
+        totalActivities: heyreachActivities.length + activityTrackingData.length,
+        duration
+    };
+}
+
+/**
+ * Nightly Client Dashboard calculation — runs at 3:00 AM Mountain Time, daily.
+ *
+ * DEPLOYMENT:
+ *   firebase deploy --only functions:nightlyClientDashboardCalc,functions:manualCalculateClientDashboard
+ */
+exports.nightlyClientDashboardCalc = functions
+    .runWith({
+        timeoutSeconds: 540,
+        memory: '512MB'
+    })
+    .pubsub.schedule('0 3 * * *') // 3:00 AM daily
+    .timeZone(CONFIG.TIMEZONE)    // America/Denver (Mountain Time)
+    .onRun(async (context) => {
+        console.log('⏰ Scheduled run: nightlyClientDashboardCalc (3 AM MT)');
+        try {
+            const result = await calculateClientDashboardHelper();
+            console.log('📊 Result:', JSON.stringify(result, null, 2));
+            return result;
+        } catch (error) {
+            console.error('❌ nightlyClientDashboardCalc failed:', error);
+            throw error;
+        }
+    });
+
+/**
+ * Manual trigger for the Client Dashboard calculation (the "Recalculate" button
+ * on connect/index_admin.html's Client Dashboard section calls this directly).
+ *
+ * Usage:
+ *   curl -X POST https://us-central1-clemail.cloudfunctions.net/manualCalculateClientDashboard
+ */
+exports.manualCalculateClientDashboard = functions
+    .runWith({
+        timeoutSeconds: 540,
+        memory: '512MB'
+    })
+    .https.onRequest(async (req, res) => {
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Access-Control-Allow-Methods', 'POST');
+        if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+        if (req.method !== 'POST') { res.status(405).send('Method Not Allowed'); return; }
+
+        console.log('🔧 Manual trigger: calculateClientDashboard');
+        try {
+            const result = await calculateClientDashboardHelper();
+            res.status(200).json(result);
+        } catch (error) {
+            console.error('❌ Manual trigger failed:', error);
+            res.status(500).json({ success: false, error: error.message });
+        }
+    });
+
 /**
  * Google Photos media proxy for taylorsideproject/photos-player.html
  * Streams Picker API video bytes to the browser (Google blocks direct CORS access).
