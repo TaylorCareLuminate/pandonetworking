@@ -965,6 +965,7 @@
       <a href="contacts-list.html"        class="nav-tab"><i class="fas fa-users"></i><span>Contacts</span></a>
       <a href="tasks-list.html"           class="nav-tab"><i class="fas fa-calendar-check"></i><span>Activities</span></a>
       <a href="company-comms-scan.html"   class="nav-tab active"><i class="fas fa-satellite-dish"></i><span>Comms Scan</span></a>
+      <a href="prospect-domain-scan.html" class="nav-tab"><i class="fas fa-radar"></i><span>Prospect Domains</span></a>
     </nav>
   </div>
 </header>
@@ -1053,6 +1054,10 @@
 
   <!-- Controls Bar -->
   <div class="controls-bar">
+    <a class="btn btn-secondary" href="prospect-domain-scan.html" style="text-decoration:none;"
+       title="Discover new prospect domains from internal email and seed this scanner">
+      <i class="fas fa-radar"></i> Find Prospect Domains
+    </a>
     <button class="btn btn-primary" id="scanAllBtn" onclick="scanAllCompanies()">
       <i class="fas fa-play"></i> Scan All Companies
     </button>
@@ -1752,6 +1757,14 @@
       // Show the People roster accordion (headers only — company bodies lazy-load on expand)
       renderRosterShell();
       document.getElementById('roster-section').style.display = 'block';
+      // Deep-link from Prospect Domain Scanner: company-comms-scan.html#roster={leadId}
+      const rosterHash = (location.hash || '').match(/^#roster=(.+)$/);
+      if (rosterHash) {
+        const targetId = decodeURIComponent(rosterHash[1]);
+        if (allAccounts.some(a => a.id === targetId)) {
+          setTimeout(() => window.openCompanyRoster(targetId, true), 200);
+        }
+      }
       // Start loading the LI inbox cache and connections cache in the background.
       // Don't await — the page UI appears immediately; scans wait for these automatically.
       loadLiCacheOnce();
@@ -1776,6 +1789,8 @@
         if (!d) return;
         if (!d.organization?.name && !d.organizationName) return;
         if (d.archived === true || d.mergedInto) return;
+        const rawContacts = Array.isArray(d.contacts) ? d.contacts
+          : (d.contacts && typeof d.contacts === 'object' ? Object.values(d.contacts) : []);
         allAccounts.push({
           id:       child.key,
           name:     String(d.organization?.name || d.organizationName || 'Unnamed'),
@@ -1784,6 +1799,12 @@
           industry: String(d.organization?.industry || d.industry || ''),
           stage:    String(d.stage     || ''),
           owner:    String(d.assignedSalesContact?.name || ''),
+          // CRM contacts (incl. those seeded by Prospect Domain Scanner)
+          contacts: rawContacts.filter(c => c && (c.email || c.firstName || c.lastName)).map(c => ({
+            email: String(c.email || '').toLowerCase(),
+            name:  [c.firstName, c.lastName].filter(Boolean).join(' ') || c.name || '',
+            title: String(c.title || ''),
+          })),
         });
       });
     }
@@ -2334,6 +2355,9 @@
       result.notes             = mergedNotes.slice(0, 50);
       result.companyDomains    = companyDomains;
       result.excludedMembers   = existing.excludedMembers || [];
+      // Preserve contacts seeded by Prospect Domain Scanner across re-scans
+      if (existing.seededContacts?.length) result.seededContacts = existing.seededContacts;
+      if (existing.fromProspectDiscovery)  result.fromProspectDiscovery = true;
       result.scanDuration      = Date.now() - t0;
 
     } catch (err) {
@@ -2348,6 +2372,8 @@
       result.notes            = existing.notes           || [];
       result.companyDomains   = existing.companyDomains  || [];
       result.excludedMembers  = existing.excludedMembers || [];
+      if (existing.seededContacts?.length) result.seededContacts = existing.seededContacts;
+      if (existing.fromProspectDiscovery)  result.fromProspectDiscovery = true;
     }
 
     try {
@@ -3656,15 +3682,40 @@
         });
       });
 
+    // Merge CRM / Prospect-Domain-Scanner seeded contacts that aren't already on threads
+    const seedList = [
+      ...(account.contacts || []),
+      ...(scan.seededContacts || []),
+    ];
+    seedList.forEach(s => {
+      const email = String(s.email || '').toLowerCase();
+      if (!email || !email.includes('@')) return;
+      if (exKeys.has('em:' + email)) return;
+      if (isInternalEmail(email) || internalBDREmails.has(email)) return;
+      if (emailMap.has(email)) {
+        const entry = emailMap.get(email);
+        if (s.name && s.name.length > (entry.name || '').length) entry.name = s.name;
+        return;
+      }
+      emailMap.set(email, {
+        email,
+        name: s.name || '',
+        domain: emailDomainOf(email),
+        classification: classifyEmailAddress(email, companyDomains),
+        count: 0, received: 0, sent: 0, lastDate: null,
+        seeded: true,
+      });
+    });
+
     const allEmailContacts = [...emailMap.values()]
       .sort((a, b) => (b.lastDate || '').localeCompare(a.lastDate || ''));
     // Primary list = company-domain employees. Fallback: if we couldn't find any
     // domain yet, show everyone so the roster isn't blank for unscanned/name-only accounts.
     const companyContacts = companyDomains.length
-      ? allEmailContacts.filter(c => c.classification === 'company')
+      ? allEmailContacts.filter(c => c.classification === 'company' || c.seeded)
       : allEmailContacts;
     const otherContacts = companyDomains.length
-      ? allEmailContacts.filter(c => c.classification !== 'company')
+      ? allEmailContacts.filter(c => c.classification !== 'company' && !c.seeded)
       : [];
 
     // ── LinkedIn accounts: one row per person (deduped by profile URL) ──
