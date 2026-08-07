@@ -763,7 +763,8 @@
     const db       = window.clemailDb;
     const queueRef = collection(db, 'connect_queue');
     const RAILWAY  = 'https://railwayclemail-production.up.railway.app';
-    const AI_MODEL = 'meta-llama/llama-4-maverick';
+    // Claude Opus — careful provenance reasoning; must not confuse sender vs prospect sources
+    const AI_MODEL = 'anthropic/claude-opus-4.7';
     const PROFILE_CACHE_COLLECTION = 'linkedin_profile_cache';
     const CACHE_FRESH_DAYS = 90;
 
@@ -1246,71 +1247,108 @@
 
     function buildSourceBundle(ctx) {
         const p = ctx.profile || {};
+        const senderEmail = ctx.bdrEmail || '(unknown sender email)';
+        const senderName = ctx.bdrName || ctx.bdrAboutMe?.name || '(unknown sender name)';
+        const prospectName = p.name || '(unknown prospect name)';
+        const prospectUrl = ctx.liUrl || p.linkedinUrl || '(unknown prospect URL)';
+
         const postsBlock = (ctx.posts || []).map((post, i) => {
             const dateStr = post.date ? new Date(post.date).toLocaleDateString('en-US') : 'unknown date';
-            return `[POST ${i + 1} | ${dateStr}]\n${post.text || ''}`;
-        }).join('\n\n') || '(no posts retrieved)';
+            return `[PROSPECT POST ${i + 1} | ${dateStr} | authored by the PROSPECT, not the sender]\n${post.text || ''}`;
+        }).join('\n\n') || '(no prospect posts retrieved)';
 
         const newsBlock = (ctx.news || []).map((n, i) => {
-            return `[NEWS ${i + 1}] ${n.headline || '(no headline)'}\nDate: ${n.date || 'n/a'}\nURL: ${n.url || 'n/a'}\n${n.content || n.summary || ''}`;
-        }).join('\n\n') || '(no company news retrieved)';
+            return `[PROSPECT COMPANY NEWS ${i + 1}] ${n.headline || '(no headline)'}\nDate: ${n.date || 'n/a'}\nURL: ${n.url || 'n/a'}\n${n.content || n.summary || ''}`;
+        }).join('\n\n') || '(no prospect-company news retrieved)';
 
-        let bdrBlock = '(no BDR About Me profile loaded)';
+        let bdrBlock = '(no SENDER About Me profile loaded)';
         if (ctx.bdrAboutMe) {
             const parts = [];
             const stmts = ctx.bdrAboutMe.statements || {};
             Object.keys(stmts).forEach(cat => {
                 const arr = Array.isArray(stmts[cat]) ? stmts[cat] : [];
-                arr.forEach(s => parts.push(`[I-STATEMENT / ${cat}] ${typeof s === 'string' ? s : (s.text || JSON.stringify(s))}`));
+                arr.forEach(s => parts.push(
+                    `[SENDER I-STATEMENT | category=${cat} | FIRST-PERSON ABOUT THE SENDER/BDR, NOT THE PROSPECT] ${typeof s === 'string' ? s : (s.text || JSON.stringify(s))}`
+                ));
             });
             (ctx.bdrAboutMe.weStatements || []).forEach(s => {
-                parts.push(`[WE-STATEMENT] ${typeof s === 'string' ? s : (s.text || JSON.stringify(s))}`);
+                parts.push(
+                    `[SENDER WE-STATEMENT | about the SENDER's company/product, NOT the prospect] ${typeof s === 'string' ? s : (s.text || JSON.stringify(s))}`
+                );
             });
-            bdrBlock = parts.length ? parts.join('\n') : '(BDR About Me exists but has no statements)';
+            bdrBlock = parts.length ? parts.join('\n') : '(SENDER About Me exists but has no statements)';
         }
 
         const queueFindings = (ctx.queueDocs || [])
             .filter(d => d.about_me_findings || d.news_data || d.ai_company_news || d.message_to_contact)
             .slice(0, 5)
-            .map(d => {
+            .map((d, i) => {
                 const bits = [
-                    `Source: ${d.source || d.generated_via || 'unknown'}`,
-                    d.message_to_contact ? `Message: ${d.message_to_contact}` : '',
-                    d.about_me_findings ? `About Me findings: ${JSON.stringify(d.about_me_findings)}` : '',
-                    d.news_data ? `Stored news_data: ${JSON.stringify(d.news_data).slice(0, 2000)}` : '',
-                    d.ai_company_news ? `ai_company_news: ${JSON.stringify(d.ai_company_news).slice(0, 1500)}` : '',
+                    `[QUEUE RECORD ${i + 1}]`,
+                    `message_source_label: ${d.source || d.generated_via || 'unknown'}`,
+                    `sender_bdr_name: ${d.bdr_name || '(n/a)'}`,
+                    `sender_bdr_email: ${d.bdr_primary_email || d.bdr_auth_email || d.account_email || '(n/a)'}`,
+                    d.message_to_contact ? `stored_outbound_message: ${d.message_to_contact}` : '',
+                    d.about_me_findings ? `stored_about_me_findings_json: ${JSON.stringify(d.about_me_findings)}` : '',
+                    d.news_data ? `stored_news_data: ${JSON.stringify(d.news_data).slice(0, 2000)}` : '',
+                    d.ai_company_news ? `stored_ai_company_news: ${JSON.stringify(d.ai_company_news).slice(0, 1500)}` : '',
                 ].filter(Boolean);
                 return bits.join('\n');
             }).join('\n\n---\n\n') || '(no queue context)';
 
         return `
-=== PROSPECT PROFILE ===
-Name: ${p.name || ''}
+CRITICAL ROLE LABELS — READ BEFORE ANALYZING
+- SENDER / BDR = the person who wrote and sent the LinkedIn outreach message (${senderName} / ${senderEmail}).
+- PROSPECT / RECIPIENT = the person who received the message (${prospectName} / ${prospectUrl}).
+- "About Me" statements belong ONLY to the SENDER. They are first-person facts about the sender (hobbies, education, career, company). They are NEVER facts about the prospect.
+- Prospect profile + prospect posts + prospect company news are about the RECIPIENT only.
+- About Me Connect messages often claim a SHARED interest ("fellow golfer"). That usually means: (a) the hobby appears in SENDER About Me, and (b) the system believed the prospect also had that interest from prospect profile/posts. Always say which side each piece came from.
+
+════════════════════════════════════════════════════════════
+SECTION A — PROSPECT / RECIPIENT DATA (about the person being messaged)
+════════════════════════════════════════════════════════════
+
+=== A1. PROSPECT LINKEDIN PROFILE (RECIPIENT ONLY) ===
+Prospect name: ${prospectName}
+Prospect LinkedIn URL: ${prospectUrl}
 Headline: ${p.headline || ''}
 Title: ${p.currentTitle || ''}
 Company: ${p.currentCompany || ''}
 Location: ${p.location || ''}
-About:
+About (prospect's own About section):
 ${p.about || '(empty)'}
 
-Experience:
+Experience (prospect):
 ${p.experienceParagraph || '(empty)'}
 
-Education:
+Education (prospect):
 ${p.educationParagraph || '(empty)'}
 
-Skills: ${(p.skills || []).map(s => typeof s === 'string' ? s : (s.name || '')).filter(Boolean).join(', ') || '(none)'}
+Skills (prospect): ${(p.skills || []).map(s => typeof s === 'string' ? s : (s.name || '')).filter(Boolean).join(', ') || '(none)'}
 
-=== LAST 10 LINKEDIN POSTS ===
+=== A2. PROSPECT'S LAST 10 LINKEDIN POSTS (RECIPIENT ONLY — not the sender) ===
 ${postsBlock}
 
-=== COMPANY NEWS ===
+=== A3. NEWS ABOUT THE PROSPECT'S COMPANY (RECIPIENT'S ORG — not the sender) ===
 ${newsBlock}
 
-=== BDR ABOUT ME STATEMENTS ===
+════════════════════════════════════════════════════════════
+SECTION B — SENDER / BDR DATA (about the person who sent the message)
+════════════════════════════════════════════════════════════
+
+=== B1. SENDER "ABOUT ME" STATEMENTS (SENDER ONLY — NOT THE PROSPECT) ===
+Sender / BDR name: ${senderName}
+Sender / BDR email: ${senderEmail}
+IMPORTANT: Every statement below is written in the sender's voice about THEMSELVES or THEIR company.
+Do NOT attribute these as facts about the prospect. If the message says "fellow golfer", and golf appears only here, say the golf claim was keyed off the SENDER's About Me (and note whether any prospect-side golf evidence also exists).
+
 ${bdrBlock}
 
-=== ANY STORED QUEUE RECORDS FOR THIS CONTACT ===
+════════════════════════════════════════════════════════════
+SECTION C — STORED SYSTEM RECORDS (may mix both roles; read fields carefully)
+════════════════════════════════════════════════════════════
+
+=== C1. CONNECT_QUEUE RECORDS FOR THIS PROSPECT URL ===
 ${queueFindings}
 `.trim();
     }
@@ -1479,10 +1517,15 @@ ${queueFindings}
         el.innerHTML = `${icons[state] || icons.pending} ${esc(label)}`;
     }
 
-    function renderBdrAboutMePanel(am) {
+    function renderBdrAboutMePanel(am, bdrEmail = '', bdrName = '') {
+        const who = [bdrName, bdrEmail].filter(Boolean).join(' · ') || 'selected BDR';
+        const banner = `<div style="background:#4c1d95;color:white;border-radius:6px;padding:0.45rem 0.7rem;font-size:0.78rem;font-weight:700;margin-bottom:0.75rem;line-height:1.4;">
+            SENDER / BDR ONLY — first-person facts about <em>${esc(who)}</em> (the person who sent the message). These are NOT about the prospect.
+        </div>`;
         if (!am) {
             return `<div class="bdr-am-panel">
-                <div class="panel-title"><i class="fas fa-user-friends"></i> BDR About Me Statements</div>
+                <div class="panel-title"><i class="fas fa-user-tie"></i> SENDER About Me (BDR) — not the prospect</div>
+                ${banner}
                 <p style="font-size:0.82rem;color:var(--gray);">No About Me profile loaded. Select a BDR and re-run deep lookup.</p>
             </div>`;
         }
@@ -1491,18 +1534,20 @@ ${queueFindings}
         const we = am.weStatements || [];
         if (!cats.length && !we.length) {
             return `<div class="bdr-am-panel">
-                <div class="panel-title"><i class="fas fa-user-friends"></i> BDR About Me Statements</div>
+                <div class="panel-title"><i class="fas fa-user-tie"></i> SENDER About Me (BDR) — not the prospect</div>
+                ${banner}
                 <p style="font-size:0.82rem;color:var(--gray);">Profile exists but has no statements yet.</p>
             </div>`;
         }
         return `<div class="bdr-am-panel">
-            <div class="panel-title"><i class="fas fa-user-friends"></i> BDR About Me Statements</div>
+            <div class="panel-title"><i class="fas fa-user-tie"></i> SENDER About Me (BDR) — not the prospect</div>
+            ${banner}
             ${cats.map(cat => `
-                <div class="stmt-cat">${esc(cat)}</div>
+                <div class="stmt-cat">Sender · ${esc(cat)}</div>
                 ${stmts[cat].map(s => `<span class="stmt-chip">${esc(typeof s === 'string' ? s : (s.text || JSON.stringify(s)))}</span>`).join('')}
             `).join('')}
             ${we.length ? `
-                <div class="stmt-cat">We Statements</div>
+                <div class="stmt-cat">Sender · We Statements (sender's company)</div>
                 ${we.map(s => `<span class="stmt-chip">${esc(typeof s === 'string' ? s : (s.text || JSON.stringify(s)))}</span>`).join('')}
             ` : ''}
         </div>`;
@@ -1511,12 +1556,12 @@ ${queueFindings}
     function renderNewsPanel(news) {
         if (!news.length) {
             return `<div class="news-panel">
-                <div class="panel-title"><i class="fas fa-newspaper"></i> Company News</div>
+                <div class="panel-title"><i class="fas fa-newspaper"></i> PROSPECT company news (recipient's org)</div>
                 <p style="font-size:0.82rem;color:#92400e;">No verified company news found (or BDR/company missing).</p>
             </div>`;
         }
         return `<div class="news-panel">
-            <div class="panel-title"><i class="fas fa-newspaper"></i> Company News (${news.length})</div>
+            <div class="panel-title"><i class="fas fa-newspaper"></i> PROSPECT company news (${news.length}) — recipient's org</div>
             ${news.slice(0, 12).map(n => `
                 <div class="news-item">
                     <div>${n.url ? `<a href="${esc(n.url)}" target="_blank">${esc(n.headline || n.url)}</a>` : `<strong>${esc(n.headline || 'Story')}</strong>`}</div>
@@ -1538,12 +1583,15 @@ ${queueFindings}
         const claims = attr.claims || [];
         const srcClass = (t) => {
             const x = (t || '').toLowerCase();
+            if (x.includes('unsourced') || x.includes('unknown')) return 'src-unsourced';
+            if (x.includes('sender') || x.includes('bdr_about') || x.includes('bdr about')) return 'src-bdr';
+            if (x.includes('prospect_post') || (x.includes('post') && x.includes('prospect'))) return 'src-post';
+            if (x.includes('prospect_profile') || (x.includes('profile') && x.includes('prospect'))) return 'src-profile';
+            if (x.includes('news')) return 'src-news';
             if (x.includes('profile')) return 'src-profile';
             if (x.includes('post')) return 'src-post';
-            if (x.includes('news')) return 'src-news';
-            if (x.includes('bdr') || x.includes('about')) return 'src-bdr';
             if (x.includes('queue') || x.includes('finding')) return 'src-queue';
-            if (x.includes('unsourced') || x.includes('unknown')) return 'src-unsourced';
+            if (x.includes('bdr') || x.includes('about')) return 'src-bdr';
             return 'src-queue';
         };
         const confClass = (c) => {
@@ -1553,14 +1601,16 @@ ${queueFindings}
             return 'conf-low';
         };
         return `<div class="attr-panel">
-            <div class="panel-title"><i class="fas fa-link"></i> Message Claim Attribution</div>
+            <div class="panel-title"><i class="fas fa-link"></i> Message Claim Attribution <span style="font-weight:500;text-transform:none;letter-spacing:0;color:#047857;">· Claude Opus</span></div>
             ${attr.summary ? `<p style="font-size:0.84rem;color:#065f46;margin-bottom:0.35rem;">${esc(attr.summary)}</p>` : ''}
             ${claims.length ? claims.map(c => {
                 const unsourced = /unsourced|unknown|not found|hallucin/i.test(c.source_type || '') || /unsourced|not found/i.test(c.evidence || '');
+                const aboutProspect = c.about_whom || c.side || '';
                 return `<div class="claim-row ${unsourced ? 'unsourced' : ''}">
                     <div class="claim-text">${esc(c.claim || '')}</div>
                     <div class="claim-meta">
                         <span class="src-badge ${srcClass(c.source_type)}">${esc(c.source_type || 'unknown')}</span>
+                        ${aboutProspect ? `<span class="src-badge ${/sender/i.test(aboutProspect) ? 'src-bdr' : /prospect/i.test(aboutProspect) ? 'src-profile' : 'conf-low'}">${esc(aboutProspect)}</span>` : ''}
                         ${c.confidence ? `<span class="src-badge ${confClass(c.confidence)}">${esc(c.confidence)} confidence</span>` : ''}
                     </div>
                     ${c.evidence ? `<div class="claim-evidence">${esc(c.evidence)}</div>` : ''}
@@ -1573,17 +1623,17 @@ ${queueFindings}
         return `
         <div class="deep-card" id="deepCard">
             <div class="deep-card-header">
-                <h2><i class="fas fa-microscope"></i> Deep Source Investigation</h2>
-                <p>Pulling everything that could have gone into this message — enriched profile, last 10 posts, company news, and BDR About Me — then tracing each claim.</p>
+                <h2><i class="fas fa-microscope"></i> Deep Source Investigation · Claude Opus</h2>
+                <p>Pulls prospect profile/posts/news + sender About Me (clearly labeled), then Opus traces each message claim to the correct side.</p>
             </div>
             <div class="deep-card-body">
                 <div class="deep-progress" id="deepProgress">
                     <div class="deep-progress-item" id="prog-queue"><i class="fas fa-circle-notch fa-spin"></i> Checking any queue records…</div>
-                    <div class="deep-progress-item" id="prog-profile"><i class="fas fa-circle" style="opacity:0.35;"></i> Enriched profile</div>
-                    <div class="deep-progress-item" id="prog-posts"><i class="fas fa-circle" style="opacity:0.35;"></i> Last 10 LinkedIn posts</div>
-                    <div class="deep-progress-item" id="prog-news"><i class="fas fa-circle" style="opacity:0.35;"></i> Company news</div>
-                    <div class="deep-progress-item" id="prog-bdr"><i class="fas fa-circle" style="opacity:0.35;"></i> BDR About Me statements</div>
-                    <div class="deep-progress-item" id="prog-ai"><i class="fas fa-circle" style="opacity:0.35;"></i> AI claim attribution</div>
+                    <div class="deep-progress-item" id="prog-profile"><i class="fas fa-circle" style="opacity:0.35;"></i> Prospect profile</div>
+                    <div class="deep-progress-item" id="prog-posts"><i class="fas fa-circle" style="opacity:0.35;"></i> Prospect's last 10 posts</div>
+                    <div class="deep-progress-item" id="prog-news"><i class="fas fa-circle" style="opacity:0.35;"></i> Prospect company news</div>
+                    <div class="deep-progress-item" id="prog-bdr"><i class="fas fa-circle" style="opacity:0.35;"></i> Sender About Me (BDR)</div>
+                    <div class="deep-progress-item" id="prog-ai"><i class="fas fa-circle" style="opacity:0.35;"></i> Opus claim attribution</div>
                 </div>
                 <div id="deepOtherMsgs"></div>
                 <div id="deepProfile"></div>
@@ -1600,7 +1650,7 @@ ${queueFindings}
                         placeholder='e.g. "Where did hockey or golf come from in this message?"'></textarea>
                     <div class="btn-row" style="margin-top:0.65rem;">
                         <button id="askQuestionBtn" class="btn btn-ask" disabled>
-                            <i class="fas fa-search"></i> Answer from Sources
+                            <i class="fas fa-search"></i> Answer from Sources (Opus)
                         </button>
                     </div>
                     <div id="qaAnswer"></div>
@@ -1613,35 +1663,45 @@ ${queueFindings}
         const message = ctx.message || '';
         if (!message) return null;
         const bundle = buildSourceBundle(ctx);
-        const prompt = `You investigate LinkedIn outreach message provenance. Map every specific claim/hook in the MESSAGE to the SOURCE DATA.
+        const prompt = `You are Claude Opus performing careful provenance analysis of a LinkedIn outreach message.
 
-MESSAGE:
+ABSOLUTE ROLE RULES (never violate):
+1. SENDER / BDR = the person who wrote and sent the message. Their "About Me" I-statements and We-statements are ONLY about the sender / sender's company.
+2. PROSPECT / RECIPIENT = the person who received the message. Their LinkedIn profile, posts, and company news are ONLY about the prospect.
+3. NEVER treat SENDER About Me content as if it describes the prospect.
+4. Phrases like "fellow golfer" / "fellow hockey fan" usually mean the SENDER is asserting a shared interest. Trace the SENDER side and the PROSPECT side separately. If golf appears only in SENDER About Me and nowhere in prospect materials, say so explicitly: keyed off SENDER About Me; no prospect-side evidence found in retrieved data.
+5. Claims about the prospect's job/title/org (e.g. "Cardiology Chief at Surrey Memorial") must be sourced from PROSPECT materials (or marked unsourced / wrong-profile if prospect data does not support them).
+6. Claims about the sender's company/product (e.g. Infinitt, KLAS) usually come from SENDER We-statements / sender company facts.
+
+OUTBOUND MESSAGE TO ANALYZE:
 """
 ${message}
 """
 
-SOURCE DATA:
+LABELED SOURCE DATA:
 ${bundle}
 
-Return ONLY valid JSON (no markdown) with this shape:
+Return ONLY valid JSON (no markdown fences) with this shape:
 {
-  "summary": "1-2 sentence overview of where the message came from",
+  "summary": "2-4 sentences. Explicitly separate what came from the SENDER vs what came from the PROSPECT.",
   "claims": [
     {
-      "claim": "short quote or paraphrase of the claim from the message",
-      "source_type": "profile|post|news|bdr_about_me|queue_findings|unsourced",
-      "evidence": "exact quote from the source data that supports this claim, or explanation if unsourced",
+      "claim": "short quote or paraphrase from the message",
+      "about_whom": "sender|prospect|shared_interest|sender_company",
+      "source_type": "sender_about_me|prospect_profile|prospect_post|prospect_company_news|queue_findings|unsourced",
+      "evidence": "Exact quote from the labeled source, and name which section (A1/A2/A3/B1/C1). If unsourced, explain what was checked.",
       "confidence": "high|medium|low"
     }
   ]
 }
 
 Rules:
-- Break the message into concrete claims (sports, schools, hometowns, career facts, news hooks, shared interests, etc.).
+- Break the message into concrete claims.
 - Prefer exact quotes in evidence.
-- If a claim is not supported by any source, source_type must be "unsourced".
+- For shared-interest claims, prefer TWO claim rows when useful: one for the sender-side source and one noting prospect-side evidence or lack thereof.
+- If prospect profile looks mismatched (wrong name/title/location vs the message), call that out in the summary.
 - Do not invent sources.`;
-        const raw = await callAi(prompt, 2800);
+        const raw = await callAi(prompt, 3500);
         return parseJsonFromAi(raw) || raw;
     }
 
@@ -1650,30 +1710,38 @@ Rules:
         if (!question.trim()) throw new Error('Enter a question first.');
         const bundle = buildSourceBundle(deepCtx);
         const msg = deepCtx.message || '(no message pasted)';
-        const prompt = `You are investigating a client question about a LinkedIn outreach message.
+        const prompt = `You are Claude Opus answering a client/admin question about where a LinkedIn outreach message got its details.
+
+ABSOLUTE ROLE RULES:
+- SENDER / BDR About Me statements are about the SENDER only — never describe them as the prospect's background.
+- Prospect profile / posts / company news are about the RECIPIENT only.
+- "Fellow X" language usually keys off a SENDER hobby/interest; say whether any prospect-side match was also found.
 
 CLIENT QUESTION:
 """
 ${question.trim()}
 """
 
-THE MESSAGE:
+OUTBOUND MESSAGE:
 """
 ${msg}
 """
 
-ALL AVAILABLE SOURCE DATA THAT COULD HAVE BEEN USED TO WRITE THE MESSAGE:
+LABELED SOURCE DATA:
 ${bundle}
 
-Answer the question by searching every source above. Quote exact passages that support your answer.
-If the thing the client is asking about appears in a BDR About Me statement, a prospect post, the prospect About/experience section, company news, or stored queue findings — say exactly which and quote it.
-If it appears nowhere in the source data, say clearly that it is UNSOURCED / not present in retrieved materials (possible hallucination, older data, or a source we did not retrieve).
-Be direct and specific. Plain text, no JSON.`;
-        return callAi(prompt, 2000);
+Answer in plain text (no JSON). Structure your answer as:
+1) Direct answer (1-2 sentences)
+2) Sender-side evidence (quote + section label, or "none")
+3) Prospect-side evidence (quote + section label, or "none found in retrieved materials")
+4) Bottom line for the client
+
+If the detail appears nowhere, say UNSOURCED clearly. Be specific and quote exactly.`;
+        return callAi(prompt, 2500);
     }
 
     async function runDeepLookup({ append = false } = {}) {
-        const { liUrlRaw, bdrVal, pastedMsg, question } = getFormState();
+        const { liUrlRaw, bdrVal, bdrLabel, pastedMsg, question } = getFormState();
         if (!liUrlRaw) {
             alert('Please enter the prospect\'s LinkedIn URL.');
             document.getElementById('liUrlInput').focus();
@@ -1704,6 +1772,7 @@ Be direct and specific. Plain text, no JSON.`;
         deepCtx = {
             liUrl: liUrlRaw,
             bdrEmail: bdrVal || '',
+            bdrName: bdrLabel || '',
             message: pastedMsg || '',
             profile: null,
             posts: [],
@@ -1760,31 +1829,32 @@ Be direct and specific. Plain text, no JSON.`;
                         if (!deepCtx.profile[k] && storedPd[k]) deepCtx.profile[k] = storedPd[k];
                     }
                 }
-                document.getElementById('deepProfile').innerHTML = renderProfile(deepCtx.profile, 'Full Enriched Prospect Profile')
+                document.getElementById('deepProfile').innerHTML = renderProfile(deepCtx.profile, 'PROSPECT profile (recipient only — not the sender)')
                     || `<div class="profile-panel"><div class="panel-title"><i class="fab fa-linkedin"></i> Prospect Profile</div><p style="font-size:0.82rem;color:var(--gray);">Profile fetched but no displayable fields.</p></div>`;
-                setProgress('prog-profile', 'done', `Profile loaded${deepCtx.profile?.currentCompany ? ` · ${deepCtx.profile.currentCompany}` : ''}`);
+                setProgress('prog-profile', 'done', `Prospect profile loaded${deepCtx.profile?.currentCompany ? ` · ${deepCtx.profile.currentCompany}` : ''}`);
             } catch (err) {
-                setProgress('prog-profile', 'fail', `Profile failed: ${err.message}`);
+                setProgress('prog-profile', 'fail', `Prospect profile failed: ${err.message}`);
                 document.getElementById('deepProfile').innerHTML = `<div class="posts-error"><strong>Profile error:</strong> ${esc(err.message)}</div>`;
                 const storedPd = queueDocs.find(d => d.profile_data)?.profile_data;
                 if (storedPd) {
                     deepCtx.profile = storedPd;
-                    document.getElementById('deepProfile').innerHTML = renderProfile(storedPd, 'Prospect Profile (from queue — live scrape failed)');
+                    document.getElementById('deepProfile').innerHTML = renderProfile(storedPd, 'PROSPECT profile from queue (live scrape failed)');
                 }
             }
 
             // 3) Posts (last 10)
-            setProgress('prog-posts', 'pending', 'Fetching last 10 LinkedIn posts (20–60s)…');
+            setProgress('prog-posts', 'pending', 'Fetching prospect\'s last 10 LinkedIn posts (20–60s)…');
             try {
                 deepCtx.posts = await fetchProspectPosts(liUrlRaw, 10);
                 document.getElementById('deepPosts').innerHTML = `
                     <div class="posts-panel">
-                        <div class="panel-title"><i class="fab fa-linkedin"></i> Last ${deepCtx.posts.length} LinkedIn Posts</div>
+                        <div class="panel-title"><i class="fab fa-linkedin"></i> PROSPECT's last ${deepCtx.posts.length} LinkedIn posts (recipient only)</div>
+                        <p style="font-size:0.78rem;color:#0369a1;margin-bottom:0.5rem;">These posts were written by / appear on the prospect's LinkedIn — not the BDR sender.</p>
                         ${renderPostsHtml(deepCtx.posts, 'deep-post')}
                     </div>`;
-                setProgress('prog-posts', 'done', `${deepCtx.posts.length} posts loaded`);
+                setProgress('prog-posts', 'done', `${deepCtx.posts.length} prospect posts loaded`);
             } catch (err) {
-                setProgress('prog-posts', 'fail', `Posts failed: ${err.message}`);
+                setProgress('prog-posts', 'fail', `Prospect posts failed: ${err.message}`);
                 document.getElementById('deepPosts').innerHTML = `<div class="posts-error"><strong>Posts error:</strong> ${esc(err.message)}</div>`;
             }
 
@@ -1819,19 +1889,26 @@ Be direct and specific. Plain text, no JSON.`;
                 }
             }
 
-            // 5) BDR About Me
+            // 5) SENDER / BDR About Me
+            if (!deepCtx.bdrName && queueDocs[0]?.bdr_name) deepCtx.bdrName = queueDocs[0].bdr_name;
             if (!deepCtx.bdrEmail) {
-                setProgress('prog-bdr', 'skip', 'BDR About Me skipped — select a BDR');
+                setProgress('prog-bdr', 'skip', 'Sender About Me skipped — select a BDR');
                 document.getElementById('deepBdrAm').innerHTML = renderBdrAboutMePanel(null);
             } else {
-                setProgress('prog-bdr', 'pending', 'Loading BDR About Me…');
+                setProgress('prog-bdr', 'pending', 'Loading sender About Me (BDR)…');
                 try {
                     deepCtx.bdrAboutMe = await loadBdrAboutMe(deepCtx.bdrEmail);
-                    document.getElementById('deepBdrAm').innerHTML = renderBdrAboutMePanel(deepCtx.bdrAboutMe);
+                    document.getElementById('deepBdrAm').innerHTML = renderBdrAboutMePanel(
+                        deepCtx.bdrAboutMe,
+                        deepCtx.bdrEmail,
+                        deepCtx.bdrName || deepCtx.bdrAboutMe?.name || ''
+                    );
                     setProgress('prog-bdr', deepCtx.bdrAboutMe ? 'done' : 'skip',
-                        deepCtx.bdrAboutMe ? `About Me loaded for ${deepCtx.bdrEmail}` : `No About Me for ${deepCtx.bdrEmail}`);
+                        deepCtx.bdrAboutMe
+                            ? `Sender About Me loaded for ${deepCtx.bdrName || deepCtx.bdrEmail}`
+                            : `No sender About Me for ${deepCtx.bdrEmail}`);
                 } catch (err) {
-                    setProgress('prog-bdr', 'fail', `About Me failed: ${err.message}`);
+                    setProgress('prog-bdr', 'fail', `Sender About Me failed: ${err.message}`);
                 }
             }
 
@@ -1843,27 +1920,27 @@ Be direct and specific. Plain text, no JSON.`;
                     const q = document.getElementById('deepQuestionBox').value.trim();
                     const out = document.getElementById('qaAnswer');
                     askBtn.disabled = true;
-                    askBtn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Searching sources…';
+                    askBtn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Opus searching sources…';
                     out.innerHTML = '';
                     try {
                         const answer = await answerQuestion(q);
-                        out.innerHTML = `<div class="qa-answer">${esc(answer)}</div>`;
+                        out.innerHTML = `<div class="qa-answer"><div style="font-size:0.72rem;font-weight:800;color:#9a3412;margin-bottom:0.45rem;">ANSWER FROM CLAUDE OPUS</div>${esc(answer)}</div>`;
                     } catch (err) {
                         out.innerHTML = `<div class="posts-error"><strong>Error:</strong> ${esc(err.message)}</div>`;
                     }
                     askBtn.disabled = false;
-                    askBtn.innerHTML = '<i class="fas fa-search"></i> Answer from Sources';
+                    askBtn.innerHTML = '<i class="fas fa-search"></i> Answer from Sources (Opus)';
                 };
             }
 
             if (deepCtx.message) {
-                setProgress('prog-ai', 'pending', 'AI mapping message claims → sources…');
+                setProgress('prog-ai', 'pending', 'Opus mapping message claims → sender vs prospect sources…');
                 try {
                     deepCtx.attribution = await runAttribution(deepCtx);
                     document.getElementById('deepAttr').innerHTML = renderAttributionPanel(deepCtx.attribution);
-                    setProgress('prog-ai', 'done', 'Claim attribution complete');
+                    setProgress('prog-ai', 'done', 'Opus claim attribution complete');
                 } catch (err) {
-                    setProgress('prog-ai', 'fail', `Attribution failed: ${err.message}`);
+                    setProgress('prog-ai', 'fail', `Opus attribution failed: ${err.message}`);
                     document.getElementById('deepAttr').innerHTML = `<div class="posts-error"><strong>Attribution error:</strong> ${esc(err.message)}</div>`;
                 }
             } else {
