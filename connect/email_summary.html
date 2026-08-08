@@ -1488,6 +1488,92 @@
             return parts[0][0].toUpperCase();
         }
 
+        // Stable identity for a contact (LinkedIn URL/ID preferred, else normalized name)
+        function getContactIdentity(contactOrData) {
+            if (!contactOrData) return null;
+            const corr = contactOrData.rawData?.correspondentProfile || {};
+            const url = (
+                contactOrData.profileUrl ||
+                contactOrData.linkedinUrl ||
+                contactOrData.leadProfileUrl ||
+                corr.profileUrl ||
+                corr.linkedinUrl ||
+                corr.publicIdentifier ||
+                ''
+            ).toString().toLowerCase().trim();
+            if (url) {
+                const cleaned = url
+                    .replace(/^https?:\/\/(www\.)?linkedin\.com\/in\//, '')
+                    .replace(/\?.*$/, '')
+                    .replace(/\/$/, '');
+                if (cleaned) return 'url:' + cleaned;
+            }
+            const id = (
+                contactOrData.leadLinkedInId ||
+                contactOrData.linkedInId ||
+                contactOrData.linkedinId ||
+                corr.id ||
+                corr.linkedin_id ||
+                ''
+            ).toString().trim();
+            if (id) return 'id:' + id;
+            const name = (contactOrData.name || `${contactOrData.leadFirstName || ''} ${contactOrData.leadLastName || ''}`.trim() || '')
+                .toLowerCase()
+                .replace(/\s+/g, ' ')
+                .trim();
+            return name ? 'name:' + name : null;
+        }
+
+        function contactTimestampMs(contact) {
+            if (!contact || contact.timestamp == null) return 0;
+            if (contact.timestamp instanceof Date) return contact.timestamp.getTime();
+            const n = Number(contact.timestamp);
+            return Number.isFinite(n) ? n : 0;
+        }
+
+        // One row per person; keep the richer / more recent entry
+        function dedupeContacts(list) {
+            if (!Array.isArray(list) || list.length === 0) return [];
+            const map = new Map();
+            for (const item of list) {
+                const key = getContactIdentity(item);
+                if (!key) continue;
+                const prev = map.get(key);
+                if (!prev) {
+                    map.set(key, item);
+                    continue;
+                }
+                const preferNew = contactTimestampMs(item) >= contactTimestampMs(prev);
+                const base = preferNew ? { ...prev, ...item } : { ...item, ...prev };
+                map.set(key, {
+                    ...base,
+                    messages: (preferNew
+                        ? ((item.messages && item.messages.length) ? item.messages : prev.messages)
+                        : ((prev.messages && prev.messages.length) ? prev.messages : item.messages)),
+                    message: preferNew ? (item.message || prev.message) : (prev.message || item.message),
+                    profilePicture: preferNew
+                        ? (item.profilePicture || prev.profilePicture)
+                        : (prev.profilePicture || item.profilePicture),
+                    title: preferNew ? (item.title || prev.title) : (prev.title || item.title),
+                    company: preferNew ? (item.company || prev.company) : (prev.company || item.company),
+                    profileUrl: preferNew ? (item.profileUrl || prev.profileUrl) : (prev.profileUrl || item.profileUrl),
+                    leadLinkedInId: preferNew
+                        ? (item.leadLinkedInId || prev.leadLinkedInId)
+                        : (prev.leadLinkedInId || item.leadLinkedInId),
+                    fromLead: preferNew ? (item.fromLead || prev.fromLead) : (prev.fromLead || item.fromLead)
+                });
+            }
+            return [...map.values()];
+        }
+
+        function extractLeadProfileFields(data) {
+            const corr = data?.rawData?.correspondentProfile || {};
+            return {
+                profileUrl: data?.leadProfileUrl || data?.profileUrl || corr.profileUrl || corr.linkedinUrl || '',
+                leadLinkedInId: data?.leadLinkedInId || data?.linkedInId || corr.id || corr.linkedin_id || ''
+            };
+        }
+
         // Load LinkedIn email associations (matches index.html approach)
         async function loadLinkedInEmailAssociations() {
             try {
@@ -1684,6 +1770,9 @@
                 meetingRequests: []
             };
             monthlyData = { connectionsReceived: 0, repliesReceived: 0, meetingRequests: 0 };
+            const seenMonthlyConnections = new Set();
+            const seenMonthlyReplies = new Set();
+            const seenMonthlyMeetings = new Set();
             
             try {
                 // =====================================================
@@ -1859,6 +1948,8 @@
                     const leadName = `${data.leadFirstName || ''} ${data.leadLastName || ''}`.trim() || 'Unknown';
                     const leadTitle = data.leadPosition || data.leadTitle || '';
                     const profilePicture = data.leadProfilePicture || data.rawData?.correspondentProfile?.pictureUrl || null;
+                    const leadProfile = extractLeadProfileFields(data);
+                    const contactIdentity = getContactIdentity({ name: leadName, ...leadProfile, rawData: data.rawData });
                     
                     switch (data.eventType) {
                         case 'CONNECTION_REQUEST_SENT':
@@ -1884,13 +1975,18 @@
                             break;
                             
                         case 'CONNECTION_REQUEST_ACCEPTED':
-                            if (eventMs >= monthStartDateMs && eventMs < monthEndDateMs) monthlyData.connectionsReceived++;
+                            if (eventMs >= monthStartDateMs && eventMs < monthEndDateMs && contactIdentity && !seenMonthlyConnections.has(contactIdentity)) {
+                                seenMonthlyConnections.add(contactIdentity);
+                                monthlyData.connectionsReceived++;
+                            }
                             if (isInWeeklyWindow) {
                                 weeklyData.connectionsReceived.push({
                                     name: leadName,
                                     title: leadTitle,
                                     company: data.leadCompany || '',
                                     profilePicture: profilePicture,
+                                    profileUrl: leadProfile.profileUrl,
+                                    leadLinkedInId: leadProfile.leadLinkedInId,
                                     timestamp: eventTimestamp
                                 });
                                 connectionsReceivedDetails.push({
@@ -1905,7 +2001,10 @@
                             
                         case 'MESSAGE_REPLY_RECEIVED':
                         case 'INMAIL_REPLY_RECEIVED':
-                            if (eventMs >= monthStartDateMs && eventMs < monthEndDateMs) monthlyData.repliesReceived++;
+                            if (eventMs >= monthStartDateMs && eventMs < monthEndDateMs && contactIdentity && !seenMonthlyReplies.has(contactIdentity)) {
+                                seenMonthlyReplies.add(contactIdentity);
+                                monthlyData.repliesReceived++;
+                            }
                             if (isInWeeklyWindow) {
                                 const messageText = data.eventData?.message || data.eventData?.messageText || 'Reply received';
                                 weeklyData.repliesReceived.push({
@@ -1913,6 +2012,8 @@
                                     title: leadTitle,
                                     message: messageText,
                                     profilePicture: profilePicture,
+                                    profileUrl: leadProfile.profileUrl,
+                                    leadLinkedInId: leadProfile.leadLinkedInId,
                                     timestamp: eventTimestamp
                                 });
                             }
@@ -2021,15 +2122,26 @@
                         const mtdSnapshot = await getDocs(mtdQuery);
                         console.log(`   📦 MTD events found for this BDR: ${mtdSnapshot.docs.length}`);
 
-                        // Reset and recount from the accurate per-BDR query
+                        // Reset and recount unique contacts from the accurate per-BDR query
                         monthlyData.connectionsReceived = 0;
                         monthlyData.repliesReceived = 0;
+                        seenMonthlyConnections.clear();
+                        seenMonthlyReplies.clear();
                         mtdSnapshot.forEach(doc => {
                             const d = doc.data();
+                            const leadName = `${d.leadFirstName || ''} ${d.leadLastName || ''}`.trim() || 'Unknown';
+                            const identity = getContactIdentity({ name: leadName, ...extractLeadProfileFields(d), rawData: d.rawData });
+                            if (!identity) return;
                             if (d.eventType === 'CONNECTION_REQUEST_ACCEPTED') {
-                                monthlyData.connectionsReceived++;
+                                if (!seenMonthlyConnections.has(identity)) {
+                                    seenMonthlyConnections.add(identity);
+                                    monthlyData.connectionsReceived++;
+                                }
                             } else if (d.eventType === 'MESSAGE_REPLY_RECEIVED' || d.eventType === 'INMAIL_REPLY_RECEIVED') {
-                                monthlyData.repliesReceived++;
+                                if (!seenMonthlyReplies.has(identity)) {
+                                    seenMonthlyReplies.add(identity);
+                                    monthlyData.repliesReceived++;
+                                }
                             }
                         });
                         console.log(`   ✅ MTD connections: ${monthlyData.connectionsReceived}, replies: ${monthlyData.repliesReceived}`);
@@ -2180,8 +2292,11 @@
 
                         if (meetingDate) {
                             const meetingMs = meetingDate.getTime();
-                            // Monthly target counter — only confirmed scheduled meetings
-                            if (isScheduled && meetingMs >= monthStartDateMs && meetingMs < monthEndDateMs) {
+                            const leadProfile = extractLeadProfileFields(data);
+                            const meetingIdentity = getContactIdentity({ name: leadName, ...leadProfile, rawData: data.rawData });
+                            // Monthly target counter — only confirmed scheduled meetings (unique contacts)
+                            if (isScheduled && meetingMs >= monthStartDateMs && meetingMs < monthEndDateMs && meetingIdentity && !seenMonthlyMeetings.has(meetingIdentity)) {
+                                seenMonthlyMeetings.add(meetingIdentity);
                                 monthlyData.meetingRequests++;
                             }
                             // Weekly list: past 7 days
@@ -2193,6 +2308,8 @@
                                     title: data.leadPosition || data.lead_position || data.rawData?.correspondentProfile?.headline || '',
                                     message: lastMessage?.text || (isScheduled ? 'Meeting scheduled' : 'Interested in meeting'),
                                     profilePicture: data.rawData?.correspondentProfile?.pictureUrl || null,
+                                    profileUrl: leadProfile.profileUrl,
+                                    leadLinkedInId: leadProfile.leadLinkedInId,
                                     timestamp: meetingDate
                                 };
                                 if (isScheduled) {
@@ -2227,13 +2344,13 @@
                         console.log(`\n   📋 Unique accounts in UNMATCHED meetings:`, unmatchedAccountIds);
                     }
                     
-                    // Sort by timestamp descending (most recent first)
-                    meetingCandidates.sort((a, b) => b.timestamp - a.timestamp);
-                    interestedCandidates.sort((a, b) => b.timestamp - a.timestamp);
-                    weeklyData.meetingRequests = meetingCandidates;
-                    weeklyData.interestedInMeeting = interestedCandidates;
-                    console.log(`   📊 Interested in meeting (this week): ${interestedCandidates.length}`);
-                    console.log(`   📊 Scheduled meetings (this week): ${meetingCandidates.length}`);
+                    // One contact per person, then sort newest first
+                    weeklyData.meetingRequests = dedupeContacts(meetingCandidates)
+                        .sort((a, b) => contactTimestampMs(b) - contactTimestampMs(a));
+                    weeklyData.interestedInMeeting = dedupeContacts(interestedCandidates)
+                        .sort((a, b) => contactTimestampMs(b) - contactTimestampMs(a));
+                    console.log(`   📊 Interested in meeting (this week): ${weeklyData.interestedInMeeting.length}`);
+                    console.log(`   📊 Scheduled meetings (this week): ${weeklyData.meetingRequests.length}`);
                     
                 } catch (meetingError) {
                     console.warn('⚠️ Could not load meeting requests:', meetingError.message);
@@ -2280,34 +2397,55 @@
 
                             const _corr2 = d.rawData?.correspondentProfile || {};
                             const leadName = (`${d.leadFirstName || _corr2.firstName || ''} ${d.leadLastName || _corr2.lastName || ''}`.trim()) || d.lead_name || 'Unknown';
-
-                            threadMap.set(leadName.toLowerCase(), {
+                            const leadProfile = extractLeadProfileFields(d);
+                            const identityKey = getContactIdentity({ name: leadName, ...leadProfile, rawData: d.rawData });
+                            const nameKey = 'name:' + leadName.toLowerCase();
+                            const thread = {
                                 name: leadName,
                                 title: d.leadPosition || d.lead_position || d.rawData?.correspondentProfile?.headline || '',
                                 profilePicture: d.rawData?.correspondentProfile?.pictureUrl || null,
+                                profileUrl: leadProfile.profileUrl,
+                                leadLinkedInId: leadProfile.leadLinkedInId,
                                 messages: msgs,
                                 fromLead  // attach helper so renderer can use it
-                            });
+                            };
+                            // Index by identity and name so activity replies can match either way
+                            if (identityKey) threadMap.set(identityKey, thread);
+                            threadMap.set(nameKey, thread);
                         }
 
-                        console.log(`📬 Conversations with recent lead replies: ${threadMap.size}`);
+                        console.log(`📬 Conversations with recent lead replies: ${new Set(threadMap.values()).size}`);
 
                         // Enrich existing reply entries with full threads
                         weeklyData.repliesReceived = weeklyData.repliesReceived.map(reply => {
-                            const thread = threadMap.get(reply.name.toLowerCase());
+                            const replyKey = getContactIdentity(reply);
+                            const nameKey = 'name:' + (reply.name || '').toLowerCase();
+                            const thread = (replyKey && threadMap.get(replyKey)) || threadMap.get(nameKey);
                             if (thread) {
-                                threadMap.delete(reply.name.toLowerCase()); // don't double-add
-                                return { ...reply, messages: thread.messages, fromLead: thread.fromLead, profilePicture: thread.profilePicture || reply.profilePicture };
+                                const identityKey = getContactIdentity(thread);
+                                if (identityKey) threadMap.delete(identityKey);
+                                threadMap.delete('name:' + (thread.name || '').toLowerCase());
+                                return {
+                                    ...reply,
+                                    messages: thread.messages,
+                                    fromLead: thread.fromLead,
+                                    profilePicture: thread.profilePicture || reply.profilePicture,
+                                    profileUrl: thread.profileUrl || reply.profileUrl,
+                                    leadLinkedInId: thread.leadLinkedInId || reply.leadLinkedInId
+                                };
                             }
                             return reply;
                         });
 
                         // Add any conversations found in inbox that weren't in the activity events
-                        for (const [, thread] of threadMap) {
+                        const remainingThreads = new Set(threadMap.values());
+                        for (const thread of remainingThreads) {
                             weeklyData.repliesReceived.push({
                                 name: thread.name,
                                 title: thread.title,
                                 profilePicture: thread.profilePicture,
+                                profileUrl: thread.profileUrl,
+                                leadLinkedInId: thread.leadLinkedInId,
                                 messages: thread.messages,
                                 fromLead: thread.fromLead,
                                 timestamp: new Date()
@@ -2318,9 +2456,15 @@
                     }
                 }
 
-                // Sort connections and replies by timestamp (most recent first)
-                weeklyData.connectionsReceived.sort((a, b) => b.timestamp - a.timestamp);
-                weeklyData.repliesReceived.sort((a, b) => b.timestamp - a.timestamp);
+                // Deduplicate contacts (same person can appear via activity + inbox / multiple events)
+                weeklyData.connectionsReceived = dedupeContacts(weeklyData.connectionsReceived)
+                    .sort((a, b) => contactTimestampMs(b) - contactTimestampMs(a));
+                weeklyData.repliesReceived = dedupeContacts(weeklyData.repliesReceived)
+                    .sort((a, b) => contactTimestampMs(b) - contactTimestampMs(a));
+                weeklyData.meetingRequests = dedupeContacts(weeklyData.meetingRequests)
+                    .sort((a, b) => contactTimestampMs(b) - contactTimestampMs(a));
+                weeklyData.interestedInMeeting = dedupeContacts(weeklyData.interestedInMeeting)
+                    .sort((a, b) => contactTimestampMs(b) - contactTimestampMs(a));
                 
                 console.log('📊 Weekly data summary (from heyreach_activity):');
                 console.log(`   Connection requests sent: ${weeklyData.connectionRequestsSent}`);
