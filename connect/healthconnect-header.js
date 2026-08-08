@@ -1,10 +1,12 @@
 /**
  * HealthConnect Common Header Component
- * Version: 3.0.0 - Reorganized Navigation & Cache-Busting
+ * Version: 3.3.0 - Firebase loginUID account resolution
  * 
  * Provides a beautiful, consistent header across all HealthConnect pages
  * with organized dropdown navigation sections.
  * 
+ * Changelog v3.3.0:
+ * - Added resolveEffectiveBDREmail() (viewer → loginUID → email fallback)
  * Changelog v3.0.0:
  * - Reorganized navigation: Me, Network and Prospects, Outreach, Admin
  * - Added cache-busting versioning (?v=3.0) to all references
@@ -387,6 +389,40 @@ async function resolveOwnBDR(user) {
 }
 
 window.resolveOwnBDR = resolveOwnBDR;
+
+/**
+ * Resolve the effective BDR account email for data queries.
+ * Priority:
+ *   1. Viewer BDR (if this login is a designated viewer for another BDR)
+ *   2. Own BDR via loginUID / primaryEmail (resolveOwnBDR)
+ *   3. Login email fallback
+ * Returns a lowercase email string, or null if no user.
+ */
+async function resolveEffectiveBDREmail(user) {
+    if (!user) return null;
+    const loginEmail = (user.email || '').toLowerCase();
+
+    try {
+        const viewerBDR = await resolveViewerBDR(loginEmail);
+        if (viewerBDR?.email) {
+            return (viewerBDR.email || '').toLowerCase();
+        }
+    } catch (e) {
+        console.warn('⚠️ resolveEffectiveBDREmail viewer lookup failed:', e.message);
+    }
+
+    try {
+        const ownBDR = await resolveOwnBDR(user);
+        if (ownBDR?.primaryEmail) {
+            return ownBDR.primaryEmail.toLowerCase();
+        }
+    } catch (e) {
+        console.warn('⚠️ resolveEffectiveBDREmail own BDR lookup failed:', e.message);
+    }
+
+    return loginEmail;
+}
+window.resolveEffectiveBDREmail = resolveEffectiveBDREmail;
 
 // Show a banner below the header indicating viewer mode.
 // When the viewer has access to multiple BDR accounts a compact switcher is shown.
