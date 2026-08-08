@@ -122,6 +122,11 @@
         }
         .load-btn:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(13,59,102,0.35); }
         .load-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .load-btn.btn-export {
+            background: linear-gradient(135deg, #10b981, #059669);
+        }
+        .load-btn.btn-export:hover { box-shadow: 0 4px 16px rgba(16,185,129,0.35); }
+        .header-actions { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
 
         .bh-note {
             background: #eff6ff;
@@ -434,6 +439,9 @@
         <button class="load-btn" id="loadBtn" onclick="loadReport()">
             <i class="fas fa-chart-bar"></i> Load Report
         </button>
+        <button class="load-btn btn-export" id="downloadBtn" onclick="downloadReport()" disabled title="Download a formatted Excel (.xlsx) report (respects active filters)">
+            <i class="fas fa-file-excel"></i> Download Excel
+        </button>
     </div>
 
     <div class="bh-note" id="bhNote">
@@ -509,7 +517,12 @@
     <div class="section-card" id="repliesSection">
         <div class="section-header">
             <h2><i class="fas fa-list"></i> Individual Replies</h2>
-            <span class="section-meta" id="repliesMeta"></span>
+            <div class="header-actions">
+                <span class="section-meta" id="repliesMeta"></span>
+                <button class="load-btn btn-export" id="downloadBtnInline" onclick="downloadReport()" disabled style="height:36px;padding:0.45rem 1rem;font-size:0.82rem;">
+                    <i class="fas fa-file-excel"></i> Download Excel
+                </button>
+            </div>
         </div>
         <div class="filter-row">
             <button class="filter-chip active" data-bucket="all" onclick="setBucketFilter('all')">All</button>
@@ -550,6 +563,7 @@ let allReplyEvents = [];
 let activeBucketFilter = 'all';
 let sortKey = 'hours';
 let sortDir = 'desc';
+let lastReportMeta = null; // { companyName, bdrName, rangeLabel, conversationCount }
 
 function checkIfAdmin(email) {
     const domain = (email || '').split('@')[1] || '';
@@ -926,6 +940,134 @@ function getSelectedBdrs() {
     return bdrs;
 }
 
+function getRangeLabel() {
+    const sel = document.getElementById('timeRangeSelect');
+    if (sel.value === 'custom') {
+        const s = document.getElementById('startDate').value;
+        const e = document.getElementById('endDate').value;
+        const fmt = d => new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        return `${fmt(s)} – ${fmt(e)}`;
+    }
+    const days = parseInt(sel.value, 10);
+    if (days >= 9999) return 'All Time';
+    if (days === 365) return 'Last 12 Months';
+    return `Last ${days} Days`;
+}
+
+function getCompanyLabel() {
+    const companyId = document.getElementById('companySelect').value;
+    if (companyId === '__ALL_BDRS__') return 'All Companies';
+    return companiesWithNames.find(c => c.customerId === companyId)?.name || companyId || 'Unknown';
+}
+
+function bucketLabel(bucket) {
+    return ({
+        fast: '0-4 hours',
+        good: '5-8 hours',
+        ok: '9-16 hours',
+        slow: '17+ hours',
+    })[bucket] || bucket;
+}
+
+function setDownloadEnabled(enabled) {
+    ['downloadBtn', 'downloadBtnInline'].forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) btn.disabled = !enabled;
+    });
+}
+
+function getFilteredSortedRows() {
+    const q = (document.getElementById('searchInput').value || '').toLowerCase().trim();
+    let rows = allReplyEvents;
+    if (activeBucketFilter !== 'all') {
+        rows = rows.filter(e => e.bucket === activeBucketFilter);
+    }
+    if (q) {
+        rows = rows.filter(e =>
+            (e.leadName || '').toLowerCase().includes(q) ||
+            (e.companyName || '').toLowerCase().includes(q) ||
+            (e.bdrName || '').toLowerCase().includes(q) ||
+            (e.bdrEmail || '').toLowerCase().includes(q) ||
+            (e.prospectSnippet || '').toLowerCase().includes(q)
+        );
+    }
+    return [...rows].sort((a, b) => {
+        let av, bv;
+        if (sortKey === 'hours') { av = a.businessHours; bv = b.businessHours; }
+        else if (sortKey === 'prospectAt') { av = a.prospectAt?.getTime() || 0; bv = b.prospectAt?.getTime() || 0; }
+        else if (sortKey === 'replyAt') { av = a.replyAt?.getTime() || 0; bv = b.replyAt?.getTime() || 0; }
+        else if (sortKey === 'lead') { av = (a.leadName || '').toLowerCase(); bv = (b.leadName || '').toLowerCase(); }
+        else if (sortKey === 'bdr') { av = (a.bdrName || '').toLowerCase(); bv = (b.bdrName || '').toLowerCase(); }
+        else { av = 0; bv = 0; }
+        if (av < bv) return sortDir === 'asc' ? -1 : 1;
+        if (av > bv) return sortDir === 'asc' ? 1 : -1;
+        return 0;
+    });
+}
+
+function slugify(str) {
+    return String(str || 'report')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_|_$/g, '')
+        .slice(0, 60) || 'report';
+}
+
+async function loadExcelJS() {
+    if (window.ExcelJS) return;
+    await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('Failed to load ExcelJS library'));
+        document.head.appendChild(s);
+    });
+}
+
+function argb(hex) {
+    return 'FF' + String(hex).replace(/^#/, '').toUpperCase();
+}
+
+function solidFill(hex) {
+    return { type: 'pattern', pattern: 'solid', fgColor: { argb: argb(hex) } };
+}
+
+function thinBorder(hex = 'CBD5E1') {
+    const edge = { style: 'thin', color: { argb: argb(hex) } };
+    return { top: edge, left: edge, bottom: edge, right: edge };
+}
+
+function bucketColors(bucket) {
+    return ({
+        fast: { bg: '065F46', fg: 'FFFFFF' },
+        good: { bg: 'BBF7D0', fg: '14532D' },
+        ok:   { bg: 'FEF08A', fg: '713F12' },
+        slow: { bg: 'FECACA', fg: '991B1B' },
+    })[bucket] || { bg: 'E5E7EB', fg: '374151' };
+}
+
+function buildBdrSummaryRows(events) {
+    const byBdr = new Map();
+    events.forEach(e => {
+        const key = e.bdrEmail || e.bdrName;
+        if (!byBdr.has(key)) {
+            byBdr.set(key, { name: e.bdrName, email: e.bdrEmail, hours: [], counts: { fast: 0, good: 0, ok: 0, slow: 0 } });
+        }
+        const row = byBdr.get(key);
+        row.hours.push(e.businessHours);
+        row.counts[e.bucket]++;
+    });
+    return Array.from(byBdr.values()).map(r => {
+        const sorted = [...r.hours].sort((a, b) => a - b);
+        return {
+            ...r,
+            total: r.hours.length,
+            avg: r.hours.reduce((s, h) => s + h, 0) / r.hours.length,
+            median: median(sorted),
+        };
+    }).sort((a, b) => a.avg - b.avg);
+}
+
 async function tryFilteredQuery(collRef, fieldName, email, cutoffTs) {
     try {
         if (cutoffTs) {
@@ -1134,6 +1276,7 @@ window.loadReport = async function loadReport() {
     const loadBtn = document.getElementById('loadBtn');
     loadBtn.disabled = true;
     loadBtn.innerHTML = '<i class="fas fa-circle-notch spinner"></i> Loading…';
+    setDownloadEnabled(false);
 
     document.getElementById('initialState').style.display = 'none';
     document.getElementById('statsBanner').classList.add('visible');
@@ -1166,13 +1309,26 @@ window.loadReport = async function loadReport() {
         allReplyEvents = extractReplyEvents(scoped, sinceDate, endDate);
         allReplyEvents.sort((a, b) => b.businessHours - a.businessHours);
 
+        const personName = personEmail
+            ? (bdrs[0]?.name || personEmail)
+            : 'All BDRs';
+        lastReportMeta = {
+            companyName: getCompanyLabel(),
+            bdrName: personName,
+            rangeLabel: getRangeLabel(),
+            conversationCount: scoped.length,
+        };
+
         console.log(`Loaded ${conversations.length} convos → ${scoped.length} scoped → ${allReplyEvents.length} reply events`);
 
         renderSummary(scoped.length);
         renderBdrBreakdown();
         renderReplyTable();
+        setDownloadEnabled(allReplyEvents.length > 0);
     } catch (err) {
         console.error(err);
+        lastReportMeta = null;
+        setDownloadEnabled(false);
         document.getElementById('repliesTableWrap').innerHTML = `
             <div class="empty-state">
                 <i class="fas fa-exclamation-triangle" style="color:#ef4444;"></i>
@@ -1290,38 +1446,13 @@ window.sortBy = function sortBy(key) {
 
 window.renderReplyTable = function renderReplyTable() {
     const wrap = document.getElementById('repliesTableWrap');
-    const q = (document.getElementById('searchInput').value || '').toLowerCase().trim();
-
-    let rows = allReplyEvents;
-    if (activeBucketFilter !== 'all') {
-        rows = rows.filter(e => e.bucket === activeBucketFilter);
-    }
-    if (q) {
-        rows = rows.filter(e =>
-            (e.leadName || '').toLowerCase().includes(q) ||
-            (e.companyName || '').toLowerCase().includes(q) ||
-            (e.bdrName || '').toLowerCase().includes(q) ||
-            (e.bdrEmail || '').toLowerCase().includes(q) ||
-            (e.prospectSnippet || '').toLowerCase().includes(q)
-        );
-    }
-
-    rows = [...rows].sort((a, b) => {
-        let av, bv;
-        if (sortKey === 'hours') { av = a.businessHours; bv = b.businessHours; }
-        else if (sortKey === 'prospectAt') { av = a.prospectAt?.getTime() || 0; bv = b.prospectAt?.getTime() || 0; }
-        else if (sortKey === 'replyAt') { av = a.replyAt?.getTime() || 0; bv = b.replyAt?.getTime() || 0; }
-        else if (sortKey === 'lead') { av = (a.leadName || '').toLowerCase(); bv = (b.leadName || '').toLowerCase(); }
-        else if (sortKey === 'bdr') { av = (a.bdrName || '').toLowerCase(); bv = (b.bdrName || '').toLowerCase(); }
-        else { av = 0; bv = 0; }
-        if (av < bv) return sortDir === 'asc' ? -1 : 1;
-        if (av > bv) return sortDir === 'asc' ? 1 : -1;
-        return 0;
-    });
+    const rows = getFilteredSortedRows();
 
     document.getElementById('repliesMeta').textContent =
         `${rows.length.toLocaleString()} of ${allReplyEvents.length.toLocaleString()} replies` +
-        (activeBucketFilter !== 'all' ? ` · filter: ${activeBucketFilter}` : '');
+        (activeBucketFilter !== 'all' ? ` · filter: ${bucketLabel(activeBucketFilter)}` : '');
+
+    setDownloadEnabled(allReplyEvents.length > 0);
 
     if (!rows.length) {
         wrap.innerHTML = `<div class="empty-state"><i class="fas fa-inbox"></i><p>No replies match the current filters.</p></div>`;
@@ -1361,6 +1492,398 @@ window.renderReplyTable = function renderReplyTable() {
         `).join('')}
         </tbody>
     </table>`;
+};
+
+window.downloadReport = async function downloadReport() {
+    if (!allReplyEvents.length) {
+        alert('Load a report first.');
+        return;
+    }
+
+    const rows = getFilteredSortedRows();
+    if (!rows.length) {
+        alert('No rows match the current filters. Clear filters or load a different range.');
+        return;
+    }
+
+    const btns = ['downloadBtn', 'downloadBtnInline']
+        .map(id => document.getElementById(id))
+        .filter(Boolean);
+    const origHtml = btns.map(b => b.innerHTML);
+    btns.forEach(b => {
+        b.disabled = true;
+        b.innerHTML = '<i class="fas fa-circle-notch spinner"></i> Building…';
+    });
+
+    try {
+        await loadExcelJS();
+
+        const meta = lastReportMeta || {
+            companyName: getCompanyLabel(),
+            bdrName: document.getElementById('bdrPersonSelect').selectedOptions[0]?.textContent || 'All BDRs',
+            rangeLabel: getRangeLabel(),
+            conversationCount: '',
+        };
+
+        const allHours = allReplyEvents.map(e => e.businessHours).sort((a, b) => a - b);
+        const filteredHours = rows.map(e => e.businessHours).sort((a, b) => a - b);
+        const counts = { fast: 0, good: 0, ok: 0, slow: 0 };
+        allReplyEvents.forEach(e => { counts[e.bucket]++; });
+        const avgAll = allHours.length ? allHours.reduce((s, h) => s + h, 0) / allHours.length : null;
+        const avgFiltered = filteredHours.length ? filteredHours.reduce((s, h) => s + h, 0) / filteredHours.length : null;
+        const medAll = median(allHours);
+        const p90All = percentile(allHours, 90);
+        const exportDate = new Date().toLocaleString('en-US', {
+            year: 'numeric', month: 'long', day: 'numeric',
+            hour: 'numeric', minute: '2-digit',
+        });
+        const searchVal = document.getElementById('searchInput').value || '';
+        const filterLabel = activeBucketFilter === 'all' ? 'All' : bucketLabel(activeBucketFilter);
+        const baseFont = { name: 'Calibri', size: 11 };
+        const bdrRows = buildBdrSummaryRows(allReplyEvents);
+
+        const wb = new ExcelJS.Workbook();
+        wb.creator = 'Pando Executive Networking';
+        wb.created = new Date();
+        wb.title = 'Reply Response Times';
+
+        // ── Sheet 1: Summary ───────────────────────────────────────────────
+        const wsSummary = wb.addWorksheet('Summary', {
+            properties: { defaultRowHeight: 18 },
+            views: [{ showGridLines: false }],
+        });
+        wsSummary.columns = [
+            { width: 32 }, { width: 28 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 16 },
+        ];
+
+        wsSummary.mergeCells('A1:F1');
+        const titleCell = wsSummary.getCell('A1');
+        titleCell.value = 'Reply Response Times';
+        titleCell.font = { name: 'Calibri', size: 20, bold: true, color: { argb: argb('FFFFFF') } };
+        titleCell.fill = solidFill('0D3B66');
+        titleCell.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+        wsSummary.getRow(1).height = 36;
+
+        wsSummary.mergeCells('A2:F2');
+        const subtitle = wsSummary.getCell('A2');
+        subtitle.value = 'Eastern business hours (Mon–Fri 8:00 AM–5:00 PM ET) · Nights & weekends excluded';
+        subtitle.font = { ...baseFont, italic: true, color: { argb: argb('1E40AF') } };
+        subtitle.fill = solidFill('DBEAFE');
+        subtitle.alignment = { vertical: 'middle', indent: 1 };
+        wsSummary.getRow(2).height = 22;
+
+        const metaPairs = [
+            ['Generated', exportDate],
+            ['Company', meta.companyName],
+            ['BDR Scope', meta.bdrName],
+            ['Reply Window', meta.rangeLabel],
+            ['Conversations Loaded', meta.conversationCount],
+            ['Total Replies Measured', allReplyEvents.length],
+            ['Rows in Export', rows.length],
+            ['Active Bucket Filter', filterLabel],
+            ['Search Filter', searchVal || '(none)'],
+        ];
+        metaPairs.forEach(([label, value], i) => {
+            const r = 4 + i;
+            const labelCell = wsSummary.getCell(`A${r}`);
+            const valueCell = wsSummary.getCell(`B${r}`);
+            labelCell.value = label;
+            valueCell.value = value;
+            labelCell.font = { ...baseFont, bold: true, color: { argb: argb('334155') } };
+            valueCell.font = { ...baseFont };
+            labelCell.fill = solidFill(i % 2 ? 'F8FAFC' : 'FFFFFF');
+            valueCell.fill = solidFill(i % 2 ? 'F8FAFC' : 'FFFFFF');
+            labelCell.border = thinBorder('E2E8F0');
+            valueCell.border = thinBorder('E2E8F0');
+        });
+
+        // KPI block
+        const kpiStart = 4 + metaPairs.length + 2;
+        wsSummary.mergeCells(`A${kpiStart}:F${kpiStart}`);
+        const kpiTitle = wsSummary.getCell(`A${kpiStart}`);
+        kpiTitle.value = 'Key Metrics (All Loaded Replies)';
+        kpiTitle.font = { ...baseFont, bold: true, size: 13, color: { argb: argb('0F172A') } };
+
+        const kpiHeaders = ['Metric', 'Value', '', '', '', ''];
+        const kpiHeaderRow = wsSummary.getRow(kpiStart + 1);
+        kpiHeaders.forEach((h, i) => {
+            const cell = kpiHeaderRow.getCell(i + 1);
+            cell.value = h;
+            if (i < 2) {
+                cell.font = { ...baseFont, bold: true, color: { argb: argb('FFFFFF') } };
+                cell.fill = solidFill('0D3B66');
+                cell.border = thinBorder('93C5FD');
+            }
+        });
+
+        const kpiData = [
+            ['Average Business Hours', avgAll == null ? '—' : Number(avgAll.toFixed(2))],
+            ['Median Business Hours', medAll == null ? '—' : Number(medAll.toFixed(2))],
+            ['90th Percentile', p90All == null ? '—' : Number(p90All.toFixed(2))],
+            ['Avg (Exported Rows Only)', avgFiltered == null ? '—' : Number(avgFiltered.toFixed(2))],
+        ];
+        kpiData.forEach((pair, i) => {
+            const r = kpiStart + 2 + i;
+            const a = wsSummary.getCell(`A${r}`);
+            const b = wsSummary.getCell(`B${r}`);
+            a.value = pair[0];
+            b.value = pair[1];
+            a.font = baseFont;
+            b.font = { ...baseFont, bold: true };
+            a.fill = solidFill(i % 2 ? 'EFF6FF' : 'FFFFFF');
+            b.fill = solidFill(i % 2 ? 'EFF6FF' : 'FFFFFF');
+            a.border = thinBorder('BFDBFE');
+            b.border = thinBorder('BFDBFE');
+            b.alignment = { horizontal: 'center' };
+        });
+
+        // Bucket distribution
+        const bucketStart = kpiStart + 2 + kpiData.length + 2;
+        wsSummary.mergeCells(`A${bucketStart}:D${bucketStart}`);
+        wsSummary.getCell(`A${bucketStart}`).value = 'Response Time Buckets';
+        wsSummary.getCell(`A${bucketStart}`).font = { ...baseFont, bold: true, size: 13 };
+
+        const bucketHeaderRow = wsSummary.getRow(bucketStart + 1);
+        ['Bucket', 'Count', '% of Total', 'Color'].forEach((h, i) => {
+            const cell = bucketHeaderRow.getCell(i + 1);
+            cell.value = h;
+            cell.font = { ...baseFont, bold: true, color: { argb: argb('FFFFFF') } };
+            cell.fill = solidFill('0D3B66');
+            cell.alignment = { horizontal: 'center', vertical: 'middle' };
+            cell.border = thinBorder('93C5FD');
+        });
+
+        const bucketDefs = [
+            { key: 'fast', label: '0–4 hours (Fast)' },
+            { key: 'good', label: '5–8 hours (Good)' },
+            { key: 'ok',   label: '9–16 hours (Slowing)' },
+            { key: 'slow', label: '17+ hours (Too Slow)' },
+        ];
+        bucketDefs.forEach((def, i) => {
+            const r = bucketStart + 2 + i;
+            const count = counts[def.key];
+            const pct = allReplyEvents.length ? Math.round((count / allReplyEvents.length) * 100) : 0;
+            const colors = bucketColors(def.key);
+            const vals = [def.label, count, `${pct}%`, ''];
+            vals.forEach((v, colIdx) => {
+                const cell = wsSummary.getCell(r, colIdx + 1);
+                cell.value = v;
+                cell.font = { ...baseFont, bold: colIdx === 0, color: { argb: argb(colors.fg) } };
+                cell.fill = solidFill(colors.bg);
+                cell.border = thinBorder('94A3B8');
+                cell.alignment = { vertical: 'middle', horizontal: colIdx === 0 ? 'left' : 'center', indent: colIdx === 0 ? 1 : 0 };
+            });
+            wsSummary.getRow(r).height = 22;
+        });
+
+        wsSummary.getCell(`A${bucketStart + 7}`).value = 'Example: prospect replies overnight, we answer by noon ET next day = 4 business hours.';
+        wsSummary.getCell(`A${bucketStart + 7}`).font = { ...baseFont, italic: true, color: { argb: argb('64748B') } };
+        wsSummary.mergeCells(`A${bucketStart + 7}:F${bucketStart + 7}`);
+
+        // ── Sheet 2: Replies ───────────────────────────────────────────────
+        const wsReplies = wb.addWorksheet('Replies', {
+            views: [{ state: 'frozen', ySplit: 2 }],
+        });
+
+        const replyCols = [
+            { header: 'Business Hours', key: 'hours', width: 15 },
+            { header: 'Bucket', key: 'bucket', width: 16 },
+            { header: 'Contact', key: 'contact', width: 22 },
+            { header: 'Company', key: 'company', width: 24 },
+            { header: 'LinkedIn', key: 'linkedin', width: 12 },
+            { header: 'BDR Name', key: 'bdrName', width: 20 },
+            { header: 'BDR Email', key: 'bdrEmail', width: 28 },
+            { header: 'Prospect Messaged (ET)', key: 'prospectAt', width: 24 },
+            { header: 'We Replied (ET)', key: 'replyAt', width: 24 },
+            { header: 'Prospect Message', key: 'prospectMsg', width: 42 },
+            { header: 'Our Reply', key: 'ourReply', width: 42 },
+            { header: 'Response Category', key: 'responseCat', width: 22 },
+            { header: 'Follow-Up Category', key: 'followUpCat', width: 24 },
+            { header: 'Source', key: 'source', width: 16 },
+            { header: 'Conversation ID', key: 'convId', width: 28 },
+        ];
+        wsReplies.columns = replyCols.map(c => ({ key: c.key, width: c.width }));
+
+        const lastColLetter = String.fromCharCode(64 + replyCols.length);
+        wsReplies.mergeCells(`A1:${lastColLetter}1`);
+        const replyBanner = wsReplies.getCell('A1');
+        replyBanner.value = `Pando Executive Networking — ${meta.companyName} · ${meta.bdrName} · ${meta.rangeLabel} · ${rows.length} replies exported · ${exportDate}`;
+        replyBanner.font = { ...baseFont, bold: true, size: 12, color: { argb: argb('1E3A5F') } };
+        replyBanner.fill = solidFill('DBEAFE');
+        replyBanner.alignment = { vertical: 'middle', indent: 1 };
+        wsReplies.getRow(1).height = 24;
+
+        const headerValues = {};
+        replyCols.forEach(c => { headerValues[c.key] = c.header; });
+        wsReplies.addRow(headerValues);
+        const headerRow = wsReplies.getRow(2);
+        headerRow.height = 26;
+        headerRow.eachCell({ includeEmpty: true }, cell => {
+            cell.font = { ...baseFont, bold: true, color: { argb: argb('FFFFFF') } };
+            cell.fill = solidFill('0D3B66');
+            cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+            cell.border = { bottom: { style: 'medium', color: { argb: argb('93C5FD') } } };
+        });
+        wsReplies.autoFilter = { from: { row: 2, column: 1 }, to: { row: 2, column: replyCols.length } };
+
+        rows.forEach((e, idx) => {
+            const rowObj = {
+                hours: Number(e.businessHours.toFixed(2)),
+                bucket: bucketLabel(e.bucket),
+                contact: e.leadName || '',
+                company: e.companyName || '',
+                linkedin: e.leadProfileUrl ? 'Open ↗' : '',
+                bdrName: e.bdrName || '',
+                bdrEmail: e.bdrEmail || '',
+                prospectAt: formatEt(e.prospectAt),
+                replyAt: formatEt(e.replyAt),
+                prospectMsg: e.prospectSnippet || '',
+                ourReply: e.replySnippet || '',
+                responseCat: e.responseCategory || '',
+                followUpCat: e.followUpCategory || '',
+                source: e.source || '',
+                convId: e.conversationId || '',
+            };
+            const dataRow = wsReplies.addRow(rowObj);
+            dataRow.height = 36;
+            const alt = idx % 2 === 1;
+            const colors = bucketColors(e.bucket);
+
+            dataRow.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+                cell.font = { ...baseFont };
+                cell.alignment = { vertical: 'middle', wrapText: colNumber >= 10 && colNumber <= 11 };
+                cell.border = thinBorder('E2E8F0');
+                if (alt) cell.fill = solidFill('F8FAFC');
+            });
+
+            // Color-code hours + bucket
+            [1, 2].forEach(col => {
+                const cell = dataRow.getCell(col);
+                cell.fill = solidFill(colors.bg);
+                cell.font = { ...baseFont, bold: true, color: { argb: argb(colors.fg) } };
+                cell.alignment = { vertical: 'middle', horizontal: 'center' };
+            });
+
+            if (e.leadProfileUrl) {
+                const linkCell = dataRow.getCell(5);
+                linkCell.value = { text: 'Open ↗', hyperlink: e.leadProfileUrl, tooltip: e.leadProfileUrl };
+                linkCell.font = { ...baseFont, color: { argb: argb('1D4ED8') }, underline: true };
+                linkCell.alignment = { vertical: 'middle', horizontal: 'center' };
+            }
+        });
+
+        // ── Sheet 3: Per-BDR (when useful) ─────────────────────────────────
+        if (bdrRows.length >= 1) {
+            const wsBdr = wb.addWorksheet('Per-BDR', {
+                views: [{ state: 'frozen', ySplit: 2 }],
+            });
+            const bdrCols = [
+                { header: 'BDR Name', key: 'name', width: 22 },
+                { header: 'BDR Email', key: 'email', width: 30 },
+                { header: 'Replies', key: 'total', width: 10 },
+                { header: 'Avg Hours', key: 'avg', width: 12 },
+                { header: 'Median Hours', key: 'median', width: 14 },
+                { header: '0–4h', key: 'fast', width: 10 },
+                { header: '5–8h', key: 'good', width: 10 },
+                { header: '9–16h', key: 'ok', width: 10 },
+                { header: '17+h', key: 'slow', width: 10 },
+            ];
+            wsBdr.columns = bdrCols.map(c => ({ key: c.key, width: c.width }));
+
+            wsBdr.mergeCells('A1:I1');
+            const bdrBanner = wsBdr.getCell('A1');
+            bdrBanner.value = `Per-BDR Summary · ${meta.companyName} · ${meta.rangeLabel}`;
+            bdrBanner.font = { ...baseFont, bold: true, size: 12, color: { argb: argb('1E3A5F') } };
+            bdrBanner.fill = solidFill('DBEAFE');
+            bdrBanner.alignment = { vertical: 'middle', indent: 1 };
+            wsBdr.getRow(1).height = 24;
+
+            const bdrHeaderVals = {};
+            bdrCols.forEach(c => { bdrHeaderVals[c.key] = c.header; });
+            wsBdr.addRow(bdrHeaderVals);
+            const bdrHeaderRow = wsBdr.getRow(2);
+            bdrHeaderRow.height = 24;
+            bdrHeaderRow.eachCell({ includeEmpty: true }, cell => {
+                cell.font = { ...baseFont, bold: true, color: { argb: argb('FFFFFF') } };
+                cell.fill = solidFill('0D3B66');
+                cell.alignment = { vertical: 'middle', horizontal: 'center' };
+            });
+            wsBdr.autoFilter = { from: { row: 2, column: 1 }, to: { row: 2, column: bdrCols.length } };
+
+            // Tint bucket headers
+            [
+                [6, '065F46'],
+                [7, '22C55E'],
+                [8, 'EAB308'],
+                [9, 'EF4444'],
+            ].forEach(([col, hex]) => {
+                bdrHeaderRow.getCell(col).fill = solidFill(hex);
+            });
+
+            bdrRows.forEach((r, idx) => {
+                const dataRow = wsBdr.addRow({
+                    name: r.name || '',
+                    email: r.email || '',
+                    total: r.total,
+                    avg: Number(r.avg.toFixed(2)),
+                    median: r.median == null ? '' : Number(r.median.toFixed(2)),
+                    fast: r.counts.fast,
+                    good: r.counts.good,
+                    ok: r.counts.ok,
+                    slow: r.counts.slow,
+                });
+                dataRow.eachCell({ includeEmpty: true }, cell => {
+                    cell.font = baseFont;
+                    cell.alignment = { vertical: 'middle', horizontal: 'center' };
+                    cell.border = thinBorder('E2E8F0');
+                    if (idx % 2 === 1) cell.fill = solidFill('F8FAFC');
+                });
+                dataRow.getCell(1).alignment = { vertical: 'middle', horizontal: 'left' };
+                dataRow.getCell(2).alignment = { vertical: 'middle', horizontal: 'left' };
+
+                const avgBucket = hoursBucket(r.avg);
+                const avgColors = bucketColors(avgBucket);
+                const avgCell = dataRow.getCell(4);
+                avgCell.fill = solidFill(avgColors.bg);
+                avgCell.font = { ...baseFont, bold: true, color: { argb: argb(avgColors.fg) } };
+
+                [
+                    [6, '065F46', 'FFFFFF'],
+                    [7, 'BBF7D0', '14532D'],
+                    [8, 'FEF08A', '713F12'],
+                    [9, 'FECACA', '991B1B'],
+                ].forEach(([col, bg, fg]) => {
+                    const cell = dataRow.getCell(col);
+                    cell.fill = solidFill(bg);
+                    cell.font = { ...baseFont, bold: true, color: { argb: argb(fg) } };
+                });
+            });
+        }
+
+        const buffer = await wb.xlsx.writeBuffer();
+        const blob = new Blob([buffer], {
+            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const today = new Date().toISOString().slice(0, 10);
+        const filterSuffix = activeBucketFilter === 'all' ? 'all' : activeBucketFilter;
+        a.href = url;
+        a.download = `reply_response_times_${slugify(meta.companyName)}_${slugify(meta.bdrName)}_${today}_${filterSuffix}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+    } catch (err) {
+        console.error('Excel export failed:', err);
+        alert('Failed to build Excel report: ' + (err.message || err));
+    } finally {
+        btns.forEach((b, i) => {
+            b.disabled = false;
+            b.innerHTML = origHtml[i] || '<i class="fas fa-file-excel"></i> Download Excel';
+        });
+        setDownloadEnabled(allReplyEvents.length > 0);
+    }
 };
 </script>
 </body>
