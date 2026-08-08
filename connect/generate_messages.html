@@ -14920,17 +14920,21 @@
             addLog(`   🤝 Loading already-connected URLs for ${bdrEmail}...`, 'info');
             const connectedUrls = await fpmLoadExistingConnectionUrls(bdrEmail);
 
-            addLog(`   📋 Loading this BDR's existing prospect list + queue...`, 'info');
+            addLog(`   📋 Loading this BDR's existing prospect list + queue + exclusions...`, 'info');
             const existingProspectUrls = new Set();
             const existingQueueUrls = new Set();
+            const excludedUrls = new Set();
             try {
                 const prospectSnap = await fetchFn(
                     q(col(db, 'prospect_contacts'), wh('userEmail', '==', bdrEmail)),
                     { pageSize: 2000, timeoutMs: 60000, maxRetries: 2 }
                 );
                 prospectSnap.forEach(d => {
-                    const u = normalizeLinkedInUrl(d.data().linkedInUrl || d.data().li_url || '');
+                    const data = d.data();
+                    const u = normalizeLinkedInUrl(data.linkedInUrl || data.li_url || '');
                     if (u) existingProspectUrls.add(u);
+                    // Soft-excluded contacts still on the BDR list — don't re-pull clones from workspace
+                    if (data.excludedFromCampaign && u) excludedUrls.add(u);
                 });
             } catch (e) {
                 addLog(`   ⚠️ Could not load BDR prospect list: ${e.message}`, 'warning');
@@ -14960,6 +14964,22 @@
             } catch (e) {
                 addLog(`   ⚠️ Could not load BDR queue: ${e.message}`, 'warning');
             }
+            // Prospect / connect exclusions (written by Target Contact / Exclude Rules, Fast Connect
+            // Review, Process Exclusions). Without this, deleting a BDR copy and re-pulling from a
+            // workspace would resurrect contacts that were already rule-excluded.
+            try {
+                for (const collName of ['prospect_exclusions', 'connect_exclusions']) {
+                    const snap = await fetchFn(col(db, collName), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
+                    snap.forEach(d => {
+                        const data = d.data();
+                        const u = normalizeLinkedInUrl(data.linkedinUrl || data.linkedInUrl || '');
+                        if (u) excludedUrls.add(u);
+                    });
+                }
+                addLog(`   🚫 Exclusion list: ${excludedUrls.size.toLocaleString()} unique URL(s)`, 'info');
+            } catch (e) {
+                addLog(`   ⚠️ Could not load exclusion lists: ${e.message}`, 'warning');
+            }
 
             let groupOutreachUrls = new Set();
             if (hypothesisGroupId) {
@@ -14971,7 +14991,7 @@
             // 4. Filter + sort (most connections first)
             let skippedNoUrl = 0, skippedMemory = 0, skippedConnected = 0;
             let skippedAlreadyOnBdr = 0, skippedQueued = 0, skippedGroupOutreach = 0;
-            let skippedHarvest = 0, skippedConnCount = 0;
+            let skippedHarvest = 0, skippedConnCount = 0, skippedExcluded = 0;
             const connFilterOn = typeof isConnectionFilterEnabled === 'function' && isConnectionFilterEnabled();
             const minConn = typeof getConnectionFilterMin === 'function' ? getConnectionFilterMin() : 250;
 
@@ -14979,11 +14999,13 @@
             const seen = new Set();
             for (const c of wsContacts) {
                 if (c.movedToHarvest) { skippedHarvest++; continue; }
+                if (c.excludedFromCampaign) { skippedExcluded++; continue; }
                 const url = normalizeLinkedInUrl(c.linkedInUrl || c.li_url || '');
                 if (!url) { skippedNoUrl++; continue; }
                 if (seen.has(url)) continue;
                 seen.add(url);
                 if (pulledMemory.has(url)) { skippedMemory++; continue; }
+                if (excludedUrls.has(url)) { skippedExcluded++; continue; }
                 if (connectedUrls.has(url)) { skippedConnected++; continue; }
                 if (existingProspectUrls.has(url)) { skippedAlreadyOnBdr++; continue; }
                 if (existingQueueUrls.has(url)) { skippedQueued++; continue; }
@@ -15023,6 +15045,7 @@
                 `(skipped: ${skippedMemory} memory, ${skippedConnected} connected, ` +
                 `${skippedAlreadyOnBdr} already on BDR, ${skippedQueued} queued, ` +
                 `${skippedGroupOutreach} group outreach` +
+                (skippedExcluded ? `, ${skippedExcluded} excluded` : '') +
                 (skippedConnCount ? `, ${skippedConnCount} below ${minConn} connections` : '') +
                 (skippedNoUrl ? `, ${skippedNoUrl} no URL` : '') +
                 (skippedHarvest ? `, ${skippedHarvest} harvest` : '') +
@@ -15039,7 +15062,7 @@
                         eligible: 0,
                         pulled: 0,
                         skippedMemory, skippedConnected, skippedAlreadyOnBdr,
-                        skippedQueued, skippedGroupOutreach
+                        skippedQueued, skippedGroupOutreach, skippedExcluded
                     }
                 };
             }
@@ -15129,7 +15152,7 @@
                     eligible: eligible.length,
                     pulled: pulled.length,
                     skippedMemory, skippedConnected, skippedAlreadyOnBdr,
-                    skippedQueued, skippedGroupOutreach
+                    skippedQueued, skippedGroupOutreach, skippedExcluded
                 }
             };
         }
@@ -15492,8 +15515,54 @@
                 const initData = await initRes.json();
                 if (!initData.success) throw new Error(initData.error || 'Init failed');
 
-                const { bdrContext, prospects: prospectList, stats } = initData;
+                const { bdrContext, stats } = initData;
+                let prospectList = initData.prospects || [];
                 addLog(`✅ ${stats.skipSummary}`, 'success');
+
+                // Client-side safety net for Target Contact / Exclude Rules + soft-excludes.
+                // Older Railway builds compared exclusion URLs without stripping https://www.,
+                // so exclusions written by hypothesis_target_rules.html (protocol-stripped) could
+                // miss. Also drop excludedFromCampaign contacts and enforce hypothesis-group
+                // membership here in case the server build hasn't picked those filters up yet.
+                try {
+                    const { collection: colEx, getDocs: gdEx, getAllDocs: gadEx } = window.clemailFirestore;
+                    const fetchEx = gadEx || gdEx;
+                    const clientExcludedUrls = new Set();
+                    for (const collName of ['prospect_exclusions', 'connect_exclusions']) {
+                        try {
+                            const snap = await fetchEx(colEx(db, collName), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
+                            snap.forEach(d => {
+                                const data = d.data();
+                                const u = normalizeLinkedInUrl(data.linkedinUrl || data.linkedInUrl || '');
+                                if (u) clientExcludedUrls.add(u);
+                            });
+                        } catch (e) {
+                            addLog(`   ⚠️ Could not load ${collName} for client filter: ${e.message}`, 'warning');
+                        }
+                    }
+                    const beforeClientFilter = prospectList.length;
+                    prospectList = prospectList.filter(p => {
+                        if (p.excludedFromCampaign) return false;
+                        const rawUrl = p.linkedInUrl || p.li_url || p.linkedin_url || p.profile_url || '';
+                        const url = normalizeLinkedInUrl(rawUrl);
+                        if (!url) return false;
+                        if (clientExcludedUrls.has(url)) return false;
+                        // Hyp sets are keyed by _normalizeHypUrl; accept either form
+                        if (fullAiHypUrlSet) {
+                            const hypForm = _normalizeHypUrl(rawUrl);
+                            if (!fullAiHypUrlSet.has(url) && !fullAiHypUrlSet.has(hypForm)) return false;
+                        }
+                        return true;
+                    });
+                    const dropped = beforeClientFilter - prospectList.length;
+                    if (dropped > 0) {
+                        addLog(`🚫 Client exclusion filter removed ${dropped} prospect(s) (excluded / soft-excluded / outside hypothesis group)`, 'warning');
+                    } else {
+                        addLog(`🚫 Client exclusion filter: ${clientExcludedUrls.size.toLocaleString()} exclusion URL(s) checked — none of the loaded prospects matched`, 'info');
+                    }
+                } catch (e) {
+                    addLog(`   ⚠️ Client exclusion filter skipped: ${e.message}`, 'warning');
+                }
 
                 // Sort by most connections first (enriched profiles prioritised).
                 // For workspace pulls, prefer the exact order from the pull step (already

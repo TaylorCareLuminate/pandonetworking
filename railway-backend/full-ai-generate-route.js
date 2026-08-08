@@ -183,7 +183,11 @@ async function runFullAiGenerate(job, opts) {
 
         const excludedUrls = new Set();
         [connectExclusionsSnap, prospectExclusionsSnap].forEach(snap =>
-            snap.forEach(d => { const u = normalizeUrl(d.data().linkedinUrl || ''); if (u) excludedUrls.add(u); })
+            snap.forEach(d => {
+                const data = d.data();
+                const u = normalizeUrl(data.linkedinUrl || data.linkedInUrl || '');
+                if (u) excludedUrls.add(u);
+            })
         );
 
         // ── Already-connected: heyreach_contacts (primary) → heyreach_activity (fallback) ──
@@ -247,7 +251,12 @@ async function runFullAiGenerate(job, opts) {
 
         const eligible = allContacts.filter(c => {
             if (c.movedToHarvest)  { skippedHarvest++;   return false; }
-            const url = normalizeUrl(c.linkedInUrl || c.li_url || '');
+            if (c.excludedFromCampaign) {
+                skippedExcluded++;
+                if (hasBatchFilter && inBatch(c)) batchSkippedExcluded++;
+                return false;
+            }
+            const url = normalizeUrl(c.linkedInUrl || c.li_url || c.linkedin_url || c.profile_url || '');
             if (!url)              { skippedNoUrl++;      return false; }
             if (!isVanityUrl(url)) { skippedNonVanity++;  return false; }
             if (seenUrls.has(url)) return false; // silent dedup
@@ -1380,16 +1389,28 @@ function addJobLog(job, message, type = 'info') {
     if (job.logs.length > 500) job.logs = job.logs.slice(-500);
 }
 
+// Canonical LinkedIn URL form used for exclusion / queue / hypothesis matching.
+// Must match protocol-stripped forms written by hypothesis_target_rules.html
+// (linkedin.com/in/slug) AND full URLs from Fast Connect Review / connect_queue
+// (https://www.linkedin.com/in/slug, locale subdomains, trailing slash, query params).
 function normalizeUrl(url) {
     if (!url) return '';
-    return url.trim().toLowerCase().replace(/\/$/, '').split('?')[0].split('#')[0];
+    const s = String(url).toLowerCase().trim();
+    const m = s.match(/linkedin\.com\/in\/([^/?#\s]+)/);
+    if (m) return 'linkedin.com/in/' + m[1].replace(/\/+$/, '');
+    return s
+        .replace(/^https?:\/\//i, '')
+        .replace(/^(?:www\.|[a-z]{2,3}\.)/i, '')
+        .replace(/[?#].*$/, '')
+        .replace(/\/+$/, '');
 }
 
 function isVanityUrl(url) {
     const parts = url.split('/in/');
     if (parts.length < 2) return false;
+    // Handles are lowercased by normalizeUrl; LinkedIn member IDs start with acoa/acob
     const handle = parts[1].split('/')[0];
-    return !handle.startsWith('ACoA') && !handle.startsWith('ACoB') && !/^[A-Z]/.test(handle);
+    return !handle.startsWith('acoa') && !handle.startsWith('acob');
 }
 
 function shuffle(array) {
@@ -1427,7 +1448,9 @@ router.post('/full-ai-init', requireAuth, async (req, res) => {
         importBatchStartTime   = null,
         importBatchEndTime     = null,
         connectionFilterEnabled = true,
-        minConnectionCount     = 250
+        minConnectionCount     = 250,
+        hypothesisGroupUrls    = null,
+        hypothesisGroupName    = null
     } = req.body;
 
     if (!bdrEmail) return res.status(400).json({ success: false, error: 'bdrEmail is required' });
@@ -1482,8 +1505,18 @@ router.post('/full-ai-init', requireAuth, async (req, res) => {
 
         const excludedUrls = new Set();
         [connectExclusionsSnap, prospectExclusionsSnap].forEach(snap =>
-            snap.forEach(d => { const u = normalizeUrl(d.data().linkedinUrl || ''); if (u) excludedUrls.add(u); })
+            snap.forEach(d => {
+                const data = d.data();
+                const u = normalizeUrl(data.linkedinUrl || data.linkedInUrl || '');
+                if (u) excludedUrls.add(u);
+            })
         );
+
+        // Optional hypothesis-group membership filter (client pre-normalizes, but
+        // re-normalize here so protocol/www/locale variants still match).
+        const hypUrlSet = Array.isArray(hypothesisGroupUrls) && hypothesisGroupUrls.length
+            ? new Set(hypothesisGroupUrls.map(normalizeUrl).filter(Boolean))
+            : null;
 
         const connectedUrls = new Set();
         try {
@@ -1528,7 +1561,7 @@ router.post('/full-ai-init', requireAuth, async (req, res) => {
         // First pass: deduplicate and identify contacts that are in the batch
         let skippedHarvest  = 0, skippedNoUrl     = 0, skippedNonVanity = 0;
         let skippedMessaged = 0, skippedExcluded  = 0, skippedConnected = 0;
-        let skippedConnCount = 0, skippedBatch    = 0;
+        let skippedConnCount = 0, skippedBatch    = 0, skippedHypGroup = 0;
         const seenUrls = new Set();
 
         // Batch membership check helpers
@@ -1559,11 +1592,24 @@ router.post('/full-ai-init', requireAuth, async (req, res) => {
 
         const eligible = allContacts.filter(c => {
             if (c.movedToHarvest) { skippedHarvest++; return false; }
-            const url = normalizeUrl(c.linkedInUrl || c.li_url || '');
+            // Soft-excluded via Target Contact / Exclude Rules (or Process Exclusions)
+            // — belt-and-suspenders in case the prospect_exclusions URL form doesn't match.
+            if (c.excludedFromCampaign) {
+                skippedExcluded++;
+                if (hasBatchFilter && inBatch(c)) batchSkippedExcluded++;
+                return false;
+            }
+            const url = normalizeUrl(c.linkedInUrl || c.li_url || c.linkedin_url || c.profile_url || '');
             if (!url)             { skippedNoUrl++;     return false; }
             if (!isVanityUrl(url)){ skippedNonVanity++; return false; }
             if (seenUrls.has(url)) return false; // silent dedup
             seenUrls.add(url);
+
+            // Hypothesis-group membership (when a group is selected on Full AI Generate)
+            if (hypUrlSet && !hypUrlSet.has(url)) {
+                skippedHypGroup++;
+                return false;
+            }
 
             // Batch membership test (silent, tracked separately)
             const inThisBatch = inBatch(c);
@@ -1627,6 +1673,7 @@ router.post('/full-ai-init', requireAuth, async (req, res) => {
             if (skippedHarvest)   parts.push(`${skippedHarvest} in harvest pool`);
             if (skippedNoUrl)     parts.push(`${skippedNoUrl} no URL`);
             if (skippedNonVanity) parts.push(`${skippedNonVanity} non-vanity URL`);
+            if (skippedHypGroup)  parts.push(`${skippedHypGroup} outside hypothesis group${hypothesisGroupName ? ` "${hypothesisGroupName}"` : ''}`);
             if (skippedMessaged)  parts.push(`${skippedMessaged} already messaged/queued`);
             if (skippedExcluded)  parts.push(`${skippedExcluded} excluded`);
             if (skippedConnected) parts.push(`${skippedConnected} already connected`);
