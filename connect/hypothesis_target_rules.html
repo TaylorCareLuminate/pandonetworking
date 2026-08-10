@@ -440,6 +440,60 @@
             </div>
         </div>
 
+        <!-- ── Step 4: Clean up already soft-excluded contacts (skipped by Step 3) ── -->
+        <div class="card" id="alreadyExcludedCard" style="display:none;">
+            <div class="card-title"><span class="step-num">4</span> Clean Up Already-Excluded Contacts</div>
+            <div class="card-subtitle">
+                Step 3 only scans prospects that are <strong>not yet excluded</strong>. Use this section to find contacts in
+                this hypothesis group that were already soft-excluded (via this page, Fast Connect Review, or Process Exclusions)
+                but are still sitting on a BDR's prospect list — then permanently delete them. This is the cleanup path for
+                exclusions done while Full AI Generate was ignoring some of those records.
+            </div>
+
+            <div class="form-row" style="margin-bottom:1rem;">
+                <button class="btn btn-primary" id="findAlreadyExcludedBtn" onclick="findAlreadyExcludedProspects()">
+                    <i class="fas fa-ban"></i> Find Already-Excluded Contacts
+                </button>
+                <button class="btn btn-outline" id="fixExclusionUrlsBtn" onclick="fixAlreadyExcludedUrlRecords()" title="Rewrite stripped linkedinUrl values on prospect_exclusions to https://… so Full AI matching works even if you keep the contact">
+                    <i class="fas fa-wrench"></i> Fix Exclusion URL Records
+                </button>
+            </div>
+
+            <div id="alreadyExcludedLoadingState" class="loading-inline" style="display:none;">
+                <i class="fas fa-spinner fa-spin"></i> <span id="alreadyExcludedLoadingMsg">Loading…</span>
+            </div>
+
+            <div id="alreadyExcludedResultsWrap" style="display:none;">
+                <div class="table-toolbar">
+                    <span style="font-size:0.85rem;font-weight:700;color:var(--gray-700);"><span id="alreadyExcludedCount">0</span> soft-excluded contact(s) still on a prospect list</span>
+                    <div class="spacer"></div>
+                    <button class="btn btn-sm btn-outline" onclick="selectAllAlreadyExcluded()"><i class="fas fa-check-double"></i> Select All</button>
+                    <button class="btn btn-sm btn-danger" style="background:#7f1d1d;" onclick="deleteSelectedAlreadyExcluded()"><i class="fas fa-trash"></i> Delete Selected</button>
+                </div>
+
+                <div class="table-scroll">
+                    <table class="results-table">
+                        <thead>
+                            <tr>
+                                <th><input type="checkbox" id="selectAllAlreadyExcludedCb" onchange="toggleSelectAllAlreadyExcluded(this.checked)"></th>
+                                <th>Contact</th>
+                                <th>Title / Company</th>
+                                <th>BDR</th>
+                                <th>Exclusion Source</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="alreadyExcludedTableBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="alreadyExcludedEmptyState" class="empty-state" style="display:none;">
+                <i class="fas fa-circle-check" style="font-size:1.8rem;margin-bottom:0.5rem;display:block;"></i>
+                No soft-excluded contacts remain on any BDR prospect list for this group.
+            </div>
+        </div>
+
         <!-- ── Bulk: Generate Message Creation Instructions for every hypothesis group ── -->
         <div class="card" id="bulkCreationCard">
             <div class="card-title"><i class="fas fa-layer-group" style="color:var(--accent);"></i> Bulk Generate Message Creation Instructions — All Hypothesis Groups</div>
@@ -543,6 +597,12 @@
 
     let _remainingProspects = []; // [{ id, url, name, title, org, bdrEmail, aiDecision: null|'exclude'|'keep', aiReason, status }]
     let _remainingFilter = 'all';
+
+    // Soft-excluded contacts still on a BDR list (Step 4 cleanup)
+    // [{ id, url, name, title, org, bdrEmail, exclusionSource, exclusionReason, exclusionAt, status, _checked, exclusionDocIds[] }]
+    let _alreadyExcludedProspects = [];
+    // prospect_exclusions docs keyed by normalized URL for this group's URLs (used by Step 4 + URL fix)
+    let _alreadyExcludedByUrl = new Map();
 
     // ── Message Creation Instructions (single-group + bulk) ──────────────────
     let ANALYSIS_PAYLOAD = null;   // Connect Success Analysis JSON (Firebase RTDB latest, else local latest.json)
@@ -918,6 +978,7 @@
         document.getElementById('titlesStatsWrap').style.display = 'none';
         document.getElementById('rulesCard').style.display = 'none';
         document.getElementById('remainingCard').style.display = 'none';
+        document.getElementById('alreadyExcludedCard').style.display = 'none';
         const setMsg = m => document.getElementById('titlesLoadingMsg').textContent = m;
 
         try {
@@ -965,6 +1026,7 @@
             document.getElementById('aiSummaryBox').style.display = 'none';
             document.getElementById('rulesCard').style.display = 'block';
             document.getElementById('remainingCard').style.display = 'block';
+            document.getElementById('alreadyExcludedCard').style.display = 'block';
             document.getElementById('remainingCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
 
             await findRemainingProspects();
@@ -1065,6 +1127,7 @@
             _currentGroup.targetContactInstructions = text;
             showAlert('Saved as this group\'s Target Contact / Exclude Rules.', 'success');
             document.getElementById('remainingCard').style.display = 'block';
+            document.getElementById('alreadyExcludedCard').style.display = 'block';
         } catch (e) {
             console.error('saveRules failed:', e);
             showAlert('Failed to save rules: ' + e.message, 'error');
@@ -1345,6 +1408,269 @@
         }
         renderRemainingTable();
         showAlert(`Permanently deleted ${ok} contact(s)${failed ? `, ${failed} failed` : ''}.`, failed ? 'warning' : 'success');
+    };
+
+    /* ══════════════════════════════════════════════════════════════════
+       STEP 4 — Already soft-excluded contacts still on a BDR prospect list
+       ══════════════════════════════════════════════════════════════════ */
+
+    async function loadExclusionDocsForGroupUrls() {
+        // Map: normalizedUrl -> [{ id, linkedinUrl, reason, at, tool, groupId, bdr }]
+        const byUrl = new Map();
+        if (!_groupUrlSet.size) return byUrl;
+
+        for (const coll of ['prospect_exclusions', 'connect_exclusions']) {
+            let snap;
+            try {
+                snap = await fx.getAllDocs(fx.collection(db, coll), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
+            } catch (e) {
+                console.warn(`${coll} load failed for Step 4:`, e.message);
+                continue;
+            }
+            snap.forEach(d => {
+                const data = d.data();
+                const url = normalizeUrl(data.linkedinUrl || data.linkedInUrl || '');
+                if (!url || !_groupUrlSet.has(url)) return;
+                const list = byUrl.get(url) || [];
+                list.push({
+                    id: d.id,
+                    coll,
+                    linkedinUrl: data.linkedinUrl || data.linkedInUrl || '',
+                    reason: data.excludedReason || data.reason || '',
+                    at: data.excludedAt || '',
+                    tool: data.excludedByTool || (coll === 'connect_exclusions' ? 'connect_exclusions' : 'prospect_exclusions'),
+                    groupId: data.hypothesisGroupId || '',
+                    bdr: data.excludedByBdr || data.excludedBy || ''
+                });
+                byUrl.set(url, list);
+            });
+        }
+        return byUrl;
+    }
+
+    function exclusionSourceLabel(docs, softFlagged) {
+        if (docs && docs.length) {
+            const tools = [...new Set(docs.map(d => d.tool).filter(Boolean))];
+            if (tools.includes('hypothesis_target_rules')) return 'Target Rules page';
+            if (tools.includes('title_similarity_scan')) return 'Title similarity scan';
+            if (tools.includes('connect_exclusions')) return 'Connect exclusions';
+            return tools[0] || 'Exclusion record';
+        }
+        if (softFlagged) return 'Soft-excluded (flag only)';
+        return 'Unknown';
+    }
+
+    window.findAlreadyExcludedProspects = async function() {
+        if (!_currentGroup) { showAlert('Load a hypothesis group first.', 'warning'); return; }
+        if (!_groupUrlSet.size) { showAlert('This group has no tagged contacts yet.', 'warning'); return; }
+
+        const btn = document.getElementById('findAlreadyExcludedBtn');
+        btn.disabled = true;
+        document.getElementById('alreadyExcludedLoadingState').style.display = 'flex';
+        document.getElementById('alreadyExcludedResultsWrap').style.display = 'none';
+        document.getElementById('alreadyExcludedEmptyState').style.display = 'none';
+        const setMsg = m => document.getElementById('alreadyExcludedLoadingMsg').textContent = m;
+
+        try {
+            setMsg('Loading exclusion records for this group…');
+            _alreadyExcludedByUrl = await loadExclusionDocsForGroupUrls();
+
+            const bdrEmails = bdrEmailsForGroup(_currentGroup);
+            if (!bdrEmails.length) {
+                showAlert('This group has no BDR(s) assigned — cannot look up prospect lists.', 'warning');
+                return;
+            }
+
+            setMsg('Scanning BDR prospect lists for soft-excluded contacts…');
+            const seen = new Set();
+            const pool = [];
+
+            for (const bdrEmail of bdrEmails) {
+                let snap;
+                try {
+                    snap = await fx.getAllDocs(
+                        fx.query(fx.collection(db, 'prospect_contacts'), fx.where('userEmail', '==', bdrEmail)),
+                        { pageSize: 2000, timeoutMs: 60000, maxRetries: 3 }
+                    );
+                } catch (e) {
+                    console.warn(`prospect_contacts load failed for ${bdrEmail}:`, e.message);
+                    continue;
+                }
+                snap.forEach(d => {
+                    const data = d.data();
+                    const url = normalizeUrl(data.linkedInUrl || data.linkedin_url || data.profile_url || '');
+                    if (!url || !_groupUrlSet.has(url)) return;
+                    const exclusionDocs = _alreadyExcludedByUrl.get(url) || [];
+                    const softFlagged = !!data.excludedFromCampaign;
+                    // Only contacts that were already marked excluded somehow, but still exist
+                    if (!softFlagged && !exclusionDocs.length) return;
+                    const key = `${d.id}`;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    const roster = _titlesByUrl.get(url) || {};
+                    const bestDoc = exclusionDocs.slice().sort((a, b) => String(b.at).localeCompare(String(a.at)))[0];
+                    pool.push({
+                        id: d.id,
+                        url,
+                        bdrEmail,
+                        name: `${data.firstName || data.name || roster.name || ''} ${data.lastName || ''}`.trim() || roster.name || '(no name)',
+                        title: data.title || roster.title || '',
+                        org: data.company || roster.org || '',
+                        exclusionSource: exclusionSourceLabel(exclusionDocs, softFlagged),
+                        exclusionReason: data.excludedReason || bestDoc?.reason || '',
+                        exclusionAt: data.excludedAt || bestDoc?.at || '',
+                        exclusionDocIds: exclusionDocs.map(x => ({ coll: x.coll, id: x.id, linkedinUrl: x.linkedinUrl })),
+                        softFlagged,
+                        status: softFlagged ? 'excluded' : 'exclusion-record-only',
+                        _checked: true
+                    });
+                });
+            }
+
+            pool.sort((a, b) => String(b.exclusionAt).localeCompare(String(a.exclusionAt)));
+            _alreadyExcludedProspects = pool;
+
+            if (!pool.length) {
+                document.getElementById('alreadyExcludedEmptyState').style.display = 'block';
+                showAlert('No soft-excluded contacts remain on any BDR prospect list for this group.', 'info');
+            } else {
+                document.getElementById('alreadyExcludedResultsWrap').style.display = 'block';
+                renderAlreadyExcludedTable();
+                showAlert(`Found ${pool.length} already-excluded contact(s) still on a prospect list.`, 'success');
+            }
+        } catch (e) {
+            console.error('findAlreadyExcludedProspects failed:', e);
+            showAlert('Failed to find already-excluded contacts: ' + e.message, 'error');
+        } finally {
+            btn.disabled = false;
+            document.getElementById('alreadyExcludedLoadingState').style.display = 'none';
+        }
+    };
+
+    function renderAlreadyExcludedTable() {
+        document.getElementById('alreadyExcludedCount').textContent = _alreadyExcludedProspects.length;
+        const tbody = document.getElementById('alreadyExcludedTableBody');
+        if (!_alreadyExcludedProspects.length) {
+            tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--gray-400);padding:1.5rem;">No contacts found.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = _alreadyExcludedProspects.map(p => {
+            let statusBadge = '<span class="badge badge-excluded-done"><i class="fas fa-ban"></i> Soft-excluded</span>';
+            if (p.status === 'deleted') statusBadge = '<span class="badge" style="background:#fef2f2;color:#7f1d1d;"><i class="fas fa-trash"></i> Deleted</span>';
+            else if (p.status === 'exclusion-record-only') statusBadge = '<span class="badge badge-exclude" title="Has an exclusion record but excludedFromCampaign is not set"><i class="fas fa-exclamation"></i> Exclusion record</span>';
+
+            const reasonTitle = escapeHtml(p.exclusionReason || '');
+            return `
+                <tr data-id="${p.id}">
+                    <td><input type="checkbox" class="already-excluded-cb" data-id="${p.id}" ${p._checked ? 'checked' : ''} onchange="toggleAlreadyExcludedCheck('${p.id}', this.checked)" ${p.status === 'deleted' ? 'disabled' : ''}></td>
+                    <td><div class="rt-name">${escapeHtml(p.name)}</div><div class="rt-sub"><a href="${escapeHtml(p.url.startsWith('http') ? p.url : 'https://' + p.url)}" target="_blank" style="color:var(--gray-400);">${escapeHtml(p.url)}</a></div></td>
+                    <td>${escapeHtml(p.title || '—')}<div class="rt-sub">${escapeHtml(p.org || '')}</div></td>
+                    <td class="rt-sub">${escapeHtml(p.bdrEmail)}</td>
+                    <td><span class="badge badge-exclude" title="${reasonTitle}">${escapeHtml(p.exclusionSource)}</span>${p.exclusionAt ? `<div class="rt-sub">${escapeHtml(String(p.exclusionAt).slice(0, 10))}</div>` : ''}</td>
+                    <td>${statusBadge}</td>
+                </tr>`;
+        }).join('');
+    }
+
+    window.toggleAlreadyExcludedCheck = function(id, checked) {
+        const p = _alreadyExcludedProspects.find(x => x.id === id);
+        if (p) p._checked = checked;
+    };
+    window.toggleSelectAllAlreadyExcluded = function(checked) {
+        _alreadyExcludedProspects.forEach(p => { if (p.status !== 'deleted') p._checked = checked; });
+        renderAlreadyExcludedTable();
+    };
+    window.selectAllAlreadyExcluded = function() {
+        _alreadyExcludedProspects.forEach(p => { if (p.status !== 'deleted') p._checked = true; });
+        renderAlreadyExcludedTable();
+    };
+
+    window.deleteSelectedAlreadyExcluded = async function() {
+        const eligible = _alreadyExcludedProspects.filter(p => p._checked && p.status !== 'deleted');
+        if (!eligible.length) { showAlert('No contacts selected.', 'warning'); return; }
+
+        const userConfirm = prompt(
+            `⚠️ PERMANENT DELETION WARNING ⚠️\n\nYou are about to PERMANENTLY DELETE ${eligible.length} already-excluded contact(s) from prospect_contacts.\n\nThis action CANNOT be undone.\n\nType "DELETE" to confirm:`
+        );
+        if (userConfirm !== 'DELETE') { showAlert('Deletion cancelled.', 'info'); return; }
+
+        let ok = 0, failed = 0;
+        for (const p of eligible) {
+            try {
+                await fx.deleteDoc(fx.doc(db, 'prospect_contacts', p.id));
+                p.status = 'deleted';
+                p._checked = false;
+                ok++;
+            } catch (e) {
+                console.error(`Failed to delete ${p.id}:`, e);
+                failed++;
+            }
+        }
+        renderAlreadyExcludedTable();
+        showAlert(`Permanently deleted ${ok} contact(s)${failed ? `, ${failed} failed` : ''}.`, failed ? 'warning' : 'success');
+    };
+
+    // Rewrite stripped linkedinUrl values (linkedin.com/in/…) to https://… on exclusion
+    // docs for this group's URLs — helps older Full AI matching without deleting contacts.
+    window.fixAlreadyExcludedUrlRecords = async function() {
+        if (!_currentGroup) { showAlert('Load a hypothesis group first.', 'warning'); return; }
+
+        const btn = document.getElementById('fixExclusionUrlsBtn');
+        btn.disabled = true;
+        document.getElementById('alreadyExcludedLoadingState').style.display = 'flex';
+        const setMsg = m => document.getElementById('alreadyExcludedLoadingMsg').textContent = m;
+
+        try {
+            setMsg('Loading exclusion records…');
+            if (!_alreadyExcludedByUrl.size) {
+                _alreadyExcludedByUrl = await loadExclusionDocsForGroupUrls();
+            }
+
+            let toFix = [];
+            _alreadyExcludedByUrl.forEach(docs => {
+                docs.forEach(d => {
+                    const raw = String(d.linkedinUrl || '');
+                    if (raw && !/^https?:\/\//i.test(raw) && /linkedin\.com\/in\//i.test(raw)) {
+                        toFix.push(d);
+                    }
+                });
+            });
+
+            if (!toFix.length) {
+                showAlert('No stripped exclusion URLs found for this group — nothing to fix.', 'info');
+                return;
+            }
+
+            if (!confirm(`Rewrite ${toFix.length} exclusion record(s) to use https://… LinkedIn URLs?\n\nThis does not delete contacts — it only updates the linkedinUrl field on exclusion docs so Full AI Generate can match them.`)) {
+                return;
+            }
+
+            setMsg(`Fixing ${toFix.length} exclusion URL(s)…`);
+            let ok = 0, failed = 0;
+            for (const d of toFix) {
+                try {
+                    await fx.updateDoc(fx.doc(db, d.coll, d.id), {
+                        linkedinUrl: `https://${String(d.linkedinUrl).replace(/^\/+/, '')}`,
+                        linkedinUrlFixedAt: new Date().toISOString(),
+                        linkedinUrlFixedBy: (currentUser && currentUser.email) || 'unknown',
+                        linkedinUrlFixedFrom: d.linkedinUrl
+                    });
+                    ok++;
+                } catch (e) {
+                    console.error(`Failed to fix exclusion ${d.coll}/${d.id}:`, e);
+                    failed++;
+                }
+            }
+            showAlert(`Fixed ${ok} exclusion URL(s)${failed ? `, ${failed} failed` : ''}.`, failed ? 'warning' : 'success');
+            // Refresh map so a subsequent Find reflects updated values
+            _alreadyExcludedByUrl = await loadExclusionDocsForGroupUrls();
+        } catch (e) {
+            console.error('fixAlreadyExcludedUrlRecords failed:', e);
+            showAlert('Failed to fix exclusion URLs: ' + e.message, 'error');
+        } finally {
+            btn.disabled = false;
+            document.getElementById('alreadyExcludedLoadingState').style.display = 'none';
+        }
     };
 
     /* ══════════════════════════════════════════════════════════════════
