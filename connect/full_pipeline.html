@@ -2770,44 +2770,35 @@
             return { kept, dropped };
         }
 
-        // Organization Type Classification — runs once per full-pipeline run (not per
-        // org) against the new /api/connect/classify-org-type endpoint, chunked at 40
-        // organizations per call. Returns a Map of orgId -> matched type name, or null
-        // for organizations the AI didn't confidently place in any given type (those
-        // fall back to the Default Rules). A chunk that fails outright leaves its
-        // organizations unassigned (null) rather than failing the whole run.
-        async function fpClassifyOrgTypes({ token, orgs, types, model }) {
-            const assignments = new Map();
-            const CHUNK_SIZE = 40;
-            for (let i = 0; i < orgs.length; i += CHUNK_SIZE) {
-                if (window.fpStopRequested) break;
-                const chunk = orgs.slice(i, i + CHUNK_SIZE);
-                try {
-                    const resp = await fetchWithRetry(`${RAILWAY_API}/api/connect/classify-org-type`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                        body: JSON.stringify({
-                            organizations: chunk.map(o => ({
-                                id: o.id,
-                                name: o.company_name || '',
-                                industry: o.company_industry || '',
-                                state: o.company_state || '',
-                                description: o.company_description || '',
-                                linkedinUrl: o.company_linkedin_url || ''
-                            })),
-                            types: types.map(t => ({ name: t.name, description: t.description || '' })),
-                            model
-                        })
-                    }, { addLog, label: 'Org type classify' });
-                    const data = await resp.json();
-                    if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
-                    data.results.forEach(r => assignments.set(String(r.id), r.type || null));
-                } catch (e) {
-                    addLog(`   ⚠️ Organization Type classify chunk failed (${e.message}) — those organizations will use the Default Rules.`, 'warning');
-                    chunk.forEach(o => assignments.set(String(o.id), null));
-                }
-            }
-            return assignments;
+        // Organization Type Classification — classifies exactly ONE organization at a
+        // time (called from inside the main per-org loop, right before that org is
+        // scanned) against /api/connect/classify-org-type. Deliberately not batched
+        // across organizations: classify → scan → filter contacts → build/review
+        // messages happens one full organization at a time, so the run log reads as
+        // one clear step-by-step story per org instead of one big upfront AI sweep.
+        // Returns the matched type name, or null if the AI didn't confidently place
+        // this org in any given type (the Default Rules apply) or the call failed.
+        async function fpClassifyOneOrgType({ token, org, types, model }) {
+            const resp = await fetchWithRetry(`${RAILWAY_API}/api/connect/classify-org-type`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                body: JSON.stringify({
+                    organizations: [{
+                        id: org.id,
+                        name: org.company_name || '',
+                        industry: org.company_industry || '',
+                        state: org.company_state || '',
+                        description: org.company_description || '',
+                        linkedinUrl: org.company_linkedin_url || ''
+                    }],
+                    types: types.map(t => ({ name: t.name, description: t.description || '' })),
+                    model
+                })
+            }, { addLog, label: 'Org type classify' });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
+            const r = (data.results || [])[0];
+            return (r && r.type) || null;
         }
 
         // Expandable per-contact table for the Target Contact / Exclude Rules filter step —
@@ -3280,17 +3271,10 @@
                 addLog(`⚠️ Could not load the DNC list (${e.message}) — organizations will NOT be DNC-checked this run.`, 'warning');
             }
 
-            // ── Organization Type Classification — runs once, up front, for every
-            // organization queued this run (before any scanning starts), so the scan
-            // loop below can look up each org's assigned type synchronously. ──
-            let fpOrgTypeAssignments = new Map(); // orgId -> matched type name, or null (default rules)
-            if (orgTypeConfig.enabled) {
-                addLog(`\n🧭 Classifying ${fpRunOrgs.length} organization(s) into ${orgTypeConfig.types.length} type(s) using ${orgTypeConfig.classifierModel}…`);
-                fpOrgTypeAssignments = await fpClassifyOrgTypes({ token, orgs: fpRunOrgs, types: orgTypeConfig.types, model: orgTypeConfig.classifierModel });
-                const tally = {};
-                fpRunOrgs.forEach(o => { const t = fpOrgTypeAssignments.get(o.id) || '(default)'; tally[t] = (tally[t] || 0) + 1; });
-                addLog(`   ✅ Classification done: ${Object.entries(tally).map(([k, v]) => `${k}: ${v}`).join(', ')}`, 'success');
-            }
+            // Organization Type Classification now happens one organization at a time,
+            // right before that organization is scanned (see the main loop below) —
+            // classify → scan → filter contacts → build/review messages, per org — rather
+            // than as one big batch call up front.
 
             try {
                 for (const plan of bdrPlan) {
@@ -3346,25 +3330,16 @@
                         fpSetProgress(Math.round((orgPointer / fpRunOrgs.length) * 100), `Org ${orgPointer}/${fpRunOrgs.length} — ${org.company_name}`);
                         addLog(`\n🏢 [${orgPointer}/${fpRunOrgs.length}] ${org.company_name}`);
 
-                        // Organization Type Classification: which type (if any) this org was
-                        // assigned, and the resulting scan rules to actually use for it. null
-                        // orgType means either the feature is off, or the AI didn't confidently
-                        // match any defined type — either way, the Default Rules apply.
+                        // Per-org scan rules — reassigned below (after DNC) once this org has
+                        // been classified, if Organization Type mode is on. null orgType means
+                        // either the feature is off, or the AI didn't confidently match any
+                        // defined type — either way, the Default Rules apply.
                         let orgScanCriteria = scanCriteria, orgSecondScanConfig = secondScanConfig, orgTypeMatched = null;
-                        if (orgTypeConfig.enabled) {
-                            const matchedName = fpOrgTypeAssignments.get(String(org.id)) || null;
-                            const matchedType = matchedName ? orgTypeConfig.types.find(t => t.name === matchedName) : null;
-                            if (matchedType) {
-                                orgScanCriteria = matchedType.criteria;
-                                orgSecondScanConfig = matchedType.secondScan || null;
-                                orgTypeMatched = matchedType.name;
-                            }
-                        }
 
                         const orgReport = {
                             orgId: org.id, name: org.company_name, linkedinUrl: org.company_linkedin_url || '',
                             bdrEmail, urlResearched: false, scanJobId: null,
-                            orgType: orgTypeMatched, // set only when Organization Type mode matched this org to a named type
+                            orgType: null, // filled in below, only when Organization Type mode matched this org to a named type
                             dncMatch: null, alreadyConnected: 0,
                             contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0,
                             droppedTitles: [], newsStories: null, messagesGenerated: 0,
@@ -3374,12 +3349,9 @@
                             costs: { scanJobHarvestUsd: 0, scanJobBebityUsd: 0, apifyLedgerUsd: 0, ledgerRuns: 0 },
                             error: null
                         };
-                        if (orgTypeConfig.enabled) {
-                            addLog(`   🧭 Organization type: ${orgTypeMatched || 'Default (no confident type match)'}`, 'dim');
-                        }
 
                         try {
-                            // ── 0. DNC check — FIRST, before any research or scan spend ──
+                            // ── 0. DNC check — FIRST, before any research, classification, or scan spend ──
                             const dncEntry = isDNCMatch(org.company_name, relevantDNC);
                             if (dncEntry) {
                                 orgReport.dncMatch = dncEntry.original_name || dncEntry.id;
@@ -3393,15 +3365,35 @@
                                 continue;
                             }
 
+                            // ── 0.5. Organization Type Classification (if enabled) — one AI call
+                            // per organization, right here, right before its scan — not a big
+                            // batch up front. Whatever type this org matches (or doesn't) decides
+                            // which scan rules get used for it below.
+                            if (orgTypeConfig.enabled) {
+                                try {
+                                    const matchedName = await fpClassifyOneOrgType({ token, org, types: orgTypeConfig.types, model: orgTypeConfig.classifierModel });
+                                    const matchedType = matchedName ? orgTypeConfig.types.find(t => t.name === matchedName) : null;
+                                    if (matchedType) {
+                                        orgScanCriteria = matchedType.criteria;
+                                        orgSecondScanConfig = matchedType.secondScan || null;
+                                        orgTypeMatched = matchedType.name;
+                                    }
+                                } catch (e) {
+                                    addLog(`   ⚠️ Organization Type classification failed (${e.message}) — using the Default Rules for this org.`, 'warning');
+                                }
+                                orgReport.orgType = orgTypeMatched;
+                                addLog(`   🧭 Organization type: ${orgTypeMatched || 'Default (no confident type match)'}`, 'dim');
+                            }
+
                             // ── 1. LinkedIn URL research (if needed) — same endpoint as the admin page ──
                             if (!org.company_linkedin_url) {
                                 addLog(`   🔗 No LinkedIn URL — researching…`);
                                 try {
                                     const result = await callResearchCompanyUrlsWithRetry([{
                                         company_name: org.company_name,
-                                        company_domain: org.company_domain || '',
-                                        company_city: org.company_city || '',
-                                        company_state: org.company_state || ''
+                                        domain: org.company_domain || '',
+                                        city: org.company_city || '',
+                                        state: org.company_state || ''
                                     }], false, 1, 1);
                                     const match = (result.companies || [])[0];
                                     if (match && match.linkedin_url) {

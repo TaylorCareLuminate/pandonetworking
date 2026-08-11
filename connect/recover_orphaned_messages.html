@@ -1452,6 +1452,11 @@
         { coll: 'connect_contact_search_log', field: 'bdrEmail',             label: 'Contact Search Log' },
         { coll: 'harvest_pool_manual_contacts', field: 'bdrEmail',           label: 'Harvest Pool Manual Contacts' },
         { coll: 'hypothesis_groups',           field: 'bdrEmail',            label: 'Hypothesis Groups (bdrEmail)' },
+        { coll: 'campaign_settings',          field: 'userEmail',            label: 'Campaign Settings (userEmail)' },
+        { coll: 'bdr_leaders',                field: 'primaryEmail',         label: 'BDR Leaders (primaryEmail)' },
+        // Catches legacy contact_profiles docs whose ID isn't the email; the
+        // doc keyed by the old email itself is migrated in executeRepair()
+        { coll: 'contact_profiles',           field: 'email',                label: 'About Me Profile (email field)' },
     ];
 
     // State for the repair tool
@@ -1577,9 +1582,15 @@
                 where('bdrEmail', '==', oldEmail)
             ));
 
+            // About Me profile is keyed by email as the doc ID, so it can't be
+            // caught by the field-based scan above — check it explicitly.
+            const aboutMeSnap = await getDoc(doc(emailDB, 'contact_profiles', oldEmail));
+            const aboutMeCount = aboutMeSnap.exists ? 1 : 0;
+
             const routingRows = [
                 { label: 'LinkedIn Email Associations (routing)', count: assocCount },
                 { label: 'LinkedIn Accounts (routing)', count: liAccSnap.size },
+                { label: 'About Me Profile (contact_profiles doc ID)', count: aboutMeCount },
             ];
             for (const r of routingRows) {
                 const tr = document.createElement('tr');
@@ -1594,9 +1605,9 @@
             total.textContent = grandTotal;
             total.className = `count-cell ${grandTotal > 0 ? 'has-records' : 'no-records'}`;
             preview.style.display = 'block';
-            execBtn.disabled = (grandTotal === 0 && assocCount === 0 && liAccSnap.size === 0);
+            execBtn.disabled = (grandTotal === 0 && assocCount === 0 && liAccSnap.size === 0 && aboutMeCount === 0);
 
-            showAlert(`Scan complete. ${grandTotal} historical record(s) + ${assocCount + liAccSnap.size} routing record(s) will be updated.`,
+            showAlert(`Scan complete. ${grandTotal} historical record(s) + ${assocCount + liAccSnap.size + aboutMeCount} routing/profile record(s) will be updated.`,
                 grandTotal > 0 ? 'warning' : 'success');
 
         } catch (e) {
@@ -1759,7 +1770,39 @@
             repairLog(`   ❌ ${e.message}`);
         }
 
-        // ── 4. Routing: harvest_pool_stats / configs (doc ID = email) ─────────
+        // ── 4. About Me profile: contact_profiles (doc ID = email) ────────────
+        // The server gates About Me message generation on contact_profiles/{bdrEmail},
+        // so if this doc isn't migrated the BDR silently loses About Me generation.
+        repairLog('\n🔗 Repairing contact_profiles (About Me profile)…');
+        try {
+            const oldProfileSnap = await getDoc(doc(emailDB, 'contact_profiles', repairOldEmail));
+            if (oldProfileSnap.exists) {
+                const newProfileSnap = await getDoc(doc(emailDB, 'contact_profiles', repairNewEmail));
+                const newHasStatements = newProfileSnap.exists &&
+                    Array.isArray(newProfileSnap.data().statements) &&
+                    newProfileSnap.data().statements.length > 0;
+                if (newHasStatements) {
+                    repairLog(`   ⚠️ A profile with About Me statements already exists for ${repairNewEmail} — left both docs untouched. Merge manually in about_me.html, then delete the old doc.`);
+                } else {
+                    await setDoc(doc(emailDB, 'contact_profiles', repairNewEmail), {
+                        ...oldProfileSnap.data(),
+                        email: repairNewEmail,
+                        migratedFrom: repairOldEmail,
+                        migratedAt: new Date().toISOString()
+                    });
+                    await deleteDoc(doc(emailDB, 'contact_profiles', repairOldEmail));
+                    repairLog(`   ✅ Migrated About Me profile: ${repairOldEmail} → ${repairNewEmail}`);
+                    totalUpdated++;
+                }
+            } else {
+                repairLog(`   ℹ️ No About Me profile doc for ${repairOldEmail} — nothing to migrate`);
+            }
+        } catch (e) {
+            errors.push(`contact_profiles: ${e.message}`);
+            repairLog(`   ❌ ${e.message}`);
+        }
+
+        // ── 5. Routing: harvest_pool_stats / configs (doc ID = email) ─────────
         for (const collName of ['harvest_pool_stats', 'harvest_pool_configs']) {
             repairLog(`\n🔗 Repairing ${collName}…`);
             try {
