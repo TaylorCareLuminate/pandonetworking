@@ -118,6 +118,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Harvest Pool (admin)', href: 'harvest_pool_admin.html', icon: 'fa-seedling' },
                 { label: 'divider' },
                 // Cleanup & Maintenance
+                { label: 'Quick Message Cleanup', href: 'quick_message_cleanup.html', icon: 'fa-broom' },
                 { label: 'Process Exclusions', href: 'process_exclusions.html', icon: 'fa-ban' },
                 { label: 'Prospect Cleanup (AI)', href: 'prospect_cleanup.html', icon: 'fa-broom' },
                 { label: 'Manage Org Contacts', href: 'manage_organization_contacts.html', icon: 'fa-users-gear' },

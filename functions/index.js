@@ -1101,7 +1101,7 @@ async function calculateClientDashboardHelper() {
         try {
             const snap = await db.collection(collectionName).where(field, '>=', monthStartTs).get();
             const docs = [];
-            snap.forEach(d => docs.push(d.data()));
+            snap.forEach(d => docs.push({ id: d.id, data: d.data() }));
             return docs;
         } catch (e) {
             console.warn(`⚠️ Query ${collectionName} by ${field} failed (field may not be a Timestamp on all docs):`, e.message);
@@ -1109,16 +1109,25 @@ async function calculateClientDashboardHelper() {
         }
     }
 
-    // heyreach_activity records may use either `timestamp` or `receivedAt` — query
-    // both and dedupe (a doc only has one of the two fields as a real Timestamp).
+    // heyreach_activity records are written with BOTH `timestamp` and `receivedAt`
+    // populated (see HEYREACH_WEBHOOKS_GUIDE.md), so querying on either field alone
+    // would miss nothing — but querying both (to be safe against any legacy docs
+    // missing one of the two) requires deduping by doc ID, since a doc can satisfy
+    // both queries and get returned twice otherwise.
     const [heyreachByTimestamp, heyreachByReceivedAt] = await Promise.all([
         loadThisMonth('heyreach_activity', 'timestamp'),
         loadThisMonth('heyreach_activity', 'receivedAt')
     ]);
-    const heyreachActivities = [...heyreachByTimestamp, ...heyreachByReceivedAt];
+    const seenHeyreachIds = new Set();
+    const heyreachActivities = [];
+    [...heyreachByTimestamp, ...heyreachByReceivedAt].forEach(({ id, data }) => {
+        if (seenHeyreachIds.has(id)) return;
+        seenHeyreachIds.add(id);
+        heyreachActivities.push(data);
+    });
 
     // activity_tracking (meetings + follow-ups) is written with `created_at`.
-    const activityTrackingData = await loadThisMonth('activity_tracking', 'created_at');
+    const activityTrackingData = (await loadThisMonth('activity_tracking', 'created_at')).map(({ data }) => data);
 
     console.log(`📥 Loaded ${heyreachActivities.length} heyreach_activity + ${activityTrackingData.length} activity_tracking docs for ${monthKey}`);
 
