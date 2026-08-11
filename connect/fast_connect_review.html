@@ -14314,6 +14314,21 @@
         }));
     }
 
+    // Full AI Generate (generate_messages.html) already runs the shared Final AI Review
+    // rules on a message right after it's created (see finalAiReviewStatus/finalAiFlagged/
+    // finalAiConcerns written there) so its concerns array uses `models` (array of every
+    // model that flagged it) per rule, whereas runFinalAiReviews() below produces one entry
+    // per rule+model with a singular `model`. Normalize to the latter shape so the review
+    // modal's per-rule/per-model breakdown renders correctly either way.
+    function normalizeStoredFinalAiConcerns(concerns) {
+        return (Array.isArray(concerns) ? concerns : []).map(c => ({
+            ruleName:     c.ruleName,
+            ruleSeverity: c.ruleSeverity || 'warning',
+            model:        c.model || (Array.isArray(c.models) ? c.models.join(', ') : (c.models || '')),
+            issues:       c.issues || []
+        }));
+    }
+
     async function runFinalAiReviews(messagesToReview, { silent = false } = {}) {
         // Make sure the cached rule set is fresh from the shared store (covers the
         // single-message re-check path, which doesn't go through patchedSubmitBatch).
@@ -14828,6 +14843,14 @@
             return submitBatch();
         }
 
+        // Full AI Generate already ran the Final AI Review rules on these messages right
+        // after generating them (finalAiReviewStatus === 'completed') — don't spend time/API
+        // calls running the exact same checks again here. Only messages that haven't been
+        // through a Final AI Review yet (e.g. from LinkedIn Post / other sources that don't
+        // review at generation time) get reviewed now.
+        const alreadyReviewed = toReview.filter(m => m.finalAiReviewStatus === 'completed');
+        const needsReview     = toReview.filter(m => m.finalAiReviewStatus !== 'completed');
+
         // Show modal in loading state
         const overlay = document.getElementById('farOverlay');
         overlay.classList.add('open');
@@ -14848,7 +14871,19 @@
                 try { await auth.currentUser.getIdToken(true); } catch {}
             }
 
-            const reviewResultsMap = await runFinalAiReviews(toReview);
+            const reviewResultsMap = needsReview.length > 0
+                ? await runFinalAiReviews(needsReview)
+                : new Map();
+
+            // Fold in the results already computed during Full AI Generate instead of
+            // re-running the same rules against the same message a second time.
+            alreadyReviewed.forEach(m => {
+                reviewResultsMap.set(m.id, {
+                    flagged:  !!m.finalAiFlagged,
+                    concerns: normalizeStoredFinalAiConcerns(m.finalAiConcerns)
+                });
+            });
+
             document.getElementById('farProgressSection').style.display = 'none';
 
             const anyFlagged = [...reviewResultsMap.values()].some(v => v.flagged);
