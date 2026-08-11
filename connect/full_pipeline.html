@@ -1235,6 +1235,16 @@
                 .replace(/\/$/, '');
         }
 
+        // Extract the "/in/<slug>" vanity handle from a normalized URL — used as a fallback
+        // match below (and by fast_connect_review.html / connect_review.html's isCurrentConnection())
+        // for contacts whose stored URL differs slightly in form from the heyreach_contacts record
+        // for the very same profile.
+        function fpLinkedInUsername(normalizedUrl) {
+            if (!normalizedUrl) return null;
+            const m = String(normalizedUrl).match(/linkedin\.com\/in\/([^/?#]+)/i);
+            return m ? m[1].toLowerCase() : null;
+        }
+
         async function fpLoadConnectedUrls(token, bdrEmail) {
             try {
                 const resp = await fetchWithRetry(`${RAILWAY_API}/api/connect/connected-urls`, {
@@ -1244,11 +1254,25 @@
                 }, { addLog, label: 'Connected URLs' });
                 const data = await resp.json().catch(() => ({}));
                 if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
-                return new Set(data.connectedUrls || []);
+                return {
+                    urls: new Set(data.connectedUrls || []),
+                    usernames: new Set(data.connectedUsernames || [])
+                };
             } catch (e) {
                 addLog(`   ⚠️ Could not load existing LinkedIn connections for ${bdrEmail} (${e.message}) — relying on the generator's own connected check.`, 'warning');
-                return new Set();
+                return { urls: new Set(), usernames: new Set() };
             }
+        }
+
+        // Exact-URL match with a vanity-slug fallback — mirrors isCurrentConnection() in
+        // fast_connect_review.html / connect_review.html so this page can't treat a contact as
+        // net-new while the review pages would flag them as already connected.
+        function fpIsUrlConnected(connectedUrls, connectedUsernames, rawUrl) {
+            const u = fpNormalizeUrl(rawUrl);
+            if (!u) return false;
+            if (connectedUrls.has(u)) return true;
+            const handle = fpLinkedInUsername(u);
+            return !!handle && connectedUsernames.has(handle);
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -2651,7 +2675,7 @@
         // Optional cross-BDR step: find contacts at this org already stored under other
         // BDRs / workspaces, refresh each one with a live LinkedIn check, and copy it to the
         // current BDR tagged with this scan job so it flows through the same generation path.
-        async function fpImportCrossBdrContacts({ org, bdrEmail, scanJobId, connectedUrlSet }) {
+        async function fpImportCrossBdrContacts({ org, bdrEmail, scanJobId, connectedUrlSet, connectedUsernameSet }) {
             const found = new Map(); // normalized url -> contact doc
             const CROSS_BDR_CAP = 100;
 
@@ -2669,11 +2693,12 @@
                     const snap = await getDocs(q);
                     snap.docs.forEach(d => {
                         const c = { id: d.id, ...d.data() };
-                        const u = fpNormalizeUrl(c.linkedInUrl || c.li_url || '');
+                        const rawUrl = c.linkedInUrl || c.li_url || '';
+                        const u = fpNormalizeUrl(rawUrl);
                         if (!u) return;
                         if ((c.userEmail || c.bdrEmail) === bdrEmail) return; // already this BDR's contact
                         // Net-new connections only — skip before wasting a refresh scrape on them
-                        if (connectedUrlSet && connectedUrlSet.has(u)) { skippedConnected++; return; }
+                        if (connectedUrlSet && fpIsUrlConnected(connectedUrlSet, connectedUsernameSet || new Set(), rawUrl)) { skippedConnected++; return; }
                         if (!found.has(u)) found.set(u, c);
                     });
                 } catch (e) {
@@ -3296,7 +3321,7 @@
 
                     // Existing LinkedIn connections for this BDR — these are all net-new
                     // connection requests, so anyone already connected is dropped up front.
-                    const connectedUrlSet = await fpLoadConnectedUrls(token, bdrEmail);
+                    const { urls: connectedUrlSet, usernames: connectedUsernameSet } = await fpLoadConnectedUrls(token, bdrEmail);
                     addLog(`   🤝 Existing LinkedIn connections loaded: ${connectedUrlSet.size} — already-connected contacts will be skipped.`, 'dim');
 
                     // BDR profile doc — used by Final AI Review context (same as generate_messages)
@@ -3447,7 +3472,7 @@
 
                             // ── 3. Optional: cross-BDR contacts (refresh + import) ──
                             if (crossBdrEnabled) {
-                                orgReport.crossBdrImported = await fpImportCrossBdrContacts({ org, bdrEmail, scanJobId: jobId, connectedUrlSet });
+                                orgReport.crossBdrImported = await fpImportCrossBdrContacts({ org, bdrEmail, scanJobId: jobId, connectedUrlSet, connectedUsernameSet });
                             }
 
                             // ── 4. Load this job's contacts + Target Contact / Exclude Rules filter ──
@@ -3464,7 +3489,7 @@
                             // full-ai-init re-applies the same check server-side as a safety net.
                             if (connectedUrlSet.size > 0 && scannedContacts.length > 0) {
                                 const before = scannedContacts.length;
-                                scannedContacts = scannedContacts.filter(c => !connectedUrlSet.has(fpNormalizeUrl(c.linkedInUrl || c.li_url || '')));
+                                scannedContacts = scannedContacts.filter(c => !fpIsUrlConnected(connectedUrlSet, connectedUsernameSet, c.linkedInUrl || c.li_url || ''));
                                 const droppedConn = before - scannedContacts.length;
                                 if (droppedConn > 0) {
                                     orgReport.alreadyConnected = droppedConn;
