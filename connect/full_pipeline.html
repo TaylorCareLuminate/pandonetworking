@@ -191,7 +191,7 @@
         <!-- ══════════ STEP 3: Organizations preview ══════════ -->
         <div class="section">
             <div class="section-title"><span class="step-num">3</span> Organizations to Scan (preview)</div>
-            <p class="section-help">Read-only preview, in scan-priority order. Add / remove / prioritize organizations in <a href="prospect_organizations_admin.html" target="_blank">Prospect Organizations Admin</a>. Organizations without a LinkedIn URL are researched automatically during the run.</p>
+            <p class="section-help">Read-only preview, in the exact order this run will process them: organizations never scanned under the Scan Name below come first, then — as a tie-breaker, so even a brand-new Scan Name doesn't just restart from the top of the priority list — organizations scanned the fewest total times across ALL scan names. Add / remove / re-prioritize organizations in <a href="prospect_organizations_admin.html" target="_blank">Prospect Organizations Admin</a> (that priority still breaks any remaining ties). Organizations without a LinkedIn URL are researched automatically during the run.</p>
 
             <div class="form-group" style="margin-bottom: 14px;">
                 <label for="fpScanName"><i class="fas fa-tag"></i> Scan Name <span style="color: var(--danger); font-weight: 400;">(required)</span></label>
@@ -227,8 +227,8 @@
             </div>
             <div style="max-height: 300px; overflow-y: auto; border: 1px solid var(--gray-200); border-radius: 8px;">
                 <table class="data-table" id="fpOrgTable">
-                    <thead><tr><th>#</th><th>Priority</th><th>Organization</th><th>LinkedIn URL</th><th>Scan Names</th></tr></thead>
-                    <tbody id="fpOrgTableBody"><tr><td colspan="5" style="text-align:center; color: var(--gray-400); padding: 20px;">Select a hypothesis group above.</td></tr></tbody>
+                    <thead><tr><th>#</th><th>Priority</th><th>Organization</th><th>LinkedIn URL</th><th title="Distinct scan names ever run against this org — the tie-breaker for queue order">Total Scans</th><th>Scan Names</th></tr></thead>
+                    <tbody id="fpOrgTableBody"><tr><td colspan="6" style="text-align:center; color: var(--gray-400); padding: 20px;">Select a hypothesis group above.</td></tr></tbody>
                 </table>
             </div>
         </div>
@@ -246,6 +246,30 @@
                 <span id="fpAiFillStatus" style="font-size: 12.5px; font-weight: 600;"></span>
             </div>
 
+            <!-- ── Organization Type Classification ── -->
+            <div class="collapsible-header" style="background: #eff6ff; border: 1px solid #bfdbfe;" onclick="document.getElementById('fpOrgTypeBody').style.display = document.getElementById('fpOrgTypeModeEnabled').checked ? 'block' : (document.getElementById('fpOrgTypeBody').style.display === 'none' ? 'block' : 'none');">
+                <label style="margin: 0; display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                    <input type="checkbox" id="fpOrgTypeModeEnabled" style="width: auto;" onclick="event.stopPropagation(); fpOnOrgTypeModeCheckboxClick(this.checked);">
+                    <i class="fas fa-sitemap"></i> Classify organizations by type — use different Employee Contact Scan Rules per type
+                </label>
+                <i class="fas fa-chevron-down" style="color: var(--gray-400);"></i>
+            </div>
+            <div id="fpOrgTypeBody" style="display:none; border: 1px dashed #93c5fd; border-radius: 10px; padding: 14px; margin-bottom: 14px; background: #f8fafc;">
+                <p style="font-size: 12.5px; color: var(--gray-600); margin: 0 0 12px;">
+                    Before scanning, an AI agent looks at each organization (name, industry, state, description, LinkedIn URL — whatever is on file) and assigns it to one of the types below.
+                    Each type gets its <strong>own complete set</strong> of Employee Contact Scan Rules (Job Functions, Seniority, Job Title Keywords, etc. — even its own fallback scan), so e.g. hospitals and technology vendors in the same
+                    hypothesis group can be scanned completely differently. Organizations that don't confidently match any type use the <strong>Default Rules</strong> below (the same fields used when this feature is off).
+                </p>
+                <div class="form-group">
+                    <label for="fpOrgTypeClassifierModel"><i class="fas fa-robot"></i> AI Agent (classifier model)</label>
+                    <select id="fpOrgTypeClassifierModel"></select>
+                    <div class="form-help">Runs once per organization queued for this run, before any scanning starts. Pick a cheaper model for large runs or a stronger one for subtle distinctions.</div>
+                </div>
+                <div id="fpOrgTypesList"></div>
+                <button class="btn" type="button" onclick="fpAddOrgTypeCard()"><i class="fas fa-plus"></i> Add Organization Type</button>
+            </div>
+
+            <div style="font-size: 13px; font-weight: 700; color: var(--gray-700); margin-bottom: 8px;" id="fpDefaultRulesLabel">Scan Rules</div>
             <div class="scan-criteria">
                 <div class="form-group" style="margin-bottom: 0;">
                     <label for="fpScanFunctions"><i class="fas fa-briefcase"></i> Job Functions (leave blank for all)</label>
@@ -535,10 +559,30 @@
         let fpGroups = [];           // hypothesis_groups docs
         let fpBdrs = [];             // bdr_leaders docs
         let fpGroupOrgs = [];        // prospect_organizations for the selected group (priority order)
-        let fpCurrentGroupScanPresets = {}; // { [scanName]: { criteria, secondScan, updatedAt } } — from the selected group's hypothesis_groups doc
+        let fpCurrentGroupScanPresets = {}; // { [scanName]: { criteria, secondScan, orgTypeMode, updatedAt } } — from the selected group's hypothesis_groups doc
         let fpLastAppliedPresetName = null; // avoids re-clobbering Step 4 fields on every keystroke once a preset has loaded
         let fpRunning = false;
         window.fpStopRequested = false;
+        let fpOrgTypeCardSeq = 0; // unique DOM ids for each dynamically-added Organization Type card
+
+        // Job Function / Seniority Level <option> lists — identical to the static Step 4
+        // (and fallback-scan) selects above, reused to build each Organization Type card's
+        // own scan-criteria selects on the fly.
+        const FP_JOBFN_OPTIONS_HTML = `
+            <option value="1">Accounting</option><option value="2">Administrative</option><option value="3">Arts &amp; Design</option>
+            <option value="4">Business Development</option><option value="5">Community &amp; Social Services</option><option value="6">Consulting</option>
+            <option value="7">Education</option><option value="8">Engineering</option><option value="9">Entrepreneurship</option>
+            <option value="10">Finance</option><option value="11">Healthcare Services</option><option value="12">Human Resources</option>
+            <option value="13">Information Technology</option><option value="14">Legal</option><option value="15">Marketing</option>
+            <option value="16">Media &amp; Communication</option><option value="17">Military &amp; Protective Services</option><option value="18">Operations</option>
+            <option value="19">Product Management</option><option value="20">Program &amp; Project Management</option><option value="21">Purchasing</option>
+            <option value="22">Quality Assurance</option><option value="23">Real Estate</option><option value="24">Research</option>
+            <option value="25">Sales</option><option value="26">Support</option>`;
+        const FP_SENIORITY_OPTIONS_HTML = `
+            <option value="100">Unpaid</option><option value="110">Training/Internship</option>
+            <option value="120">Entry Level / Manager</option><option value="220">Senior / Director</option>
+            <option value="300">VP (Vice President)</option><option value="310">C-Level (CIO, CTO, CISO, etc.)</option>
+            <option value="320">Partner</option>`;
 
         // ════════════════════════════════════════════════════════════════════
         // FROM generate_messages.html — fetchWithRetry (verbatim)
@@ -1349,7 +1393,7 @@
             fpGroupOrgs = [];
             fpCurrentGroupScanPresets = {};
             fpLastAppliedPresetName = null;
-            document.getElementById('fpOrgTableBody').innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--gray-400); padding: 20px;">Select a hypothesis group above.</td></tr>';
+            document.getElementById('fpOrgTableBody').innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--gray-400); padding: 20px;">Select a hypothesis group above.</td></tr>';
             ['fpOrgCountTotal','fpOrgCountWithUrl','fpOrgCountScanned','fpOrgCountThisName'].forEach(id => document.getElementById(id).textContent = '–');
             document.getElementById('fpScanName').value = '';
             document.getElementById('fpScanNameStatus').textContent = '';
@@ -1415,7 +1459,7 @@
         // section of prospect_organizations_admin.html uses, ordered by hypothesis_priority.
         async function fpLoadGroupOrgs(groupId) {
             const tbody = document.getElementById('fpOrgTableBody');
-            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--gray-400); padding: 20px;"><i class="fas fa-spinner fa-spin"></i> Loading organizations…</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--gray-400); padding: 20px;"><i class="fas fa-spinner fa-spin"></i> Loading organizations…</td></tr>';
             try {
                 const snap = await getDocs(query(
                     collection(db, 'prospect_organizations'),
@@ -1449,7 +1493,7 @@
                 fpUpdateScanNameStatus();
             } catch (e) {
                 console.error('Failed to load group orgs:', e);
-                tbody.innerHTML = `<tr><td colspan="5" style="text-align:center; color: var(--danger); padding: 20px;">Error: ${escHtml(e.message)}</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color: var(--danger); padding: 20px;">Error: ${escHtml(e.message)}</td></tr>`;
             }
         }
 
@@ -1458,6 +1502,37 @@
         function fpOrgScanLabels(org) {
             if (Array.isArray(org.scan_labels) && org.scan_labels.length) return org.scan_labels;
             return org.last_scan_label ? [org.last_scan_label] : [];
+        }
+
+        // How many distinct scans (any name) this organization has ever been through —
+        // used as the "scanned the least across all scans" tie-breaker when queueing.
+        function fpOrgTotalScanCount(org) {
+            return fpOrgScanLabels(org).length;
+        }
+
+        // Builds this run's working queue in priority order:
+        //   1) organizations never scanned under THIS exact scan name come first
+        //      (or, in skip mode, organizations already scanned under it are dropped
+        //      entirely instead of just being pushed to the back);
+        //   2) as a tie-breaker (including among "already scanned this name" ones when
+        //      not skipping), organizations scanned the fewest total times across ALL
+        //      scan names go first — so a brand-new scan name still favors the
+        //      least-covered organizations rather than starting from the top of the
+        //      manually-set priority list every time;
+        //   3) any remaining ties keep the existing hypothesis-priority order (stable
+        //      sort over the already priority-sorted fpGroupOrgs).
+        function fpBuildRunQueue(scanName, skipAlreadyScanned) {
+            if (skipAlreadyScanned) {
+                return fpGroupOrgs
+                    .filter(o => !fpOrgScanLabels(o).includes(scanName))
+                    .sort((a, b) => fpOrgTotalScanCount(a) - fpOrgTotalScanCount(b));
+            }
+            return [...fpGroupOrgs].sort((a, b) => {
+                const aDone = fpOrgScanLabels(a).includes(scanName) ? 1 : 0;
+                const bDone = fpOrgScanLabels(b).includes(scanName) ? 1 : 0;
+                if (aDone !== bDone) return aDone - bDone;
+                return fpOrgTotalScanCount(a) - fpOrgTotalScanCount(b);
+            });
         }
 
         // Record that this scan name has been fully applied to an organization — ONLY call
@@ -1639,10 +1714,14 @@
             const tbody = document.getElementById('fpOrgTableBody');
             const currentName = (document.getElementById('fpScanName')?.value || '').trim();
             if (fpGroupOrgs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--gray-400); padding: 20px;">No organizations tied to this group yet — add them in Prospect Organizations Admin.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--gray-400); padding: 20px;">No organizations tied to this group yet — add them in Prospect Organizations Admin.</td></tr>';
                 return;
             }
-            tbody.innerHTML = fpGroupOrgs.map((o, i) => {
+            // Preview in the exact order the run would use: with a Scan Name typed, that's
+            // fpBuildRunQueue's priority order; with no name yet, just the raw priority list.
+            const skip = document.getElementById('fpSkipAlreadyScanned')?.checked ?? true;
+            const ordered = currentName ? fpBuildRunQueue(currentName, skip) : fpGroupOrgs;
+            tbody.innerHTML = ordered.map((o, i) => {
                 const labels = fpOrgScanLabels(o);
                 const hasCurrent = currentName && labels.includes(currentName);
                 const scanCell = labels.length
@@ -1656,6 +1735,7 @@
                         <td>${o.hypothesis_priority ?? '—'}</td>
                         <td><strong>${escHtml(o.company_name || '(unnamed)')}</strong>${o.company_state ? ` <span style="color: var(--gray-400); font-size: 11px;">${escHtml(o.company_state)}</span>` : ''}</td>
                         <td>${o.company_linkedin_url ? `<a href="${escHtml(o.company_linkedin_url)}" target="_blank" style="color: var(--primary); font-size: 12px;">${escHtml(o.company_linkedin_url.replace(/^https?:\/\/(www\.)?/, '').slice(0, 45))}</a>` : '<span class="badge badge-amber">will research</span>'}</td>
+                        <td style="text-align:center; color: var(--gray-500);">${fpOrgTotalScanCount(o)}</td>
                         <td style="font-size: 12px;">${scanCell}</td>
                     </tr>
                 `;
@@ -2149,6 +2229,192 @@
             document.getElementById(prefix === '2' ? 'fpScan2FilterPrompt' : 'fpScanFilterPrompt').value = criteria.filter_prompt || '';
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // Organization Type Classification — an AI agent looks at each organization
+        // and assigns it to one of these user-defined types before scanning, so each
+        // type can carry its own complete Employee Contact Scan Rules (including its
+        // own fallback second scan). Cards are built dynamically so there can be any
+        // number of types; every field inside a card is scoped by CSS class (not id)
+        // so the same field names can repeat across cards.
+        // ════════════════════════════════════════════════════════════════════
+        window.fpToggleOrgTypeMode = function(enabled) {
+            document.getElementById('fpOrgTypeBody').style.display = enabled ? 'block' : 'none';
+            document.getElementById('fpDefaultRulesLabel').textContent = enabled
+                ? "Default Rules (used when an organization doesn't confidently match any type above)"
+                : 'Scan Rules';
+        };
+
+        // Bound to the checkbox's onclick — separate from fpToggleOrgTypeMode so that
+        // rebuilding the UI from a saved preset (fpApplyOrgTypesConfig) can show/hide
+        // the section without also seeding two blank cards every time.
+        window.fpOnOrgTypeModeCheckboxClick = function(checked) {
+            fpToggleOrgTypeMode(checked);
+            if (checked && document.getElementById('fpOrgTypesList').children.length === 0) {
+                fpAddOrgTypeCard();
+                fpAddOrgTypeCard();
+            }
+        };
+
+        window.fpAddOrgTypeCard = function(data) {
+            const wrap = document.createElement('div');
+            wrap.className = 'fp-org-type-card';
+            wrap.style.cssText = 'border:1px solid var(--gray-300); border-radius:10px; padding:12px 14px; margin-bottom:10px; background:white;';
+            wrap.innerHTML = `
+                <div style="display:flex; gap:10px; align-items:flex-start; margin-bottom:10px;">
+                    <div style="flex:1;">
+                        <label style="margin-bottom:3px;">Type Name</label>
+                        <input type="text" class="ot-name" placeholder="e.g. Hospital / Health System">
+                    </div>
+                    <button class="btn btn-danger" type="button" style="margin-top:22px;" onclick="fpRemoveOrgTypeCard(this)" title="Remove this type"><i class="fas fa-trash"></i></button>
+                </div>
+                <div class="form-group">
+                    <label>Classification Description <span style="font-weight:400; color:var(--gray-500);">(what the AI agent should look for)</span></label>
+                    <textarea class="ot-desc" style="min-height:50px;" placeholder="e.g. Hospitals, health systems, and clinical care providers"></textarea>
+                </div>
+                <div class="collapsible-header" style="background: var(--gray-50);" onclick="const b=this.nextElementSibling; b.style.display = (b.style.display === 'none') ? 'block' : 'none';">
+                    <span style="font-size:12.5px; font-weight:700; color:var(--gray-700);"><i class="fas fa-filter"></i> Employee Contact Scan Rules for this type</span>
+                    <i class="fas fa-chevron-down" style="color: var(--gray-400);"></i>
+                </div>
+                <div class="ot-rules-body" style="display:block;">
+                    <div class="scan-criteria">
+                        <div class="form-group" style="margin-bottom:0;">
+                            <label>Job Functions (leave blank for all)</label>
+                            <select class="ot-functions" multiple style="height:140px;">${FP_JOBFN_OPTIONS_HTML}</select>
+                        </div>
+                        <div class="form-group" style="margin-bottom:0;">
+                            <label>Seniority Levels (leave blank for all)</label>
+                            <select class="ot-seniority" multiple style="height:140px;">${FP_SENIORITY_OPTIONS_HTML}</select>
+                        </div>
+                    </div>
+                    <div class="grid-3">
+                        <div class="form-group"><label>Max Contacts per Organization</label><input type="number" class="ot-max" value="25" min="1" max="2000"></div>
+                        <div class="form-group"><label>Location Filter (optional)</label><input type="text" class="ot-locations" placeholder="e.g. Missouri, Texas, New York"></div>
+                        <div class="form-group"><label>Search Query (optional)</label><input type="text" class="ot-query"></div>
+                    </div>
+                    <div class="grid-2">
+                        <div class="form-group"><label>Job Title Keywords (one per line)</label><textarea class="ot-titles" style="min-height:60px;"></textarea></div>
+                        <div class="form-group"><label>AI Filter Prompt (optional)</label><textarea class="ot-filterprompt" style="min-height:60px;"></textarea></div>
+                    </div>
+                    <div class="collapsible-header" onclick="const c=this.closest('.fp-org-type-card'); const cb=c.querySelector('.ot-secondscan-enabled'); const b=c.querySelector('.ot-secondscan-body'); b.style.display = cb.checked ? 'block' : (b.style.display === 'none' ? 'block' : 'none');">
+                        <label style="margin: 0; display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" class="ot-secondscan-enabled" style="width: auto;" onclick="event.stopPropagation(); this.closest('.fp-org-type-card').querySelector('.ot-secondscan-body').style.display = this.checked ? 'block' : 'none';">
+                            <i class="fas fa-redo"></i> Enable Fallback (Second) Scan for this type
+                        </label>
+                        <i class="fas fa-chevron-down" style="color: var(--gray-400);"></i>
+                    </div>
+                    <div class="ot-secondscan-body" style="display:none; border: 1px dashed var(--gray-300); border-radius: 10px; padding: 12px;">
+                        <div class="form-group">
+                            <label>Run fallback when first scan saves fewer than</label>
+                            <input type="number" class="ot-2-threshold" value="5" min="1" max="100" style="width: 100px;"> contacts
+                        </div>
+                        <div class="scan-criteria">
+                            <div class="form-group" style="margin-bottom:0;"><label>Job Functions (fallback)</label><select class="ot-2-functions" multiple style="height:120px;">${FP_JOBFN_OPTIONS_HTML}</select></div>
+                            <div class="form-group" style="margin-bottom:0;"><label>Seniority Levels (fallback)</label><select class="ot-2-seniority" multiple style="height:120px;">${FP_SENIORITY_OPTIONS_HTML}</select></div>
+                        </div>
+                        <div class="grid-3">
+                            <div class="form-group"><label>Max Contacts (fallback)</label><input type="number" class="ot-2-max" value="25" min="1" max="2000"></div>
+                            <div class="form-group"><label>Location Filter (fallback)</label><input type="text" class="ot-2-locations"></div>
+                            <div class="form-group"><label>Search Query (fallback)</label><input type="text" class="ot-2-query"></div>
+                        </div>
+                        <div class="grid-2">
+                            <div class="form-group"><label>Job Title Keywords (fallback)</label><textarea class="ot-2-titles" style="min-height:50px;"></textarea></div>
+                            <div class="form-group"><label>AI Filter Prompt (fallback)</label><textarea class="ot-2-filterprompt" style="min-height:50px;"></textarea></div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.getElementById('fpOrgTypesList').appendChild(wrap);
+            if (data) fpApplyOrgTypeCard(wrap, data);
+            return wrap;
+        };
+
+        window.fpRemoveOrgTypeCard = function(btn) {
+            const card = btn.closest('.fp-org-type-card');
+            if (card && confirm('Remove this organization type? Its scan rules will be lost unless you re-add it before running.')) card.remove();
+        };
+
+        // Reads/writes one criteria set (job functions, seniority, etc.) scoped to a
+        // container element instead of fixed ids — `fieldPrefix` is '' for a card's
+        // primary rules or '2-' for its fallback scan, matching the .ot-<prefix><field>
+        // class names above.
+        function fpReadCriteriaFromScope(scope, fieldPrefix) {
+            const el = (cls) => scope.querySelector(`.ot-${fieldPrefix}${cls}`);
+            let jobFunctions = Array.from(el('functions').selectedOptions).map(o => o.value);
+            let seniority    = Array.from(el('seniority').selectedOptions).map(o => o.value);
+            if (jobFunctions.length === 0 || jobFunctions.length === 26) jobFunctions = [];
+            if (seniority.length === 0 || seniority.length === 7) seniority = [];
+            const maxEmployees = parseInt(el('max').value) || 25;
+            const locationsRaw = el('locations').value.trim();
+            const locations    = locationsRaw ? locationsRaw.split(',').map(l => l.trim()).filter(l => l.length > 0) : [];
+            const searchQuery  = el('query').value.trim() || null;
+            const titlesRaw    = el('titles').value.trim();
+            const jobTitles    = titlesRaw ? titlesRaw.split('\n').map(t => t.trim()).filter(t => t.length > 0) : [];
+            const filterPrompt = el('filterprompt').value.trim();
+            return {
+                function_ids: jobFunctions, seniority_level_ids: seniority, max_employees: maxEmployees,
+                locations: locations.length > 0 ? locations : null, filter_prompt: filterPrompt || null,
+                search_query: searchQuery, job_titles: jobTitles.length > 0 ? jobTitles : null
+            };
+        }
+
+        function fpWriteCriteriaToScope(scope, criteria, fieldPrefix) {
+            if (!criteria) return;
+            const el = (cls) => scope.querySelector(`.ot-${fieldPrefix}${cls}`);
+            const fnIds = new Set((criteria.function_ids || []).map(String));
+            [...el('functions').options].forEach(o => o.selected = fnIds.size > 0 && fnIds.has(o.value));
+            const snIds = new Set((criteria.seniority_level_ids || []).map(String));
+            [...el('seniority').options].forEach(o => o.selected = snIds.size > 0 && snIds.has(o.value));
+            el('max').value = criteria.max_employees || 25;
+            el('locations').value = (criteria.locations || []).join(', ');
+            el('query').value = criteria.search_query || '';
+            el('titles').value = (criteria.job_titles || []).join('\n');
+            el('filterprompt').value = criteria.filter_prompt || '';
+        }
+
+        function fpApplyOrgTypeCard(scope, data) {
+            scope.querySelector('.ot-name').value = data.name || '';
+            scope.querySelector('.ot-desc').value = data.description || '';
+            fpWriteCriteriaToScope(scope, data.criteria, '');
+            const hasSecond = !!data.secondScan;
+            scope.querySelector('.ot-secondscan-enabled').checked = hasSecond;
+            scope.querySelector('.ot-secondscan-body').style.display = hasSecond ? 'block' : 'none';
+            if (hasSecond) {
+                scope.querySelector('.ot-2-threshold').value = data.secondScan.threshold || 5;
+                fpWriteCriteriaToScope(scope, data.secondScan.criteria, '2-');
+            }
+        }
+
+        // Reads the full Organization Type configuration off the Step 4 form: whether
+        // the feature is on, which AI agent classifies each org, and every defined
+        // type's name, classification description, and complete scan criteria (+
+        // optional fallback scan). Cards with no name are ignored — they're never sent
+        // to the classifier and never used as a scan rule set.
+        function fpReadOrgTypesConfig() {
+            const enabled = document.getElementById('fpOrgTypeModeEnabled').checked;
+            const classifierModel = document.getElementById('fpOrgTypeClassifierModel').value || 'anthropic/claude-sonnet-5';
+            const types = [...document.querySelectorAll('#fpOrgTypesList .fp-org-type-card')].map(card => {
+                const name = card.querySelector('.ot-name').value.trim();
+                const description = card.querySelector('.ot-desc').value.trim();
+                const criteria = fpReadCriteriaFromScope(card, '');
+                const secondScan = card.querySelector('.ot-secondscan-enabled').checked
+                    ? { threshold: parseInt(card.querySelector('.ot-2-threshold').value) || 5, criteria: fpReadCriteriaFromScope(card, '2-') }
+                    : null;
+                return { name, description, criteria, secondScan };
+            }).filter(t => t.name);
+            return { enabled, classifierModel, types };
+        }
+
+        // Rebuilds the Organization Type cards from a saved config (loaded via a Scan
+        // Name preset) — the inverse of fpReadOrgTypesConfig.
+        function fpApplyOrgTypesConfig(config) {
+            document.getElementById('fpOrgTypesList').innerHTML = '';
+            const enabled = !!(config && config.enabled);
+            document.getElementById('fpOrgTypeModeEnabled').checked = enabled;
+            fpToggleOrgTypeMode(enabled);
+            if (config && config.classifierModel) document.getElementById('fpOrgTypeClassifierModel').value = config.classifierModel;
+            (config?.types || []).forEach(t => fpAddOrgTypeCard(t));
+        }
+
         // Loads a saved Scan Name preset (Step 4 rules previously used under this exact
         // name, for this hypothesis group) onto the form, including the fallback second
         // scan if one was saved. No-op if this exact name has no saved preset, or if it's
@@ -2173,19 +2439,21 @@
                 document.getElementById('fpSecondScanThreshold').value = preset.secondScan.threshold || 5;
                 fpApplyScanCriteria(preset.secondScan.criteria, '2');
             }
+            fpApplyOrgTypesConfig(preset.orgTypeMode || null);
             fpLastAppliedPresetName = name;
             const when = preset.updatedAt ? new Date(preset.updatedAt).toLocaleDateString() : '';
             statusEl.innerHTML = `<span style="color: var(--success);"><i class="fas fa-wand-magic-sparkles"></i> Loaded the saved Step 4 rules for "${escHtml(name)}"${when ? ` (last used ${when})` : ''}.</span>`;
         }
 
-        // Saves the current Step 4 rules as the preset for this Scan Name, on this
-        // hypothesis group's doc — called right before a run starts, so the same name
-        // always maps to whatever rules it was actually run with.
-        async function fpSaveScanNamePreset(groupId, scanName, criteria, secondScanConfig) {
+        // Saves the current Step 4 rules — including the Organization Type mode, if
+        // enabled — as the preset for this Scan Name, on this hypothesis group's doc.
+        // Called right before a run starts, so the same name always maps to whatever
+        // rules it was actually run with.
+        async function fpSaveScanNamePreset(groupId, scanName, criteria, secondScanConfig, orgTypeMode) {
             try {
                 const updatedPresets = {
                     ...fpCurrentGroupScanPresets,
-                    [scanName]: { criteria, secondScan: secondScanConfig, updatedAt: new Date().toISOString() }
+                    [scanName]: { criteria, secondScan: secondScanConfig, orgTypeMode: orgTypeMode || null, updatedAt: new Date().toISOString() }
                 };
                 await updateDoc(doc(db, 'hypothesis_groups', groupId), { scanNamePresets: updatedPresets });
                 fpCurrentGroupScanPresets = updatedPresets;
@@ -2502,6 +2770,46 @@
             return { kept, dropped };
         }
 
+        // Organization Type Classification — runs once per full-pipeline run (not per
+        // org) against the new /api/connect/classify-org-type endpoint, chunked at 40
+        // organizations per call. Returns a Map of orgId -> matched type name, or null
+        // for organizations the AI didn't confidently place in any given type (those
+        // fall back to the Default Rules). A chunk that fails outright leaves its
+        // organizations unassigned (null) rather than failing the whole run.
+        async function fpClassifyOrgTypes({ token, orgs, types, model }) {
+            const assignments = new Map();
+            const CHUNK_SIZE = 40;
+            for (let i = 0; i < orgs.length; i += CHUNK_SIZE) {
+                if (window.fpStopRequested) break;
+                const chunk = orgs.slice(i, i + CHUNK_SIZE);
+                try {
+                    const resp = await fetchWithRetry(`${RAILWAY_API}/api/connect/classify-org-type`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                        body: JSON.stringify({
+                            organizations: chunk.map(o => ({
+                                id: o.id,
+                                name: o.company_name || '',
+                                industry: o.company_industry || '',
+                                state: o.company_state || '',
+                                description: o.company_description || '',
+                                linkedinUrl: o.company_linkedin_url || ''
+                            })),
+                            types: types.map(t => ({ name: t.name, description: t.description || '' })),
+                            model
+                        })
+                    }, { addLog, label: 'Org type classify' });
+                    const data = await resp.json();
+                    if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
+                    data.results.forEach(r => assignments.set(String(r.id), r.type || null));
+                } catch (e) {
+                    addLog(`   ⚠️ Organization Type classify chunk failed (${e.message}) — those organizations will use the Default Rules.`, 'warning');
+                    chunk.forEach(o => assignments.set(String(o.id), null));
+                }
+            }
+            return assignments;
+        }
+
         // Expandable per-contact table for the Target Contact / Exclude Rules filter step —
         // shows every contact the AI classifier dropped for this org, with its title, company,
         // and the classifier's own stated reason (not just the top-3 title summary).
@@ -2811,26 +3119,34 @@
             }
             const skipAlreadyScanned = document.getElementById('fpSkipAlreadyScanned').checked;
 
-            // Build this run's working queue: organizations already scanned under this
-            // exact name are either dropped entirely (skip mode) or pushed to the back
-            // of the priority-ordered queue (so fresh organizations always go first).
+            // Build this run's working queue: organizations never scanned under this exact
+            // name go first (dropped entirely in skip mode, or just moved to the back
+            // otherwise); within/among those, organizations scanned the fewest times
+            // across ALL scan names go first too, so even a brand-new scan name still
+            // favors the least-covered organizations. See fpBuildRunQueue for the full
+            // priority order.
             const alreadyScannedCount = fpGroupOrgs.filter(o => fpOrgScanLabels(o).includes(scanName)).length;
-            let fpRunOrgs;
-            if (skipAlreadyScanned) {
-                fpRunOrgs = fpGroupOrgs.filter(o => !fpOrgScanLabels(o).includes(scanName));
-            } else {
-                fpRunOrgs = [...fpGroupOrgs].sort((a, b) => {
-                    const aDone = fpOrgScanLabels(a).includes(scanName) ? 1 : 0;
-                    const bDone = fpOrgScanLabels(b).includes(scanName) ? 1 : 0;
-                    return aDone - bDone; // stable sort — keeps priority order within each bucket
-                });
+            const fpRunOrgs = fpBuildRunQueue(scanName, skipAlreadyScanned);
+
+            // Organization Type Classification (optional) — if enabled and at least one
+            // named type exists, each queued organization is classified into one of these
+            // types before scanning, and that type's own criteria/secondScan are used
+            // instead of the default Step 4 rules. Orgs that don't confidently match any
+            // type (or when disabled) fall back to the default rules built further below.
+            const orgTypeConfig = fpReadOrgTypesConfig();
+            if (orgTypeConfig.enabled && orgTypeConfig.types.length === 0) {
+                addLog('⚠️ Organization Type mode is checked but no named type was defined — running with the Default Rules for every organization.', 'warning');
+                orgTypeConfig.enabled = false;
             }
 
             const totalTarget = bdrPlan.reduce((s, b) => s + b.target, 0);
             const scanNameNote = alreadyScannedCount > 0
                 ? `\n• ${alreadyScannedCount} organization(s) already scanned as "${scanName}" — ${skipAlreadyScanned ? 'will be skipped' : 'moved to the back of the queue'}`
                 : '';
-            if (!confirm(`Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules, news is searched once per organization, and messages are generated + Opus reviewed one at a time.`)) return;
+            const orgTypeNoteForConfirm = orgTypeConfig.enabled
+                ? `\n• Each organization will first be classified by AI (${orgTypeConfig.classifierModel}) into one of ${orgTypeConfig.types.length} type(s) (${orgTypeConfig.types.map(t => t.name).join(', ')}), each using its own scan rules`
+                : '';
+            if (!confirm(`Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}${orgTypeNoteForConfirm}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules, news is searched once per organization, and messages are generated + Opus reviewed one at a time.`)) return;
 
             const buildModel   = document.getElementById('fpBuildModel').value;
             const opusModel    = document.getElementById('fpOpusModel').value;
@@ -2860,9 +3176,10 @@
                 ? { threshold: parseInt(document.getElementById('fpSecondScanThreshold').value) || 5, criteria: fpBuildScanCriteria('2') }
                 : null;
 
-            // Keep this Scan Name's Step 4 rules in sync — whatever rules this run actually
-            // uses become "the" rules for this name, so picking it again later reloads them.
-            await fpSaveScanNamePreset(groupId, scanName, scanCriteria, secondScanConfig);
+            // Keep this Scan Name's Step 4 rules (and Organization Type config) in sync —
+            // whatever rules this run actually uses become "the" rules for this name, so
+            // picking it again later reloads them.
+            await fpSaveScanNamePreset(groupId, scanName, scanCriteria, secondScanConfig, orgTypeConfig);
 
             // ── Step 6: cost shut-down rates ──
             // Of the target cost per message, ~$0.03 is AI and ~$0.02 is post scrapes;
@@ -2915,7 +3232,7 @@
                 settings: {
                     routingMode, connectionFilterEnabled: connFilterOn, minConnectionCount: connFilterMin,
                     opusExcludeMode, crossBdrEnabled, finalReviewEnabled, profileMsgFallback: profileMsgFallbackOn,
-                    scanCriteria, secondScan: secondScanConfig,
+                    scanCriteria, secondScan: secondScanConfig, orgTypeMode: orgTypeConfig,
                     costGuard: { costPerMessage, apifyPerMessageLimit, minSpendBeforeEnforcing: costMinSpend },
                     scanName, skipAlreadyScanned, alreadyScannedSkippedAtStart: skipAlreadyScanned ? alreadyScannedCount : 0
                 },
@@ -2961,6 +3278,18 @@
                 addLog(`🚫 DNC list loaded: ${allDncList.length} entr${allDncList.length === 1 ? 'y' : 'ies'} — every organization is checked before it is scanned.`);
             } catch (e) {
                 addLog(`⚠️ Could not load the DNC list (${e.message}) — organizations will NOT be DNC-checked this run.`, 'warning');
+            }
+
+            // ── Organization Type Classification — runs once, up front, for every
+            // organization queued this run (before any scanning starts), so the scan
+            // loop below can look up each org's assigned type synchronously. ──
+            let fpOrgTypeAssignments = new Map(); // orgId -> matched type name, or null (default rules)
+            if (orgTypeConfig.enabled) {
+                addLog(`\n🧭 Classifying ${fpRunOrgs.length} organization(s) into ${orgTypeConfig.types.length} type(s) using ${orgTypeConfig.classifierModel}…`);
+                fpOrgTypeAssignments = await fpClassifyOrgTypes({ token, orgs: fpRunOrgs, types: orgTypeConfig.types, model: orgTypeConfig.classifierModel });
+                const tally = {};
+                fpRunOrgs.forEach(o => { const t = fpOrgTypeAssignments.get(o.id) || '(default)'; tally[t] = (tally[t] || 0) + 1; });
+                addLog(`   ✅ Classification done: ${Object.entries(tally).map(([k, v]) => `${k}: ${v}`).join(', ')}`, 'success');
             }
 
             try {
@@ -3017,9 +3346,25 @@
                         fpSetProgress(Math.round((orgPointer / fpRunOrgs.length) * 100), `Org ${orgPointer}/${fpRunOrgs.length} — ${org.company_name}`);
                         addLog(`\n🏢 [${orgPointer}/${fpRunOrgs.length}] ${org.company_name}`);
 
+                        // Organization Type Classification: which type (if any) this org was
+                        // assigned, and the resulting scan rules to actually use for it. null
+                        // orgType means either the feature is off, or the AI didn't confidently
+                        // match any defined type — either way, the Default Rules apply.
+                        let orgScanCriteria = scanCriteria, orgSecondScanConfig = secondScanConfig, orgTypeMatched = null;
+                        if (orgTypeConfig.enabled) {
+                            const matchedName = fpOrgTypeAssignments.get(String(org.id)) || null;
+                            const matchedType = matchedName ? orgTypeConfig.types.find(t => t.name === matchedName) : null;
+                            if (matchedType) {
+                                orgScanCriteria = matchedType.criteria;
+                                orgSecondScanConfig = matchedType.secondScan || null;
+                                orgTypeMatched = matchedType.name;
+                            }
+                        }
+
                         const orgReport = {
                             orgId: org.id, name: org.company_name, linkedinUrl: org.company_linkedin_url || '',
                             bdrEmail, urlResearched: false, scanJobId: null,
+                            orgType: orgTypeMatched, // set only when Organization Type mode matched this org to a named type
                             dncMatch: null, alreadyConnected: 0,
                             contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0,
                             droppedTitles: [], newsStories: null, messagesGenerated: 0,
@@ -3029,6 +3374,9 @@
                             costs: { scanJobHarvestUsd: 0, scanJobBebityUsd: 0, apifyLedgerUsd: 0, ledgerRuns: 0 },
                             error: null
                         };
+                        if (orgTypeConfig.enabled) {
+                            addLog(`   🧭 Organization type: ${orgTypeMatched || 'Default (no confident type match)'}`, 'dim');
+                        }
 
                         try {
                             // ── 0. DNC check — FIRST, before any research or scan spend ──
@@ -3076,7 +3424,7 @@
 
                             // ── 2. Apify Employee Contact Scan (same job pipeline as the admin page) ──
                             const { jobId, job } = await fpRunScanJob({
-                                org, bdrEmail, acct, criteria: scanCriteria, secondScanConfig, runId, groupName, groupId, scanName
+                                org, bdrEmail, acct, criteria: orgScanCriteria, secondScanConfig: orgSecondScanConfig, runId, groupName, groupId, scanName
                             });
                             orgReport.scanJobId = jobId;
                             orgReport.contactsScanned = job.results?.contacts_saved || 0;
@@ -3901,6 +4249,11 @@
                         { value: 'claude-haiku',   label: 'Claude Haiku 3.5 (legacy)' },
                         { value: 'llama-maverick', label: 'Llama 4 Maverick (legacy)' }
                     ]
+                });
+                // The Organization Type classifier — lets you pick which AI agent decides
+                // each organization's type. Defaults to Claude Sonnet 5, same as Build Model.
+                window.AiModelCatalog.populateSelect(document.getElementById('fpOrgTypeClassifierModel'), models, {
+                    selected: 'anthropic/claude-sonnet-5'
                 });
             }).catch(() => {});
 
