@@ -444,6 +444,13 @@
                 <div style="font-size:.8rem; color:var(--gray);">Unique Models in Use</div>
             </div>
         </div>
+        <div class="section-card" style="flex:1.4; min-width:220px; padding:1rem 1.25rem; display:flex; align-items:center; gap:.75rem;">
+            <i class="fas fa-cloud" id="syncStatusIcon" style="color:var(--gray); font-size:1.5rem;"></i>
+            <div>
+                <div style="font-size:.95rem; font-weight:700; color:var(--secondary);" id="syncStatusText">Connecting to shared store…</div>
+                <div style="font-size:.78rem; color:var(--gray);" id="syncStatusDetail">Rules are shared across every browser, device &amp; page</div>
+            </div>
+        </div>
         <div class="section-card" style="flex:1; min-width:200px; padding:1rem 1.25rem; display:flex; align-items:center; gap:.75rem; flex:2;">
             <i class="fas fa-circle-info" style="color:var(--primary); font-size:1.5rem; flex-shrink:0;"></i>
             <div style="font-size:.82rem; color:var(--gray); line-height:1.5;">
@@ -561,7 +568,7 @@
                 <div class="two-col" style="gap:1.5rem;">
                     <div>
                         <h3 style="font-size:.95rem; margin-bottom:.75rem;"><i class="fas fa-file-export" style="color:var(--success);"></i> Export Rules</h3>
-                        <p style="font-size:.85rem; color:var(--gray); margin-bottom:1rem;">Download all rules as a JSON file to back them up or share with another browser.</p>
+                        <p style="font-size:.85rem; color:var(--gray); margin-bottom:1rem;">Download all rules as a JSON file to back them up. (Rules already sync automatically across browsers via the shared store.)</p>
                         <button class="btn btn-success" onclick="exportRules()"><i class="fas fa-download"></i> Export JSON</button>
                     </div>
                     <div>
@@ -580,7 +587,7 @@
                 <hr style="margin:1.5rem 0; border-color:var(--border);">
                 <div>
                     <h3 style="font-size:.95rem; margin-bottom:.75rem; color:var(--danger);"><i class="fas fa-trash-alt"></i> Clear All Rules</h3>
-                    <p style="font-size:.85rem; color:var(--gray); margin-bottom:.75rem;">Remove all review rules from localStorage. This cannot be undone (unless you export first).</p>
+                    <p style="font-size:.85rem; color:var(--gray); margin-bottom:.75rem;">Remove all review rules from the shared store (affects every browser and generation page). This cannot be undone (unless you export first).</p>
                     <button class="btn btn-danger btn-sm" onclick="clearAllRules()"><i class="fas fa-trash-alt"></i> Delete All Rules</button>
                 </div>
             </div>
@@ -793,20 +800,66 @@
     </div>
 </div>
 
+<!-- Auth + clemail wrapper give this page access to the shared cloud rules store -->
+<script src="../js/auth.js"></script>
+<script src="../js/clemail-firestore-wrapper.js"></script>
+<script src="final-ai-review-rules-store.js"></script>
+
 <script>
 // ── Storage ────────────────────────────────────────────────────────────────
-const STORAGE_KEY = 'finalAiReviews_v2';
+// Rules live in ONE shared Firestore doc (connect_settings/final_ai_review_rules)
+// so every browser, device, and site edits the same set. localStorage is only a
+// warm cache / offline fallback, managed by final-ai-review-rules-store.js.
+const RulesStore = window.FinalAiReviewRulesStore;
 
 function loadRules() {
-    try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        return raw ? JSON.parse(raw) : [];
-    } catch { return []; }
+    return RulesStore.readCache();
 }
 
 function saveRules(rules) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(rules));
+    RulesStore.writeCache(rules);   // instant local save so the UI never blocks
     refreshUI();
+    pushRulesToCloud(rules);        // async shared-store save (status shown in header)
+}
+
+// ── Cloud sync status ──────────────────────────────────────────────────────
+let _cloudSaveSeq = 0;
+
+function setSyncStatus(state, detail = '') {
+    const icon = document.getElementById('syncStatusIcon');
+    const text = document.getElementById('syncStatusText');
+    const det  = document.getElementById('syncStatusDetail');
+    if (!icon || !text) return;
+    if (state === 'syncing') {
+        icon.className = 'fas fa-cloud-arrow-up';
+        icon.style.color = 'var(--warning)';
+        text.textContent = 'Syncing with shared store…';
+        text.style.color = 'var(--secondary)';
+    } else if (state === 'synced') {
+        icon.className = 'fas fa-circle-check';
+        icon.style.color = 'var(--success)';
+        text.textContent = 'Synced with shared store';
+        text.style.color = 'var(--success)';
+    } else { // error
+        icon.className = 'fas fa-triangle-exclamation';
+        icon.style.color = 'var(--danger)';
+        text.textContent = 'Not synced — using this browser\'s copy';
+        text.style.color = 'var(--danger)';
+    }
+    if (det && detail) det.textContent = detail;
+}
+
+async function pushRulesToCloud(rules) {
+    const seq = ++_cloudSaveSeq;
+    setSyncStatus('syncing');
+    try {
+        await RulesStore.saveCloud(rules, { updatedFrom: 'final_ai_review.html' });
+        if (seq === _cloudSaveSeq) setSyncStatus('synced');
+    } catch (e) {
+        if (seq !== _cloudSaveSeq) return;
+        setSyncStatus('error', 'Sign in on this site, then save the rule again to sync it.');
+        showAlert(`Saved in this browser, but syncing to the shared store failed: ${escHtml(e.message)}.<br>Other browsers and generation pages will NOT see this change until it syncs — make sure you're signed in, then edit and save again.`, 'danger');
+    }
 }
 
 // ── Tab switching ──────────────────────────────────────────────────────────
@@ -1214,7 +1267,27 @@ Do NOT flag messages that are simply warm, friendly, or enthusiastic. Only flag 
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────
-refreshUI();
+refreshUI(); // instant paint from the local cache while the cloud sync runs
+
+(async () => {
+    setSyncStatus('syncing');
+    // Wait for auth.js to finish restoring the session (if it's still working)
+    // so the very first cloud read doesn't fail on a not-yet-ready auth state.
+    try { await Promise.race([window.firebaseReady, new Promise(r => setTimeout(r, 12000))]); } catch { /* proceed with fallback */ }
+
+    const res = await RulesStore.sync();
+    refreshUI();
+
+    if (res.source === 'cloud' || res.source === 'empty') {
+        setSyncStatus('synced');
+    } else if (res.source === 'migrated') {
+        setSyncStatus('synced');
+        showAlert(`Moved ${res.rules.length} rule(s) from this browser into the shared store — they're now visible from every browser, device, and generation page.`, 'success');
+    } else { // cache-fallback
+        setSyncStatus('error', 'Sign in on this site to load/sync the shared rules.');
+        showAlert(`Couldn't reach the shared rules store (${escHtml(res.error || 'unknown error')}). Showing this browser's local copy — changes made now will sync the next time a save succeeds.`, 'warning');
+    }
+})();
 </script>
 </body>
 </html>

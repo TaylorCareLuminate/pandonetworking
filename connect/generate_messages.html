@@ -17,6 +17,8 @@
     <script src="../js/folder-protection.js?v=2.1"></script>
     <!-- CLEmail Secure API Wrapper -->
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <!-- Shared Final AI Review rules store (Firestore-backed, localStorage cache) -->
+    <script src="final-ai-review-rules-store.js"></script>
     <!-- Shared Message Filtering Logic -->
     <script src="message-filter-logic.js?v=1.4"></script>
     <!-- Workspace routing helpers (sentinels, optgroups, merged workspace lookup) -->
@@ -14334,13 +14336,14 @@
         // commonalities found) rather than being reconstructed later from caches.
         // ══════════════════════════════════════════════════════════════════════
 
-        const FULL_AI_FINAL_REVIEWS_KEY = 'finalAiReviews_v2';
-
+        // Rules come from the SHARED Firestore store (connect_settings/final_ai_review_rules)
+        // via final-ai-review-rules-store.js. The localStorage key is just its warm cache —
+        // call `await window.FinalAiReviewRulesStore.sync()` before reading to make sure this
+        // browser has the latest shared rule set (done at the start of every generation run).
         function loadFinalAiReviewRules() {
-            try {
-                const raw = localStorage.getItem(FULL_AI_FINAL_REVIEWS_KEY);
-                return raw ? JSON.parse(raw) : [];
-            } catch { return []; }
+            return window.FinalAiReviewRulesStore
+                ? window.FinalAiReviewRulesStore.readCache()
+                : [];
         }
 
         // Maps a Full AI Generate source label to the sourceFilter keys used by
@@ -15446,13 +15449,23 @@
                 // reconstruction from a later cache lookup). Order per message is therefore:
                 // generate → Opus review → Final AI reviews, all before moving to the next prospect.
                 const finalReviewEnabled = !!document.getElementById('fullAiFinalReviewEnabled')?.checked;
-                const finalReviewRules   = finalReviewEnabled ? loadFinalAiReviewRules().filter(r => r.enabled) : [];
+                let finalReviewRules = [];
+                if (finalReviewEnabled) {
+                    // Pull the latest shared rule set from Firestore before the run —
+                    // this is what guarantees the same rules fire here as everywhere else,
+                    // regardless of which browser/device configured them.
+                    const rulesSync = await window.FinalAiReviewRulesStore.sync();
+                    finalReviewRules = (rulesSync.rules || []).filter(r => r.enabled);
+                    if (rulesSync.source === 'cache-fallback') {
+                        addLog(`⚠️ Couldn't reach the shared Final AI Review store (${rulesSync.error || 'unknown error'}) — falling back to this browser's cached copy (${finalReviewRules.length} enabled rule(s)).`, 'warning');
+                    }
+                }
                 let finalReviewBdrProfile = {};
                 let finalReviewApprovedCount = 0, finalReviewFlaggedCount = 0;
                 if (finalReviewEnabled && finalReviewRules.length === 0) {
-                    addLog('⚠️ Final AI Review is enabled but no rules are configured — open final_ai_review.html to set some up. Skipping for this run.', 'warning');
+                    addLog('⚠️ Final AI Review is enabled but no enabled rules exist in the shared store — open final_ai_review.html to set some up. Skipping for this run.', 'warning');
                 } else if (finalReviewEnabled) {
-                    addLog(`🚩 Final AI Review enabled — ${finalReviewRules.length} rule(s) will run on each message right after its Opus Review.`, 'info');
+                    addLog(`🚩 Final AI Review enabled — ${finalReviewRules.length} shared rule(s) will run on each message right after its Opus Review.`, 'info');
                     if (finalReviewRules.some(r => (r.includeFields || []).includes('bdr_profile'))) {
                         try {
                             const bdrProfSnap = await getDoc(doc(db, 'contact_profiles', bdrEmail));

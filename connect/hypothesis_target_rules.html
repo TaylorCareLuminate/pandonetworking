@@ -1179,6 +1179,15 @@
                         name: `${data.firstName || data.name || roster.name || ''} ${data.lastName || ''}`.trim() || roster.name || '(no name)',
                         title: data.title || roster.title || '',
                         org: data.company || roster.org || '',
+                        // Enriched LinkedIn profile fields (same fields Fast Connect Review's Opus
+                        // Review sends) — lets the AI rule check see actual job history / bio
+                        // instead of just the stored title+company, so it can catch job changes,
+                        // seniority mismatches, etc. the same way the more accurate reviews do.
+                        headline: data.headline || '',
+                        about: data.about || '',
+                        experience: data.experience || '',
+                        education: data.education || '',
+                        connections: data.linkedInConnectionCount ?? null,
                         aiDecision: null,
                         aiReason: '',
                         status: 'pending'
@@ -1267,6 +1276,47 @@
         renderRemainingTable();
     };
 
+    // Builds the compact "profile" object sent alongside title/org to the classify
+    // endpoint — same enriched fields (headline, connections, about, experience,
+    // education) and same formatting Fast Connect Review's Opus Review sends, so this
+    // rule check has the same signal to work with instead of just a bare title+company.
+    function buildProfilePayloadForClassify(p) {
+        const payload = {};
+        if (p.headline) payload.headline = p.headline;
+        if (p.connections != null) payload.connections = Number(p.connections);
+        if (p.about) payload.about = String(p.about).slice(0, 1200);
+        if (p.experience) {
+            try {
+                const raw = typeof p.experience === 'string' ? JSON.parse(p.experience) : p.experience;
+                if (Array.isArray(raw) && raw.length > 0) {
+                    payload.experience = raw.slice(0, 5).map(e => {
+                        const title = e.title || e.jobTitle || e.position || '';
+                        const company = e.companyName || e.company || e.subtitle || '';
+                        const dates = [e.startDate || e.start, e.endDate || e.end].filter(Boolean).join(' – ');
+                        return [[title, company].filter(Boolean).join(' at '), dates].filter(Boolean).join(' | ');
+                    }).filter(Boolean);
+                } else if (typeof raw === 'string' && raw.trim()) {
+                    payload.experience = [raw.slice(0, 600)];
+                }
+            } catch (_) {
+                if (typeof p.experience === 'string' && p.experience.trim()) payload.experience = [p.experience.slice(0, 600)];
+            }
+        }
+        if (p.education) {
+            try {
+                const raw = typeof p.education === 'string' ? JSON.parse(p.education) : p.education;
+                if (Array.isArray(raw) && raw.length > 0) {
+                    payload.education = raw.slice(0, 3).map(e => {
+                        const school = e.schoolName || e.school || e.institution || '';
+                        const degree = e.degreeName || e.degree || e.fieldOfStudy || '';
+                        return [school, degree].filter(Boolean).join(', ');
+                    }).filter(Boolean);
+                }
+            } catch (_) { /* ignore malformed education JSON */ }
+        }
+        return payload;
+    }
+
     // ── Run rule check: chunk & call the bulk-classify endpoint ─────────────
     window.runRuleCheck = async function() {
         const rules = (document.getElementById('proposedRulesText').value || _currentGroup?.targetContactInstructions || '').trim();
@@ -1282,7 +1332,11 @@
 
         try {
             const token = await currentUser.getIdToken();
-            const CHUNK_SIZE = 50;
+            // Smaller than before (was 50) since each contact's payload is now much larger
+            // (enriched profile data, not just title+org) — keeps each request's prompt a
+            // reasonable size and mirrors the smaller batch sizes the more-accurate Opus
+            // review pipelines use.
+            const CHUNK_SIZE = 25;
             const toCheck = _remainingProspects.filter(p => p.status === 'pending');
             const chunks = chunkArr(toCheck, CHUNK_SIZE);
             let done = 0;
@@ -1293,7 +1347,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
                     body: JSON.stringify({
-                        contacts: chunk.map(p => ({ id: p.id, title: p.title, org: p.org })),
+                        contacts: chunk.map(p => ({ id: p.id, title: p.title, org: p.org, profile: buildProfilePayloadForClassify(p) })),
                         rules,
                         groupName: _currentGroup.name || '',
                         model: selectedAiModel()

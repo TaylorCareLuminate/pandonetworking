@@ -3376,6 +3376,8 @@
     <script src="../js/auth.js"></script>
     <!-- CLEmail Secure API Wrapper -->
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <!-- Shared Final AI Review rules store (Firestore-backed, localStorage cache) -->
+    <script src="final-ai-review-rules-store.js"></script>
     <!-- Shared Message Filtering Logic -->
     <script src="message-filter-logic.js?v=1.4"></script>
     <!-- Load PandoConnect common header -->
@@ -13930,7 +13932,9 @@
     // ══════════════════════════════════════════════════════════════════════
     // FINAL AI REVIEW SYSTEM
     // Runs configurable multi-model AI checks on approved messages before
-    // submission. Rules are stored in localStorage by final_ai_review.html.
+    // submission. Rules live in the SHARED Firestore store
+    // (connect_settings/final_ai_review_rules) managed by final_ai_review.html
+    // via final-ai-review-rules-store.js; localStorage is just its warm cache.
     // ══════════════════════════════════════════════════════════════════════
 
     const FINAL_AI_REVIEWS_KEY = 'finalAiReviews_v2';
@@ -13984,12 +13988,13 @@
         'deepseek/deepseek-chat-v3:free':  { label: '🌊 DeepSeek', cls: 'deepseek' }
     };
 
-    // Load enabled review rules
+    // Load review rules from the shared store's local cache. Call
+    // `await window.FinalAiReviewRulesStore.sync()` first (done at page init and
+    // right before submit-time reviews) to make sure the cache is up to date.
     function loadFinalAiReviewRules() {
-        try {
-            const raw = localStorage.getItem(FINAL_AI_REVIEWS_KEY);
-            return raw ? JSON.parse(raw) : [];
-        } catch { return []; }
+        return window.FinalAiReviewRulesStore
+            ? window.FinalAiReviewRulesStore.readCache()
+            : [];
     }
 
     // Update the status text in the control panel
@@ -14310,6 +14315,9 @@
     }
 
     async function runFinalAiReviews(messagesToReview, { silent = false } = {}) {
+        // Make sure the cached rule set is fresh from the shared store (covers the
+        // single-message re-check path, which doesn't go through patchedSubmitBatch).
+        try { await window.FinalAiReviewRulesStore?.sync(); } catch { /* cache fallback */ }
         const rules = loadFinalAiReviewRules().filter(r => r.enabled);
         if (rules.length === 0) return new Map();
 
@@ -14803,6 +14811,18 @@
             if (msg) toReview.push(msg);
         });
 
+        // Refresh the shared rule set from Firestore right before reviewing, so
+        // rules edited from any browser/device are always the ones that fire here.
+        try {
+            const rulesSync = await window.FinalAiReviewRulesStore.sync();
+            if (rulesSync.source === 'cache-fallback') {
+                console.warn('[FinalAIReview] Shared store unreachable — using cached rules:', rulesSync.error);
+            }
+        } catch (e) {
+            console.warn('[FinalAIReview] Rules sync failed, using cached rules:', e.message);
+        }
+        updateFinalAiReviewStatus();
+
         const rules = loadFinalAiReviewRules().filter(r => r.enabled);
         if (rules.length === 0 || toReview.length === 0) {
             return submitBatch();
@@ -14868,11 +14888,23 @@
         });
     }
 
-    // Initial status update
+    // Initial status update from the local cache, then refresh from the shared
+    // Firestore store so this page reflects rules configured anywhere.
     updateFinalAiReviewStatus();
+    window.FinalAiReviewRulesStore?.sync()
+        .then(() => updateFinalAiReviewStatus())
+        .catch(e => console.warn('[FinalAIReview] Initial rules sync failed:', e.message));
 
-    // Refresh status when page is focused (user may have changed rules in another tab)
-    window.addEventListener('focus', updateFinalAiReviewStatus);
+    // Refresh status when page is focused (user may have changed rules in another
+    // tab or browser). Re-syncs from the shared store at most once a minute.
+    let _lastRulesFocusSync = 0;
+    window.addEventListener('focus', () => {
+        if (Date.now() - _lastRulesFocusSync < 60000) { updateFinalAiReviewStatus(); return; }
+        _lastRulesFocusSync = Date.now();
+        window.FinalAiReviewRulesStore?.sync()
+            .then(() => updateFinalAiReviewStatus())
+            .catch(() => updateFinalAiReviewStatus());
+    });
     window.addEventListener('storage', e => {
         if (e.key === FINAL_AI_REVIEWS_KEY) updateFinalAiReviewStatus();
     });

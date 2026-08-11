@@ -15,6 +15,8 @@
     <script src="../js/folder-protection.js?v=2.1"></script>
     <!-- CLEmail Secure API Wrapper -->
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <!-- Shared Final AI Review rules store (Firestore-backed, localStorage cache) -->
+    <script src="final-ai-review-rules-store.js"></script>
     <!-- Shared AI model catalog (managed on ai_models_admin.html) -->
     <script src="../js/ai-model-catalog.js"></script>
 
@@ -434,7 +436,7 @@
                         <input type="checkbox" id="fpFinalReviewEnabled" checked style="width: auto;">
                         <span><i class="fas fa-flag"></i> Run Final AI Reviews on each message</span>
                     </label>
-                    <div class="form-help">Uses the same rules configured in <a href="final_ai_review.html" target="_blank">Final AI Review</a> (shared via this browser), fed the actual profile / news / post data used to build each message.</div>
+                    <div class="form-help">Uses the same rules configured in <a href="final_ai_review.html" target="_blank">Final AI Review</a> (shared cloud store — same rules on every browser and device), fed the actual profile / news / post data used to build each message.</div>
                 </div>
                 <div class="form-group">
                     <label style="display: flex; align-items: center; gap: 8px;">
@@ -815,13 +817,14 @@
         // ════════════════════════════════════════════════════════════════════
         // FROM generate_messages.html — Final AI Review engine (verbatim)
         // ════════════════════════════════════════════════════════════════════
-        const FULL_AI_FINAL_REVIEWS_KEY = 'finalAiReviews_v2';
-
+        // Rules come from the SHARED Firestore store (connect_settings/final_ai_review_rules)
+        // via final-ai-review-rules-store.js. The localStorage key is just its warm cache —
+        // `await window.FinalAiReviewRulesStore.sync()` runs at the start of every pipeline
+        // run so this browser always fires the same rules as every other browser/page.
         function loadFinalAiReviewRules() {
-            try {
-                const raw = localStorage.getItem(FULL_AI_FINAL_REVIEWS_KEY);
-                return raw ? JSON.parse(raw) : [];
-            } catch { return []; }
+            return window.FinalAiReviewRulesStore
+                ? window.FinalAiReviewRulesStore.readCache()
+                : [];
         }
 
         function getFullAiMessageSourceKey(src) {
@@ -839,7 +842,18 @@
                 if (msg.postText) out.post_text = msg.postText;
                 if (msg.postUrl)  out.post_url  = msg.postUrl;
                 if (msg.postDate) out.post_date = msg.postDate;
-                out.post_type = 'regular';
+                out.post_type = msg.postType || 'regular';
+                // Repost/quote posts have their real content in resharedPostText — without
+                // this, the reshared content the message is actually reacting to never makes
+                // it into the Final AI Review context (post_text can also be empty for pure
+                // reposts, which this fills in as a fallback). Field names match what
+                // fast_connect_review.html's buildFinalReviewContext() looks for.
+                if (msg.resharedPostText) {
+                    out.reshared_post_text = msg.resharedPostText;
+                    if (!out.post_text) out.post_text = msg.resharedPostText;
+                    if (msg.resharedAuthorFirstName) out.resharedAuthorFirstName = msg.resharedAuthorFirstName;
+                    if (msg.resharedAuthorLastName)  out.resharedAuthorLastName  = msg.resharedAuthorLastName;
+                }
             } else if (src === 'Internet Search' && msg.newsItem) {
                 const n = msg.newsItem;
                 const newsData = {};
@@ -898,6 +912,11 @@
             if (sourceData.post_text) ctx.post_text = sourceData.post_text;
             if (sourceData.post_url)  ctx.post_url  = sourceData.post_url;
             ctx.post_type = sourceData.post_type || 'regular';
+            if (sourceData.reshared_post_text) {
+                ctx.reshared_post_text = sourceData.reshared_post_text;
+                const resharedAuthor = [sourceData.resharedAuthorFirstName, sourceData.resharedAuthorLastName].filter(Boolean).join(' ');
+                if (resharedAuthor) ctx.reshared_post_author = resharedAuthor;
+            }
             if (sourceData.post_date) {
                 ctx.post_date = sourceData.post_date;
                 try {
@@ -2821,7 +2840,16 @@
             const opusExcludeMode = document.getElementById('fpOpusExcludeMode').value;
             const crossBdrEnabled = document.getElementById('fpCrossBdrEnabled').checked;
             const finalReviewEnabled = document.getElementById('fpFinalReviewEnabled').checked;
-            const finalReviewRules = finalReviewEnabled ? loadFinalAiReviewRules().filter(r => r.enabled) : [];
+            // Pull the latest shared rule set from Firestore before the run so the same
+            // rules fire here as on every other browser/device/page.
+            let finalReviewRules = [];
+            if (finalReviewEnabled) {
+                const rulesSync = await window.FinalAiReviewRulesStore.sync();
+                finalReviewRules = (rulesSync.rules || []).filter(r => r.enabled);
+                if (rulesSync.source === 'cache-fallback') {
+                    addLog(`⚠️ Couldn't reach the shared Final AI Review store (${rulesSync.error || 'unknown error'}) — falling back to this browser's cached copy (${finalReviewRules.length} enabled rule(s)).`, 'warning');
+                }
+            }
             const profileMsgFallbackOn = document.getElementById('fpProfileMsgFallback').checked;
 
             const targetInstr   = document.getElementById('fpTargetInstructions').value;
@@ -2851,7 +2879,7 @@
                 if (!confirm('The Message Review Instructions field is empty, so the Opus Review step will be SKIPPED for this run.\n\nContinue without Opus Review?')) return;
             }
             if (finalReviewEnabled && finalReviewRules.length === 0) {
-                addLog('⚠️ Final AI Review is enabled but no rules are configured in this browser — open final_ai_review.html to set some up. Skipping for this run.', 'warning');
+                addLog('⚠️ Final AI Review is enabled but no enabled rules exist in the shared store — open final_ai_review.html to set some up. Skipping for this run.', 'warning');
             }
 
             // ── Run setup ──
