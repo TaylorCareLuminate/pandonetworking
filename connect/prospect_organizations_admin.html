@@ -3297,12 +3297,20 @@
 
             <!-- Group selector row -->
             <div style="display:flex; gap:1rem; align-items:flex-end; flex-wrap:wrap; margin-bottom:1rem;">
+                <div style="flex:1; min-width:240px;">
+                    <label for="hypoCompanySelect" style="display:block; font-weight:600; margin-bottom:0.5rem; color:var(--secondary);">
+                        <i class="fas fa-building"></i> Company
+                    </label>
+                    <select id="hypoCompanySelect" onchange="onHypoCompanyChange()" style="width:100%; padding:0.75rem; border:2px solid var(--border); border-radius:8px; font-size:1rem;">
+                        <option value="">Loading companies…</option>
+                    </select>
+                </div>
                 <div style="flex:1; min-width:280px;">
                     <label for="hypoGroupSelect" style="display:block; font-weight:600; margin-bottom:0.5rem; color:var(--secondary);">
                         <i class="fas fa-layer-group"></i> Hypothesis Group
                     </label>
-                    <select id="hypoGroupSelect" onchange="onHypoGroupChange()" style="width:100%; padding:0.75rem; border:2px solid var(--border); border-radius:8px; font-size:1rem;">
-                        <option value="">Loading hypothesis groups…</option>
+                    <select id="hypoGroupSelect" onchange="onHypoGroupChange()" disabled style="width:100%; padding:0.75rem; border:2px solid var(--border); border-radius:8px; font-size:1rem;">
+                        <option value="">-- Select a company first --</option>
                     </select>
                 </div>
                 <div>
@@ -14324,6 +14332,7 @@
         const HYPO_SENTINEL_PREFIX = '__hypo__:';
 
         let hypoGroups = [];               // [{ id, name, scanPriority, ... }]
+        let hypoSelectedCompany = '';       // company chosen in hypoCompanySelect ('' | '__unassigned__' | company name)
         let hypoCurrentGroupId = null;
         let hypoCurrentGroupName = null;
         let hypoOrgsData = [];             // group's org docs
@@ -14353,26 +14362,97 @@
             return bdrEmail;
         }
 
+        // ── Company-first filtering: company -> its BDRs -> hypothesis groups owned by those BDRs ──
+        function hypoGroupEmails(g) {
+            return (g.bdrEmails && g.bdrEmails.length) ? g.bdrEmails : (g.bdrEmail ? [g.bdrEmail] : []);
+        }
+
+        // Real BDRs only (excludes the workspace pseudo-entries that get mixed into
+        // _allBDRSources for the "From BDR / Workspace" org-source picker) — hypothesis
+        // groups are owned by BDR email, not workspace id, so those don't apply here.
+        function hypoRealBdrSources() {
+            return (typeof _allBDRSources !== 'undefined' ? _allBDRSources : []).filter(s => !(s.email || '').startsWith('__ws__:'));
+        }
+
+        function hypoCompanyBdrEmailSet(company) {
+            return new Set(
+                hypoRealBdrSources()
+                    .filter(s => (s.group || 'Other') === company)
+                    .map(s => (s.email || '').toLowerCase())
+                    .filter(Boolean)
+            );
+        }
+
+        function hypoPopulateCompanySelect() {
+            const sel = document.getElementById('hypoCompanySelect');
+            if (!sel) return;
+            const prev = hypoSelectedCompany || sel.value;
+            const companies = [...new Set(hypoRealBdrSources().map(s => s.group || 'Other'))].sort();
+            sel.innerHTML = '<option value="">-- Select a company --</option>' +
+                '<option value="__unassigned__">⚠️ Unassigned Groups (no BDR linked)</option>' +
+                companies.map(co => `<option value="${escAdminHtml(co)}">${escAdminHtml(co)}</option>`).join('');
+            if (prev && (prev === '__unassigned__' || companies.includes(prev))) {
+                sel.value = prev;
+            }
+            hypoSelectedCompany = sel.value || '';
+            hypoPopulateGroupSelectForCompany();
+        }
+
+        window.onHypoCompanyChange = function() {
+            hypoSelectedCompany = document.getElementById('hypoCompanySelect').value || '';
+            hypoPopulateGroupSelectForCompany();
+        };
+
+        function hypoPopulateGroupSelectForCompany() {
+            const sel = document.getElementById('hypoGroupSelect');
+            if (!sel) return;
+            const prevGroupId = hypoCurrentGroupId;
+
+            if (!hypoSelectedCompany) {
+                sel.innerHTML = '<option value="">-- Select a company first --</option>';
+                sel.disabled = true;
+                onHypoGroupChange();
+                return;
+            }
+
+            let groups;
+            if (hypoSelectedCompany === '__unassigned__') {
+                groups = hypoGroups.filter(g => hypoGroupEmails(g).length === 0);
+            } else {
+                const companyEmails = hypoCompanyBdrEmailSet(hypoSelectedCompany);
+                groups = hypoGroups.filter(g => {
+                    const emails = hypoGroupEmails(g);
+                    return emails.length > 0 && emails.some(e => companyEmails.has((e || '').toLowerCase()));
+                });
+            }
+            groups = groups.slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+            sel.innerHTML = groups.length
+                ? '<option value="">-- Select a hypothesis group --</option>' +
+                  groups.map(g => {
+                      const prio = (g.scanPriority !== null && g.scanPriority !== undefined && g.scanPriority !== '') ? ` · priority ${g.scanPriority}` : '';
+                      return `<option value="${escAdminHtml(g.id)}">${escAdminHtml(g.name || '(unnamed group)')}${prio}</option>`;
+                  }).join('')
+                : '<option value="">-- No hypothesis groups for this company --</option>';
+            sel.disabled = groups.length === 0;
+
+            // Keep the current selection alive across refreshes, if it still belongs to this company
+            if (prevGroupId && groups.some(g => g.id === prevGroupId)) {
+                sel.value = prevGroupId;
+            }
+            onHypoGroupChange();
+        }
+
         // ── Group list ────────────────────────────────────────────────────
         window.hypoLoadGroups = async function() {
             const select = document.getElementById('hypoGroupSelect');
             try {
-                select.innerHTML = '<option value="">Loading hypothesis groups…</option>';
                 const snap = await getDocs(collection(db, 'hypothesis_groups'));
                 hypoGroups = snap.docs
                     .map(d => ({ id: d.id, ...d.data() }))
                     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
-                select.innerHTML = '<option value="">-- Select a hypothesis group --</option>' +
-                    hypoGroups.map(g => {
-                        const prio = (g.scanPriority !== null && g.scanPriority !== undefined && g.scanPriority !== '') ? ` · priority ${g.scanPriority}` : '';
-                        return `<option value="${escAdminHtml(g.id)}">${escAdminHtml(g.name || '(unnamed group)')}${prio}</option>`;
-                    }).join('');
-
-                // Keep the current selection alive across refreshes
-                if (hypoCurrentGroupId && hypoGroups.some(g => g.id === hypoCurrentGroupId)) {
-                    select.value = hypoCurrentGroupId;
-                }
+                hypoPopulateCompanySelect();
                 console.log(`✅ Loaded ${hypoGroups.length} hypothesis groups`);
             } catch (error) {
                 console.error('Error loading hypothesis groups:', error);
