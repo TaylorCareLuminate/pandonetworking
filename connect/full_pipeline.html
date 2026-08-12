@@ -184,7 +184,7 @@
         <!-- ══════════ STEP 2: BDRs & message counts ══════════ -->
         <div class="section">
             <div class="section-title"><span class="step-num">2</span> BDRs &amp; Messages to Generate</div>
-            <p class="section-help">Only BDRs linked to the selected hypothesis group are shown (link BDRs to groups in Connect Hypothesis Documentation). Check each BDR who needs messages and set how many. Organizations from the group are scanned one at a time and their contacts assigned to the current BDR until that BDR's count is met, then the pipeline moves to the next BDR.</p>
+            <p class="section-help">Only BDRs linked to the selected hypothesis group are shown (link BDRs to groups in Connect Hypothesis Documentation). Check each BDR who needs messages and set how many. Organizations from the group are scanned one at a time; each organization's contacts are assigned to whichever checked BDR's turn it is, alternating between BDRs round-robin until every BDR's count is met (a BDR that reaches its target early drops out and the rest keep alternating).</p>
             <div id="fpBdrList" style="max-height: 320px; overflow-y: auto;"><span style="color: var(--gray-500); font-size: 13px;">Select a client and hypothesis group above.</span></div>
         </div>
 
@@ -539,7 +539,7 @@
         import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
 
         // Use CLEmail wrapper for secure data access via Railway backend
-        const { collection, getDocs, getAllDocs, query, where, doc, getDoc, updateDoc, setDoc, deleteDoc, addDoc } = window.clemailFirestore;
+        const { collection, getDocs, getAllDocs, query, where, doc, getDoc, updateDoc, setDoc, deleteDoc, addDoc, writeBatch } = window.clemailFirestore;
 
         console.log('⏳ Waiting for auth.js to initialize...');
         await window.firebaseReady;
@@ -2806,6 +2806,75 @@
             return { kept, dropped };
         }
 
+        // ── Rule-dropped contacts: moved OUT of prospect_contacts entirely ──────────
+        // Contacts that fail the Target Contact / Exclude Rules used to just stay in
+        // prospect_contacts forever, unflagged, requiring manual cleanup later. Instead,
+        // each dropped contact's doc is copied into prospect_contacts_deleted (with the
+        // rule reason + org + hypothesis group it was scanned for) and removed from
+        // prospect_contacts, via writeBatch — Firestore batches cap out at 500 operations
+        // and this is 2 ops/contact (a set + a delete), so we chunk generously below that.
+        async function fpArchiveDroppedContacts({ dropped, org, groupId, groupName, scanJobId, scanName, bdrEmail }) {
+            if (!dropped || dropped.length === 0) return;
+            const CHUNK = 200;
+            for (let i = 0; i < dropped.length; i += CHUNK) {
+                const chunk = dropped.slice(i, i + CHUNK);
+                try {
+                    const batch = writeBatch(db);
+                    for (const c of chunk) {
+                        const { id, _ruleReason, ...rest } = c;
+                        batch.set(doc(collection(db, 'prospect_contacts_deleted')), {
+                            ...rest,
+                            originalId: id,
+                            bdrEmail,
+                            deletedReason: 'rules_exclude',
+                            ruleReason: _ruleReason || '',
+                            hypothesisGroupId: groupId || null,
+                            hypothesisGroupName: groupName || '',
+                            orgId: org.id,
+                            orgName: org.company_name || '',
+                            scanJobId: scanJobId || null,
+                            scanName: scanName || '',
+                            deletedAt: new Date().toISOString(),
+                            deletedBy: 'full_pipeline_rules_filter'
+                        });
+                        batch.delete(doc(db, 'prospect_contacts', id));
+                    }
+                    await batch.commit();
+                } catch (e) {
+                    addLog(`   ⚠️ Could not archive ${chunk.length} rule-dropped contact(s) to prospect_contacts_deleted (${e.message}) — they were left in prospect_contacts.`, 'warning');
+                }
+            }
+            addLog(`   🗑️ ${dropped.length} rule-dropped contact(s) moved to prospect_contacts_deleted.`, 'dim');
+        }
+
+        // ── Kept contacts: tagged with the hypothesis group they were scanned for ──
+        // Every contact that PASSES the Target Contact / Exclude Rules stays in
+        // prospect_contacts (whether or not it ends up with a generated message), but
+        // now gets stamped with the hypothesis group so it's traceable later — same
+        // group doc shape used by Connect Hypothesis Documentation (hypothesis_groups,
+        // fields: id/name).
+        async function fpTagKeptContactsWithHypothesisGroup({ kept, groupId, groupName }) {
+            if (!kept || kept.length === 0 || !groupId) return;
+            const taggedAt = new Date().toISOString();
+            const CHUNK = 400; // 1 op/contact (update only)
+            for (let i = 0; i < kept.length; i += CHUNK) {
+                const chunk = kept.slice(i, i + CHUNK);
+                try {
+                    const batch = writeBatch(db);
+                    for (const c of chunk) {
+                        batch.update(doc(db, 'prospect_contacts', c.id), {
+                            hypothesisGroupId: groupId,
+                            hypothesisGroupName: groupName || '',
+                            hypothesisGroupTaggedAt: taggedAt
+                        });
+                    }
+                    await batch.commit();
+                } catch (e) {
+                    addLog(`   ⚠️ Could not tag ${chunk.length} contact(s) with the hypothesis group (${e.message}).`, 'warning');
+                }
+            }
+        }
+
         // Organization Type Classification — classifies exactly ONE organization at a
         // time (called from inside the main per-org loop, right before that org is
         // scanned) against /api/connect/classify-org-type. Deliberately not batched
@@ -3173,7 +3242,7 @@
             const orgTypeNoteForConfirm = orgTypeConfig.enabled
                 ? `\n• Each organization will first be classified by AI (${orgTypeConfig.classifierModel}) into one of ${orgTypeConfig.types.length} type(s) (${orgTypeConfig.types.map(t => t.name).join(', ')}), each using its own scan rules`
                 : '';
-            if (!confirm(`Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}${orgTypeNoteForConfirm}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules, news is searched once per organization, and messages are generated + Opus reviewed one at a time.`)) return;
+            if (!confirm(`Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}${orgTypeNoteForConfirm}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules — matches are tagged with this hypothesis group and stay in prospect_contacts (whether or not they end up with a message), while rule-dropped contacts are moved to prospect_contacts_deleted — news is searched once per organization, and messages are generated + Opus reviewed one at a time.`)) return;
 
             const buildModel   = document.getElementById('fpBuildModel').value;
             const opusModel    = document.getElementById('fpOpusModel').value;
@@ -3313,6 +3382,13 @@
             // than as one big batch call up front.
 
             try {
+                // ── Per-BDR context — precomputed for ALL BDRs up front (LinkedIn account,
+                // DNC scope, existing connections, Final AI Review profile, Opus instructions)
+                // so the main loop below can alternate between BDRs organization-by-organization
+                // instead of fully draining one BDR's target before starting the next. Doing this
+                // setup here (rather than lazily inside each BDR's own loop) is what makes that
+                // alternation possible without duplicating any of these lookups.
+                const bdrContexts = new Map();
                 for (const plan of bdrPlan) {
                     if (window.fpStopRequested) break;
                     const bdrEmail = plan.bdrEmail;
@@ -3346,8 +3422,26 @@
                     }
                     const bdrOpusInstr = bdrRec.opusReviewInstructions || '';
 
-                    while (plan.generated < plan.target && orgPointer < fpRunOrgs.length) {
-                        if (window.fpStopRequested) break;
+                    bdrContexts.set(bdrEmail, { plan, bdrEmail, bdrRec, acct, relevantDNC, connectedUrlSet, connectedUsernameSet, finalReviewBdrProfile, bdrOpusInstr });
+                }
+
+                // ── Main loop — round-robins between BDRs one organization at a time ──
+                // Each turn picks the next BDR (in list order) that hasn't hit its target yet,
+                // then pulls the next organization off the shared queue for that BDR. This is
+                // what makes messages alternate between BDRs instead of one BDR consuming
+                // organizations until its whole target is met before the next BDR gets any.
+                let bdrTurn = 0;
+                while (!window.fpStopRequested && orgPointer < fpRunOrgs.length && bdrPlan.some(p => p.generated < p.target)) {
+                    let ctx = null;
+                    for (let tries = 0; tries < bdrPlan.length; tries++) {
+                        const candidate = bdrPlan[bdrTurn % bdrPlan.length];
+                        bdrTurn++;
+                        if (candidate.generated < candidate.target) { ctx = bdrContexts.get(candidate.bdrEmail); break; }
+                    }
+                    if (!ctx) break; // no BDR still needs messages — shouldn't happen given the while condition, but guard anyway
+
+                    const { plan, bdrEmail, bdrRec, acct, relevantDNC, connectedUrlSet, connectedUsernameSet, finalReviewBdrProfile, bdrOpusInstr } = ctx;
+
                         const org = fpRunOrgs[orgPointer++];
 
                         // Proactively refresh the auth token before EVERY organization. A run
@@ -3536,6 +3630,13 @@
                             fpRenderStats();
                             addLog(`   🎯 Rules filter: ${kept.length} matched, ${dropped.length} dropped${dropped.length ? ` (top dropped: ${orgReport.droppedTitles.slice(0, 3).map(t => `"${t.title}"×${t.count}`).join(', ')})` : ''}.`);
                             fpRenderDroppedByRulesTable(org.company_name, dropped);
+
+                            // Rule-dropped contacts don't linger in prospect_contacts for later
+                            // manual cleanup — move them to prospect_contacts_deleted now. Everything
+                            // that DID pass the rules gets tagged with this hypothesis group right
+                            // away too, whether or not it ends up with a generated message below.
+                            await fpArchiveDroppedContacts({ dropped, org, groupId, groupName, scanJobId: jobId, scanName, bdrEmail });
+                            await fpTagKeptContactsWithHypothesisGroup({ kept, groupId, groupName });
 
                             if (kept.length === 0) {
                                 orgReport.error = 'no_matches';
@@ -4145,12 +4246,14 @@
                                 break;
                             }
                         }
-                    }
+                }
 
+                for (const plan of bdrPlan) {
+                    const bdrRec = fpBdrs.find(b => b.primaryEmail === plan.bdrEmail) || {};
                     if (plan.generated >= plan.target) {
-                        addLog(`\n🎯 ${bdrRec.name || bdrEmail}: target reached (${plan.generated}/${plan.target}).`, 'success');
+                        addLog(`\n🎯 ${bdrRec.name || plan.bdrEmail}: target reached (${plan.generated}/${plan.target}).`, 'success');
                     } else if (orgPointer >= fpRunOrgs.length) {
-                        addLog(`\n⚠️ ${bdrRec.name || bdrEmail}: ran out of organizations at ${plan.generated}/${plan.target} message(s).`, 'warning');
+                        addLog(`\n⚠️ ${bdrRec.name || plan.bdrEmail}: ran out of organizations at ${plan.generated}/${plan.target} message(s).`, 'warning');
                     }
                 }
 
