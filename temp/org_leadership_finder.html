@@ -138,6 +138,14 @@
         .conf-high   { background: #10b981; }
         .conf-medium { background: #f59e0b; }
         .conf-low    { background: #ef4444; }
+        .src-tag { display: inline-block; font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; padding: 1px 6px; border-radius: 4px; margin-left: 5px; vertical-align: middle; }
+        .src-database   { background: #ede9fe; color: #5b21b6; }
+        .src-web_search { background: #e0f2fe; color: #075985; }
+
+        .checkbox-row { display: flex; align-items: flex-start; gap: 0.6rem; margin-bottom: 1rem; }
+        .checkbox-row input[type=checkbox] { width: 18px; height: 18px; margin-top: 2px; cursor: pointer; flex-shrink: 0; }
+        .checkbox-row label { font-size: 0.88rem; font-weight: 600; cursor: pointer; }
+        .checkbox-row .form-help { margin-top: 2px; }
 
         .empty-state { text-align: center; padding: 3rem; color: var(--gray); }
         .empty-state i { font-size: 2.5rem; margin-bottom: 0.75rem; display: block; opacity: 0.35; }
@@ -153,7 +161,7 @@
 
     <div class="page-header">
         <h1><i class="fas fa-user-tie"></i> Executive Leadership Finder — Web Search + AI</h1>
-        <p>Load a list of organizations and this tool runs live web searches (Brave) for each one, then asks an AI model (Grok by default) to extract the named executives for the titles you choose — CIO, CISO, CMIO, CTO, CDO, CNIO, CAO, or any custom title — along with their LinkedIn URL when one turns up in the search results. Nothing is invented: a name or LinkedIn URL is only reported when it's actually backed by evidence in the search results.</p>
+        <p>Load a list of organizations and this tool finds named executives for the titles you choose — CIO, CISO, CMIO, CTO, CDO, CNIO, CAO, or any custom title — from two sources: our own contact database (every BDR and workspace, matched to your titles by AI) and live web searches (Brave) with AI extraction (Grok by default), along with their LinkedIn URL wherever one is available. Nothing is invented: a name or LinkedIn URL is only reported when it's actually backed by a real database record or evidence in the search results.</p>
     </div>
 
     <div id="authGate" class="section auth-gate">
@@ -241,6 +249,13 @@
                 <div class="model-note" id="modelNote"></div>
             </div>
         </div>
+        <div class="checkbox-row">
+            <input type="checkbox" id="chkDbScan" checked onchange="updateRunEstimate()">
+            <div>
+                <label for="chkDbScan"><i class="fas fa-database"></i> Also search existing contacts across all BDRs/workspaces</label>
+                <div class="form-help">Before running any web searches, checks our own database (<code>prospect_contacts</code> — every BDR and workspace, not just yours) for contacts already on file at each organization, then uses AI to match their titles against the roles below (handling variations like "SVP &amp; CIO"). Any role already found this way skips its web search for that organization, so this can also make the run faster and cheaper.</div>
+            </div>
+        </div>
         <div id="runEstimate" class="info-box"></div>
         <div class="range-box" id="rangeBox" style="display:none;">
             <label for="rangeFrom"><i class="fas fa-list-ol"></i> Search organizations</label>
@@ -251,6 +266,7 @@
             <button class="btn btn-ghost btn-sm" onclick="resetRange()"><i class="fas fa-undo"></i> All</button>
         </div>
         <div class="pipeline" id="pipeline" style="display:none;">
+            <div class="pipe-step" id="pipeDb"><i class="fas fa-database"></i>Database Scan</div>
             <div class="pipe-step" id="pipeStart"><i class="fas fa-play"></i>Starting</div>
             <div class="pipe-step" id="pipeRun"><i class="fas fa-spinner"></i>Running</div>
             <div class="pipe-step" id="pipeDone"><i class="fas fa-check"></i>Complete</div>
@@ -295,6 +311,8 @@
 
 <script src="../js/auth.js"></script>
 <script src="../js/ai-model-catalog.js"></script>
+<script src="../js/clemail-firestore-wrapper.js"></script>
+<script src="../js/contact-fields.js"></script>
 <script type="module">
 await window.firebaseReady;
 
@@ -554,8 +572,10 @@ function updateRunEstimate() {
     const n = organizations.length;
     const t = getEnabledTitles().length;
     const queriesPerOrg = 1 + t;
+    const dbScanOn = document.getElementById('chkDbScan')?.checked;
     document.getElementById('runEstimate').innerHTML =
-        `<i class="fas fa-chart-line"></i> ${n} organization(s) × ${t} title(s) → about ${queriesPerOrg} web search(es) per organization (~${(n * queriesPerOrg).toLocaleString()} total) plus one AI extraction call per organization. Larger runs can take a while — this tool runs in the background so you can leave the tab open and check back.`;
+        `<i class="fas fa-chart-line"></i> ${n} organization(s) × ${t} title(s) → about ${queriesPerOrg} web search(es) per organization (~${(n * queriesPerOrg).toLocaleString()} total) plus one AI extraction call per organization. Larger runs can take a while — this tool runs in the background so you can leave the tab open and check back.` +
+        (dbScanOn ? ` A database scan runs first and may reduce the web searches actually needed.` : ``);
 }
 
 // ── Model dropdown ─────────────────────────────────────────────────────────
@@ -619,9 +639,144 @@ function setPipe(id, state) {
 function orgKey(o) { return [o.name, o.city, o.state].map(v => (v || '').toLowerCase().trim()).join('|'); }
 
 function mergeJobResults(newRows) {
+    newRows.forEach(r => {
+        Object.values(r.contacts || {}).forEach(c => { if (c && !c.source) c.source = 'web_search'; });
+    });
     const byKey = new Map(jobResults.map(r => [orgKey(r.org), r]));
     newRows.forEach(r => byKey.set(orgKey(r.org), r));
     jobResults = [...byKey.values()];
+}
+
+// Overlays database-sourced contacts (found via the cross-BDR/workspace scan)
+// onto jobResults, taking priority over any web-search result for the same
+// organization/role slot — the web search was skipped for those roles anyway.
+function applyDbOverlay(dbContactsByOrg) {
+    if (!dbContactsByOrg || dbContactsByOrg.size === 0) return;
+    jobResults.forEach(r => {
+        const dbRoles = dbContactsByOrg.get(orgKey(r.org));
+        if (!dbRoles) return;
+        r.contacts = { ...(r.contacts || {}), ...dbRoles };
+    });
+}
+
+// ── Database scan (cross-BDR/workspace) ─────────────────────────────────────
+// Queries prospect_contacts directly with no owner/BDR filter, so it naturally
+// spans every BDR and workspace — mirrors the same unfiltered-query approach
+// "Pull Contacts from Other BDRs" uses in prospect_organizations_admin.html.
+async function runClientConcurrency(items, worker, concurrency) {
+    let idx = 0;
+    async function next() {
+        while (idx < items.length) {
+            const my = idx++;
+            await worker(items[my], my);
+        }
+    }
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, next));
+}
+
+function resolveContactName(c) {
+    return String(c.fullName || `${c.firstName || c.contact_first_name || ''} ${c.lastName || c.contact_last_name || ''}`.trim()
+        || c.name || c.contact_name || '').trim();
+}
+
+async function fetchContactsForOrgName(orgName) {
+    const { collection, getDocs, query, where } = window.clemailFirestore;
+    const db = window.clemailDb;
+    const byId = new Map();
+    for (const field of ['company', 'companyName']) {
+        try {
+            const snap = await getDocs(query(collection(db, 'prospect_contacts'), where(field, '==', orgName)));
+            snap.docs.forEach(d => { if (!byId.has(d.id)) byId.set(d.id, { id: d.id, ...d.data() }); });
+        } catch (err) {
+            console.warn(`[db-scan] Query failed for "${orgName}" (${field}):`, err.message);
+        }
+    }
+    return [...byId.values()];
+}
+
+async function classifyTitlesAgainstRoles(rawTitles, enabledTitles) {
+    if (rawTitles.length === 0) return {};
+    let token;
+    try { token = await getToken(); } catch (e) { return {}; }
+    try {
+        const resp = await fetch(`${RAILWAY}/api/connect/org-leadership-finder/classify-titles`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            body: JSON.stringify({ titles: rawTitles, targetTitles: enabledTitles })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
+        return data.classifications || {};
+    } catch (err) {
+        log(`  ⚠ Title classification failed (${err.message}) — database contacts skipped this run.`, 'log-dim');
+        return {};
+    }
+}
+
+/**
+ * Returns a Map of orgKey(org) -> { [roleKey]: contact } built from contacts
+ * already on file in prospect_contacts, across every BDR and workspace.
+ */
+async function runDatabaseScan(orgsToScan, enabledTitles) {
+    const dbContactsByOrg = new Map();
+    const candidatesByOrgKey = new Map();
+    const allRawTitles = new Set();
+
+    log(`▶ Database scan — checking ${orgsToScan.length} organization(s) for existing contacts across all BDRs/workspaces…`, 'log-info');
+
+    let scanned = 0;
+    await runClientConcurrency(orgsToScan, async (org) => {
+        const name = (org.name || '').trim();
+        let contacts = [];
+        if (name) {
+            try { contacts = await fetchContactsForOrgName(name); }
+            catch (err) { console.warn(`[db-scan] "${name}" failed:`, err.message); }
+        }
+        scanned++;
+        if (scanned % 25 === 0 || scanned === orgsToScan.length) {
+            log(`  …scanned ${scanned}/${orgsToScan.length} organization(s) in database`, 'log-dim');
+        }
+        if (contacts.length === 0) return;
+
+        const resolved = contacts.map(c => {
+            const title = (window.ContactFields ? window.ContactFields.resolveTitle(c) : (c.title || c.jobTitle || '')).trim();
+            const url = c.linkedInUrl || c.linkedin_url || c.contact_linkedin_url || '';
+            return { title, name: resolveContactName(c), url };
+        }).filter(c => c.title && c.name);
+
+        if (resolved.length === 0) return;
+        resolved.forEach(c => allRawTitles.add(c.title));
+        candidatesByOrgKey.set(orgKey(org), resolved);
+    }, 6);
+
+    if (allRawTitles.size === 0) {
+        log('  No existing database contacts matched by organization name.', 'log-dim');
+        return dbContactsByOrg;
+    }
+
+    log(`  Found candidate contacts at ${candidatesByOrgKey.size} organization(s) — classifying ${allRawTitles.size} unique title(s) with AI…`, 'log-info');
+    const classifications = await classifyTitlesAgainstRoles([...allRawTitles], enabledTitles);
+
+    for (const [key, candidates] of candidatesByOrgKey) {
+        const roleMap = {};
+        for (const c of candidates) {
+            const roleKey = classifications[c.title];
+            if (!roleKey || roleMap[roleKey]) continue; // keep first match per role
+            roleMap[roleKey] = {
+                name: c.name,
+                title_text: c.title,
+                linkedin_url: c.url || null,
+                source_url: null,
+                confidence: 'high',
+                source: 'database'
+            };
+        }
+        if (Object.keys(roleMap).length > 0) dbContactsByOrg.set(key, roleMap);
+    }
+
+    const totalMatched = [...dbContactsByOrg.values()].reduce((sum, r) => sum + Object.keys(r).length, 0);
+    log(`✅ Database scan complete — ${totalMatched} matching contact(s) found across ${dbContactsByOrg.size} organization(s).`, 'log-ok');
+    return dbContactsByOrg;
 }
 
 async function startJob(orgsToSearch, enabledTitles, model) {
@@ -774,6 +929,7 @@ window.runSearch = async function() {
     if (searchOrgs.length === 0) { alert('The selected range is empty.'); return; }
     const enabledTitles = getEnabledTitles();
     const model = document.getElementById('modelSelect').value;
+    const dbScanOn = document.getElementById('chkDbScan').checked;
 
     btn.disabled = true;
     btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starting…';
@@ -782,12 +938,27 @@ window.runSearch = async function() {
     document.getElementById('logBox').innerHTML = '';
     document.getElementById('logBox').style.display = '';
     document.getElementById('runError').style.display = 'none';
-    setPipe('pipeStart', 'active'); setPipe('pipeRun', ''); setPipe('pipeDone', '');
+    setPipe('pipeDb', dbScanOn ? 'active' : 'done'); setPipe('pipeStart', ''); setPipe('pipeRun', ''); setPipe('pipeDone', '');
 
     const jobIdsThisRun = [];
-    let remainingOrgs = searchOrgs;
+    let dbContactsByOrg = new Map();
 
     try {
+        if (dbScanOn) {
+            try {
+                dbContactsByOrg = await runDatabaseScan(searchOrgs, enabledTitles);
+            } catch (dbErr) {
+                log(`⚠ Database scan failed (${dbErr.message}) — continuing with web search only.`, 'log-dim');
+            }
+        }
+        setPipe('pipeDb', 'done'); setPipe('pipeStart', 'active');
+
+        let remainingOrgs = searchOrgs.map(o => {
+            const dbRoles = dbContactsByOrg.get(orgKey(o));
+            const skipTitleKeys = dbRoles ? Object.keys(dbRoles) : [];
+            return { ...o, skipTitleKeys };
+        });
+
         const isPartial = searchOrgs.length !== organizations.length;
         log(`▶ Starting job for ${searchOrgs.length}${isPartial ? ` of ${organizations.length}` : ''} organization(s), ${enabledTitles.length} title(s), model ${model}…`, 'log-info');
 
@@ -830,6 +1001,7 @@ window.runSearch = async function() {
 
         setPipe('pipeRun', 'done'); setPipe('pipeDone', 'done');
         mergeJobResults(serverResults);
+        applyDbOverlay(dbContactsByOrg);
         renderResults();
 
     } catch (err) {
@@ -842,6 +1014,7 @@ window.runSearch = async function() {
             .sort((a, b) => b.results.length - a.results.length)[0];
         if (checkpoint) {
             mergeJobResults(checkpoint.results);
+            applyDbOverlay(dbContactsByOrg);
             log(`♻ Recovered ${checkpoint.results.length} result(s) from local checkpoint saved ${new Date(checkpoint.savedAt).toLocaleTimeString()}.`, 'log-ok');
             renderResults();
         }
@@ -882,10 +1055,15 @@ function renderResults() {
         label: c.abbr,
         count: jobResults.filter(r => r.contacts && r.contacts[c.key]).length
     }));
+    const allContacts = jobResults.flatMap(r => Object.values(r.contacts || {}).filter(Boolean));
+    const dbCount = allContacts.filter(c => c.source === 'database').length;
+    const webCount = allContacts.length - dbCount;
 
     document.getElementById('statsRow').innerHTML =
         `<div class="stat-pill"><span class="val" style="color:var(--primary);">${totalOrgs}</span> organizations processed</div>` +
         `<div class="stat-pill"><span class="val" style="color:var(--success);">${withAny}</span> with ≥1 contact found</div>` +
+        `<div class="stat-pill"><i class="fas fa-database" style="color:#5b21b6;"></i> <span class="val" style="color:#5b21b6;">${dbCount}</span> from database</div>` +
+        `<div class="stat-pill"><i class="fas fa-globe" style="color:#075985;"></i> <span class="val" style="color:#075985;">${webCount}</span> from web search</div>` +
         perTitleCounts.map(p => `<div class="stat-pill">${escHtml(p.label)}: <span class="val" style="color:var(--teal);">${p.count}</span></div>`).join('');
 
     renderResultsTableHead(cols);
@@ -934,8 +1112,11 @@ window.renderResultsTable = function() {
             const liLink = contact.linkedin_url
                 ? `<a href="${escHtml(contact.linkedin_url)}" target="_blank" rel="noopener" class="li-link"><i class="fab fa-linkedin"></i> Profile</a>`
                 : '';
+            const srcTag = contact.source === 'database'
+                ? `<span class="src-tag src-database" title="Found in our own contact database (any BDR/workspace)">DB</span>`
+                : `<span class="src-tag src-web_search" title="Found via live web search">Web</span>`;
             return `<td class="contact-cell">
-                <div class="contact-name"><span class="conf-dot ${confClass}" title="Confidence: ${escHtml(contact.confidence || 'medium')}"></span>${escHtml(contact.name)}</div>
+                <div class="contact-name"><span class="conf-dot ${confClass}" title="Confidence: ${escHtml(contact.confidence || 'medium')}"></span>${escHtml(contact.name)}${srcTag}</div>
                 ${contact.title_text ? `<div class="contact-title">${escHtml(contact.title_text)}</div>` : ''}
                 ${liLink}
             </td>`;
@@ -954,13 +1135,13 @@ window.exportWideCSV = function() {
     if (jobResults.length === 0) { alert('No results yet.'); return; }
     const cols = enabledTitleList();
     const headers = ['Organization', 'City', 'State'];
-    cols.forEach(c => headers.push(`${c.abbr} Name`, `${c.abbr} Title`, `${c.abbr} LinkedIn URL`));
+    cols.forEach(c => headers.push(`${c.abbr} Name`, `${c.abbr} Title`, `${c.abbr} LinkedIn URL`, `${c.abbr} Source`));
     let csv = headers.map(csvEsc).join(',') + '\n';
     jobResults.forEach(r => {
         const row = [r.org.name, r.org.city, r.org.state];
         cols.forEach(c => {
             const contact = r.contacts && r.contacts[c.key];
-            row.push(contact?.name || '', contact?.title_text || '', contact?.linkedin_url || '');
+            row.push(contact?.name || '', contact?.title_text || '', contact?.linkedin_url || '', contact?.source || '');
         });
         csv += row.map(csvEsc).join(',') + '\n';
     });
@@ -970,13 +1151,13 @@ window.exportWideCSV = function() {
 window.exportLongCSV = function() {
     if (jobResults.length === 0) { alert('No results yet.'); return; }
     const cols = enabledTitleList();
-    const headers = ['Organization', 'City', 'State', 'Role Key', 'Role Full Title', 'Name', 'Title Found', 'LinkedIn URL', 'Source URL', 'Confidence'];
+    const headers = ['Organization', 'City', 'State', 'Role Key', 'Role Full Title', 'Name', 'Title Found', 'LinkedIn URL', 'Source URL', 'Confidence', 'Found Via'];
     let csv = headers.map(csvEsc).join(',') + '\n';
     jobResults.forEach(r => {
         cols.forEach(c => {
             const contact = r.contacts && r.contacts[c.key];
             if (!contact) return;
-            csv += [r.org.name, r.org.city, r.org.state, c.abbr, c.fullName, contact.name, contact.title_text || '', contact.linkedin_url || '', contact.source_url || '', contact.confidence || '']
+            csv += [r.org.name, r.org.city, r.org.state, c.abbr, c.fullName, contact.name, contact.title_text || '', contact.linkedin_url || '', contact.source_url || '', contact.confidence || '', contact.source || '']
                 .map(csvEsc).join(',') + '\n';
         });
     });
