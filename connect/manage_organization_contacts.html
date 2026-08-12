@@ -2378,6 +2378,8 @@
                 Describe a type of organization and AI will search the web (Brave) then classify every prospect org
                 in the selected source using <strong>DeepSeek V4 Pro</strong>. Runs
                 <strong>5 in parallel</strong> for speed. You can pause mid-run and resume exactly where you left off.
+                Works on workspaces, BDRs, and <strong>🧪 Hypothesis Groups</strong> — handy for pruning organizations
+                (e.g. hospitals and health systems) out of a hypothesis group's target list.
             </p>
 
             <!-- Mode Toggle Tabs -->
@@ -2463,7 +2465,7 @@
                 <div class="form-group" style="margin-bottom:0;">
                     <label class="form-label"><i class="fas fa-sign-out-alt"></i> Source — classify orgs FROM</label>
                     <select id="aiClassSource" class="form-select" onchange="window.onAIClassSourceChange()">
-                        <option value="">-- Select source workspace or BDR --</option>
+                        <option value="">-- Select source workspace, BDR, or hypothesis group --</option>
                     </select>
                     <span id="aiClassSourceOrgCount" style="font-size:0.82rem; color:var(--gray); margin-top:0.3rem; display:block;"></span>
                 </div>
@@ -2627,6 +2629,13 @@
                                        style="display:none;"
                                        onchange="window._syncAIClassOpToggle && window._syncAIClassOpToggle()">
                                 <i class="fas fa-trash"></i> Delete
+                            </label>
+                            <label style="display:none;align-items:center;gap:0.35rem;cursor:pointer;padding:6px 13px;border-radius:6px;border:2px solid #b45309;background:white;color:#b45309;font-size:0.84rem;font-weight:600;transition:all 0.15s;"
+                                   id="aiClassOpUntagLabel" title="Untag from this hypothesis group only. Orgs that also live in a real workspace/BDR stay put; orgs that exist solely in this group's own pool are deleted.">
+                                <input type="radio" name="aiClassOpMode" value="untag" id="aiClassOpUntag"
+                                       style="display:none;"
+                                       onchange="window._syncAIClassOpToggle && window._syncAIClassOpToggle()">
+                                <i class="fas fa-unlink"></i> Remove from Group
                             </label>
                         </div>
                         <span id="aiClassOpHint" style="font-size:0.74rem;color:var(--gray);max-width:290px;line-height:1.35;">Orgs are <strong>removed</strong> from the source.</span>
@@ -3373,6 +3382,21 @@ Sales / Marketing / Business Development (VP Sales, Marketing Director, BD)</tex
         const WR = window.WorkspaceRouting;
         const fsApi = () => window.clemailFirestoreModule;
 
+        // Sentinel used to represent "a hypothesis group" as a SOURCE in the AI
+        // Organization Classifier's source dropdown (mirrors WR's workspace sentinels,
+        // but hypothesis groups are their own thing — orgs are tagged onto them via
+        // `hypothesis_group_ids`, not owned by `bdrEmail`, so they need a separate
+        // query path). Source-only, same reasoning as workspaces being source-only
+        // in the Move dropdown: you tag orgs into a group elsewhere (prospect_organizations_admin.html),
+        // not by "moving" them here.
+        const HG_SOURCE_PREFIX = '__hgrp__:';
+        const isHgSource = (src) => typeof src === 'string' && src.startsWith(HG_SOURCE_PREFIX);
+        const hgIdFromSource = (src) => src.slice(HG_SOURCE_PREFIX.length);
+        // Orgs created directly inside a hypothesis group's own pool (no real
+        // workspace/BDR) are owned by this bdrEmail sentinel — mirrors the constant
+        // of the same name in prospect_organizations_admin.html.
+        const HYPO_POOL_BDR_PREFIX = '__hypo__:';
+
         // Wait for auth.js to initialize
         console.log('⏳ Waiting for auth.js to initialize...');
         await window.firebaseReady;
@@ -3384,8 +3408,18 @@ Sales / Marketing / Business Development (VP Sales, Marketing Director, BD)</tex
         const emailDB = window.clemailDb;
         console.log('🔒 CLEmail secure wrapper ready');
 
-        /** Orgs for a BDR email or merged workspace (multiple bdrEmail sentinels). */
+        /** Orgs for a BDR email, merged workspace (multiple bdrEmail sentinels), or hypothesis group. */
         async function _loadOrgsForMoveSource(src) {
+            if (isHgSource(src)) {
+                const gid = hgIdFromSource(src);
+                const orgSnap = await getAllDocs(
+                    query(collection(emailDB, 'prospect_organizations'), where('hypothesis_group_ids', 'array-contains', gid)),
+                    { pageSize: 2000, timeoutMs: 60000, maxRetries: 3 }
+                );
+                const out = [];
+                orgSnap.forEach(d => out.push({ id: d.id, ...d.data() }));
+                return out;
+            }
             if (WR.isWorkspaceSentinel(src)) {
                 const wid = WR.parseIdFromSentinel(src);
                 const sens = await WR.getRoutingSentinelsForCanonical(emailDB, { getDoc, doc }, wid);
@@ -6000,7 +6034,9 @@ Sales / Marketing / Business Development (VP Sales, Marketing Director, BD)</tex
 
             _buildMoveDropdown('moveSourceSelect', true);   // source: workspaces + BDRs
             _buildMoveTargetList();                         // target: multi-select BDR checkbox list
-            window._loadMoveHgGroups();                      // hypothesis-group assignment dropdown
+            // Hypothesis groups load async — rebuild the AI classifier's source dropdown
+            // (which lists them as a source) once they're in, in case it renders first.
+            window._loadMoveHgGroups().then(() => _buildAIClassDropdowns());
             _buildAIClassDropdowns();                       // AI classifier source + destination
             _buildAIContactClassDropdowns();               // AI contact classifier source + destination
             _buildAITitleGroupDropdowns();                 // AI title-group classifier source + destination
@@ -9594,7 +9630,7 @@ Return ONLY a raw JSON array:
             if (!srcSel || !destSel) return;
 
             function buildOptions(includeWsFirst) {
-                const parts = [`<option value="">-- Select ${includeWsFirst ? 'source' : 'destination'} workspace or BDR --</option>`];
+                const parts = [`<option value="">-- Select ${includeWsFirst ? 'source workspace, BDR, or hypothesis group' : 'destination workspace or BDR'} --</option>`];
                 parts.push(WR.workspaceOptgroupsHtml(_moveWorkspaces, { customerMap: bdrCustomerMap }));
                 groupBdrsByCompany(allBdrs).forEach(({ company, bdrs: groupBdrs }) => {
                     parts.push(`<optgroup label="${company.replace(/"/g, '&quot;')}">`);
@@ -9603,6 +9639,16 @@ Return ONLY a raw JSON array:
                     );
                     parts.push(`</optgroup>`);
                 });
+                // Hypothesis groups are SOURCE-only here — matched orgs get moved to a
+                // real workspace/BDR, duplicated, deleted, or untagged, never "moved into"
+                // another group from this tool (use prospect_organizations_admin.html for that).
+                if (includeWsFirst && _moveHgGroups.length > 0) {
+                    parts.push(`<optgroup label="🧪 Hypothesis Groups">`);
+                    _moveHgGroups.forEach(g => {
+                        parts.push(`<option value="${HG_SOURCE_PREFIX}${g.id}">${escapeHtml(g.name)}</option>`);
+                    });
+                    parts.push(`</optgroup>`);
+                }
                 return parts.join('');
             }
 
@@ -9610,9 +9656,26 @@ Return ONLY a raw JSON array:
             destSel.innerHTML = buildOptions(false);
         }
 
+        /** Show/hide the "Remove from Group" op (only meaningful for a hypothesis-group source). */
+        function _updateAIClassUntagAvailability(src) {
+            const wrap = document.getElementById('aiClassOpUntagLabel');
+            if (!wrap) return;
+            const show = isHgSource(src);
+            wrap.style.display = show ? 'flex' : 'none';
+            if (!show) {
+                const untagRadio = document.getElementById('aiClassOpUntag');
+                if (untagRadio && untagRadio.checked) {
+                    const moveRadio = document.getElementById('aiClassOpMove');
+                    if (moveRadio) moveRadio.checked = true;
+                }
+            }
+            window._syncAIClassOpToggle && window._syncAIClassOpToggle();
+        }
+
         window.onAIClassSourceChange = async function() {
             const src     = document.getElementById('aiClassSource').value;
             const countEl = document.getElementById('aiClassSourceOrgCount');
+            _updateAIClassUntagAvailability(src);
             if (!src || !countEl) return;
             countEl.textContent = '⏳ Counting organizations…';
             try {
@@ -13971,13 +14034,16 @@ Return ONLY a raw JSON array:
             const op       = document.querySelector('input[name="aiClassOpMode"]:checked')?.value || 'move';
             const isCopy   = op === 'copy';
             const isDelete = op === 'delete';
+            const isUntag  = op === 'untag';
+            const isPlainMove = !isCopy && !isDelete && !isUntag;
 
             const moveLabel   = document.getElementById('aiClassOpMoveLabel');
             const copyLabel   = document.getElementById('aiClassOpCopyLabel');
             const deleteLabel = document.getElementById('aiClassOpDeleteLabel');
+            const untagLabel  = document.getElementById('aiClassOpUntagLabel');
             if (moveLabel) {
-                moveLabel.style.background = (!isCopy && !isDelete) ? 'var(--primary)' : 'white';
-                moveLabel.style.color      = (!isCopy && !isDelete) ? 'white'          : 'var(--primary)';
+                moveLabel.style.background = isPlainMove ? 'var(--primary)' : 'white';
+                moveLabel.style.color      = isPlainMove ? 'white'          : 'var(--primary)';
             }
             if (copyLabel) {
                 copyLabel.style.background = isCopy ? 'var(--success)' : 'white';
@@ -13987,33 +14053,49 @@ Return ONLY a raw JSON array:
                 deleteLabel.style.background = isDelete ? 'var(--danger)' : 'white';
                 deleteLabel.style.color      = isDelete ? 'white'         : 'var(--danger)';
             }
+            if (untagLabel) {
+                untagLabel.style.background = isUntag ? '#b45309' : 'white';
+                untagLabel.style.color      = isUntag ? 'white'   : '#b45309';
+            }
 
             const destGroup = document.getElementById('aiClassDestGroup');
             if (destGroup) {
-                destGroup.style.opacity        = isDelete ? '0.35' : '1';
-                destGroup.style.pointerEvents  = isDelete ? 'none' : '';
+                const noDest = isDelete || isUntag;
+                destGroup.style.opacity        = noDest ? '0.35' : '1';
+                destGroup.style.pointerEvents  = noDest ? 'none' : '';
             }
 
             const hint = document.getElementById('aiClassOpHint');
             if (hint) {
                 if (isDelete)      hint.innerHTML = 'Selected orgs will be <strong>permanently deleted</strong>.';
+                else if (isUntag)  hint.innerHTML = 'Removes the <strong>hypothesis-group tag only</strong>. Orgs that exist solely in this group\'s own pool are deleted outright; orgs also owned by a real workspace/BDR just lose the tag and stay put.';
                 else if (isCopy)   hint.innerHTML = 'New copies created in destination. The <strong>originals stay</strong> in the source.';
                 else               hint.innerHTML = 'Orgs are <strong>removed</strong> from the source.';
             }
 
             const deleteContactsWrap = document.getElementById('aiClassDeleteContactsWrap');
-            if (deleteContactsWrap) deleteContactsWrap.style.display = isDelete ? 'flex' : 'none';
+            if (deleteContactsWrap) {
+                // Cascade contact-delete only makes sense for a plain BDR/workspace
+                // source — hypothesis-group orgs aren't owned by the group the same way.
+                const curSrc = document.getElementById('aiClassSource')?.value || '';
+                const canCascade = isDelete && !isHgSource(curSrc);
+                deleteContactsWrap.style.display = canCascade ? 'flex' : 'none';
+                if (!canCascade) {
+                    const cb = document.getElementById('aiClassDeleteContactsToo');
+                    if (cb) cb.checked = false;
+                }
+            }
 
             const verbEl = document.getElementById('aiClassOpVerb');
-            if (verbEl) verbEl.textContent = isDelete ? 'Delete' : isCopy ? 'Duplicate' : 'Move';
+            if (verbEl) verbEl.textContent = isDelete ? 'Delete' : isUntag ? 'Remove' : isCopy ? 'Duplicate' : 'Move';
 
             const actionLabel = document.getElementById('aiClassMoveActionLabel');
-            if (actionLabel) actionLabel.textContent = isDelete ? 'Delete' : isCopy ? 'Duplicate' : 'Move';
+            if (actionLabel) actionLabel.textContent = isDelete ? 'Delete' : isUntag ? 'Remove' : isCopy ? 'Duplicate' : 'Move';
 
             const btn = document.getElementById('btnMoveAISelected');
             if (btn) {
-                btn.style.background = isDelete ? 'var(--danger)' : isCopy ? 'var(--success)' : 'var(--primary)';
-                btn.querySelector('i').className = isDelete ? 'fas fa-trash' : 'fas fa-random';
+                btn.style.background = isDelete ? 'var(--danger)' : isUntag ? '#b45309' : isCopy ? 'var(--success)' : 'var(--primary)';
+                btn.querySelector('i').className = isDelete ? 'fas fa-trash' : isUntag ? 'fas fa-unlink' : 'fas fa-random';
             }
         };
 
@@ -14031,14 +14113,18 @@ Return ONLY a raw JSON array:
 
             const isDelete       = op === 'delete';
             const isCopy         = op === 'copy';
+            const isUntag        = op === 'untag';
             const alsoDelContacts = isDelete && !!document.getElementById('aiClassDeleteContactsToo')?.checked;
 
-            if (!isDelete && !dest) { alert('Please select a destination workspace or BDR.'); return; }
+            if (!isDelete && !isUntag && !dest) { alert('Please select a destination workspace or BDR.'); return; }
 
-            const opVerb   = isDelete ? 'Delete' : isCopy ? 'Duplicate' : 'Move';
-            const opPast   = isDelete ? 'deleted' : isCopy ? 'duplicated' : 'moved';
+            const opVerb   = isDelete ? 'Delete' : isUntag ? 'Remove' : isCopy ? 'Duplicate' : 'Move';
+            const opPast   = isDelete ? 'deleted' : isUntag ? 'removed' : isCopy ? 'duplicated' : 'moved';
             const src      = document.getElementById('aiClassSource')?.value || '';
             const srcLabel = document.getElementById('aiClassSource')?.selectedOptions[0]?.textContent.trim() || 'source';
+            const hgId     = isHgSource(src) ? hgIdFromSource(src) : null;
+
+            if (isUntag && !hgId) { alert('"Remove from Group" only applies when the source is a hypothesis group.'); return; }
 
             const destOpt   = dest ? document.querySelector(`#aiClassDest option[value="${CSS.escape(dest)}"]`) : null;
             const destLabel = (destOpt?.textContent || dest || '').replace(/^🗂️\s*/, '');
@@ -14046,7 +14132,12 @@ Return ONLY a raw JSON array:
             const confirmMsg = isDelete
                 ? `Permanently DELETE ${toAct.length} organization(s)?` +
                   (alsoDelContacts ? '\nTheir contacts will ALSO be permanently deleted.' : '') +
+                  (hgId ? `\n\n⚠️ These orgs may also be used in other workspaces/BDRs — deleting here removes them everywhere, not just from "${srcLabel}". Use "Remove from Group" instead if you only want to untag them.` : '') +
                   `\n\nThis cannot be undone.`
+                : isUntag
+                ? `Remove ${toAct.length} organization(s) from hypothesis group "${srcLabel}"?\n\n` +
+                  `Orgs that exist only in this group's own pool will be permanently deleted (they have nowhere else to live).\n` +
+                  `Orgs also owned by a real workspace/BDR will simply lose the group tag and stay exactly where they are.`
                 : `${opVerb} ${toAct.length} organization(s) to "${destLabel}"?\n\n` +
                   (isCopy
                       ? `Originals will remain in "${srcLabel}".\nNew copies will be created in the destination.`
@@ -14081,7 +14172,7 @@ Return ONLY a raw JSON array:
             }
 
             const now = new Date();
-            let done = 0, errors = 0, contactsDeleted = 0, contactErrors = 0;
+            let done = 0, errors = 0, contactsDeleted = 0, contactErrors = 0, untagDeleted = 0;
             for (const row of toAct) {
                 try {
                     if (isDelete) {
@@ -14102,6 +14193,29 @@ Return ONLY a raw JSON array:
                                 }
                             }
                         }
+                    } else if (isUntag) {
+                        // Untag from this hypothesis group only. If the org's remaining
+                        // group list is empty AND it's owned by this group's own pool
+                        // sentinel (never a real workspace/BDR), it has nowhere else to
+                        // live, so delete it outright — mirrors hypoUnlinkOrgDoc() in
+                        // prospect_organizations_admin.html.
+                        const ids   = (Array.isArray(row.org.hypothesis_group_ids) ? row.org.hypothesis_group_ids : []).filter(id => id !== hgId);
+                        const names = { ...(row.org.hypothesis_group_names || {}) };
+                        delete names[hgId];
+                        const isPoolOnly = ids.length === 0 && (row.org.bdrEmail || '').startsWith(HYPO_POOL_BDR_PREFIX);
+
+                        if (isPoolOnly) {
+                            await deleteDoc(doc(emailDB, 'prospect_organizations', row.org.id));
+                            untagDeleted++;
+                        } else {
+                            await setDoc(
+                                doc(emailDB, 'prospect_organizations', row.org.id),
+                                { hypothesis_group_ids: ids, hypothesis_group_names: names, last_updated_at: now.toISOString() },
+                                { merge: true }
+                            );
+                        }
+                        row.org._deleted = true; // either way, it no longer belongs to this group's list
+                        row.selected     = false;
                     } else if (isCopy) {
                         const { id: _id, ...orgData } = row.org;
                         await addDoc(collection(emailDB, 'prospect_organizations'), {
@@ -14127,14 +14241,18 @@ Return ONLY a raw JSON array:
                 }
             }
 
-            if (isDelete) {
+            if (isDelete || isUntag) {
                 _aiClassRows = _aiClassRows.filter(r => !r.org._deleted);
             }
 
-            const summary = `✅ ${opVerb}d ${done} org(s)${!isDelete ? ` to "${destLabel}"` : ''}.` +
-                            (alsoDelContacts ? ` Deleted ${contactsDeleted} contact(s).` : '') +
-                            (errors ? ` (${errors} org errors)` : '') +
-                            (contactErrors ? ` (${contactErrors} contact errors)` : '');
+            const summary = isUntag
+                ? `✅ Removed ${done} org(s) from "${srcLabel}"` +
+                  (untagDeleted ? ` (${untagDeleted} deleted outright — pool-only)` : '') + `.` +
+                  (errors ? ` (${errors} errors)` : '')
+                : `✅ ${opVerb}d ${done} org(s)${!isDelete ? ` to "${destLabel}"` : ''}.` +
+                  (alsoDelContacts ? ` Deleted ${contactsDeleted} contact(s).` : '') +
+                  (errors ? ` (${errors} org errors)` : '') +
+                  (contactErrors ? ` (${contactErrors} contact errors)` : '');
             if (moveStatus) { moveStatus.textContent = summary; moveStatus.style.color = 'var(--success)'; }
 
             window.renderAIClassResults();
