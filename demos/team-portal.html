@@ -485,7 +485,7 @@
             <h3>PandoConnect Pulse</h3>
             <p>See live replies, connections, and harvest pool progress — the same dashboard clients log into to track their campaign.</p>
           </div>
-          <a class="btn btn-primary" href="../connect/index.html" target="_blank" rel="noopener">
+          <a class="btn btn-primary" href="https://pandonetworking.com/connect/index.html" target="_blank" rel="noopener">
             Open Connect Dashboard <i class="fas fa-arrow-up-right-from-square"></i>
           </a>
         </div>
@@ -509,6 +509,10 @@
     let currentReservations = [];
     let currentScope = 'mine';
     let isAdminUser = false;
+    // The reservation ID that the currently-open booking iframe is scheduling
+    // a call for. Set right before the iframe is shown; consumed by the
+    // postMessage listener once book.html confirms the meeting was booked.
+    let pendingScheduleReservationId = null;
 
     // ── Tabs ──────────────────────────────────────────────
     document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -576,6 +580,45 @@
       }, 500);
     });
 
+    // ── Open the booking iframe for a given reservation ────
+    // Shared by the "just reserved" flow and the per-row "Schedule Call" /
+    // "Reschedule" button, so there's always a way back into the calendar
+    // for a reservation, not just in the moment right after reserving it.
+    function openBookingEmbed(reservationId, companyName, meetingWith) {
+      pendingScheduleReservationId = reservationId;
+      document.getElementById('bookingEmbedCompany').textContent = companyName;
+      document.getElementById('bookingEmbedHost').textContent = TEAM_INFO[meetingWith].name;
+      document.getElementById('bookingFrame').src = `../public/schedule/book.html?type=${meetingWith}-30`;
+      const embed = document.getElementById('bookingEmbed');
+      embed.classList.add('show');
+      embed.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+    window.openBookingEmbed = openBookingEmbed;
+
+    // The embedded book.html posts a message back once it actually books a
+    // meeting on the host's Microsoft calendar (see public/schedule/book.html
+    // confirmBooking()). This is the step that makes "reserve a company" and
+    // "actually get a call on Taylor/Joe/Sam's calendar" the same action
+    // instead of two unrelated things a team member has to remember to do.
+    window.addEventListener('message', async (event) => {
+      const msg = event.data;
+      if (!msg || msg.source !== 'pando-schedule' || msg.status !== 'booked') return;
+      if (!pendingScheduleReservationId) return;
+
+      const reservationId = pendingScheduleReservationId;
+      pendingScheduleReservationId = null;
+      try {
+        await apiFetch(`/api/team-portal/reservations/${reservationId}/mark-scheduled`, {
+          method: 'POST',
+          body: JSON.stringify({ bookingId: msg.bookingId, startTime: msg.startTime }),
+        });
+        showAlert('reserveAlert', 'success', `<i class="fas fa-circle-check"></i> Meeting booked on the calendar${msg.invitesSent === false ? ' — but the calendar invite could not be sent automatically, so please confirm directly.' : ' and calendar invites sent.'}`);
+        loadReservations();
+      } catch (err) {
+        console.warn('Could not record scheduled meeting on reservation:', err.message);
+      }
+    });
+
     // ── Reserve a company ─────────────────────────────────
     document.getElementById('reserveBtn').addEventListener('click', async () => {
       hideAlert('reserveAlert');
@@ -600,16 +643,12 @@
         });
 
         if (data.alreadyOwned) {
-          showAlert('reserveAlert', 'info', 'You already have this company reserved. Scroll down to schedule or manage it.');
+          showAlert('reserveAlert', 'info', 'You already have this company reserved. Use the calendar below to schedule your intro call.');
         } else {
-          showAlert('reserveAlert', 'success', `<i class="fas fa-circle-check"></i> <strong>${companyName}</strong> is reserved to you until ${new Date(data.reservation.expiresAt).toLocaleDateString()}. Now schedule your intro call below.`);
+          showAlert('reserveAlert', 'success', `<i class="fas fa-circle-check"></i> <strong>${companyName}</strong> is reserved to you until ${new Date(data.reservation.expiresAt).toLocaleDateString()}. Now pick a time below to actually get it on ${TEAM_INFO[meetingWith].name}'s calendar.`);
         }
 
-        document.getElementById('bookingEmbedCompany').textContent = companyName;
-        document.getElementById('bookingEmbedHost').textContent = TEAM_INFO[meetingWith].name;
-        document.getElementById('bookingFrame').src = `../public/schedule/book.html?type=${meetingWith}-30`;
-        document.getElementById('bookingEmbed').classList.add('show');
-
+        openBookingEmbed(data.reservation.id, companyName, meetingWith);
         loadReservations();
       } catch (err) {
         if (err.status === 409) {
@@ -652,6 +691,7 @@
               <th>Company</th>
               ${showOwner ? '<th>Reserved By</th>' : ''}
               <th>Meeting With</th>
+              <th>Meeting</th>
               <th>Reserved</th>
               <th>Expires</th>
               <th>Status</th>
@@ -662,21 +702,36 @@
           <tbody>
             ${rows.map(r => {
               const s = statusLabel(r);
+              const meetingCell = r.meetingScheduled
+                ? `<span class="status-badge active"><i class="fas fa-calendar-check"></i> ${new Date(r.meetingStartTime).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span>`
+                : `<span class="status-badge expired"><i class="fas fa-calendar-xmark"></i> Not scheduled</span>`;
+              const companyJsArg = JSON.stringify(r.companyName).replace(/'/g, '&#39;');
+              const scheduleBtn = r.status === 'active'
+                ? `<button class="btn btn-outline btn-sm" onclick='scheduleReservationCall("${r.id}", ${companyJsArg}, "${r.meetingWith}")'><i class="fas fa-calendar-plus"></i> ${r.meetingScheduled ? 'Reschedule' : 'Schedule Call'}</button>`
+                : '';
               return `
                 <tr>
                   <td class="company-cell">${escapeHtml(r.companyName)}</td>
                   ${showOwner ? `<td>${escapeHtml(r.reservedByName || r.reservedByEmail)}</td>` : ''}
                   <td>${escapeHtml(r.meetingWithName || r.meetingWith)}</td>
+                  <td>${meetingCell}</td>
                   <td>${new Date(r.reservedAt).toLocaleDateString()}</td>
                   <td>${new Date(r.expiresAt).toLocaleDateString()}</td>
                   <td><span class="status-badge ${s.cls}"><i class="fas ${s.icon}"></i> ${s.label}</span></td>
                   <td class="notes-cell">${escapeHtml(r.notes || '—')}</td>
-                  <td>${r.status === 'active' ? `<button class="btn btn-danger-outline btn-sm" onclick="releaseReservation('${r.id}')">Release</button>` : ''}</td>
+                  <td style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+                    ${scheduleBtn}
+                    ${r.status === 'active' ? `<button class="btn btn-danger-outline btn-sm" onclick="releaseReservation('${r.id}')">Release</button>` : ''}
+                  </td>
                 </tr>`;
             }).join('')}
           </tbody>
         </table>`;
     }
+
+    window.scheduleReservationCall = function(id, companyName, meetingWith) {
+      openBookingEmbed(id, companyName, meetingWith);
+    };
 
     function escapeHtml(str) {
       const d = document.createElement('div');
