@@ -1422,6 +1422,8 @@
     let roleColumnMappings = {};
     let database = null;
     let activeCustomerIds = new Set();
+    let clientIncludedNames = new Set();
+    let clientIncludedKareKeys = new Set();
     let filteredCustomers = [];
     let pendingChanges = new Map();
     let selectedRows = new Set();
@@ -1461,6 +1463,32 @@
       }
     }
 
+    function getCompanyBullhornId(company) {
+      const id = company?.bullhornid ?? company?.bullhorn_id;
+      if (id === null || id === undefined || id === '') return null;
+      return id;
+    }
+
+    function isActiveStatus(status) {
+      return String(status || '').trim().toLowerCase() === 'active';
+    }
+
+    function addActiveCustomerId(id) {
+      if (id === null || id === undefined || id === '') return;
+      activeCustomerIds.add(id);
+      activeCustomerIds.add(String(id));
+      const asInt = parseInt(id, 10);
+      if (!Number.isNaN(asInt)) activeCustomerIds.add(asInt);
+    }
+
+    function removeActiveCustomerId(id) {
+      if (id === null || id === undefined || id === '') return;
+      activeCustomerIds.delete(id);
+      activeCustomerIds.delete(String(id));
+      const asInt = parseInt(id, 10);
+      if (!Number.isNaN(asInt)) activeCustomerIds.delete(asInt);
+    }
+
     // Fetch active companies
     async function fetchActiveCompanies() {
       try {
@@ -1475,12 +1503,10 @@
           const activeCompanies = {};
           
           Object.entries(data).forEach(([id, company]) => {
-            if (company.status === 'Active' && company.bullhornid) {
+            const bullhornid = getCompanyBullhornId(company);
+            if (isActiveStatus(company.status) && bullhornid !== null) {
               activeCompanies[id] = company;
-              // Add both string and number versions to handle data type mismatches
-              activeCustomerIds.add(company.bullhornid);
-              activeCustomerIds.add(company.bullhornid.toString());
-              activeCustomerIds.add(parseInt(company.bullhornid));
+              addActiveCustomerId(bullhornid);
             }
           });
           
@@ -1504,23 +1530,26 @@
         console.log('🔗 Building KARE to Company mapping...');
         const mapping = {};
         
-        // For each KARE record, find the matching company by bullhorn_id
+        // For each KARE record, find the matching company by key or bullhorn_id
         Object.entries(kareData).forEach(([kareOrgId, kareOrg]) => {
+          if (companiesData[kareOrgId]) {
+            mapping[kareOrgId] = companiesData[kareOrgId];
+            return;
+          }
+
           const kareBullhornId = kareOrg.bullhorn_id || kareOrg.bullhornid;
-          
-          if (kareBullhornId) {
-            // Find matching company
-            const matchingCompany = Object.values(companiesData).find(company => {
-              const companyBullhornId = company.bullhornid;
-              return companyBullhornId == kareBullhornId || 
-                     companyBullhornId === String(kareBullhornId) ||
-                     String(companyBullhornId) === String(kareBullhornId) ||
-                     parseInt(companyBullhornId) === parseInt(kareBullhornId);
-            });
-            
-            if (matchingCompany) {
-              mapping[kareOrgId] = matchingCompany;
-            }
+          if (!kareBullhornId && kareBullhornId !== 0) return;
+
+          const matchingCompany = Object.values(companiesData).find(company => {
+            const companyBullhornId = getCompanyBullhornId(company);
+            if (companyBullhornId === null) return false;
+            return companyBullhornId == kareBullhornId ||
+                   String(companyBullhornId) === String(kareBullhornId) ||
+                   parseInt(companyBullhornId, 10) === parseInt(kareBullhornId, 10);
+          });
+
+          if (matchingCompany) {
+            mapping[kareOrgId] = matchingCompany;
           }
         });
         
@@ -1532,56 +1561,67 @@
       }
     }
 
-    // Fetch client overrides from ppccare/client_overrides
-    async function fetchClientOverrides() {
+    // Apply client overrides (from current_clients.html) to the active companies map
+    // - "exclude": remove the company even if it is Active in Bullhorn
+    // - "include": add the company even if it is Inactive / missing from the customer list
+    async function applyClientOverrides(activeCompanies) {
       try {
         const { ref, get } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js');
-        const snap = await get(ref(database, 'ppccare/client_overrides'));
-        return snap.exists() ? snap.val() : {};
-      } catch (error) {
-        console.warn('⚠️ Could not load client overrides, proceeding without them:', error);
-        return {};
-      }
-    }
+        const [overridesSnap, allCompaniesSnap] = await Promise.all([
+          get(ref(database, 'ppccare/client_overrides')),
+          get(ref(database, 'ppccare/companies'))
+        ]);
+        const overrides = overridesSnap.exists() ? overridesSnap.val() : {};
+        const allCompanies = allCompaniesSnap.exists() ? allCompaniesSnap.val() : {};
 
-    // Apply client overrides to activeCustomerIds
-    // - "exclude" override: remove company's bullhornid from the active set
-    // - "include" override: force-add company's bullhornid even if the company is inactive
-    async function applyClientOverrides(allCompanies) {
-      const overrides = await fetchClientOverrides();
-      if (!Object.keys(overrides).length) return;
+        clientIncludedNames.clear();
+        clientIncludedKareKeys.clear();
 
-      Object.entries(overrides).forEach(([companyKey, override]) => {
-        const ov = override && typeof override === 'object' ? override : {};
-        const status = ov.status;
-        if (!status) return;
+        if (!Object.keys(overrides).length) return;
 
-        // Look up the company's bullhornid (prefer override cache, fall back to live companies)
-        const company = allCompanies[companyKey];
-        const bullhornid = ov.bullhornid
-          || (company && (company.bullhornid || company.bullhorn_id));
+        Object.entries(overrides).forEach(([companyKey, override]) => {
+          const ov = override && typeof override === 'object' ? override : {};
+          const status = ov.status;
+          if (!status) return;
 
-        if (!bullhornid && status !== 'include') return;
-
-        if (status === 'exclude') {
-          // Remove this ID in all its forms
-          [bullhornid, String(bullhornid), parseInt(bullhornid)].forEach(id => {
-            if (id !== null && id !== undefined && !isNaN(id)) activeCustomerIds.delete(id);
-          });
-          console.log(`🚫 Client override EXCLUDE applied: ${ov.name || companyKey} (${bullhornid})`);
-
-        } else if (status === 'include') {
-          // Force-add even if the company was not active
-          if (bullhornid) {
-            [bullhornid, String(bullhornid), parseInt(bullhornid)].forEach(id => {
-              if (id !== null && id !== undefined && !isNaN(id)) activeCustomerIds.add(id);
-            });
-            console.log(`✅ Client override INCLUDE applied: ${ov.name || companyKey} (${bullhornid})`);
+          if (status === 'exclude') {
+            const company = activeCompanies[companyKey] || allCompanies[companyKey];
+            const bullhornid = ov.bullhornid ?? getCompanyBullhornId(company);
+            delete activeCompanies[companyKey];
+            removeActiveCustomerId(bullhornid);
+            console.log(`🚫 Client override EXCLUDE applied: ${ov.name || companyKey} (${bullhornid})`);
+            return;
           }
-        }
-      });
 
-      console.log(`🔧 After client overrides: ${activeCustomerIds.size} active customer IDs`);
+          if (status !== 'include') return;
+
+          if (ov.name) clientIncludedNames.add(ov.name);
+          if (ov.source === 'kare') clientIncludedKareKeys.add(companyKey);
+
+          if (!activeCompanies[companyKey]) {
+            if (allCompanies[companyKey]) {
+              activeCompanies[companyKey] = allCompanies[companyKey];
+            } else if (ov.bullhornid || ov.name) {
+              // KARE-only org: synthesize a minimal company object from override data
+              activeCompanies[companyKey] = {
+                org: ov.name,
+                bullhornid: ov.bullhornid,
+                bullhorn_id: ov.bullhornid,
+                status: 'Active'
+              };
+            }
+          }
+
+          const company = activeCompanies[companyKey];
+          const bullhornid = ov.bullhornid ?? getCompanyBullhornId(company);
+          addActiveCustomerId(bullhornid);
+          console.log(`✅ Client override INCLUDE applied: ${ov.name || companyKey} (${bullhornid})`);
+        });
+
+        console.log(`🔧 After client overrides: ${Object.keys(activeCompanies).length} companies, ${activeCustomerIds.size} active customer IDs`);
+      } catch (error) {
+        console.warn('⚠️ Could not apply client overrides, proceeding without them:', error);
+      }
     }
 
     // Fetch KARE data (filtered by active customers)
@@ -1647,24 +1687,25 @@
               console.log(`   Org name: ${org?.organization_name}`);
             }
             
+            const orgName = org?.organization_name || '';
+            const includedByOverride = clientIncludedKareKeys.has(id) ||
+              (orgName && clientIncludedNames.has(orgName));
+
             // Check multiple possible field names and data types
             const possibleIds = [
               org?.bullhorn_id,
-              org?.bullhornid,
-              org?.bullhorn_id?.toString(),
-              org?.bullhornid?.toString(),
-              parseInt(org?.bullhorn_id),
-              parseInt(org?.bullhornid)
-            ].filter(val => val !== null && val !== undefined && !isNaN(val));
+              org?.bullhornid
+            ].filter(val => val !== null && val !== undefined && val !== '');
             
             if (index < 3) {
               console.log(`   Possible IDs found: [${possibleIds.join(', ')}]`);
             }
             
-            const hasMatch = possibleIds.some(possibleId => {
-              const match = activeCustomerIds.has(possibleId) || 
-                           activeCustomerIds.has(possibleId.toString()) ||
-                           activeCustomerIds.has(parseInt(possibleId));
+            const hasMatch = includedByOverride || possibleIds.some(possibleId => {
+              const asInt = parseInt(possibleId, 10);
+              const match = activeCustomerIds.has(possibleId) ||
+                           activeCustomerIds.has(String(possibleId)) ||
+                           (!Number.isNaN(asInt) && activeCustomerIds.has(asInt));
               
               if (index < 3 && match) {
                 console.log(`   ✅ MATCH FOUND! Possible ID ${possibleId} matches active customer`);
