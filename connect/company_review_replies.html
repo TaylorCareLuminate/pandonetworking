@@ -7323,9 +7323,17 @@
                                 <!-- Ignore Button -->
                                 <button class="btn ${conv.ignored || conv.isCurrentlyIgnored ? 'btn-secondary' : 'btn-danger'}" 
                                         onclick="ignoreConversation('${conv.id}')" 
-                                        style="margin-bottom: 1rem; width: 100%; ${conv.ignored || conv.isCurrentlyIgnored ? 'background: #6b7280; color: white; border: 2px solid #4b5563;' : ''}">
+                                        style="margin-bottom: 0.5rem; width: 100%; ${conv.ignored || conv.isCurrentlyIgnored ? 'background: #6b7280; color: white; border: 2px solid #4b5563;' : ''}">
                                     <i class="fas ${conv.ignored || conv.isCurrentlyIgnored ? 'fa-eye' : 'fa-eye-slash'}"></i> 
                                     ${conv.ignored || conv.isCurrentlyIgnored ? '✓ Conversation Ignored - Click to Un-Ignore' : 'Ignore Conversation, Not Pando Executive Networking Originated'}
+                                </button>
+
+                                <!-- Wrong Contact Button -->
+                                <button class="btn ${isWrongContact ? 'btn-secondary' : 'btn-danger'}"
+                                        onclick="toggleWrongContact('${conv.id}')"
+                                        style="margin-bottom: 1rem; width: 100%; ${isWrongContact ? 'background: #6b7280; color: white; border: 2px solid #4b5563;' : ''}">
+                                    <i class="fas ${isWrongContact ? 'fa-undo' : 'fa-user-slash'}"></i>
+                                    ${isWrongContact ? '✓ Marked as Wrong Contact - Click to Unmark' : 'Mark as Wrong Contact'}
                                 </button>
                                 
                                 <div class="category-selectors">
@@ -7348,15 +7356,11 @@
                                         </select>
                                     </div>
                                     <div class="category-selector">
-                                        <label>Follow-Up Category:</label>
-                                        <select id="followup-${conv.id}" onchange="saveCategoryAuto('${conv.id}')">
-                                            <option value="">-- Keep Current --</option>
-                                            <option value="No Follow Up" ${followUpCategory === 'No Follow Up' ? 'selected' : ''}>No Follow Up</option>
-                                            <option value="Followed Up No Invite" ${followUpCategory === 'Followed Up No Invite' ? 'selected' : ''}>Followed Up No Invite</option>
-                                            <option value="Followed Up Soft Invite" ${followUpCategory === 'Followed Up Soft Invite' ? 'selected' : ''}>Followed Up Soft Invite</option>
-                                            <option value="Followed Up Calendar Link" ${followUpCategory === 'Followed Up Calendar Link' ? 'selected' : ''}>Followed Up Calendar Link</option>
-                                            <option value="Qualified Wrong Contact" ${followUpCategory === 'Qualified Wrong Contact' ? 'selected' : ''}>❌ Qualified Wrong Contact</option>
-                                        </select>
+                                        <label>Follow-Ups Sent <span style="font-weight:400; text-transform:none; color:#9ca3af;">(fix if the AI got this wrong)</span>:</label>
+                                        <input type="number" id="invitesSentInput-${conv.id}" min="0" max="10" step="1"
+                                               value="${conv.followUpInvitesSent || 0}"
+                                               onchange="setFollowUpInvitesSentManual('${conv.id}', this.value)"
+                                               style="width:100%; padding:8px; border:2px solid #cbd5e1; border-radius:6px; font-size:0.9rem;">
                                     </div>
                                 </div>
                                 ${conv.manualCategoryOverride ? '<p style="color: #10b981; font-size: 0.85rem; margin-top: 0.5rem;"><i class="fas fa-lock"></i> Manual override active - AI will not recategorize</p>' : ''}
@@ -7561,15 +7565,15 @@
             `;
         }
 
-        // Save category changes (auto-save when dropdown changes)
+        // Save category changes (auto-save when the Response Category dropdown changes). The
+        // old "Follow-Up Category" dropdown was removed from the card — Wrong Contact now has its
+        // own dedicated toggleWrongContact() button, and the other Follow-Up Category values
+        // (No Follow Up / Followed Up No Invite / etc.) are no longer surfaced anywhere in the UI.
         window.saveCategoryAuto = async function(conversationId) {
             const responseSelect = document.getElementById(`response-${conversationId}`);
-            const followUpSelect = document.getElementById(`followup-${conversationId}`);
-            
-            const responseValue = responseSelect.value;
-            const followUpValue = followUpSelect.value;
-            
-            if (!responseValue && !followUpValue) {
+            const responseValue = responseSelect ? responseSelect.value : '';
+
+            if (!responseValue) {
                 return; // Nothing to save
             }
             
@@ -7594,8 +7598,7 @@
                 const updateData = {
                     manualCategoryOverride: true // Mark as manual override so AI won't change it
                 };
-                if (responseValue) updateData.responseCategory = responseValue;
-                if (followUpValue) updateData.followUpCategory = followUpValue;
+                updateData.responseCategory = responseValue;
                 
                 // For webhook conversations, store override in a separate collection
                 if (conversationId.startsWith('webhook_')) {
@@ -7633,8 +7636,7 @@
                 }
                 
                 // Update the conversation object
-                if (responseValue) conversation.responseCategory = responseValue;
-                if (followUpValue) conversation.followUpCategory = followUpValue;
+                conversation.responseCategory = responseValue;
                 conversation.manualCategoryOverride = true;
 
                 // Scheduled/Declined mean no more follow-up invitations — clear any pending draft
@@ -7716,7 +7718,7 @@
                 }
                 
                 // Show brief confirmation in the UI
-                const selectElement = responseValue ? responseSelect : followUpSelect;
+                const selectElement = responseSelect;
                 const originalBorder = selectElement.style.border;
                 selectElement.style.border = '2px solid #10b981';
                 setTimeout(() => {
@@ -8140,6 +8142,86 @@
             } catch (error) {
                 console.error('❌ Error marking conversation as declined:', error);
                 alert('❌ Error marking conversation as declined: ' + error.message);
+            }
+        };
+
+        // Toggle "Qualified Wrong Contact" — excludes this conversation from prospect counts,
+        // the Conversation Categories grid, and CSV/PDF exports. Replaces the old granular
+        // "Follow-Up Category" dropdown (No Follow Up / Followed Up No Invite / etc.) — that
+        // dropdown's other values are no longer surfaced now that the grid tracks invites-sent
+        // instead, but "Qualified Wrong Contact" is still the same underlying followUpCategory
+        // value everywhere else in the app relies on for exclusion.
+        window.toggleWrongContact = async function(conversationId) {
+            const conversation = allConversations.find(c => c.id === conversationId);
+            if (!conversation) return;
+            const isCurrentlyWrong = conversation.followUpCategory === 'Qualified Wrong Contact';
+            const confirmMessage = isCurrentlyWrong
+                ? 'Unmark this contact as a wrong contact? They will be counted again in follow-up totals and reports.'
+                : 'Mark this contact as a wrong contact? They will be excluded from follow-up totals and reports.';
+            if (!confirm(confirmMessage)) return;
+
+            const newFollowUpCategory = isCurrentlyWrong ? 'No Follow Up' : 'Qualified Wrong Contact';
+            const { collection, docId } = resolveConversationDocRef(conversation);
+            try {
+                const response = await fetch(`${RAILWAY_URL}/heyreach/inbox/update-conversation-category`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        conversationId: docId,
+                        collection,
+                        followUpCategory: newFollowUpCategory,
+                        manualCategoryOverride: true
+                    })
+                });
+                const result = await response.json();
+                if (!result.success) throw new Error(result.error || 'Failed to update category');
+
+                conversation.followUpCategory = newFollowUpCategory;
+                conversation.manualCategoryOverride = true;
+                console.log(`✅ ${isCurrentlyWrong ? 'Un-marked' : 'Marked'} ${conversationId} as Wrong Contact`);
+                updateCategoryGrid();
+                applyAllFilters();
+            } catch (error) {
+                console.error('❌ Error toggling wrong contact status:', error);
+                alert('❌ Error toggling wrong contact status: ' + error.message);
+            }
+        };
+
+        // Manually correct the "1-2-3" invite counter shown on the card — e.g. the AI/tracker
+        // undercounted a calendar link that was already in the BDR's original outreach message,
+        // long before this tracker existed (see countInvitationsSent's one-time backfill on the
+        // server, which only ever runs once — this lets an admin fix it by hand any time after).
+        window.setFollowUpInvitesSentManual = async function(conversationId, rawValue) {
+            const conversation = allConversations.find(c => c.id === conversationId);
+            if (!conversation) return;
+            const input = document.getElementById(`invitesSentInput-${conversationId}`);
+            const parsed = parseInt(rawValue, 10);
+            if (!Number.isInteger(parsed) || parsed < 0) {
+                alert('Please enter a valid non-negative number.');
+                if (input) input.value = conversation.followUpInvitesSent || 0;
+                return;
+            }
+
+            const { collection, docId } = resolveConversationDocRef(conversation);
+            try {
+                const response = await fetch(`${RAILWAY_URL}/heyreach/inbox/set-followup-invites-sent`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ collection, docId, invitesSent: parsed })
+                });
+                const result = await response.json();
+                if (!result.success) throw new Error(result.error || 'Failed to update invite count');
+
+                conversation.followUpInvitesSent = parsed;
+                conversation.followUpSequence = null;
+                console.log(`✅ Manually set follow-ups sent to ${parsed} for ${conversationId}`);
+                updateFollowUpDraftCount();
+                updateCategoryGrid();
+                applyAllFilters();
+            } catch (error) {
+                console.error('❌ Error setting follow-ups sent:', error);
+                alert('❌ Error setting follow-ups sent: ' + error.message);
+                if (input) input.value = conversation.followUpInvitesSent || 0;
             }
         };
 

@@ -4417,6 +4417,16 @@ We help busy executives with their networking, often on LinkedIn. We do this for
 
 Let me know if a meeting would be helpful.`;
 
+  // Used instead of STALE_RECONNECT_MESSAGE when the company works primarily in
+  // employee benefits — pitches the benefits-leader interview series rather than
+  // the general executive-networking rebrand message.
+  const BENEFITS_FOLLOWUP_MESSAGE =
+`It has been quite a while since we last connected.
+
+HealthLuminate is doing something new and I wanted to connect with you about it. We are conducting interviews with employee benefits leaders, letting these leaders speak out anonymously about what partners are actually making a difference with cost containment and meaningful benefits design.
+
+Given our conversation before, I was hoping to ask your thoughts on the questions and our approach. Let me know if you have a minute we can connect.`;
+
   function lastCommsDate(emails, liMsgs) {
     let max = 0;
     for (const e of emails || []) {
@@ -4729,6 +4739,23 @@ Let me know if a meeting would be helpful.`;
     }
   }
 
+  // Persists a "Not Applicable" (NA) flag for companies that are neither B2B nor
+  // an employee-benefits business — permanently excluded from future follow-up
+  // scans (see fuClassifyCompany). Unlike "Never Engaged", this is sticky and not
+  // auto-cleared, since re-checking would require another paid Brave + AI call.
+  async function fuSetNotApplicable(account, reason) {
+    try {
+      await waitForWrapper();
+      const { doc, setDoc } = window.clemailFirestore;
+      const existing = scanState[account.id] || {};
+      const updated = { ...existing, notApplicable: true, notApplicableAt: new Date().toISOString(), notApplicableReason: reason || '' };
+      await setDoc(doc(window.clemailDb, 'company_comms_scans', account.id), updated);
+      scanState[account.id] = updated;
+    } catch (e) {
+      console.warn('fuSetNotApplicable failed:', e.message);
+    }
+  }
+
   // ── Main entry ──────────────────────────────────────────────────────────────
   // Uses the already-collected comms scan data (emails + LinkedIn per company)
   // rather than re-scanning BDR inboxes.  One AI call per company.
@@ -4784,6 +4811,7 @@ Let me know if a meeting would be helpful.`;
       if (SKIP_STAGES.has(stage)) return false;
       const s = scanState[a.id];
       if (!s?.lastScanDate) return false;
+      if (s.notApplicable) return false; // not B2B and not benefits — permanently excluded
       const { hex, other } = splitHexEmails(allRealOf(s));
       const li = allLiOf(s);
       const hexOnly = hex.length > 0 && other.length === 0 && li.length === 0;
@@ -4807,6 +4835,10 @@ Let me know if a meeting would be helpful.`;
     const skippedStage = allAccounts.filter(a => SKIP_STAGES.has((a.stage || '').toLowerCase().trim()));
     if (skippedStage.length) {
       fuLog(`⏭ Skipping ${skippedStage.length} existing customer${skippedStage.length === 1 ? '' : 's'} (Active / Building / Paused): ${skippedStage.slice(0, 5).map(a => a.name).join(', ')}${skippedStage.length > 5 ? '…' : ''}`, 'info');
+    }
+    const skippedNA = allAccounts.filter(a => scanState[a.id]?.notApplicable);
+    if (skippedNA.length) {
+      fuLog(`⏭ Skipping ${skippedNA.length} compan${skippedNA.length === 1 ? 'y' : 'ies'} marked "NA" (not B2B, not benefits): ${skippedNA.slice(0, 5).map(a => a.name).join(', ')}${skippedNA.length > 5 ? '…' : ''}`, 'info');
     }
 
     // Persist "Never Engaged" markers so future scans skip these orgs without
@@ -4857,10 +4889,6 @@ Let me know if a meeting would be helpful.`;
       const staleReconnect = !hexOnly && last1to1 && (
         daysAgo(last1to1) >= staleDays || !lastInLookback
       );
-      const emailsForAi = hexOnly ? hexAll : (staleReconnect ? otherAll : otherEmails);
-      const liForCard   = staleReconnect ? allLi : liMsgs;
-      const usedTemplate = hexOnly || staleReconnect;
-
       const pct = Math.round((i / targetAccounts.length) * 90);
       fuSetStatus(`Analyzing ${account.name}… (${i + 1}/${targetAccounts.length})`, pct);
       if (hexOnly) {
@@ -4871,28 +4899,45 @@ Let me know if a meeting would be helpful.`;
         fuLog(`[${account.name}] ${otherEmails.length} email(s), ${liMsgs.length} LinkedIn conv(s)${hexEmails.length ? ` · ignored ${hexEmails.length} HEX meeting email${hexEmails.length === 1 ? '' : 's'}` : ''}`);
       }
 
-      // B2B gate — verify via live Brave search that this is actually a business
-      // selling to other businesses before recommending ANY outreach (AI follow-up,
-      // HEX intro, or rebrand reconnect). Consumer brands, care-delivery providers,
-      // government/nonprofit entities, etc. are skipped.
-      const b2bCheck = await fuCheckB2B(account);
-      if (!b2bCheck.isB2B) {
-        fuLog(`  ⛔ Skipped — doesn't look like a B2B company (Brave search): ${b2bCheck.reason || 'no reason given'}`, 'warning');
+      // Classification gate — verify via live Brave search + AI whether this is a
+      // B2B business and/or works primarily in employee benefits, before
+      // recommending ANY outreach (AI follow-up, HEX intro, or reconnect).
+      //   - Benefits companies get a dedicated benefits-leader-interview reconnect.
+      //   - B2B (non-benefits) companies get the existing HEX/rebrand/AI messaging.
+      //   - Neither B2B nor benefits → mark "NA" and never scan again.
+      const classification = await fuClassifyCompany(account);
+      if (!classification.isB2B && !classification.isBenefits) {
+        fuLog(`  ⛔ Marked NA — not a B2B company and not in employee benefits (Brave search): ${classification.reason || 'no reason given'}`, 'warning');
+        await fuSetNotApplicable(account, classification.reason || '');
         analyzed++;
         document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
         if (i < targetAccounts.length - 1 && !fuShouldStop) await sleep(400);
         continue;
       }
-      if (b2bCheck.unverified) {
-        fuLog(`  ⚠ Could not verify B2B status via Brave search — proceeding anyway.`, 'warning');
+      if (classification.unverified) {
+        fuLog(`  ⚠ Could not verify B2B/benefits status via Brave search — proceeding anyway.`, 'warning');
       }
+
+      // A HEX-only connection has no real prior 1:1 conversation to reference, so
+      // the benefits reconnect (which says "given our conversation before") only
+      // applies when there's actual history beyond the shared meeting-group emails.
+      const benefitsPath = classification.isBenefits && !hexOnly;
+      if (benefitsPath) {
+        fuLog(`[${account.name}] Classified as employee benefits — using benefits-leader interview reconnect${hexAll.length ? ` · ignored ${hexAll.length} HEX meeting email${hexAll.length === 1 ? '' : 's'}` : ''}`);
+      }
+
+      const emailsForAi = hexOnly ? hexAll : ((staleReconnect || benefitsPath) ? otherAll : otherEmails);
+      const liForCard   = (staleReconnect || benefitsPath) ? allLi : liMsgs;
+      const usedTemplate = hexOnly || staleReconnect || benefitsPath;
 
       const analysis = hexOnly
         ? fuHexOnlyAnalysis(account, hexAll)
-        : staleReconnect
-          ? fuStaleReconnectAnalysis(account, otherAll, allLi, last1to1)
-          : await fuAnalyzeCompany(account, emailsForAi, liMsgs, notes,
-                                   screeningPrompt, contentPrompt, minDaysSince, skipScheduled);
+        : benefitsPath
+          ? fuBenefitsAnalysis(account, otherAll, allLi)
+          : staleReconnect
+            ? fuStaleReconnectAnalysis(account, otherAll, allLi, last1to1)
+            : await fuAnalyzeCompany(account, emailsForAi, liMsgs, notes,
+                                     screeningPrompt, contentPrompt, minDaysSince, skipScheduled);
 
       analyzed++;
       document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
@@ -4902,7 +4947,7 @@ Let me know if a meeting would be helpful.`;
         continue;
       }
 
-      if (hexOnly || staleReconnect || (analysis.shouldFollowUp && (analysis.fitScore || 0) >= fitThreshold)) {
+      if (hexOnly || staleReconnect || benefitsPath || (analysis.shouldFollowUp && (analysis.fitScore || 0) >= fitThreshold)) {
         // Find the LinkedIn conversation that best matches the AI-identified contact.
         // First try an exact or first-name match on leadName; fall back to liMsgs[0].
         const aiName      = (analysis.contactName || '').toLowerCase().trim();
@@ -4932,7 +4977,7 @@ Let me know if a meeting would be helpful.`;
           contactTitle:      analysis.contactTitle || '',
           contactCompany:    account.name,
           contactLocation:   bestLi?.leadLocation  || '', // best-effort, used for timezone guessing when inserting times
-          source:            hexOnly ? 'HEX intro' : (staleReconnect ? 'Rebrand reconnect' : (analysis.channel || 'linkedin')),
+          source:            hexOnly ? 'HEX intro' : (benefitsPath ? 'Benefits reconnect' : (staleReconnect ? 'Rebrand reconnect' : (analysis.channel || 'linkedin'))),
           llamaScore:        analysis.fitScore      || 5,
           urgency:           analysis.urgency       || 'medium',
           reason:            analysis.reason        || '',
@@ -4952,6 +4997,7 @@ Let me know if a meeting would be helpful.`;
           _bdrEmail:         bdrEmail,
           hexOnly,
           staleReconnect,
+          isBenefits:        benefitsPath,
         });
         fuLog(`  ✓ Follow-up recommended for ${analysis.contactName} (score ${analysis.fitScore}/10, ${analysis.urgency})`, 'success');
       } else {
@@ -4959,8 +5005,8 @@ Let me know if a meeting would be helpful.`;
       }
 
       if (i < targetAccounts.length - 1 && !fuShouldStop) {
-        // Every account now makes at least a Brave + B2B-check AI call; template paths
-        // (HEX/reconnect) skip the heavier follow-up-drafting call, so need less pacing.
+        // Every account now makes at least a Brave + classification AI call; template
+        // paths (HEX/benefits/reconnect) skip the heavier follow-up-drafting call.
         await sleep(usedTemplate ? 500 : 1000);
       }
     }
@@ -4989,16 +5035,21 @@ Let me know if a meeting would be helpful.`;
     setTimeout(() => { if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-stop"></i> Stop'; } }, 4000);
   };
 
-  // ── B2B eligibility gate ─────────────────────────────────────────────────
+  // ── B2B / employee-benefits eligibility gate ────────────────────────────
   // Before recommending ANY outreach (AI follow-up, HEX intro, or rebrand
-  // reconnect), run a live Brave search on the company and have AI confirm it's
-  // an actual B2B business — not a consumer brand, care-delivery provider,
-  // government/nonprofit entity, or something unrelated. Cached per account for
-  // the rest of the session so re-scans don't repeat the same search.
-  const fuB2bCache = new Map(); // accountId → { isB2B, reason, unverified }
+  // reconnect), run a live Brave search on the company and have AI classify it:
+  //   isB2B      — sells to other businesses/organizations, not a consumer
+  //                brand, care-delivery provider, government/nonprofit entity.
+  //   isBenefits — works primarily in employee benefits (broker/consultant,
+  //                benefits admin platform, point-solution vendor, carrier/TPA
+  //                focused on employer-sponsored benefits).
+  // Companies that are neither B2B nor benefits are marked "NA" and excluded
+  // from future scans entirely. Cached per account for the rest of the session
+  // so re-scans don't repeat the same search/AI call.
+  const fuClassifyCache = new Map(); // accountId → { isB2B, isBenefits, reason, unverified }
 
-  async function fuCheckB2B(account) {
-    if (fuB2bCache.has(account.id)) return fuB2bCache.get(account.id);
+  async function fuClassifyCompany(account) {
+    if (fuClassifyCache.has(account.id)) return fuClassifyCache.get(account.id);
 
     const query = `${account.name}${account.domain ? ' ' + account.domain : ''} company what they do`;
     let snippetText = '';
@@ -5017,14 +5068,14 @@ Let me know if a meeting would be helpful.`;
         }
       }
     } catch (e) {
-      console.warn('fuCheckB2B: Brave search failed for', account.name, e.message);
+      console.warn('fuClassifyCompany: Brave search failed for', account.name, e.message);
     }
 
     // No search context available — don't block outreach on a network hiccup,
     // but flag it as unverified so the log makes that clear.
     if (!snippetText) {
-      const result = { isB2B: true, reason: 'Brave search returned no results.', unverified: true };
-      fuB2bCache.set(account.id, result);
+      const result = { isB2B: true, isBenefits: false, reason: 'Brave search returned no results.', unverified: true };
+      fuClassifyCache.set(account.id, result);
       return result;
     }
 
@@ -5036,15 +5087,17 @@ COMPANY: ${account.name}${account.domain ? ' (' + account.domain + ')' : ''}
 WEB SEARCH RESULTS:
 ${snippetText}
 
-TASK: Based ONLY on the search results above, decide whether this is a business that sells products or services to OTHER BUSINESSES or organizations (B2B) — e.g. vendors, software/tech companies, consulting firms, agencies, healthcare IT/services companies.
+TASK: Based ONLY on the search results above, answer two questions about this company.
 
-Answer "false" if it is primarily:
-- A consumer-facing brand (B2C), retailer, or restaurant
-- A hospital, health system, clinic, or other care-delivery provider (not a vendor)
-- A government agency, school, or nonprofit that is not itself a vendor
-- A staffing/recruiting site for individuals, a personal page, or an unrelated/unclear entity
+1. isB2B — does this business sell products or services to OTHER BUSINESSES or organizations (B2B) — e.g. vendors, software/tech companies, consulting firms, agencies, healthcare IT/services companies? Answer false if it is primarily:
+   - A consumer-facing brand (B2C), retailer, or restaurant
+   - A hospital, health system, clinic, or other care-delivery provider (not a vendor)
+   - A government agency, school, or nonprofit that is not itself a vendor
+   - A staffing/recruiting site for individuals, a personal page, or an unrelated/unclear entity
 
-Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_false, "reason": "one concise sentence"}`;
+2. isBenefits — does this company work PRIMARILY in employee benefits — e.g. a benefits broker/consultant, benefits administration platform, a benefits point-solution vendor, or an insurance carrier/TPA focused on employer-sponsored benefits? Answer false for broader healthcare IT/services companies, unrelated B2B vendors, or any non-B2B entity.
+
+Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_false, "isBenefits": true_or_false, "reason": "one concise sentence covering both answers"}`;
 
     try {
       const res = await fetch(`${RAILWAY_URL}/api/ai-profile-eval`, {
@@ -5055,7 +5108,7 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
           model:       'moonshotai/kimi-k3',
           prompt,
           temperature: 0.1,
-          max_tokens:  150,
+          max_tokens:  200,
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -5065,13 +5118,17 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
       const match   = cleaned.match(/\{[\s\S]*\}/);
       if (!match) throw new Error('No JSON in AI response');
       const parsed = JSON.parse(match[0]);
-      const result = { isB2B: parsed.isB2B !== false, reason: parsed.reason || '' };
-      fuB2bCache.set(account.id, result);
+      const result = {
+        isB2B:      parsed.isB2B !== false,
+        isBenefits: parsed.isBenefits === true,
+        reason:     parsed.reason || '',
+      };
+      fuClassifyCache.set(account.id, result);
       return result;
     } catch (e) {
-      console.warn('fuCheckB2B: classification failed for', account.name, e.message);
-      const result = { isB2B: true, reason: 'B2B classification call failed.', unverified: true };
-      fuB2bCache.set(account.id, result);
+      console.warn('fuClassifyCompany: classification failed for', account.name, e.message);
+      const result = { isB2B: true, isBenefits: false, reason: 'Classification call failed.', unverified: true };
+      fuClassifyCache.set(account.id, result);
       return result;
     }
   }
@@ -5137,6 +5194,28 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
       fitScore:       6,
       message:        STALE_RECONNECT_MESSAGE,
       staleReconnect: true,
+    };
+  }
+
+  // Company is primarily an employee-benefits business — pitch the benefits-leader
+  // interview series instead of the generic rebrand reconnect.
+  function fuBenefitsAnalysis(account, emails, liMsgs) {
+    const contact = fuContactFromHexEmails(account, emails);
+    const li = (liMsgs || [])[0];
+    const name = contact.name || li?.leadName || 'Unknown';
+    const hasLi = (liMsgs || []).length > 0;
+    return {
+      shouldFollowUp: true,
+      contactName:    name,
+      contactTitle:   li?.leadPosition || '',
+      contactEmail:   contact.email || '',
+      channel:        contact.email ? 'email' : (hasLi ? 'linkedin' : 'email'),
+      reason:         'Company works primarily in employee benefits — using benefits-leader interview reconnect.',
+      summary:        `${account.name} is primarily an employee-benefits organization. Reconnecting about our confidential benefits-leader interview series instead of the standard rebrand messaging.`,
+      urgency:        'low',
+      fitScore:       6,
+      message:        BENEFITS_FOLLOWUP_MESSAGE,
+      isBenefits:     true,
     };
   }
 
@@ -6176,8 +6255,9 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     if (!fu) return;
     fuComposeState = { type: 'email', idx };
 
-    // HEX-only intros must be a new email — never reply-all to the HEX meeting blast.
-    const skipThread = !!fu.hexOnly || ((fu._emails || []).length > 0 && (fu._emails || []).every(isHexMeetingEmail));
+    // HEX-only intros and benefits reconnects must be a new email — never reply-all
+    // to the HEX meeting blast or bury a fresh reconnect at the bottom of an old thread.
+    const skipThread = !!fu.hexOnly || !!fu.isBenefits || ((fu._emails || []).length > 0 && (fu._emails || []).every(isHexMeetingEmail));
     const emails = skipThread ? [] : (fu._emails || []).slice().sort((a, b) => {
       const da = a.date ? new Date(a.date).getTime() : 0;
       const db = b.date ? new Date(b.date).getTime() : 0;
@@ -6196,11 +6276,15 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       bdrEmail,
       to:        fu.contactEmail || '',
       cc:        '',
-      subject:   skipThread
+      subject:   fu.hexOnly
         ? 'Great to be connected'
-        : (fu.staleReconnect
-          ? 'Pando Executive Networking (formerly HealthLuminate)'
-          : (fu.contactCompany ? `Re: ${fu.contactCompany}` : 'Following up')),
+        : (fu.isBenefits
+          ? 'Quick question for you — HealthLuminate'
+          : (fu.staleReconnect
+            ? 'Pando Executive Networking (formerly HealthLuminate)'
+            : (skipThread
+              ? 'Great to be connected'
+              : (fu.contactCompany ? `Re: ${fu.contactCompany}` : 'Following up')))),
       body:      document.getElementById(`fu-msg-${idx}`)?.value || fu.message || '',
       threadId,
       inReplyTo,
