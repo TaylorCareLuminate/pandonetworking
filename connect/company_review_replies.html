@@ -3992,6 +3992,11 @@
         }
 
         function conversationHasFollowUpDraft(c) {
+            // Belt-and-suspenders: a draft generated before a contact was marked Scheduled/Declined
+            // to Meet should never count as "ready to send" even if the followUpSequence field on
+            // the doc hasn't been cleared yet (e.g. stale data from before that clearing was fixed).
+            const rc = c.responseCategory || 'Response';
+            if (rc === 'Scheduled' || rc === 'Declined to Meet') return false;
             return !!(c.followUpSequence && c.followUpSequence.status === 'pending_review' && c.followUpSequence.draftMessage);
         }
 
@@ -4546,10 +4551,11 @@
                         const waitingNote = r.waitingOnProspect ? `<br>⏸️ ${r.waitingOnProspect} paused — marked "waiting on prospect", no new messages since.` : '';
                         const notEligibleNote = r.notEligible ? `<br>🚫 ${r.notEligible} not eligible — declined to meet or already scheduled.` : '';
                         const alreadyDraftedNote = r.alreadyDrafted ? `<br>📋 ${r.alreadyDrafted} already had a draft waiting for review.` : '';
+                        const alreadyQueuedNote = r.alreadyQueued ? `<br>📬 ${r.alreadyQueued} skipped — already have a message queued to send later (from "Scan for Follow-Up Opportunities").` : '';
                         progress.innerHTML = `
                             <p style="color: #10b981; font-weight: 600; background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">✅ Follow-Up Sequence Scan Complete!</p>
                             <p style="color: #4a5568; background: white; padding: 0.5rem 1rem; border-radius: 8px; margin-top: 0.5rem;">
-                                ${bdrNote}Scanned: ${r.scanned} | Drafts ready: ${r.drafted} | Sequence already complete: ${r.complete} | Errors: ${r.errors}${categorizedNote}${tooSoonNote}${waitingNote}${notEligibleNote}${alreadyDraftedNote}${skippedBdrNote}${heldNote}${humanNote}${schedNote}
+                                ${bdrNote}Scanned: ${r.scanned} | Drafts ready: ${r.drafted} | Sequence already complete: ${r.complete} | Errors: ${r.errors}${categorizedNote}${tooSoonNote}${waitingNote}${notEligibleNote}${alreadyDraftedNote}${alreadyQueuedNote}${skippedBdrNote}${heldNote}${humanNote}${schedNote}
                                 ${r.drafted ? `<br>📨 Use the <strong>"Follow-Ups Ready"</strong> filter button above to review each draft and send.` : ''}
                             </p>
                         `;
@@ -7122,7 +7128,7 @@
                         </div>
                     ` : ''}
 
-                    ${conv.followUpSequence && conv.followUpSequence.status === 'pending_review' && conv.followUpSequence.draftMessage ? `
+                    ${conv.followUpSequence && conv.followUpSequence.status === 'pending_review' && conv.followUpSequence.draftMessage && responseCategory !== 'Scheduled' && responseCategory !== 'Declined to Meet' ? `
                         <div class="followup-draft-banner" style="padding: 1rem 2rem; background: #f0fdfa; border-top: 2px solid #5eead4; border-bottom: 2px solid #5eead4;">
                             <div style="display:flex; align-items:flex-start; gap:0.5rem; margin-bottom:0.6rem;">
                                 <i class="fas fa-paper-plane" style="color:#0d9488; margin-top:2px;"></i>
@@ -7584,15 +7590,7 @@
                 return;
             }
             
-            // Determine the collection based on source or ID pattern
-            let collection = 'heyreach_inbox'; // Default
-            if (conversation.source === 'webhook' || conversationId.startsWith('webhook_')) {
-                collection = 'heyreach_activity';
-            } else if (conversation.source === 'linkedinMessages') {
-                collection = 'linkedinMessages';
-            }
-            
-            console.log('💾 Auto-saving to collection:', collection, 'ID:', conversationId);
+            console.log('💾 Auto-saving category for:', conversationId, '→', responseValue);
             
             try {
                 const updateData = {
@@ -7600,7 +7598,9 @@
                 };
                 updateData.responseCategory = responseValue;
                 
-                // For webhook conversations, store override in a separate collection
+                // Webhook-sourced conversations are identified on this page by a synthesized ID
+                // (see resolveConversationDocRef) — other flows that only know that synthesized ID
+                // still need to find this override, so it's kept mirrored here too.
                 if (conversationId.startsWith('webhook_')) {
                     const { doc, setDoc } = window.clemailFirestore;
                     const overrideRef = doc(emailDB, 'conversation_category_overrides', conversationId);
@@ -7612,28 +7612,35 @@
                         updatedBy: currentUserEmail
                     });
                     console.log('✅ Override saved to separate collection');
-                } else {
-                    // For regular conversations, update the document directly
-                    const response = await fetch(`${RAILWAY_URL}/heyreach/inbox/update-conversation-category`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            conversationId: conversationId,
-                            collection: collection,
-                            ...updateData
-                        })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (!result.success) {
-                        console.error('❌ Failed to save:', result.error);
-                        return;
-                    }
-                    console.log('✅ Category updated in document');
                 }
+                
+                // Always ALSO write directly onto the actual raw document (same as the Decline /
+                // Mark Followed Up / Wrong Contact quick-action buttons) — this is what the
+                // follow-up scan jobs read, and it's what actually clears a stale followUpSequence
+                // draft in Firestore. Writing only to the override collection above (the old
+                // behavior for webhook conversations) left the raw doc's pending draft in place
+                // forever once marked Scheduled/Declined to Meet, so the "follow-up ready to send"
+                // banner kept showing even though the card correctly displayed the new category.
+                const { collection: rawCollection, docId: rawDocId } = resolveConversationDocRef(conversation);
+                const response = await fetch(`${RAILWAY_URL}/heyreach/inbox/update-conversation-category`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        conversationId: rawDocId,
+                        collection: rawCollection,
+                        ...updateData
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (!result.success) {
+                    console.error('❌ Failed to save:', result.error);
+                    return;
+                }
+                console.log('✅ Category updated in document');
                 
                 // Update the conversation object
                 conversation.responseCategory = responseValue;
