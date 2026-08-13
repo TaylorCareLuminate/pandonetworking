@@ -122,6 +122,11 @@
     }
     .panel-head h2 { margin: 0; font-size: 1em; color: var(--primary); display: flex; align-items: center; gap: 8px; }
     .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .bulk-bar {
+      width: 100%; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      padding-top: 10px; margin-top: 2px; border-top: 1px solid #e2e8f0;
+    }
+    .bulk-count { font-size: 0.82em; color: #475569; font-weight: 600; margin-right: 4px; }
 
     .table-wrap { overflow-x: auto; max-height: 70vh; }
     table.domains { width: 100%; border-collapse: collapse; font-size: 0.86em; }
@@ -271,6 +276,8 @@
       <div class="filters">
         <input class="ctrl-input" id="searchFilter" type="search" placeholder="Filter domain / company / contact…"
                oninput="window.renderTable()" style="width:240px;">
+        <input class="ctrl-input" id="whyFilter" type="search" placeholder="Filter by Why text…"
+               oninput="window.renderTable()" style="width:240px;" title="Matches the Why column (AI reason or sample subject)">
         <select class="ctrl-input" id="statusFilter" onchange="window.renderTable()">
           <option value="">All statuses</option>
           <option value="new">Not in CRM</option>
@@ -287,6 +294,15 @@
           <option value="domain">Sort: domain</option>
           <option value="recent">Sort: last activity</option>
         </select>
+      </div>
+      <div class="bulk-bar" id="bulkBar">
+        <span class="bulk-count" id="bulkCount">No matching domains</span>
+        <button class="btn btn-success btn-sm" id="massAddBtn" onclick="window.massAddFiltered()" disabled>
+          <i class="fas fa-user-plus"></i> Add matching
+        </button>
+        <button class="btn btn-secondary btn-sm" id="massDismissBtn" onclick="window.massDismissFiltered()" disabled>
+          <i class="fas fa-eye-slash"></i> Dismiss matching
+        </button>
       </div>
     </div>
     <div class="table-wrap" id="tableWrap">
@@ -845,6 +861,14 @@
     return Object.values(rec.contacts || {});
   }
 
+  function whyText(rec) {
+    return String(rec?.ai?.reason || (rec?.sampleSubjects || [])[0] || '').trim();
+  }
+
+  function canActOn(rec) {
+    return rec.status === 'new' || rec.status === 'watch' || rec.status === 'skip';
+  }
+
   window.runAiEval = async function () {
     if (isRunning) return;
     const targets = [...domainMap.values()].filter(r =>
@@ -989,6 +1013,7 @@ ${JSON.stringify(payload, null, 2)}`;
 
   function filteredSorted() {
     const q = (document.getElementById('searchFilter').value || '').toLowerCase().trim();
+    const whyQ = (document.getElementById('whyFilter').value || '').toLowerCase().trim();
     const status = document.getElementById('statusFilter').value;
     const sort = document.getElementById('sortFilter').value;
     let rows = [...domainMap.values()];
@@ -1001,6 +1026,9 @@ ${JSON.stringify(payload, null, 2)}`;
         ].join(' ').toLowerCase();
         return blob.includes(q);
       });
+    }
+    if (whyQ) {
+      rows = rows.filter(r => whyText(r).toLowerCase().includes(whyQ));
     }
     if (status === 'new') rows = rows.filter(r => r.status === 'new');
     if (status === 'watch') rows = rows.filter(r => r.status === 'watch' || (r.ai?.shouldWatch && r.status === 'new'));
@@ -1020,9 +1048,30 @@ ${JSON.stringify(payload, null, 2)}`;
     return rows;
   }
 
+  function updateBulkBar(rows) {
+    const actionable = rows.filter(canActOn);
+    const countEl = document.getElementById('bulkCount');
+    const addBtn = document.getElementById('massAddBtn');
+    const dismissBtn = document.getElementById('massDismissBtn');
+    const whyQ = (document.getElementById('whyFilter').value || '').trim();
+    if (countEl) {
+      const whyNote = whyQ ? ` for Why “${whyQ}”` : '';
+      countEl.textContent = `${rows.length} matching${whyNote} · ${actionable.length} can be added or dismissed`;
+    }
+    if (addBtn) {
+      addBtn.disabled = isRunning || !actionable.length;
+      addBtn.innerHTML = `<i class="fas fa-user-plus"></i> Add matching${actionable.length ? ` (${actionable.length})` : ''}`;
+    }
+    if (dismissBtn) {
+      dismissBtn.disabled = isRunning || !actionable.length;
+      dismissBtn.innerHTML = `<i class="fas fa-eye-slash"></i> Dismiss matching${actionable.length ? ` (${actionable.length})` : ''}`;
+    }
+  }
+
   window.renderTable = function () {
     const wrap = document.getElementById('tableWrap');
     const rows = filteredSorted();
+    updateBulkBar(rows);
     if (!domainMap.size) {
       wrap.innerHTML = `<div class="empty"><i class="fas fa-binoculars"></i>Run <strong>Scan Internal Emails</strong> to discover external domains.</div>`;
       return;
@@ -1054,7 +1103,7 @@ ${JSON.stringify(payload, null, 2)}`;
     const contacts = contactsList(r).sort((a, b) => (b.count || 0) - (a.count || 0));
     const score = r.ai?.score;
     const scoreCls = score == null ? 'low' : score >= 70 ? 'high' : score >= 45 ? 'mid' : 'low';
-    const canAdd = r.status === 'new' || r.status === 'watch' || r.status === 'skip';
+    const canAdd = canActOn(r);
     const leadId = r.leadId || r.crmLeadId;
     return `
       <tr>
@@ -1078,7 +1127,7 @@ ${JSON.stringify(payload, null, 2)}`;
         </td>
         <td>${r.messageCount || 0}</td>
         <td class="muted">${fmtRel(r.lastActivity)}</td>
-        <td class="reason">${escHtml(r.ai?.reason || (r.sampleSubjects || [])[0] || '')}</td>
+        <td class="reason">${escHtml(whyText(r))}</td>
         <td>
           <div class="actions">
             ${canAdd ? `<button class="btn btn-success btn-sm" onclick='window.addAsProspect(${JSON.stringify(r.domain)})'><i class="fas fa-user-plus"></i> Add</button>` : ''}
@@ -1237,6 +1286,72 @@ ${JSON.stringify(payload, null, 2)}`;
     } catch (err) {
       console.error(err);
       showToast('Add failed: ' + err.message, 'error');
+    }
+  };
+
+  window.massAddFiltered = async function () {
+    if (isRunning) return;
+    const list = filteredSorted().filter(canActOn);
+    if (!list.length) {
+      showToast('No matching domains to add. Adjust the Why filter first.', 'warning');
+      return;
+    }
+    if (!confirm(`Add ${list.length} matching domain${list.length === 1 ? '' : 's'} as watched CRM prospects?`)) return;
+    isRunning = true;
+    document.getElementById('massAddBtn').disabled = true;
+    document.getElementById('massDismissBtn').disabled = true;
+    let ok = 0;
+    try {
+      for (const rec of list) {
+        try {
+          await createProspectFromDomain(rec);
+          ok++;
+        } catch (e) {
+          console.warn('Add failed for', rec.domain, e.message);
+        }
+        await sleep(120);
+      }
+      try { await persistDiscoveries(); } catch (_) {}
+      showToast(`Added ${ok} of ${list.length} matching prospects`, ok ? 'success' : 'warning');
+    } finally {
+      isRunning = false;
+      renderTable();
+      updateStats();
+    }
+  };
+
+  window.massDismissFiltered = async function () {
+    if (isRunning) return;
+    const list = filteredSorted().filter(canActOn);
+    if (!list.length) {
+      showToast('No matching domains to dismiss. Adjust the Why filter first.', 'warning');
+      return;
+    }
+    if (!confirm(`Dismiss ${list.length} matching domain${list.length === 1 ? '' : 's'}? They will be hidden from new/watch/skip lists.`)) return;
+    isRunning = true;
+    document.getElementById('massAddBtn').disabled = true;
+    document.getElementById('massDismissBtn').disabled = true;
+    try {
+      await waitForWrapper();
+      const { doc, setDoc } = window.clemailFirestore;
+      for (let i = 0; i < list.length; i++) {
+        const rec = list[i];
+        rec.status = 'dismissed';
+        try {
+          await setDoc(doc(window.clemailDb, 'prospect_domain_scans', domainDocId(rec.domain)), serializeRec(rec));
+        } catch (e) {
+          console.warn('Dismiss failed for', rec.domain, e.message);
+        }
+        if (i % 15 === 0) await sleep(40);
+      }
+      showToast(`Dismissed ${list.length} matching domain${list.length === 1 ? '' : 's'}`, 'success');
+    } catch (err) {
+      console.error(err);
+      showToast('Mass dismiss failed: ' + err.message, 'error');
+    } finally {
+      isRunning = false;
+      renderTable();
+      updateStats();
     }
   };
 
