@@ -1238,6 +1238,10 @@
         <input type="number" id="fuLookback" value="180" min="7" max="365">
       </div>
       <div class="fu-field">
+        <label title="If the last 1:1 email or LinkedIn is older than this, use the HealthLuminate → Pando reconnect message instead of AI.">Reconnect if last contact older than (days)</label>
+        <input type="number" id="fuStaleDays" value="365" min="90" max="3650">
+      </div>
+      <div class="fu-field">
         <label>Interest score threshold (1–10)</label>
         <input type="number" id="fuThreshold" value="5" min="1" max="10">
       </div>
@@ -4186,6 +4190,9 @@
     );
     const liAll = scan.linkedInMessages || [];
     const hexOnly = hexEmails.length > 0 && otherEmails.length === 0 && !liAll.length;
+    const staleDays = parseInt(document.getElementById('fuStaleDays')?.value, 10) || 365;
+    const last1to1 = lastCommsDate(otherEmails, liAll);
+    const staleReconnect = !hexOnly && last1to1 && daysAgo(last1to1) >= staleDays;
     const emailsForSummary = hexOnly ? hexEmails : otherEmails;
 
     const emailLines = emailsForSummary.slice(0, 20).map(e => {
@@ -4220,7 +4227,9 @@ ${noteLines ? '\nCRM NOTES:\n' + noteLines : ''}
 NOTE: Ignore any automated, marketing, or bulk emails (newsletters, no-reply senders, out-of-office replies, receipts, notifications). Only consider genuine person-to-person conversations in your summary.
 ${hexOnly
   ? 'HEX-ONLY: The only email connection is DRI Monthly Healthcare Executive Exchange (HEX) group meeting emails. They share that group with Taylor; there is no 1:1 sales thread. Say so, and note that a warm HEX-intro follow-up is appropriate.'
-  : 'Ignore DRI Monthly / Healthcare Executive Exchange (HEX) meeting emails when other 1:1 messages exist — those are group invites, not a relationship.'}
+  : staleReconnect
+    ? `STALE RECONNECT: Last 1:1 contact was ${fmtDaysAgo(last1to1)}. They knew the firm as HealthLuminate or CareLuminate, which is now Pando Executive Networking. Ignore HEX meeting emails. Recommend a reconnect that explains the rebrand, that we help busy executives with networking (often on LinkedIn), and that we have scheduled hundreds of meetings / coordinated thousands of conversations / tens of thousands of connections for CEOs and Presidents.`
+    : 'Ignore DRI Monthly / Healthcare Executive Exchange (HEX) meeting emails when other 1:1 messages exist — those are group invites, not a relationship.'}
 
 TASK: Write a concise, human-readable narrative summary (3-6 sentences) that captures:
 1. Who has been in contact and when (most recent contact first)
@@ -4400,6 +4409,42 @@ ${escHtml(cached.text)}
 We provide concierge executive networking services, helping busy executives keep up on networking when they don't have the time to do it. Let me know if that is interesting.
 
 Either way, great to be connected. Let me know if I can ever be of help.`;
+
+  const STALE_RECONNECT_MESSAGE =
+`It's been a while since we last connected — I wanted to share a quick update. HealthLuminate (and before that, CareLuminate) is now Pando Executive Networking.
+
+We help busy executives with their networking, often on LinkedIn. We do this for multiple CEOs and Presidents, and have scheduled hundreds of meetings, coordinated thousands of conversations, and tens of thousands of connections for our clients.
+
+Let me know if a meeting would be helpful.`;
+
+  function lastCommsDate(emails, liMsgs) {
+    let max = 0;
+    for (const e of emails || []) {
+      const t = e.date ? new Date(e.date).getTime() : 0;
+      if (!isNaN(t) && t > max) max = t;
+    }
+    for (const li of liMsgs || []) {
+      const t = li.date ? new Date(li.date).getTime() : 0;
+      if (!isNaN(t) && t > max) max = t;
+    }
+    return max ? new Date(max) : null;
+  }
+
+  function daysAgo(date) {
+    if (!date) return null;
+    return Math.floor((Date.now() - date.getTime()) / 86400000);
+  }
+
+  function fmtDaysAgo(date) {
+    const d = daysAgo(date);
+    if (d == null) return 'a long time ago';
+    if (d >= 365) {
+      const y = Math.round(d / 365);
+      return y === 1 ? 'about a year ago' : `${y} years ago`;
+    }
+    if (d >= 45) return `${Math.round(d / 30)} months ago`;
+    return `${d} days ago`;
+  }
 
   function preferTaylorEmail(fallback) {
     const accounts = internalOAuthAccounts || [];
@@ -4637,6 +4682,7 @@ Either way, great to be connected. Let me know if I can ever be of help.`;
     const screeningPrompt = document.getElementById('fuScreeningPrompt').value.trim();
     const contentPrompt   = document.getElementById('fuContentPrompt').value.trim();
     const lookbackDays    = parseInt(document.getElementById('fuLookback').value)     || 180;
+    const staleDays       = parseInt(document.getElementById('fuStaleDays').value)    || 365;
     const fitThreshold    = parseInt(document.getElementById('fuThreshold').value)    || 5;
     const minDaysSince    = parseInt(document.getElementById('fuMinDays').value)      || 21;
     const testN           = parseInt(document.getElementById('fuTestN').value) || null;
@@ -4664,21 +4710,26 @@ Either way, great to be connected. Let me know if I can ever be of help.`;
     // Marketing/automated emails are stripped BEFORE the AI sees them so they don't
     // waste an AI call or skew the interest score.
     const cutoff = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
-    const realEmailsOf = s => (s.emails || []).filter(e =>
-      (!e.date || new Date(e.date) >= cutoff) &&
-      !isNoiseEmail(e));
-    const liMsgsOf = s => (s.linkedInMessages || []).filter(li =>
+    const allRealOf = s => (s.emails || []).filter(e => !isNoiseEmail(e));
+    const allLiOf   = s => s.linkedInMessages || [];
+    const realEmailsOf = s => allRealOf(s).filter(e =>
+      !e.date || new Date(e.date) >= cutoff);
+    const liMsgsOf = s => allLiOf(s).filter(li =>
       !li.date || new Date(li.date) >= cutoff);
 
-    // Target: scanned companies that have at least one real email or LinkedIn conversation
+    // Target: scanned companies with HEX-only, recent 1:1, or stale 1:1 history
     const pool = allAccounts.filter(a => {
-      // Skip existing customers (Active / Building / Paused)
       const stage = (a.stage || '').toLowerCase().trim();
       if (SKIP_STAGES.has(stage)) return false;
-
       const s = scanState[a.id];
       if (!s?.lastScanDate) return false;
-      return realEmailsOf(s).length > 0 || liMsgsOf(s).length > 0;
+      const { hex, other } = splitHexEmails(allRealOf(s));
+      const li = allLiOf(s);
+      if (hex.length && !other.length && !li.length) return true;
+      if (realEmailsOf(s).length > 0 || liMsgsOf(s).length > 0) return true;
+      const last = lastCommsDate(other, li);
+      if (last) return true; // history exists but nothing in lookback → reconnect
+      return false;
     });
     const targetAccounts = testN ? pool.slice(0, testN) : pool;
 
@@ -4689,12 +4740,12 @@ Either way, great to be connected. Let me know if I can ever be of help.`;
     }
 
     if (!targetAccounts.length) {
-      fuSetStatus('No companies with comms in that lookback window — run Comms Scan first.');
+      fuSetStatus('No companies with comms on file — run Comms Scan first.');
       fuSetBtnState(false);
       return;
     }
 
-    fuLog(`Analyzing ${targetAccounts.length} compan${targetAccounts.length === 1 ? 'y' : 'ies'} · lookback ${lookbackDays}d · threshold ${fitThreshold}/10`);
+    fuLog(`Analyzing ${targetAccounts.length} compan${targetAccounts.length === 1 ? 'y' : 'ies'} · lookback ${lookbackDays}d · reconnect after ${staleDays}d · threshold ${fitThreshold}/10`);
     if (testN) fuLog(`Test mode: top ${targetAccounts.length} companies with communications`);
     document.getElementById('fuJobCount').textContent = `0 / ${targetAccounts.length} analyzed`;
 
@@ -4714,22 +4765,36 @@ Either way, great to be connected. Let me know if I can ever be of help.`;
       const emails = realEmailsOf(scan);
       const liMsgs = liMsgsOf(scan);
       const notes  = scan.notes || [];
+      const allReal = allRealOf(scan);
+      const allLi   = allLiOf(scan);
+      const { hex: hexAll, other: otherAll } = splitHexEmails(allReal);
       const { hex: hexEmails, other: otherEmails } = splitHexEmails(emails);
-      const hexOnly = hexEmails.length > 0 && otherEmails.length === 0 && liMsgs.length === 0;
-      const emailsForAi = hexOnly ? hexEmails : otherEmails;
+      const hexOnly = hexAll.length > 0 && otherAll.length === 0 && allLi.length === 0;
+      const last1to1 = lastCommsDate(otherAll, allLi);
+      const lastInLookback = lastCommsDate(otherEmails, liMsgs);
+      const staleReconnect = !hexOnly && last1to1 && (
+        daysAgo(last1to1) >= staleDays || !lastInLookback
+      );
+      const emailsForAi = hexOnly ? hexAll : (staleReconnect ? otherAll : otherEmails);
+      const liForCard   = staleReconnect ? allLi : liMsgs;
+      const usedTemplate = hexOnly || staleReconnect;
 
       const pct = Math.round((i / targetAccounts.length) * 90);
       fuSetStatus(`Analyzing ${account.name}… (${i + 1}/${targetAccounts.length})`, pct);
       if (hexOnly) {
-        fuLog(`[${account.name}] HEX-only connection (${hexEmails.length} DRI Monthly meeting email${hexEmails.length === 1 ? '' : 's'}) — using HEX intro`);
+        fuLog(`[${account.name}] HEX-only connection (${hexAll.length} DRI Monthly meeting email${hexAll.length === 1 ? '' : 's'}) — using HEX intro`);
+      } else if (staleReconnect) {
+        fuLog(`[${account.name}] Last 1:1 was ${fmtDaysAgo(last1to1)} — using HealthLuminate → Pando reconnect${hexAll.length ? ` · ignored ${hexAll.length} HEX meeting email${hexAll.length === 1 ? '' : 's'}` : ''}`);
       } else {
         fuLog(`[${account.name}] ${otherEmails.length} email(s), ${liMsgs.length} LinkedIn conv(s)${hexEmails.length ? ` · ignored ${hexEmails.length} HEX meeting email${hexEmails.length === 1 ? '' : 's'}` : ''}`);
       }
 
       const analysis = hexOnly
-        ? fuHexOnlyAnalysis(account, hexEmails)
-        : await fuAnalyzeCompany(account, emailsForAi, liMsgs, notes,
-                                 screeningPrompt, contentPrompt, minDaysSince, skipScheduled);
+        ? fuHexOnlyAnalysis(account, hexAll)
+        : staleReconnect
+          ? fuStaleReconnectAnalysis(account, otherAll, allLi, last1to1)
+          : await fuAnalyzeCompany(account, emailsForAi, liMsgs, notes,
+                                   screeningPrompt, contentPrompt, minDaysSince, skipScheduled);
 
       analyzed++;
       document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
@@ -4739,43 +4804,43 @@ Either way, great to be connected. Let me know if I can ever be of help.`;
         continue;
       }
 
-      if (hexOnly || (analysis.shouldFollowUp && (analysis.fitScore || 0) >= fitThreshold)) {
+      if (hexOnly || staleReconnect || (analysis.shouldFollowUp && (analysis.fitScore || 0) >= fitThreshold)) {
         // Find the LinkedIn conversation that best matches the AI-identified contact.
         // First try an exact or first-name match on leadName; fall back to liMsgs[0].
         const aiName      = (analysis.contactName || '').toLowerCase().trim();
         const aiFirstName = aiName.split(/\s+/)[0];
         const bestLi = (aiName
-          ? liMsgs.find(li => {
+          ? liForCard.find(li => {
               const n = (li.leadName || '').toLowerCase();
               return n === aiName
                 || (aiFirstName.length > 1 && n.startsWith(aiFirstName));
             })
-          : null) || liMsgs[0] || null;
+          : null) || liForCard[0] || null;
 
         // Resolve BDR email: HEX-only intros go from Taylor; otherwise prefer the conversation BDR
         const bdrEmail = hexOnly
-          ? preferTaylorEmail(hexEmails[0]?.oauthAccount || emails[0]?.oauthAccount || '')
-          : (bestLi?.bdrEmail || otherEmails[0]?.oauthAccount || emails[0]?.oauthAccount || '');
+          ? preferTaylorEmail(hexAll[0]?.oauthAccount || emails[0]?.oauthAccount || '')
+          : (bestLi?.bdrEmail || otherAll[0]?.oauthAccount || otherEmails[0]?.oauthAccount || emails[0]?.oauthAccount || '');
         // Look up HeyReach account ID for LinkedIn sending
         const heyreachId = [...linkedInAccountIdMapping.entries()]
           .find(([, e]) => e === (bdrEmail || '').toLowerCase())?.[0] || null;
         // Best contact email: search the email threads for a non-BDR address
         const contactEmail = hexOnly
-          ? (analysis.contactEmail || fuExtractContactEmail(hexEmails, analysis.contactName, bdrEmail))
-          : fuExtractContactEmail(otherEmails, analysis.contactName, bdrEmail);
+          ? (analysis.contactEmail || fuExtractContactEmail(hexAll, analysis.contactName, bdrEmail))
+          : (analysis.contactEmail || fuExtractContactEmail(emailsForAi, analysis.contactName, bdrEmail));
 
         results.push({
           contactName:       analysis.contactName  || 'Unknown',
           contactTitle:      analysis.contactTitle || '',
           contactCompany:    account.name,
           contactLocation:   bestLi?.leadLocation  || '', // best-effort, used for timezone guessing when inserting times
-          source:            hexOnly ? 'HEX intro' : (analysis.channel || 'linkedin'),
+          source:            hexOnly ? 'HEX intro' : (staleReconnect ? 'Rebrand reconnect' : (analysis.channel || 'linkedin')),
           llamaScore:        analysis.fitScore      || 5,
           urgency:           analysis.urgency       || 'medium',
           reason:            analysis.reason        || '',
           aiSummary:         analysis.summary       || '',
           message:           analysis.message       || '',
-          transcript:        fuBuildTranscript(emailsForAi, liMsgs),
+          transcript:        fuBuildTranscript(emailsForAi, liForCard),
           contactEmail,
           contactLinkedInUrl: bestLi?.leadProfileUrl || '',
           conversationId:    bestLi?.id             || null,
@@ -4785,16 +4850,17 @@ Either way, great to be connected. Let me know if I can ever be of help.`;
           _accountName:      account.name,
           _crmNotes:         notes,
           _emails:           emailsForAi,
-          _liMsgs:           enrichLiMsgDates(liMsgs),
+          _liMsgs:           enrichLiMsgDates(liForCard),
           _bdrEmail:         bdrEmail,
           hexOnly,
+          staleReconnect,
         });
         fuLog(`  ✓ Follow-up recommended for ${analysis.contactName} (score ${analysis.fitScore}/10, ${analysis.urgency})`, 'success');
       } else {
         fuLog(`  — No follow-up needed (score ${analysis.fitScore || '?'}/10)${analysis.reason ? ' — ' + analysis.reason : ''}`);
       }
 
-      if (i < targetAccounts.length - 1 && !fuShouldStop && !hexOnly) {
+      if (i < targetAccounts.length - 1 && !fuShouldStop && !usedTemplate) {
         await sleep(1000); // 1 s between AI calls to avoid rate-limit (429)
       }
     }
@@ -4863,6 +4929,27 @@ Either way, great to be connected. Let me know if I can ever be of help.`;
       fitScore:       6,
       message:        HEX_FOLLOWUP_MESSAGE,
       hexOnly:        true,
+    };
+  }
+
+  function fuStaleReconnectAnalysis(account, emails, liMsgs, lastDate) {
+    const contact = fuContactFromHexEmails(account, emails);
+    const li = (liMsgs || [])[0];
+    const name = contact.name || li?.leadName || 'Unknown';
+    const ago = fmtDaysAgo(lastDate);
+    const hasLi = (liMsgs || []).length > 0;
+    return {
+      shouldFollowUp: true,
+      contactName:    name,
+      contactTitle:   li?.leadPosition || '',
+      contactEmail:   contact.email || '',
+      channel:        contact.email ? 'email' : (hasLi ? 'linkedin' : 'email'),
+      reason:         `Last 1:1 contact was ${ago} — they knew us as HealthLuminate / CareLuminate. Using Pando reconnect.`,
+      summary:        `Last 1:1 contact with ${account.name} was ${ago}. They would have known the firm as HealthLuminate or CareLuminate, now Pando Executive Networking. No recent conversation — reconnect with the rebrand and what we do for busy executives.`,
+      urgency:        'low',
+      fitScore:       6,
+      message:        STALE_RECONNECT_MESSAGE,
+      staleReconnect: true,
     };
   }
 
@@ -5922,7 +6009,11 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       bdrEmail,
       to:        fu.contactEmail || '',
       cc:        '',
-      subject:   skipThread ? 'Great to be connected' : (fu.contactCompany ? `Re: ${fu.contactCompany}` : 'Following up'),
+      subject:   skipThread
+        ? 'Great to be connected'
+        : (fu.staleReconnect
+          ? 'Pando Executive Networking (formerly HealthLuminate)'
+          : (fu.contactCompany ? `Re: ${fu.contactCompany}` : 'Following up')),
       body:      document.getElementById(`fu-msg-${idx}`)?.value || fu.message || '',
       threadId,
       inReplyTo,
