@@ -2797,23 +2797,33 @@
         async function fpFilterContactsByRules({ token, contacts, rules, groupName }) {
             if (!rules || !rules.trim()) {
                 addLog('   ℹ️ No Target Contact / Exclude Rules set — keeping all scanned contacts.', 'dim');
-                return { kept: contacts, dropped: [] };
+                return { kept: contacts, dropped: [], refreshedToken: null };
             }
             const kept = [], dropped = [];
             const CHUNK_SIZE = 50;
+            let refreshedToken = null;
             for (let i = 0; i < contacts.length; i += CHUNK_SIZE) {
                 if (window.fpStopRequested) break;
                 const chunk = contacts.slice(i, i + CHUNK_SIZE);
+                const callClassify = (tok) => fetchWithRetry(`${RAILWAY_API}/api/connect/hypothesis-title-classify`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${tok}` },
+                    body: JSON.stringify({
+                        contacts: chunk.map(p => ({ id: p.id, title: p.title || '', org: p.company || '' })),
+                        rules,
+                        groupName: groupName || ''
+                    })
+                }, { addLog, label: 'Rule classify' });
                 try {
-                    const resp = await fetchWithRetry(`${RAILWAY_API}/api/connect/hypothesis-title-classify`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                        body: JSON.stringify({
-                            contacts: chunk.map(p => ({ id: p.id, title: p.title || '', org: p.company || '' })),
-                            rules,
-                            groupName: groupName || ''
-                        })
-                    }, { addLog, label: 'Rule classify' });
+                    let resp = await callClassify(refreshedToken || token);
+                    // A 401 here is almost always the same transient-null/expired-token
+                    // window full-ai-init hits below — try one real refresh before
+                    // degrading to "unfiltered" (which used to happen silently every time).
+                    if (resp.status === 401) {
+                        addLog('   🔄 Rule classify got 401 — refreshing token and retrying...', 'warning');
+                        const newTok = await fpTryRefreshToken();
+                        if (newTok) { refreshedToken = newTok; resp = await callClassify(refreshedToken); }
+                    }
                     const data = await resp.json();
                     if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
                     const byId = new Map(data.results.map(r => [String(r.id), r]));
@@ -2827,7 +2837,7 @@
                     kept.push(...chunk);
                 }
             }
-            return { kept, dropped };
+            return { kept, dropped, refreshedToken };
         }
 
         // ── Rule-dropped contacts: moved OUT of prospect_contacts entirely ──────────
@@ -3010,24 +3020,31 @@
         // for every contact through orgPreVerifiedItems (the only intentional deviation from
         // the per-contact generate_messages flow).
         async function fpPrefetchOrgNews({ token, bdrEmail, org, sampleTitle }) {
+            const call = (tok) => fetchWithRetry(`${RAILWAY_API}/api/connect/org-news-prefetch`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${tok}` },
+                body: JSON.stringify({ bdrEmail, organizationName: org.company_name, sampleTitle: sampleTitle || '' })
+            }, { addLog, label: 'Org news prefetch', retries: 1 });
             try {
                 addLog(`   📰 Searching news for ${org.company_name} (once for the whole organization)…`);
-                const resp = await fetchWithRetry(`${RAILWAY_API}/api/connect/org-news-prefetch`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                    body: JSON.stringify({ bdrEmail, organizationName: org.company_name, sampleTitle: sampleTitle || '' })
-                }, { addLog, label: 'Org news prefetch', retries: 1 });
+                let resp = await call(token);
+                let refreshedToken = null;
+                if (resp.status === 401) {
+                    addLog('   🔄 Org news prefetch got 401 — refreshing token and retrying...', 'warning');
+                    const newTok = await fpTryRefreshToken();
+                    if (newTok) { refreshedToken = newTok; resp = await call(refreshedToken); }
+                }
                 const data = await resp.json().catch(() => ({}));
                 if (!resp.ok || !data.success) {
                     addLog(`   ⚠️ Org news prefetch failed (${data.error || `HTTP ${resp.status}`}) — falling back to per-contact news search.`, 'warning');
-                    return null; // null = fall back to the normal per-contact org news search
+                    return { items: null, refreshedToken }; // null = fall back to the normal per-contact org news search
                 }
                 const items = data.verifiedItems || [];
                 addLog(`   📰 Org news: ${items.length} verified stor${items.length === 1 ? 'y' : 'ies'} (outcome: ${data.outcome})`, items.length ? 'success' : 'dim');
-                return items; // may be [] — that means "already searched, nothing found, skip org news per contact"
+                return { items, refreshedToken }; // items may be [] — that means "already searched, nothing found, skip org news per contact"
             } catch (e) {
                 addLog(`   ⚠️ Org news prefetch error: ${e.message} — falling back to per-contact news search.`, 'warning');
-                return null;
+                return { items: null, refreshedToken: null };
             }
         }
 
@@ -3389,6 +3406,14 @@
             let token = await auth.currentUser.getIdToken();
             let lastTokenRefreshAt = Date.now();
             let orgPointer = 0;
+            // Circuit breaker for the auth-failure cascade described above full-ai-init's
+            // retry loop: if several organizations IN A ROW fail specifically because
+            // full-ai-init couldn't get a valid token, the session is very likely dead
+            // (not transient) — better to stop the run cleanly than silently burn through
+            // the rest of the org queue for hours with zero messages generated. Orgs that
+            // fail this way are NOT scan-label-stamped, so resuming later re-tries them.
+            let fpConsecutiveAuthFailures = 0;
+            const FP_MAX_CONSECUTIVE_AUTH_FAILURES = 3;
 
             // ── DNC list — loaded once, filtered per BDR context inside the loop ──
             let allDncList = [];
@@ -3638,9 +3663,10 @@
                             }
 
                             report.aiCallCounts.ruleClassify += Math.ceil(scannedContacts.length / 50);
-                            const { kept, dropped } = await fpFilterContactsByRules({
+                            const { kept, dropped, refreshedToken: rulesRefreshedToken } = await fpFilterContactsByRules({
                                 token, contacts: scannedContacts, rules: targetInstr, groupName
                             });
+                            if (rulesRefreshedToken) { token = rulesRefreshedToken; lastTokenRefreshAt = Date.now(); }
                             orgReport.matched = kept.length;
                             orgReport.dropped = dropped.length;
                             orgReport.droppedTitles = fpSummarizeDroppedTitles(dropped);
@@ -3671,9 +3697,10 @@
                             }
 
                             // ── 5. Org news — ONCE per organization ──
-                            const orgNewsItems = await fpPrefetchOrgNews({
+                            const { items: orgNewsItems, refreshedToken: newsRefreshedToken } = await fpPrefetchOrgNews({
                                 token, bdrEmail, org, sampleTitle: kept[0]?.title || ''
                             });
+                            if (newsRefreshedToken) { token = newsRefreshedToken; lastTokenRefreshAt = Date.now(); }
                             orgReport.newsStories = orgNewsItems === null ? null : orgNewsItems.length;
 
                             // ── 6. Full AI init — pass matched contact URLs as the URL filter ──
@@ -3696,22 +3723,34 @@
                                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
                                 body: buildInitBody()
                             }, { addLog, label: 'Full AI init' });
-                            if (initRes.status === 401) {
-                                // Auth token expired mid-run — refresh once and retry before giving up.
-                                addLog('   🔄 Auth token expired — refreshing and retrying…', 'warning');
-                                try {
-                                    if (auth.currentUser) { token = await auth.currentUser.getIdToken(true); lastTokenRefreshAt = Date.now(); }
-                                } catch (_te) {}
+                            // A single-shot "refresh once and retry" here used to be enough, but this
+                            // call happens ONCE PER ORGANIZATION across a run of hundreds/thousands of
+                            // orgs — a much bigger surface than generate_messages.html (which calls
+                            // full-ai-init exactly once per batch). Once a run hit a bad token/session
+                            // window, a single retry that also failed meant the ENTIRE org — and every
+                            // org after it, for the rest of the run — was silently abandoned with zero
+                            // messages, for hours, with no recovery attempt and no alert. Retry harder,
+                            // and wait for a transiently-null auth.currentUser to recover.
+                            for (let initAttempt = 1; initRes.status === 401 && initAttempt <= 2; initAttempt++) {
+                                addLog(`   🔄 Auth token expired (attempt ${initAttempt}/2) — refreshing and retrying…`, 'warning');
+                                const newTok = await fpTryRefreshToken(/* waitForRecovery */ initAttempt === 2);
+                                if (!newTok) {
+                                    addLog('   ⚠️ Could not obtain a fresh auth token — session may genuinely be signed out.', 'warning');
+                                    break;
+                                }
+                                token = newTok; lastTokenRefreshAt = Date.now();
                                 initRes = await fetchWithRetry(`${RAILWAY_API}/api/connect/full-ai-init`, {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
                                     body: buildInitBody()
-                                }, { addLog, label: 'Full AI init (retry after token refresh)' });
+                                }, { addLog, label: `Full AI init (retry ${initAttempt} after token refresh)` });
                             }
                             if (!initRes.ok) {
                                 const errText = await initRes.text().catch(() => '');
+                                if (initRes.status === 401) fpConsecutiveAuthFailures++;
                                 throw new Error(`full-ai-init failed: ${initRes.status} — ${errText.substring(0, 200)}`);
                             }
+                            fpConsecutiveAuthFailures = 0;
                             const initData = await initRes.json();
                             if (!initData.success) throw new Error(initData.error || 'full-ai-init failed');
                             const { bdrContext, prospects: prospectList, stats } = initData;
@@ -4226,6 +4265,20 @@
                             orgReport.error = orgErr.message;
                             addLog(`   ❌ Organization failed: ${orgErr.message}`, 'error');
                             if (orgErr.message === 'Stopped by user') { report.orgs.push(orgReport); await saveReport(); throw orgErr; }
+
+                            // Circuit breaker: N orgs in a row failing with 401/Unauthorized from
+                            // full-ai-init means the session is very likely genuinely dead, not
+                            // transient — continuing would silently churn through the rest of the
+                            // org queue for hours generating zero messages (this is exactly what
+                            // happened in past runs). Stop cleanly instead; nothing is lost, since
+                            // orgs that fail here never get scan-label-stamped and will be retried
+                            // automatically the next time this scan name is run.
+                            if (/401|Unauthorized/i.test(orgErr.message) && fpConsecutiveAuthFailures >= FP_MAX_CONSECUTIVE_AUTH_FAILURES) {
+                                addLog(`\n🛑 Stopping run — ${fpConsecutiveAuthFailures} organizations in a row failed with auth/401 errors even after refreshing the token. Your sign-in session is very likely no longer valid. Refresh the page, sign in again, and re-run this scan — organizations that failed this way were NOT marked complete and will be re-scanned automatically.`, 'error');
+                                report.orgs.push(orgReport);
+                                await saveReport();
+                                throw new Error('Stopped: repeated auth/401 failures — session likely expired, please refresh and sign in again');
+                            }
                         }
 
                         // Update totals + save report after every org, so partial runs keep data

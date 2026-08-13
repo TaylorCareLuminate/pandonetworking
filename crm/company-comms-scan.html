@@ -4907,6 +4907,93 @@ Let me know if a meeting would be helpful.`;
     setTimeout(() => { if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-stop"></i> Stop'; } }, 4000);
   };
 
+  // ── B2B eligibility gate ─────────────────────────────────────────────────
+  // Before recommending ANY outreach (AI follow-up, HEX intro, or rebrand
+  // reconnect), run a live Brave search on the company and have AI confirm it's
+  // an actual B2B business — not a consumer brand, care-delivery provider,
+  // government/nonprofit entity, or something unrelated. Cached per account for
+  // the rest of the session so re-scans don't repeat the same search.
+  const fuB2bCache = new Map(); // accountId → { isB2B, reason, unverified }
+
+  async function fuCheckB2B(account) {
+    if (fuB2bCache.has(account.id)) return fuB2bCache.get(account.id);
+
+    const query = `${account.name}${account.domain ? ' ' + account.domain : ''} company what they do`;
+    let snippetText = '';
+    try {
+      const res = await fetch(`${RAILWAY_URL}/api/brave-web-search`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ query, count: 5 }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.results?.length) {
+          snippetText = data.results.slice(0, 5)
+            .map((r, i) => `[${i + 1}] ${r.title}\n${r.description || ''}`)
+            .join('\n\n');
+        }
+      }
+    } catch (e) {
+      console.warn('fuCheckB2B: Brave search failed for', account.name, e.message);
+    }
+
+    // No search context available — don't block outreach on a network hiccup,
+    // but flag it as unverified so the log makes that clear.
+    if (!snippetText) {
+      const result = { isB2B: true, reason: 'Brave search returned no results.', unverified: true };
+      fuB2bCache.set(account.id, result);
+      return result;
+    }
+
+    const prompt =
+`You are screening companies before a B2B executive-networking firm reaches out to them.
+
+COMPANY: ${account.name}${account.domain ? ' (' + account.domain + ')' : ''}
+
+WEB SEARCH RESULTS:
+${snippetText}
+
+TASK: Based ONLY on the search results above, decide whether this is a business that sells products or services to OTHER BUSINESSES or organizations (B2B) — e.g. vendors, software/tech companies, consulting firms, agencies, healthcare IT/services companies.
+
+Answer "false" if it is primarily:
+- A consumer-facing brand (B2C), retailer, or restaurant
+- A hospital, health system, clinic, or other care-delivery provider (not a vendor)
+- A government agency, school, or nonprofit that is not itself a vendor
+- A staffing/recruiting site for individuals, a personal page, or an unrelated/unclear entity
+
+Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_false, "reason": "one concise sentence"}`;
+
+    try {
+      const res = await fetch(`${RAILWAY_URL}/api/ai-profile-eval`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider:    'openrouter',
+          model:       'moonshotai/kimi-k3',
+          prompt,
+          temperature: 0.1,
+          max_tokens:  150,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data    = await res.json();
+      const raw     = (data.message || data.response || '').trim();
+      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      const match   = cleaned.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error('No JSON in AI response');
+      const parsed = JSON.parse(match[0]);
+      const result = { isB2B: parsed.isB2B !== false, reason: parsed.reason || '' };
+      fuB2bCache.set(account.id, result);
+      return result;
+    } catch (e) {
+      console.warn('fuCheckB2B: classification failed for', account.name, e.message);
+      const result = { isB2B: true, reason: 'B2B classification call failed.', unverified: true };
+      fuB2bCache.set(account.id, result);
+      return result;
+    }
+  }
+
   // ── Per-company AI analysis ─────────────────────────────────────────────────
 
   function fuContactFromHexEmails(account, hexEmails) {
