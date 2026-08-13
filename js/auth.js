@@ -1,12 +1,12 @@
 // Version and debug info
-const AUTH_VERSION = '1.4.0-cross-tab-fix';
+const AUTH_VERSION = '1.5.0-persistence-unify';
 console.log(`🔄 Auth script loading... (v${AUTH_VERSION})`);
 console.log(`🛡️ 12-hour session protection enabled globally`);
 console.log(`👥 Cross-tab authentication synchronization enabled`);
 console.log(`🔗 Multi-directory Firebase app instance sharing enabled`);
-console.log(`🔧 FIX v1.4: Intentional logout flag now per-tab (sessionStorage) - prevents mass tab logout`);
-console.log(`🔧 FIX v1.4: Cross-tab storage handler no longer bypasses protection on logout from another tab`);
-console.log(`🔧 FIX v1.4: Token refresh coordinated across tabs to prevent race conditions`);
+console.log(`🔧 FIX v1.5: Removed setPersistence(browserLocalPersistence) override - auth.js now uses the`);
+console.log(`   same default persistence (IndexedDB) as /crm pages, so opening a CRM tab and a Connect tab`);
+console.log(`   no longer migrates the session between storage layers and logs one of them out`);
 
 // Firebase configuration
 const firebaseConfig = {
@@ -519,7 +519,7 @@ async function initializeFirebaseAuth() {
     
     // Import Firebase modules
     const { initializeApp, getApps } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js');
-    const { getAuth, onAuthStateChanged, browserLocalPersistence, setPersistence } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
+    const { getAuth, onAuthStateChanged } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
     const { getFirestore } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
     const { getDatabase, ref, get, set, update, remove, child } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js');
     
@@ -539,13 +539,18 @@ async function initializeFirebaseAuth() {
     db = getFirestore(app);
     database = getDatabase(app);
     
-    // Ensure persistence is set to LOCAL (browser local storage)
-    try {
-      await setPersistence(auth, browserLocalPersistence);
-      console.log('✅ Auth persistence set to LOCAL');
-    } catch (error) {
-      console.warn('⚠️ Could not set auth persistence:', error);
-    }
+    // IMPORTANT (v1.5 fix): Do NOT call setPersistence(browserLocalPersistence) here.
+    //
+    // getAuth() already persists sessions across browser restarts using its default
+    // storage (IndexedDB first, localStorage fallback). Forcing localStorage made
+    // this script fight with every page that uses plain getAuth() (all /crm pages):
+    //   - A /crm page load migrated the saved user localStorage → IndexedDB,
+    //     DELETING the firebase:authUser localStorage key. Tabs on auth.js pages
+    //     saw that deletion as a logout ("Auth key removed in another tab").
+    //   - An auth.js page load then moved it back IndexedDB → localStorage,
+    //     logging out any open /crm tabs.
+    // Leaving the SDK default everywhere keeps the session in one place so tabs in
+    // different directories no longer log each other out.
     
     // Expose to window
     window.auth = auth;

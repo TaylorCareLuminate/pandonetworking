@@ -35,7 +35,7 @@ async function getSharedFirebaseApp() {
   try {
     // Import Firebase modules
     const { initializeApp, getApps } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js');
-    const { getAuth, setPersistence, browserLocalPersistence } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
+    const { getAuth } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
     const { getDatabase } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js');
     const { getFirestore } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
     
@@ -55,14 +55,11 @@ async function getSharedFirebaseApp() {
     // Get auth instance
     const auth = getAuth(app);
     
-    // Ensure auth persistence is set to LOCAL (browser localStorage)
-    // This is critical for cross-tab authentication
-    try {
-      await setPersistence(auth, browserLocalPersistence);
-      console.log('✅ Shared Firebase: Auth persistence set to LOCAL');
-    } catch (error) {
-      console.warn('⚠️ Could not set auth persistence:', error);
-    }
+    // NOTE: Do NOT call setPersistence(browserLocalPersistence) here.
+    // getAuth()'s default persistence (IndexedDB) already survives browser
+    // restarts, and forcing localStorage migrates the saved session between
+    // storage layers, which logs out tabs open in other directories.
+    // See js/auth.js v1.5 fix for details.
     
     // Get database instances
     const database = getDatabase(app);
