@@ -2447,8 +2447,8 @@
               if (!msgDate) continue;
               if (sinceDate && msgDate <= sinceDate) continue;
 
-              // Skip marketing, automated, and bulk emails
-              if (isMarketingEmail(msg)) continue;
+              // Skip marketing, automated, and bulk emails — keep HEX meeting emails
+              if (isNoiseEmail(msg)) continue;
 
               emails.push({
                 id:           msgId,
@@ -3407,7 +3407,7 @@
     if (tab === 'emails') {
       const rawItems = scan.emails || [];
       // Filter marketing/automated emails at display time so already-stored scans are also clean
-      const items = rawItems.filter(e => !isMarketingEmail({ from: e.from, subject: e.subject, to: e.to }));
+      const items = rawItems.filter(e => !isNoiseEmail(e));
       if (!items.length) {
         panelBody.innerHTML = `<div class="empty-panel"><i class="fas fa-envelope-open"></i><p>No emails found for this company${rawItems.length ? ' (all were filtered as marketing/automated)' : ''}.</p></div>`;
         return;
@@ -3658,15 +3658,18 @@
     // ── Email contacts: aggregate externals, classify by domain ──
     const emailMap = new Map();
     (scan.emails || [])
-      .filter(e => !isMarketingEmail({ from: e.from, subject: e.subject, to: e.to }))
+      .filter(e => !isNoiseEmail(e))
       .forEach(e => {
         const isSent    = e.folder === 'SENT' || e.folder === 'SentItems';
+        const hexMail   = isHexMeetingEmail(e);
         const fromAddrs = new Set(parseAddressList(e.from).map(p => p.email));
         externalAddressesOf(e).forEach(p => {
           if (exKeys.has('em:' + p.email)) return;
+          const klass = classifyEmailAddress(p.email, companyDomains);
+          // HEX blasts CC many executives — only keep this company's domain
+          if (hexMail && klass !== 'company') return;
           let entry = emailMap.get(p.email);
           if (!entry) {
-            const klass = classifyEmailAddress(p.email, companyDomains);
             entry = {
               email: p.email, name: '', domain: emailDomainOf(p.email),
               classification: klass,
@@ -4178,7 +4181,14 @@
     const today = new Date().toLocaleDateString('en-US',
       { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
 
-    const emailLines = (scan.emails || []).slice(0, 20).map(e => {
+    const { hex: hexEmails, other: otherEmails } = splitHexEmails(
+      (scan.emails || []).filter(e => !isNoiseEmail(e))
+    );
+    const liAll = scan.linkedInMessages || [];
+    const hexOnly = hexEmails.length > 0 && otherEmails.length === 0 && !liAll.length;
+    const emailsForSummary = hexOnly ? hexEmails : otherEmails;
+
+    const emailLines = emailsForSummary.slice(0, 20).map(e => {
       const daysAgo = e.date ? Math.floor((Date.now() - new Date(e.date)) / 86400000) : '?';
       const dir     = (e.folder === 'SENT' || e.folder === 'SentItems') ? 'SENT' : 'RECEIVED';
       return `  [${daysAgo}d ago | ${dir}] "${e.subject}" — from ${e.from || '?'} to ${e.to || '?'} | "${(e.snippet || '').slice(0, 120)}"`;
@@ -4208,6 +4218,9 @@ ${liLines || '  (none)'}
 ${noteLines ? '\nCRM NOTES:\n' + noteLines : ''}
 
 NOTE: Ignore any automated, marketing, or bulk emails (newsletters, no-reply senders, out-of-office replies, receipts, notifications). Only consider genuine person-to-person conversations in your summary.
+${hexOnly
+  ? 'HEX-ONLY: The only email connection is DRI Monthly Healthcare Executive Exchange (HEX) group meeting emails. They share that group with Taylor; there is no 1:1 sales thread. Say so, and note that a warm HEX-intro follow-up is appropriate.'
+  : 'Ignore DRI Monthly / Healthcare Executive Exchange (HEX) meeting emails when other 1:1 messages exist — those are group invites, not a relationship.'}
 
 TASK: Write a concise, human-readable narrative summary (3-6 sentences) that captures:
 1. Who has been in contact and when (most recent contact first)
@@ -4330,7 +4343,6 @@ ${escHtml(cached.text)}
     // ── Subject-line signals ─────────────────────────────────────────────────
     const marketingSubjects = [
       /\bunsubscribe\b/,      /\bnewsletter\b/,
-      /\bdri monthly\b/,
       /\bweekly digest\b/,    /\bmonthly digest\b/,  /\bdaily digest\b/,
       /\byou('re| are) invited\b/,
       /\blimited.?time offer\b/, /\bspecial offer\b/, /\bexclusive offer\b/,
@@ -4350,6 +4362,52 @@ ${escHtml(cached.text)}
     if (/undisclosed.recipients|undisclosed recipients/i.test(to)) return true;
 
     return false;
+  }
+
+  // DRI Monthly Healthcare Executive Exchange (HEX) group meeting emails.
+  // These are a shared-group connection with Taylor, not 1:1 sales threads.
+  function isHexMeetingEmail(msg) {
+    if (!msg) return false;
+    const subject = (msg.subject || '').toLowerCase();
+    const from    = (msg.from || msg.sender || '').toString().toLowerCase();
+    const to      = (msg.to || '').toString().toLowerCase();
+    const snippet = (msg.snippet || msg.bodyPreview || msg.bodyText || '').toString().toLowerCase();
+    const blob    = `${subject}\n${from}\n${to}\n${snippet}`;
+    if (/\bdri monthly\b/.test(blob)) return true;
+    if (/\bhealthcare executive exchange\b/.test(blob)) return true;
+    if (/\bhex\b/.test(subject) && (/\bdri\b/.test(blob) || /\bexecutive exchange\b/.test(blob))) return true;
+    return false;
+  }
+
+  // Marketing/automated noise, excluding HEX meeting emails (those are handled separately).
+  function isNoiseEmail(msg) {
+    return isMarketingEmail(msg) && !isHexMeetingEmail(msg);
+  }
+
+  function splitHexEmails(emails) {
+    const hex = [];
+    const other = [];
+    for (const e of emails || []) {
+      if (isHexMeetingEmail(e)) hex.push(e);
+      else other.push(e);
+    }
+    return { hex, other };
+  }
+
+  const HEX_FOLLOWUP_MESSAGE =
+`I see we are both in the DRI Monthly meetings. Just emailing in case it would make sense to meet at some point. I am the former President of KLAS Research and now own/run an executive networking firm, Pando Executive Networking.
+
+We provide concierge executive networking services, helping busy executives keep up on networking when they don't have the time to do it. Let me know if that is interesting.
+
+Either way, great to be connected. Let me know if I can ever be of help.`;
+
+  function preferTaylorEmail(fallback) {
+    const accounts = internalOAuthAccounts || [];
+    const taylor = accounts.find(a => {
+      const e = (a.email || '').toLowerCase();
+      return e.includes('taylor') && isInternalEmail(e);
+    });
+    return taylor?.email || fallback || '';
   }
 
   // Strips common email signature patterns and quoted reply history,
@@ -4608,7 +4666,7 @@ ${escHtml(cached.text)}
     const cutoff = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
     const realEmailsOf = s => (s.emails || []).filter(e =>
       (!e.date || new Date(e.date) >= cutoff) &&
-      !isMarketingEmail({ from: e.from, subject: e.subject, to: e.to }));
+      !isNoiseEmail(e));
     const liMsgsOf = s => (s.linkedInMessages || []).filter(li =>
       !li.date || new Date(li.date) >= cutoff);
 
@@ -4656,13 +4714,22 @@ ${escHtml(cached.text)}
       const emails = realEmailsOf(scan);
       const liMsgs = liMsgsOf(scan);
       const notes  = scan.notes || [];
+      const { hex: hexEmails, other: otherEmails } = splitHexEmails(emails);
+      const hexOnly = hexEmails.length > 0 && otherEmails.length === 0 && liMsgs.length === 0;
+      const emailsForAi = hexOnly ? hexEmails : otherEmails;
 
       const pct = Math.round((i / targetAccounts.length) * 90);
       fuSetStatus(`Analyzing ${account.name}… (${i + 1}/${targetAccounts.length})`, pct);
-      fuLog(`[${account.name}] ${emails.length} email(s), ${liMsgs.length} LinkedIn conv(s)`);
+      if (hexOnly) {
+        fuLog(`[${account.name}] HEX-only connection (${hexEmails.length} DRI Monthly meeting email${hexEmails.length === 1 ? '' : 's'}) — using HEX intro`);
+      } else {
+        fuLog(`[${account.name}] ${otherEmails.length} email(s), ${liMsgs.length} LinkedIn conv(s)${hexEmails.length ? ` · ignored ${hexEmails.length} HEX meeting email${hexEmails.length === 1 ? '' : 's'}` : ''}`);
+      }
 
-      const analysis = await fuAnalyzeCompany(account, emails, liMsgs, notes,
-                                               screeningPrompt, contentPrompt, minDaysSince, skipScheduled);
+      const analysis = hexOnly
+        ? fuHexOnlyAnalysis(account, hexEmails)
+        : await fuAnalyzeCompany(account, emailsForAi, liMsgs, notes,
+                                 screeningPrompt, contentPrompt, minDaysSince, skipScheduled);
 
       analyzed++;
       document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
@@ -4672,7 +4739,7 @@ ${escHtml(cached.text)}
         continue;
       }
 
-      if (analysis.shouldFollowUp && (analysis.fitScore || 0) >= fitThreshold) {
+      if (hexOnly || (analysis.shouldFollowUp && (analysis.fitScore || 0) >= fitThreshold)) {
         // Find the LinkedIn conversation that best matches the AI-identified contact.
         // First try an exact or first-name match on leadName; fall back to liMsgs[0].
         const aiName      = (analysis.contactName || '').toLowerCase().trim();
@@ -4685,26 +4752,30 @@ ${escHtml(cached.text)}
             })
           : null) || liMsgs[0] || null;
 
-        // Resolve BDR email: prefer the BDR from the matched conversation
-        const bdrEmail = bestLi?.bdrEmail || emails[0]?.oauthAccount || '';
+        // Resolve BDR email: HEX-only intros go from Taylor; otherwise prefer the conversation BDR
+        const bdrEmail = hexOnly
+          ? preferTaylorEmail(hexEmails[0]?.oauthAccount || emails[0]?.oauthAccount || '')
+          : (bestLi?.bdrEmail || otherEmails[0]?.oauthAccount || emails[0]?.oauthAccount || '');
         // Look up HeyReach account ID for LinkedIn sending
         const heyreachId = [...linkedInAccountIdMapping.entries()]
-          .find(([, e]) => e === bdrEmail.toLowerCase())?.[0] || null;
+          .find(([, e]) => e === (bdrEmail || '').toLowerCase())?.[0] || null;
         // Best contact email: search the email threads for a non-BDR address
-        const contactEmail = fuExtractContactEmail(emails, analysis.contactName, bdrEmail);
+        const contactEmail = hexOnly
+          ? (analysis.contactEmail || fuExtractContactEmail(hexEmails, analysis.contactName, bdrEmail))
+          : fuExtractContactEmail(otherEmails, analysis.contactName, bdrEmail);
 
         results.push({
           contactName:       analysis.contactName  || 'Unknown',
           contactTitle:      analysis.contactTitle || '',
           contactCompany:    account.name,
           contactLocation:   bestLi?.leadLocation  || '', // best-effort, used for timezone guessing when inserting times
-          source:            analysis.channel      || 'linkedin',
+          source:            hexOnly ? 'HEX intro' : (analysis.channel || 'linkedin'),
           llamaScore:        analysis.fitScore      || 5,
           urgency:           analysis.urgency       || 'medium',
           reason:            analysis.reason        || '',
           aiSummary:         analysis.summary       || '',
           message:           analysis.message       || '',
-          transcript:        fuBuildTranscript(emails, liMsgs),
+          transcript:        fuBuildTranscript(emailsForAi, liMsgs),
           contactEmail,
           contactLinkedInUrl: bestLi?.leadProfileUrl || '',
           conversationId:    bestLi?.id             || null,
@@ -4713,16 +4784,17 @@ ${escHtml(cached.text)}
           _accountId:        account.id,
           _accountName:      account.name,
           _crmNotes:         notes,
-          _emails:           emails, // already filtered to real (non-marketing) emails above
+          _emails:           emailsForAi,
           _liMsgs:           enrichLiMsgDates(liMsgs),
           _bdrEmail:         bdrEmail,
+          hexOnly,
         });
         fuLog(`  ✓ Follow-up recommended for ${analysis.contactName} (score ${analysis.fitScore}/10, ${analysis.urgency})`, 'success');
       } else {
         fuLog(`  — No follow-up needed (score ${analysis.fitScore || '?'}/10)${analysis.reason ? ' — ' + analysis.reason : ''}`);
       }
 
-      if (i < targetAccounts.length - 1 && !fuShouldStop) {
+      if (i < targetAccounts.length - 1 && !fuShouldStop && !hexOnly) {
         await sleep(1000); // 1 s between AI calls to avoid rate-limit (429)
       }
     }
@@ -4752,6 +4824,47 @@ ${escHtml(cached.text)}
   };
 
   // ── Per-company AI analysis ─────────────────────────────────────────────────
+
+  function fuContactFromHexEmails(account, hexEmails) {
+    const companyDomains = [normalizeDomain(account.domain)].filter(Boolean);
+    let best = { email: '', name: '' };
+    for (const e of hexEmails || []) {
+      for (const field of [e.from, e.to, e.cc]) {
+        for (const p of parseAddressList(field)) {
+          if (!p.email) continue;
+          if (isInternalEmail(p.email) || internalBDREmails.has(p.email)) continue;
+          if (companyDomains.length && !isCompanyDomainMatch(p.email, companyDomains)) continue;
+          if (!best.email || (p.name && p.name.length > (best.name || '').length)) {
+            best = { email: p.email, name: p.name || best.name };
+          }
+        }
+      }
+    }
+    if (!best.email) {
+      best.email = fuExtractContactEmail(hexEmails, '', preferTaylorEmail('')) || '';
+    }
+    if (!best.name && best.email) {
+      best.name = best.email.split('@')[0].split(/[._-]/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    }
+    return best;
+  }
+
+  function fuHexOnlyAnalysis(account, hexEmails) {
+    const contact = fuContactFromHexEmails(account, hexEmails);
+    return {
+      shouldFollowUp: true,
+      contactName:    contact.name || 'Unknown',
+      contactTitle:   '',
+      contactEmail:   contact.email || '',
+      channel:        'email',
+      reason:         'Only connection is DRI Monthly Healthcare Executive Exchange (HEX) meeting emails — using HEX intro.',
+      summary:        `The only recorded connection with ${account.name} is the DRI Monthly Healthcare Executive Exchange (HEX) meeting group with Taylor. There is no 1:1 email or LinkedIn history.`,
+      urgency:        'low',
+      fitScore:       6,
+      message:        HEX_FOLLOWUP_MESSAGE,
+      hexOnly:        true,
+    };
+  }
 
   async function fuAnalyzeCompany(account, emails, liMsgs, notes,
                                    screeningPrompt, contentPrompt, minDaysSince, skipScheduled) {
@@ -4790,6 +4903,7 @@ ${notesLines ? '\nCRM NOTES:\n' + notesLines : ''}
 
 RULES:
 - IGNORE any automated, marketing, or bulk emails (no-reply senders, newsletters, unsubscribe notices, out-of-office replies, receipts, delivery notifications, password resets). Only consider genuine person-to-person messages.
+- IGNORE DRI Monthly Healthcare Executive Exchange (HEX) group meeting emails. They are a shared-group connection, not a 1:1 sales conversation. They have already been stripped from this list when other messages exist.
 - Do NOT recommend follow-up if the BDR's most recent outbound message was sent fewer than ${minDaysSince} days ago with no reply yet.
 - Do NOT recommend follow-up if the contact clearly declined, asked to stop, or unsubscribed.
 ${skipScheduled ? '- Do NOT recommend follow-up if a meeting or call is already scheduled, or the contact said they would book a time — they are already in motion.' : ''}
@@ -4856,9 +4970,9 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     const lines = [];
 
     // Emails — filter marketing, then show up to 10 most recent
-    const realEmails = (emails || []).filter(e => !isMarketingEmail({
-      from: e.from, subject: e.subject, to: e.to,
-    }));
+    const incoming = emails || [];
+    const nonHex = incoming.filter(e => !isNoiseEmail(e) && !isHexMeetingEmail(e));
+    const realEmails = nonHex.length ? nonHex : incoming.filter(e => !isNoiseEmail(e));
     realEmails.slice(0, 10).forEach(e => {
       const daysAgo = e.date ? Math.floor((Date.now() - new Date(e.date)) / 86400000) : '?';
       const isSent  = e.folder === 'SENT' || e.folder === 'SentItems';
@@ -5788,9 +5902,9 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     if (!fu) return;
     fuComposeState = { type: 'email', idx };
 
-    // Find the most recent non-sent email in the conversation to thread into.
-    // Sort by date descending and pick the first one that has a threadId or id.
-    const emails = (fu._emails || []).slice().sort((a, b) => {
+    // HEX-only intros must be a new email — never reply-all to the HEX meeting blast.
+    const skipThread = !!fu.hexOnly || ((fu._emails || []).length > 0 && (fu._emails || []).every(isHexMeetingEmail));
+    const emails = skipThread ? [] : (fu._emails || []).slice().sort((a, b) => {
       const da = a.date ? new Date(a.date).getTime() : 0;
       const db = b.date ? new Date(b.date).getTime() : 0;
       return db - da;
@@ -5800,13 +5914,15 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     const threadId  = threadAnchor ? (threadAnchor.threadId || '') : '';
     const inReplyTo = threadAnchor ? (threadAnchor.messageId || threadAnchor.id || '') : '';
     // Use the BDR email from the threaded email's oauth account if available
-    const bdrEmail  = threadAnchor?.oauthAccount || fu._bdrEmail || '';
+    const bdrEmail  = skipThread
+      ? (preferTaylorEmail(fu._bdrEmail) || fu._bdrEmail || '')
+      : (threadAnchor?.oauthAccount || fu._bdrEmail || '');
 
     _openEmailComposeShared({
       bdrEmail,
       to:        fu.contactEmail || '',
       cc:        '',
-      subject:   fu.contactCompany ? `Re: ${fu.contactCompany}` : 'Following up',
+      subject:   skipThread ? 'Great to be connected' : (fu.contactCompany ? `Re: ${fu.contactCompany}` : 'Following up'),
       body:      document.getElementById(`fu-msg-${idx}`)?.value || fu.message || '',
       threadId,
       inReplyTo,
