@@ -219,7 +219,7 @@
 
 <div class="container">
   <div class="help">
-    Scans internal OAuth inboxes, extracts every external email domain, and scores whether that organization
+    Scans internal OAuth <strong>Inbox and Sent</strong> folders, extracts every external email domain, and scores whether that organization
     looks like a healthcare prospect worth watching. <strong>Add as Prospect</strong> creates a CRM account
     (with discovered contacts) and seeds the Company Comms Scanner so you can watch their communications.
   </div>
@@ -249,7 +249,7 @@
     <button class="btn btn-danger" id="stopBtn" onclick="window.stopDomainScan()" style="display:none;">
       <i class="fas fa-stop"></i> Stop
     </button>
-    <label class="ctrl-label" title="Max messages to pull per mailbox (INBOX + SENT combined). API pages in batches of 50.">Msgs / mailbox
+    <label class="ctrl-label" title="Max messages to pull per folder. Inbox and Sent each get this limit. API pages in batches of 50.">Msgs / folder
       <input class="ctrl-input" id="msgLimit" type="number" min="50" max="50000" value="5000" step="50" style="width:90px;margin-left:6px;">
     </label>
     <button class="btn btn-success" id="addWatchBtn" onclick="window.addAllRecommended()" disabled>
@@ -614,7 +614,7 @@
   }
 
   function upsertDomainFromMessage(msg, oauthEmail) {
-    const fields = [msg.from, msg.to, msg.cc].map(normalizeEmailField);
+    const fields = [msg.from, msg.to, msg.cc, msg.bcc].map(normalizeEmailField);
     const addrs = fields.flatMap(parseAddressList);
     const date = parseEmailDate(msg.date || msg.receivedDateTime || msg.internalDate);
     const dateIso = date ? date.toISOString() : null;
@@ -685,8 +685,8 @@
     document.getElementById('scanBtn').disabled = true;
     document.getElementById('aiBtn').disabled = true;
     document.getElementById('stopBtn').style.display = '';
-    // Target total messages per mailbox (across folders). Backend returns ≤50/page.
-    const mailboxCap = Math.max(50, Math.min(50000, parseInt(document.getElementById('msgLimit').value, 10) || 5000));
+    // Cap is per folder so Sent is not starved after a large Inbox.
+    const folderCap = Math.max(50, Math.min(50000, parseInt(document.getElementById('msgLimit').value, 10) || 5000));
     const PAGE_SIZE = 50;
 
     // Keep prior AI / status for domains we already know
@@ -702,22 +702,24 @@
         if (shouldStop) break;
         const isMicrosoft = (oauthAcc.provider || '').toLowerCase() === 'microsoft'
           || oauthAcc.accountId?.startsWith('microsoft_');
-        // API maps INBOX/SENT for both providers (case-insensitive)
-        const folders = ['INBOX', 'SENT'];
-        let mailboxPulled = 0;
+        // Gmail: INBOX/SENT. Microsoft Graph: inbox/SentItems (API also maps SENT → sentItems).
+        const folders = isMicrosoft ? ['inbox', 'SentItems'] : ['INBOX', 'SENT'];
+        const folderWeight = 1 / folders.length;
         setProgress(
           Math.round((done / mailboxes.length) * 100),
-          `Scanning ${oauthAcc.email}… (0 / ${mailboxCap})`
+          `Scanning ${oauthAcc.email}… Inbox + Sent`
         );
 
-        for (const folder of folders) {
-          if (shouldStop || mailboxPulled >= mailboxCap) break;
+        for (let fi = 0; fi < folders.length; fi++) {
+          const folder = folders[fi];
+          if (shouldStop) break;
+          let folderPulled = 0;
           let pageToken = null;
           let page = 0;
           try {
-            while (!shouldStop && mailboxPulled < mailboxCap) {
+            while (!shouldStop && folderPulled < folderCap) {
               page++;
-              const remaining = mailboxCap - mailboxPulled;
+              const remaining = folderCap - folderPulled;
               const params = new URLSearchParams({
                 accountId: oauthAcc.accountId,
                 folder,
@@ -727,7 +729,7 @@
               const headers = await getAuthHeaders();
               const res = await fetch(`${RAILWAY_URL}/oauth/test/inbox?${params}`, { headers });
               if (!res.ok) {
-                console.warn('Inbox fetch failed', oauthAcc.email, folder, res.status);
+                console.warn('Mailbox fetch failed', oauthAcc.email, folder, res.status);
                 break;
               }
               const data = await res.json();
@@ -736,7 +738,7 @@
 
               for (const msg of messages) {
                 pulled++;
-                mailboxPulled++;
+                folderPulled++;
                 if (!isMarketingEmail({
                   from: normalizeEmailField(msg.from || msg.sender),
                   subject: msg.subject,
@@ -746,16 +748,17 @@
                     from: normalizeEmailField(msg.from || msg.sender),
                     to: normalizeEmailField(msg.to || msg.toRecipients),
                     cc: normalizeEmailField(msg.cc || msg.ccRecipients),
+                    bcc: normalizeEmailField(msg.bcc || msg.bccRecipients),
                     subject: msg.subject,
-                    date: msg.date || msg.receivedDateTime || msg.internalDate,
+                    date: msg.date || msg.sentDateTime || msg.receivedDateTime || msg.internalDate,
                   }, oauthAcc.email);
                 }
-                if (mailboxPulled >= mailboxCap) break;
+                if (folderPulled >= folderCap) break;
               }
 
               setProgress(
-                Math.round(((done + mailboxPulled / mailboxCap) / mailboxes.length) * 100),
-                `Scanning ${oauthAcc.email} · ${folder} · page ${page} (${mailboxPulled} / ${mailboxCap})`
+                Math.round(((done + (fi + folderPulled / folderCap) * folderWeight) / mailboxes.length) * 100),
+                `Scanning ${oauthAcc.email} · ${folder} · page ${page} (${folderPulled} / ${folderCap})`
               );
 
               pageToken = data.nextPageToken || null;
@@ -902,7 +905,7 @@
       lastActivity: r.lastActivity,
     }));
 
-    const prompt = `You evaluate email domains found in HealthLuminate's internal sales inboxes.
+    const prompt = `You evaluate email domains found in HealthLuminate's internal Inbox and Sent folders.
 HealthLuminate sells into / networks with healthcare organizations (providers, payers, health IT vendors, digital health, benefits, revenue cycle, clinical ops, consulting firms selling into healthcare).
 
 For EACH domain, decide if we should ADD them as a watched prospect client in our CRM.
