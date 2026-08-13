@@ -2516,7 +2516,7 @@
             </div>
             <div>
                 <label>Business Days Out</label>
-                <input type="number" id="itmStartDay" value="10" min="0" max="60" />
+                <input type="number" id="itmStartDay" value="6" min="0" max="60" />
             </div>
             <div>
                 <label>Window (days)</label>
@@ -2719,6 +2719,7 @@
         </div>
       </div>
       <div id="followUpScheduleStatus" style="display:none; margin-bottom:1rem; padding:0.75rem 1rem; border-radius:10px; font-size:0.88rem; font-weight:500;"></div>
+      <div id="fuBdrsFailed" style="display:none; margin-bottom:1.25rem; background:#fef2f2; border:1px solid #fca5a5; border-radius:10px; padding:0.85rem 1rem; font-size:0.82rem; color:#991b1b;"></div>
       <div id="fuExcludedBreakdown" style="display:none; margin-bottom:1rem; font-size:0.78rem; color:#64748b;"></div>
       <div id="fuEaSetupNeeded" style="display:none; margin-bottom:1.25rem; background:#faf5ff; border:1px solid #e9d5ff; border-radius:10px; padding:0.85rem 1rem; font-size:0.82rem; color:#8A6B2E;"></div>
       <div id="fuHarvestCandidates" style="display:none; margin-bottom:1.25rem; background:#fffbeb; border:1px solid #fde68a; border-radius:10px; padding:0.85rem 1rem; font-size:0.82rem; color:#92400e;"></div>
@@ -2777,7 +2778,7 @@
         // plain-script code (e.g. openFollowUpScanModal) can read their current values without
         // hitting a ReferenceError.
         window.getFollowUpScanContext = function() {
-            return { selectedBdrEmailFilter, selectedCompanyBDREmails, accountEmail };
+            return { selectedBdrEmailFilter, selectedCompanyBDREmails, selectedCompanyBDRs, accountEmail, currentUserEmail };
         };
         let connectedNoReplyContacts = [];
         let selectedContactIds = new Set();
@@ -3135,7 +3136,7 @@
 
             document.getElementById('itmLinkNote').innerHTML = `<i class="fas fa-link"></i> Using calendar: ${escapeHtml(calendarLink)}`;
             document.getElementById('itmDuration').value = '30';
-            document.getElementById('itmStartDay').value = '10';
+            document.getElementById('itmStartDay').value = '6';
             document.getElementById('itmWindowDays').value = '4';
             document.getElementById('itmResults').innerHTML = '';
             document.getElementById('itmInsertBtn').disabled = true;
@@ -3170,7 +3171,7 @@
         window.fetchInsertTimesAvailability = async function() {
             const duration   = parseInt(document.getElementById('itmDuration').value) || 30;
             const tz         = document.getElementById('itmTimezone').value;
-            const startDay   = Math.max(0, parseInt(document.getElementById('itmStartDay').value) || 10);
+            const startDay   = Math.max(0, parseInt(document.getElementById('itmStartDay').value) || 6);
             const windowDays = Math.max(1, parseInt(document.getElementById('itmWindowDays').value) || 4);
 
             const rangeStart = itmBusinessDayDateStr(startDay);
@@ -3302,7 +3303,7 @@
                 return `${dayStr}: ${itmBuildHumanTimeLine(dates, tz, duration)} ${tzLabel}`;
             });
 
-            insertIntoReply(itmConvId, lines.join('\n\n'));
+            insertIntoReply(itmConvId, lines.join('\n'));
             closeInsertTimesModal();
         };
 
@@ -5020,6 +5021,8 @@
         // Load companies and their BDRs for admin selector
         let allBDRs = []; // Store all BDRs globally
         let selectedCompanyBDREmails = []; // Store selected company's BDR emails (both primary and LinkedIn)
+        let selectedCompanyBDRs = []; // Store selected company's BDR person objects (one entry per real person — use this, not
+        // selectedCompanyBDREmails, whenever you need a distinct per-BDR list, since the emails array mixes in LinkedIn aliases)
         let currentGroupFilterCompanyScope = null; // customerId (or '__ALL_BDRS__'/null) currently selected in the company dropdown
         let allCustomers = []; // Store all customers for name lookups
         let bdrProfileCache = new Map(); // Cache: BDR email -> { linkedInUrl, calendarLink, textInserts }
@@ -5359,6 +5362,7 @@
                         // Reset to own company
                         console.log('🔄 Resetting to own company');
                         selectedCompanyBDREmails = [];
+                        selectedCompanyBDRs = [];
                         viewingBdrEmail = currentUserEmail;
                         accountEmail = viewingBdrEmail;
                         populateBdrPersonDropdown([]);
@@ -5373,6 +5377,7 @@
                         // All BDRs across all companies
                         console.log(`🌐 Switching to ALL BDRs (${allBDRs.length} total)`);
                         selectedCompanyBDREmails = collectEmailsForBDRs(allBDRs);
+                        selectedCompanyBDRs = allBDRs;
                         console.log(`📧 Collected ${selectedCompanyBDREmails.length} unique email addresses across all BDRs`);
                         viewingBdrEmail = selectedCompanyBDREmails[0] || currentUserEmail;
                         accountEmail = viewingBdrEmail;
@@ -5388,6 +5393,7 @@
                         console.log(`🔄 Switching to company: ${companyName} with ${companyBDRs.length} BDRs`);
                         
                         selectedCompanyBDREmails = collectEmailsForBDRs(companyBDRs);
+                        selectedCompanyBDRs = companyBDRs;
                         
                         console.log(`📧 Collected ${selectedCompanyBDREmails.length} unique email addresses for filtering:`, selectedCompanyBDREmails);
                         
@@ -7614,6 +7620,17 @@
                 if (responseValue) conversation.responseCategory = responseValue;
                 if (followUpValue) conversation.followUpCategory = followUpValue;
                 conversation.manualCategoryOverride = true;
+
+                // Scheduled/Declined mean no more follow-up invitations — clear any pending draft
+                // (from an earlier "Draft Follow-Up Sequences" run) so the "ready to send" banner
+                // doesn't keep showing on the card for something that no longer needs a follow-up.
+                // The backend endpoint above already deletes the field in Firestore; mirror it
+                // locally so the card updates immediately without a full reload.
+                let needsRerender = false;
+                if ((responseValue === 'Scheduled' || responseValue === 'Declined to Meet') && conversation.followUpSequence) {
+                    conversation.followUpSequence = null;
+                    needsRerender = true;
+                }
                 
                 // Track meeting scheduled for cost/revenue reporting
                 if (responseValue === 'Scheduled') {
@@ -7673,6 +7690,14 @@
                 
                 // Update the grid
                 updateCategoryGrid();
+
+                if (needsRerender) {
+                    // Re-renders the list so the now-stale "Follow-up ready to send" banner
+                    // disappears immediately (full re-render, so skip the border/lock-icon
+                    // tweaks below — they'd target elements that are about to be replaced).
+                    applyAllFilters();
+                    return;
+                }
                 
                 // Show brief confirmation in the UI
                 const selectElement = responseValue ? responseSelect : followUpSelect;
@@ -10898,6 +10923,7 @@ let followUpJobId = null;
 let followUpPollTimer = null;
 let followUpScanResults = [];
 let followUpBdrEmail = '';
+let followUpBdrEmails = null; // set (array) instead of followUpBdrEmail when scanning a whole company across multiple BDRs
 let followUpSessionSlots = new Set();
 
 // Response/Follow-up categories offered as include/exclude chips in the scan modal.
@@ -10944,30 +10970,43 @@ window.toggleFuCategoryChip = function(containerId, value) {
 };
 
 function openFollowUpScanModal() {
-  // The follow-up scan generates messages using ONE BDR's calendar link, EA outreach settings,
-  // and voice — it can't sensibly run across multiple BDRs at once. Require a specific BDR to be
-  // picked (via the "Filter to one BDR" dropdown) whenever more than one is currently in scope.
+  // The follow-up scan drafts messages using a BDR's calendar link, EA outreach settings, and
+  // voice. When a specific BDR is picked (via the "Filter to one BDR" dropdown), scan just them.
+  // Otherwise, when multiple BDRs are in scope (a whole company, or "All BDRs"), scan every one
+  // of them in turn — each still gets their own calendar link/EA settings/voice server-side.
   //
   // NOTE: `bdrSelect` is the *company* selector — its values are customerIds, '', or the
   // '__ALL_BDRS__' sentinel, NEVER a BDR email. Reading it directly as bdrEmail (as this used to
   // do) sent literal garbage like "__ALL_BDRS__" to the backend and crashed the scan job.
   //
-  // NOTE: selectedBdrEmailFilter/selectedCompanyBDREmails/accountEmail live in the page's
+  // NOTE: selectedBdrEmailFilter/selectedCompanyBDRs/accountEmail live in the page's
   // `type="module"` script, which has its own isolated top-level scope — they aren't visible as
   // bare identifiers here. Read them via the window.getFollowUpScanContext() accessor instead.
   const scanCtx = (typeof window.getFollowUpScanContext === 'function') ? window.getFollowUpScanContext() : {};
   const currentBdrEmailFilter = scanCtx.selectedBdrEmailFilter;
-  const currentCompanyBDREmails = scanCtx.selectedCompanyBDREmails;
+  // selectedCompanyBDRs is one entry per real person (unlike selectedCompanyBDREmails, which
+  // mixes in LinkedIn aliases and would over-count how many distinct BDRs are in scope).
+  const distinctCompanyBdrEmails = [...new Set((scanCtx.selectedCompanyBDRs || [])
+    .map(b => (b.primaryEmail || '').toLowerCase())
+    .filter(Boolean))];
+
+  followUpBdrEmails = null;
   if (currentBdrEmailFilter && currentBdrEmailFilter[0]) {
     followUpBdrEmail = currentBdrEmailFilter[0];
-  } else if (Array.isArray(currentCompanyBDREmails) && currentCompanyBDREmails.length > 1) {
-    alert('Please pick a specific BDR from the "Filter to one BDR" dropdown above before scanning for follow-up opportunities — this scan is generated per-BDR using their calendar link and voice.');
-    return;
+  } else if (distinctCompanyBdrEmails.length > 1) {
+    // No specific BDR picked, but multiple are in scope — scan the whole company/group,
+    // cycling through each BDR one at a time server-side.
+    followUpBdrEmails = distinctCompanyBdrEmails;
+    followUpBdrEmail = '';
+  } else if (distinctCompanyBdrEmails.length === 1) {
+    followUpBdrEmail = distinctCompanyBdrEmails[0];
   } else {
-    followUpBdrEmail = scanCtx.accountEmail || '';
+    followUpBdrEmail = scanCtx.accountEmail || scanCtx.currentUserEmail || '';
   }
-  if (!followUpBdrEmail || followUpBdrEmail === '__ALL_BDRS__') { alert('Please select a BDR from the dropdown first.'); return; }
-  document.getElementById('followUpBdrLabel').textContent = followUpBdrEmail;
+  if (!followUpBdrEmails && (!followUpBdrEmail || followUpBdrEmail === '__ALL_BDRS__')) { alert('Please select a BDR from the dropdown first.'); return; }
+  document.getElementById('followUpBdrLabel').textContent = followUpBdrEmails
+    ? `${followUpBdrEmails.length} BDRs in this company (scanning each one in turn)`
+    : followUpBdrEmail;
   document.getElementById('followUpScanForm').style.display = 'block';
   document.getElementById('followUpProgress').style.display = 'none';
   document.getElementById('followUpResults').style.display = 'none';
@@ -11025,7 +11064,7 @@ async function startFollowUpScan() {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        bdrEmail: followUpBdrEmail,
+        ...(followUpBdrEmails ? { bdrEmails: followUpBdrEmails } : { bdrEmail: followUpBdrEmail }),
         contactGroup: includeOtherCampaign ? 'both' : 'replied',
         lookbackDays, minDaysSinceProspect, maxDaysSinceAny, maxUnanswered, skipScheduled,
         responseCategoryFilter, followUpCategoryFilter, meetingTopic
@@ -11070,9 +11109,23 @@ function pollFollowUpJob() {
 
 function showFollowUpResults(results) {
   document.getElementById('followUpResults').style.display = 'block';
-  const { scanned = 0, approved = 0, generated = 0, followUps = [], harvestCandidates = [], pendingEaSetup = [], excludedCounts = {} } = results;
+  const { scanned = 0, approved = 0, generated = 0, followUps = [], harvestCandidates = [], pendingEaSetup = [], excludedCounts = {}, bdrsScanned = [], bdrsFailed = [] } = results;
   followUpScanResults = followUps;
-  document.getElementById('followUpResultsSummary').innerHTML = `Scanned <strong>${scanned}</strong> conversations · <strong>${approved}</strong> matched a category rule · <strong>${generated}</strong> follow-up(s) drafted`;
+  let summaryHtml = `Scanned <strong>${scanned}</strong> conversations · <strong>${approved}</strong> matched a category rule · <strong>${generated}</strong> follow-up(s) drafted`;
+  if (followUpBdrEmails) {
+    summaryHtml += ` · across <strong>${bdrsScanned.length}</strong> of ${followUpBdrEmails.length} BDR(s)`;
+  }
+  document.getElementById('followUpResultsSummary').innerHTML = summaryHtml;
+  const failedEl = document.getElementById('fuBdrsFailed');
+  if (failedEl) {
+    if (bdrsFailed.length > 0) {
+      failedEl.style.display = 'block';
+      failedEl.innerHTML = `<strong><i class="fas fa-triangle-exclamation"></i> ${bdrsFailed.length} BDR(s) could not be scanned:</strong><ul style="margin:0.4rem 0 0 1.1rem; padding:0;">` +
+        bdrsFailed.map(f => `<li>${escapeHtmlFU(f.bdrEmail)} — ${escapeHtmlFU(f.error || 'unknown error')}</li>`).join('') + `</ul>`;
+    } else {
+      failedEl.style.display = 'none';
+    }
+  }
   document.getElementById('scheduleAllBtn').style.display = generated > 0 ? 'flex' : 'none';
   document.getElementById('followUpScheduleStatus').style.display = 'none';
 
@@ -11094,8 +11147,8 @@ function showFollowUpResults(results) {
   const eaSetupEl = document.getElementById('fuEaSetupNeeded');
   if (pendingEaSetup.length > 0) {
     eaSetupEl.style.display = 'block';
-    eaSetupEl.innerHTML = `<strong><i class="fas fa-user-tie"></i> ${pendingEaSetup.length} need an executive assistant nudge, but held back</strong> — this BDR hasn't saved EA Outreach settings (and/or a calendar link) yet. Go to <strong>About Me → Executive Assistant Outreach Message</strong> to configure the assistant name, BDR first name, and pronoun, then re-run this scan:<ul style="margin:0.4rem 0 0 1.1rem; padding:0;">` +
-      pendingEaSetup.slice(0, 25).map(h => `<li>${escapeHtmlFU(h.contactName)}${h.company ? ` — ${escapeHtmlFU(h.company)}` : ''}</li>`).join('') +
+    eaSetupEl.innerHTML = `<strong><i class="fas fa-user-tie"></i> ${pendingEaSetup.length} need an executive assistant nudge, but held back</strong> — that BDR hasn't saved EA Outreach settings (and/or a calendar link) yet. Go to <strong>About Me → Executive Assistant Outreach Message</strong> to configure the assistant name, BDR first name, and pronoun, then re-run this scan:<ul style="margin:0.4rem 0 0 1.1rem; padding:0;">` +
+      pendingEaSetup.slice(0, 25).map(h => `<li>${escapeHtmlFU(h.contactName)}${h.company ? ` — ${escapeHtmlFU(h.company)}` : ''}${followUpBdrEmails && h.bdrName ? ` <em style="color:#a78bfa;">(${escapeHtmlFU(h.bdrName)})</em>` : ''}</li>`).join('') +
       (pendingEaSetup.length > 25 ? `<li>…and ${pendingEaSetup.length - 25} more</li>` : '') + `</ul>`;
   } else {
     eaSetupEl.style.display = 'none';
@@ -11105,7 +11158,7 @@ function showFollowUpResults(results) {
   if (harvestCandidates.length > 0) {
     harvestEl.style.display = 'block';
     harvestEl.innerHTML = `<strong><i class="fas fa-seedling"></i> ${harvestCandidates.length} left alone for a harvest campaign</strong> (followed up already, never showed interest in meeting — no message drafted):<ul style="margin:0.4rem 0 0 1.1rem; padding:0;">` +
-      harvestCandidates.slice(0, 25).map(h => `<li>${escapeHtmlFU(h.contactName)}${h.company ? ` — ${escapeHtmlFU(h.company)}` : ''}</li>`).join('') +
+      harvestCandidates.slice(0, 25).map(h => `<li>${escapeHtmlFU(h.contactName)}${h.company ? ` — ${escapeHtmlFU(h.company)}` : ''}${followUpBdrEmails && h.bdrName ? ` <em style="color:#d97706;">(${escapeHtmlFU(h.bdrName)})</em>` : ''}</li>`).join('') +
       (harvestCandidates.length > 25 ? `<li>…and ${harvestCandidates.length - 25} more</li>` : '') + `</ul>`;
   } else {
     harvestEl.style.display = 'none';
@@ -11139,6 +11192,7 @@ function showFollowUpResults(results) {
           <div style="font-size:0.75rem;color:#94a3b8;margin-top:3px;">${fu.lastMessageAt ? 'Last activity: ' + new Date(fu.lastMessageAt).toLocaleDateString() : 'No prior messages'}</div>
         </div>
         <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;">
+          ${followUpBdrEmails && (fu.bdrName || fu.bdrEmail) ? `<span class="fu-tag" style="background:#ede9fe;color:#5b21b6;"><i class="fas fa-user"></i> ${escapeHtmlFU(fu.bdrName || fu.bdrEmail)}</span>` : ''}
           <span class="fu-tag" style="background:${fu.bucket==='ea_outreach'?'#fce7f3;color:#9d174d':'#dbeafe;color:#1e40af'}">${escapeHtmlFU(fu.bucketLabel || 'Follow-up')}</span>
           <span class="fu-tag" style="background:${fu.source==='connected_no_reply'?'#fef3c7;color:#92400e':fu.source==='other_campaign'?'#ede9fe;color:#5b21b6':'#dcfce7;color:#166534'}">${fu.source==='connected_no_reply'?'Connected · No Reply':fu.source==='other_campaign'?`Other: ${fu.campaignName||'Campaign'}`:'Active Convo'}</span>
         </div>
@@ -11222,26 +11276,46 @@ async function scheduleFollowUps(items, inlineStatusEl) {
     const { doc, setDoc, Timestamp } = window.clemailFirestore;
     const db = window.clemailDb;
     const user = window.auth.currentUser;
-    const slots = await getFollowUpSlots(followUpBdrEmail, items.length);
-    if (slots.length < items.length) { statusEl.style.background = '#fef3c7'; statusEl.style.border = '1px solid #fcd34d'; statusEl.style.color = '#92400e'; statusEl.textContent = `⚠️ Only ${slots.length} slot(s) available — scheduling ${slots.length} of ${items.length} messages.`; }
+
+    // A whole-company scan mixes follow-ups from several BDRs together — each one has their own
+    // calendar/queue, so slots must be requested and booked per-BDR rather than off one global.
+    const byBdr = new Map();
+    items.forEach(fu => {
+      const bdr = (fu.bdrEmail || followUpBdrEmail || '').toLowerCase();
+      if (!byBdr.has(bdr)) byBdr.set(bdr, []);
+      byBdr.get(bdr).push(fu);
+    });
+
     let scheduled = 0;
-    for (let i = 0; i < Math.min(items.length, slots.length); i++) {
-      const fu = items[i];
-      const slotTime = slots[i];
-      const docId = `followup_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      await setDoc(doc(db, 'linkedin_message_queue', docId), {
-        id: docId, bdrEmail: followUpBdrEmail.toLowerCase(), recipientName: fu.contactName,
-        recipientLinkedInUrl: fu.contactLinkedInUrl || '', recipientLinkedInAccountId: fu.linkedInAccountId || null,
-        message: fu.message, scheduledTime: Timestamp.fromDate(slotTime), createdAt: Timestamp.now(),
-        createdBy: user?.email || 'admin', status: 'pending', conversationId: fu.conversationId || null,
-        recipientCustomerId: fu.customerId || null, source: 'follow_up_scan', sourceJobId: followUpJobId || null,
-        followUpScanReason: fu.llamaReason || '', followUpScanBucket: fu.bucket || ''
-      });
-      scheduled++;
-      statusEl.textContent = `⏳ Scheduled ${scheduled} of ${Math.min(items.length, slots.length)}…`;
+    let shortfall = 0;
+    let firstSlotTime = null;
+    for (const [bdrEmailForGroup, groupItems] of byBdr) {
+      const slots = await getFollowUpSlots(bdrEmailForGroup, groupItems.length);
+      if (slots.length < groupItems.length) shortfall += (groupItems.length - slots.length);
+      for (let i = 0; i < Math.min(groupItems.length, slots.length); i++) {
+        const fu = groupItems[i];
+        const slotTime = slots[i];
+        if (!firstSlotTime || slotTime < firstSlotTime) firstSlotTime = slotTime;
+        const docId = `followup_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        await setDoc(doc(db, 'linkedin_message_queue', docId), {
+          id: docId, bdrEmail: bdrEmailForGroup, recipientName: fu.contactName,
+          recipientLinkedInUrl: fu.contactLinkedInUrl || '', recipientLinkedInAccountId: fu.linkedInAccountId || null,
+          message: fu.message, scheduledTime: Timestamp.fromDate(slotTime), createdAt: Timestamp.now(),
+          createdBy: user?.email || 'admin', status: 'pending', conversationId: fu.conversationId || null,
+          recipientCustomerId: fu.customerId || null, source: 'follow_up_scan', sourceJobId: followUpJobId || null,
+          followUpScanReason: fu.llamaReason || '', followUpScanBucket: fu.bucket || ''
+        });
+        scheduled++;
+        statusEl.textContent = `⏳ Scheduled ${scheduled} of ${items.length}…`;
+      }
     }
-    statusEl.style.background = '#f0fdf4'; statusEl.style.border = '1px solid #86efac'; statusEl.style.color = '#166634';
-    statusEl.innerHTML = `✅ <strong>${scheduled}</strong> scheduled! First slot: ${slots[0]?.toLocaleString() || '—'}`;
+    if (shortfall > 0) {
+      statusEl.style.background = '#fef3c7'; statusEl.style.border = '1px solid #fcd34d'; statusEl.style.color = '#92400e';
+      statusEl.textContent = `⚠️ Only ${scheduled} of ${items.length} could be scheduled — ${shortfall} ran out of open slots in the next 90 days.`;
+    } else {
+      statusEl.style.background = '#f0fdf4'; statusEl.style.border = '1px solid #86efac'; statusEl.style.color = '#166634';
+      statusEl.innerHTML = `✅ <strong>${scheduled}</strong> scheduled! First slot: ${firstSlotTime?.toLocaleString() || '—'}`;
+    }
   } catch(e) {
     statusEl.style.background = '#fef2f2'; statusEl.style.border = '1px solid #fca5a5'; statusEl.style.color = '#991b1b';
     statusEl.textContent = 'Error: ' + e.message;
