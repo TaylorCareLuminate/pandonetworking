@@ -4446,6 +4446,39 @@ Let me know if a meeting would be helpful.`;
     return `${d} days ago`;
   }
 
+  // Phrases that indicate a genuinely warm, personal sent email — e.g. after meeting
+  // someone in person, at an event, or on a call — as opposed to a cold/templated
+  // outreach message. Used as proof of a real relationship even without a reply on file.
+  function isIntimateSentEmail(msg) {
+    const subject = (msg.subject || '').toLowerCase();
+    const snippet = (msg.snippet || msg.bodyPreview || msg.bodyText || '').toString().toLowerCase();
+    const blob = `${subject} ${snippet}`;
+    const intimatePatterns = [
+      /\b(great|nice|good|lovely|wonderful|real pleasure|pleasure) (meeting|catching up with|speaking with|connecting with|chatting with|talking with)\b/,
+      /\b(great|nice|good) (to meet|to see) you\b/,
+      /\benjoyed (meeting|our conversation|catching up|connecting|speaking)\b/,
+      /\bit was (great|so great|wonderful|a pleasure|nice) (meeting|to meet|catching up with|speaking with|connecting with)\b/,
+      /\bthanks for (meeting|the meeting|taking the time|catching up|the call|the conversation|connecting)\b/,
+      /\bgreat (call|conversation|chat) (today|yesterday|earlier|with you)\b/,
+    ];
+    return intimatePatterns.some(r => r.test(blob));
+  }
+
+  // Real evidence of engagement with this org outside of HEX meeting emails: an
+  // inbound reply, an intimate/personal sent email (proof of an actual meeting or
+  // relationship even with no reply on file), or a genuine two-way LinkedIn conversation
+  // (LinkedIn matches already require both sides to have sent at least one message).
+  function computeEngagement(nonHexEmails, liMsgs) {
+    const isSentMsg = e => e.folder === 'SENT' || e.folder === 'SentItems';
+    const hasInboundReal  = (nonHexEmails || []).some(e => !isSentMsg(e));
+    const hasIntimateSent = (nonHexEmails || []).some(e => isSentMsg(e) && isIntimateSentEmail(e));
+    const hasLiEngagement = (liMsgs || []).length > 0;
+    return {
+      engaged: hasInboundReal || hasIntimateSent || hasLiEngagement,
+      hasInboundReal, hasIntimateSent, hasLiEngagement,
+    };
+  }
+
   function preferTaylorEmail(fallback) {
     const accounts = internalOAuthAccounts || [];
     const taylor = accounts.find(a => {
@@ -4674,6 +4707,28 @@ Let me know if a meeting would be helpful.`;
     });
   }
 
+  // Persists the "Never Engaged" flag onto each account's company_comms_scans doc
+  // (full-record write, matching how the rest of this file updates scanState) so
+  // future follow-up scans can skip — or, once re-engaged, stop skipping — them
+  // without needing to re-derive it every time from the raw comms data.
+  async function fuSetNeverEngaged(accounts, value) {
+    try {
+      await waitForWrapper();
+      const { doc, setDoc } = window.clemailFirestore;
+      const nowIso = new Date().toISOString();
+      for (const a of accounts) {
+        const existing = scanState[a.id] || {};
+        const updated = value
+          ? { ...existing, neverEngaged: true, neverEngagedAt: nowIso }
+          : { ...existing, neverEngaged: false, neverEngagedAt: null, reEngagedAt: nowIso };
+        await setDoc(doc(window.clemailDb, 'company_comms_scans', a.id), updated);
+        scanState[a.id] = updated;
+      }
+    } catch (e) {
+      console.warn('fuSetNeverEngaged failed:', e.message);
+    }
+  }
+
   // ── Main entry ──────────────────────────────────────────────────────────────
   // Uses the already-collected comms scan data (emails + LinkedIn per company)
   // rather than re-scanning BDR inboxes.  One AI call per company.
@@ -4717,7 +4772,13 @@ Let me know if a meeting would be helpful.`;
     const liMsgsOf = s => allLiOf(s).filter(li =>
       !li.date || new Date(li.date) >= cutoff);
 
-    // Target: scanned companies with HEX-only, recent 1:1, or stale 1:1 history
+    // Target: scanned companies with HEX-only, recent 1:1, or stale 1:1 history.
+    // Also identifies "Never Engaged" orgs along the way — outside of HEX emails, they
+    // have never emailed us back, never received an intimate/personal email from us, and
+    // have no genuine two-way LinkedIn conversation. Those are excluded here and marked
+    // below so future scans skip them automatically unless they engage again.
+    const neverEngagedAccounts = [];
+    const reEngagedAccounts    = [];
     const pool = allAccounts.filter(a => {
       const stage = (a.stage || '').toLowerCase().trim();
       if (SKIP_STAGES.has(stage)) return false;
@@ -4725,7 +4786,16 @@ Let me know if a meeting would be helpful.`;
       if (!s?.lastScanDate) return false;
       const { hex, other } = splitHexEmails(allRealOf(s));
       const li = allLiOf(s);
-      if (hex.length && !other.length && !li.length) return true;
+      const hexOnly = hex.length > 0 && other.length === 0 && li.length === 0;
+      if (hexOnly) return true;
+
+      const eng = computeEngagement(other, li);
+      if (!eng.engaged) {
+        neverEngagedAccounts.push(a);
+        return false;
+      }
+      if (s.neverEngaged) reEngagedAccounts.push(a); // was flagged before, has since engaged
+
       if (realEmailsOf(s).length > 0 || liMsgsOf(s).length > 0) return true;
       const last = lastCommsDate(other, li);
       if (last) return true; // history exists but nothing in lookback → reconnect
@@ -4737,6 +4807,18 @@ Let me know if a meeting would be helpful.`;
     const skippedStage = allAccounts.filter(a => SKIP_STAGES.has((a.stage || '').toLowerCase().trim()));
     if (skippedStage.length) {
       fuLog(`⏭ Skipping ${skippedStage.length} existing customer${skippedStage.length === 1 ? '' : 's'} (Active / Building / Paused): ${skippedStage.slice(0, 5).map(a => a.name).join(', ')}${skippedStage.length > 5 ? '…' : ''}`, 'info');
+    }
+
+    // Persist "Never Engaged" markers so future scans skip these orgs without
+    // recomputing, and clear the flag on anyone who has since engaged.
+    if (neverEngagedAccounts.length) {
+      const toMark = neverEngagedAccounts.filter(a => !scanState[a.id]?.neverEngaged);
+      fuLog(`🚫 Marking ${neverEngagedAccounts.length} compan${neverEngagedAccounts.length === 1 ? 'y' : 'ies'} "Never Engaged" — no reply, intimate email, or LinkedIn conversation on record: ${neverEngagedAccounts.slice(0, 5).map(a => a.name).join(', ')}${neverEngagedAccounts.length > 5 ? '…' : ''}`, 'warning');
+      if (toMark.length) await fuSetNeverEngaged(toMark, true);
+    }
+    if (reEngagedAccounts.length) {
+      fuLog(`✅ Clearing "Never Engaged" on ${reEngagedAccounts.length} compan${reEngagedAccounts.length === 1 ? 'y' : 'ies'} that have since engaged: ${reEngagedAccounts.slice(0, 5).map(a => a.name).join(', ')}${reEngagedAccounts.length > 5 ? '…' : ''}`, 'info');
+      await fuSetNeverEngaged(reEngagedAccounts, false);
     }
 
     if (!targetAccounts.length) {
