@@ -2673,6 +2673,12 @@
     let _companyProspectTotal = 0;     // count of unique prospect URLs for selected company
     let _prospectLoadingCompany = '';  // tracks which company is being loaded
 
+    // Chunked groups (thousands of contacts) don't carry their URLs on the
+    // parent doc, so the coverage bar can't compute overlap against
+    // _companyProspectSet without fetching hypothesis_group_chunks first.
+    // groupId → Set<normalizedUrl>, populated lazily by _loadChunkedGroupUrls().
+    let _chunkedGroupUrlCache = {};
+
     // ── Firestore 1 MB doc-size limit workaround ─────────────────────────────
     // Groups with thousands of contacts exceed the 1 MB Firestore document limit.
     // When the data is too large we split contactLinkedInUrls + taggedContacts into
@@ -2703,6 +2709,24 @@
             }
         }
         return { urls, tagged };
+    }
+
+    // Loads full URL sets for every chunked group in `allGroups` so the prospect
+    // coverage bar (and summary totals) can compute a real overlap instead of the
+    // hardcoded 0 that chunked groups fell back to previously. Fire-and-forget —
+    // re-renders the cards once done.
+    async function _loadChunkedGroupUrls() {
+        const chunkedGroups = allGroups.filter(g => g._chunked);
+        if (!chunkedGroups.length) return;
+        await Promise.all(chunkedGroups.map(async g => {
+            try {
+                const { urls } = await _readGroupContacts({ id: g.id }, g);
+                _chunkedGroupUrlCache[g.id] = new Set(urls.map(u => normalizeUrl(u)));
+            } catch (e) {
+                console.warn(`[_loadChunkedGroupUrls] Failed for group ${g.id}:`, e.message);
+            }
+        }));
+        window.filterGroups();
     }
 
     // Writes contactLinkedInUrls + taggedContacts to a group document ref.
@@ -3254,7 +3278,11 @@
                 return tb - ta;
             });
 
+            // Reset the chunked-URL cache and re-fetch for the groups now in scope —
+            // stale entries from a previous company/filter would otherwise leak in.
+            _chunkedGroupUrlCache = {};
             window.filterGroups();
+            _loadChunkedGroupUrls();
 
             // populateBdrDropdowns() (which renders the Q1 Correlation panel's BDR
             // checklist and, from there, its group dropdown) runs BEFORE this async
@@ -3341,15 +3369,16 @@
 
         // Prospect coverage bar
         let coverageHtml = '';
-        if (_companyProspectSet === null) {
-            // Still loading
+        const chunkedUrlsPending = g._chunked && !_chunkedGroupUrlCache[g.id];
+        if (_companyProspectSet === null || chunkedUrlsPending) {
+            // Still loading (company prospects and/or this chunked group's URLs)
             coverageHtml = `<div class="prospect-loading-pill">
                 <i class="fas fa-circle-notch fa-spin" style="font-size:0.65rem;"></i> Loading prospects…
             </div>`;
         } else if (_companyProspectTotal > 0) {
             // Count how many of this group's contacts are in the company prospect set
             const groupUrls = g._chunked
-                ? [] // chunked groups: we only have the count, not the URLs on the card; show count-based estimate
+                ? [..._chunkedGroupUrlCache[g.id]]
                 : (g.contactLinkedInUrls || []).map(u => normalizeUrl(u));
             const inProspects = groupUrls.length > 0
                 ? groupUrls.filter(u => _companyProspectSet.has(u)).length
@@ -3444,7 +3473,9 @@
             // Count unique contacts across all groups that are in prospect set
             const allGroupUrls = new Set();
             groups.forEach(g => {
-                if (!g._chunked) {
+                if (g._chunked) {
+                    (_chunkedGroupUrlCache[g.id] || []).forEach(u => allGroupUrls.add(u));
+                } else {
                     (g.contactLinkedInUrls || []).forEach(u => allGroupUrls.add(normalizeUrl(u)));
                 }
             });
