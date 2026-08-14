@@ -1845,6 +1845,36 @@
         return null;
     }
 
+    // Drop connect_queue items still sitting in HeyReach's send queue so they
+    // do not inflate the Sent denominator. Same rule as BDR/Company analysis:
+    // keep if HeyReach confirmed CONNECTION_REQUEST_SENT, or if pushed >30 days
+    // ago (assume a missed webhook). Only last-30-day pushes with no webhook
+    // confirmation are removed.
+    function filterInQueueItems(items, actuallySentUrls) {
+        if (!items.length || !actuallySentUrls || actuallySentUrls.size === 0) {
+            return { items, removedCount: 0 };
+        }
+        const QUEUE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+        const queueCutoff = new Date(Date.now() - QUEUE_WINDOW_MS);
+        const isInQueue = item => {
+            const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
+            const slug = liSlug(raw);
+            const url  = normalizeUrl(raw);
+            if (slug && actuallySentUrls.has(slug)) return false;
+            if (url  && actuallySentUrls.has(url))  return false;
+            const pushDate = safeToDate(
+                item.heyreach_push_date || item.pushed_date ||
+                item.adminApprovedAt || item.customerApprovedAt ||
+                item.pushed_at || item.created_at ||
+                item.uploaded_date || item.generated_at
+            );
+            if (!pushDate || pushDate < queueCutoff) return false;
+            return true;
+        };
+        const kept = items.filter(item => !isInQueue(item));
+        return { items: kept, removedCount: items.length - kept.length };
+    }
+
     function setLoadingStep(text, state) {
         // state: 'active' | 'done' | 'error'
         const steps = document.getElementById('loadingSteps');
@@ -2347,6 +2377,8 @@
                     document.getElementById('loadingPanel').style.display = 'none';
                     return;
                 }
+                // Stamp / batch queries can include drafts that were never pushed
+                sentItems = sentItems.filter(m => m.pushed_to_heyreach);
             }
 
             updateLoadingStep(step1, `${sentItems.length} outreach records loaded (${[...new Set(sentItems.map(m => m.account_email).filter(Boolean))].length} BDR${bdrEmailArr.length !== 1 ? 's' : ''})`, 'done');
@@ -2364,6 +2396,32 @@
                 ...sentItems.map(m => (m.account_email || '').toLowerCase())
             ].filter(Boolean))];
             const hasFunnelEmails = funnelEmails.length > 0;
+
+            // ── Step 1b: Filter out connections still in the HeyReach queue ──
+            // Same toggle + rule as BDR/Company: unsent (in-queue) messages must
+            // not enter the Sent denominator — including Outcomes by Message Variation.
+            const filterUnsent = document.getElementById('filterUnsentToggle')?.checked !== false;
+            if (filterUnsent && hasFunnelEmails) {
+                const step1b = setLoadingStep('Checking HeyReach queue status…', 'active');
+                const actuallySentUrls = await loadActuallySentConnections(funnelEmails);
+                if (actuallySentUrls.size > 0) {
+                    const beforeCount = sentItems.length;
+                    const filtered = filterInQueueItems(sentItems, actuallySentUrls);
+                    sentItems = filtered.items;
+                    console.log('[Groups Analysis] Queue filter — pushed:', beforeCount,
+                        '| removed (in-queue, ≤30d, no webhook):', filtered.removedCount,
+                        '| kept:', sentItems.length,
+                        '| actuallySentUrls:', actuallySentUrls.size);
+                    updateLoadingStep(step1b,
+                        `${actuallySentUrls.size} confirmed sent by HeyReach` +
+                        (filtered.removedCount > 0 ? ` · ${filtered.removedCount} still-in-queue removed` : ' · no in-queue connections found'),
+                        'done');
+                } else {
+                    updateLoadingStep(step1b,
+                        'No CONNECTION_REQUEST_SENT webhook events found — cannot filter queue. Showing all pushed connections.',
+                        'done');
+                }
+            }
 
             // ── Step 2: Load HeyReach acceptance events ───────────────────────
             const step2 = setLoadingStep('Loading connection acceptances from HeyReach…', 'active');
@@ -3330,33 +3388,10 @@
                 actuallySentUrls = await loadActuallySentConnections(allEmailsArr);
 
                 if (actuallySentUrls.size > 0) {
-                    // 30-day window — matches the backend bdr_dashboard_service.js constant
-                    const QUEUE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
-                    const queueCutoff = new Date(Date.now() - QUEUE_WINDOW_MS);
-
-                    // Returns true when a sentItem is likely still sitting in HeyReach's queue
-                    const isInQueue = item => {
-                        const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
-                        const slug = liSlug(raw);
-                        const url  = normalizeUrl(raw);
-                        // Confirmed dispatched by HeyReach webhook → NOT in queue
-                        if (slug && actuallySentUrls.has(slug)) return false;
-                        if (url  && actuallySentUrls.has(url))  return false;
-                        // Pushed >30 days ago → assume sent even if webhook was missed
-                        const pushDate = safeToDate(
-                            item.heyreach_push_date || item.pushed_date ||
-                            item.adminApprovedAt || item.customerApprovedAt ||
-                            item.pushed_at || item.created_at ||
-                            item.uploaded_date || item.generated_at
-                        );
-                        if (!pushDate || pushDate < queueCutoff) return false;
-                        // Pushed within last 30 days with no webhook confirmation → in queue
-                        return true;
-                    };
-
-                    const beforeCount  = sentItemsAllTime.length;
-                    sentItemsAllTime   = sentItemsAllTime.filter(item => !isInQueue(item));
-                    const removedCount = beforeCount - sentItemsAllTime.length;
+                    const beforeCount = sentItemsAllTime.length;
+                    const filtered = filterInQueueItems(sentItemsAllTime, actuallySentUrls);
+                    sentItemsAllTime = filtered.items;
+                    const removedCount = filtered.removedCount;
 
                     console.log('[outcomes] Queue filter — pushed:', beforeCount,
                         '| removed (in-queue, ≤30d, no webhook):', removedCount,
