@@ -7622,7 +7622,9 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
 
             const REPORT_DAYS = 30;
             let allSentEvents = [];
+            let allMessageSentEvents = [];
             let sentEventsOk = false;
+            let messageSentEventsOk = false;
             try {
                 const evResp = await fetch(`${RAILWAY_BASE}/api/connect-queue/connection-request-sent-events?limit=50000&daysBack=${REPORT_DAYS}`);
                 if (!evResp.ok) throw new Error('HTTP ' + evResp.status);
@@ -7635,7 +7637,42 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 console.warn('[bdr-dashboard] sent-events fetch failed, will fall back to Firestore per-BDR:', e);
             }
 
-            return { authToLinkedIn, idToBdr, emailToAccountIds, bdrLeaderInfoByEmail, allSentEvents, sentEventsOk, REPORT_DAYS };
+            // Load MESSAGE_SENT + INMAIL_SENT from Firestore for harvest/follow-up pending counts.
+            // Only runs when the user clicks Verify (this context is lazy-loaded).
+            try {
+                const { collection, query, where, orderBy, getDocs, limit: fsLimit, Timestamp } = window.clemailFirestore;
+                const since = new Date();
+                since.setDate(since.getDate() - REPORT_DAYS);
+                const loadMsgType = async (eventType) => {
+                    const snap = await getDocs(query(
+                        collection(emailDB, 'heyreach_activity'),
+                        where('eventType', '==', eventType),
+                        where('timestamp', '>=', Timestamp.fromDate(since)),
+                        orderBy('timestamp', 'desc'),
+                        fsLimit(20000)
+                    ));
+                    const events = [];
+                    snap.forEach(d => {
+                        const data = d.data();
+                        events.push({
+                            leadProfileUrl: data.leadProfileUrl || null,
+                            accountEmail: (data.accountEmail || data.bdrEmail || '').toLowerCase(),
+                            linkedInAccountId: data.linkedInAccountId != null ? String(data.linkedInAccountId) : null,
+                        });
+                    });
+                    return events;
+                };
+                const [msgEvents, inmailEvents] = await Promise.all([
+                    loadMsgType('MESSAGE_SENT'),
+                    loadMsgType('INMAIL_SENT'),
+                ]);
+                allMessageSentEvents = msgEvents.concat(inmailEvents);
+                messageSentEventsOk = true;
+            } catch (e) {
+                console.warn('[bdr-dashboard] MESSAGE_SENT fetch failed (non-fatal):', e);
+            }
+
+            return { authToLinkedIn, idToBdr, emailToAccountIds, bdrLeaderInfoByEmail, allSentEvents, sentEventsOk, allMessageSentEvents, messageSentEventsOk, REPORT_DAYS };
         }
 
         // ── Live HeyReach status cross-check ────────────────────────────────────
@@ -7794,6 +7831,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             const sentMatchAccountIds = bdrLeaderAccountId ? new Set([bdrLeaderAccountId]) : bdrAccountIds;
 
             let sentUrlsForBdr;
+            let sentMessageUrlsForBdr = new Set();
             if (ctx.sentEventsOk) {
                 sentUrlsForBdr = new Set();
                 for (const ev of ctx.allSentEvents) {
@@ -7816,6 +7854,25 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 sentUrlsForBdr = await loadSentUrlsFirestoreFallback(emailDB, emailSet, ctx.idToBdr, sentMatchAccountIds, ctx.REPORT_DAYS);
             }
 
+            if (ctx.messageSentEventsOk && Array.isArray(ctx.allMessageSentEvents)) {
+                for (const ev of ctx.allMessageSentEvents) {
+                    let matched = false;
+                    if (ev.accountEmail && emailSet.has(String(ev.accountEmail).toLowerCase())) {
+                        matched = true;
+                    } else if (ev.linkedInAccountId) {
+                        const id = String(ev.linkedInAccountId);
+                        if (sentMatchAccountIds.has(id)) matched = true;
+                        else {
+                            const mapped = ctx.idToBdr.get(id);
+                            if (mapped && emailSet.has(mapped)) matched = true;
+                        }
+                    }
+                    if (!matched) continue;
+                    const url = normalizeHrQueueUrl(ev.leadProfileUrl || '');
+                    if (url) sentMessageUrlsForBdr.add(url);
+                }
+            }
+
             const cutoff = Date.now() - ctx.REPORT_DAYS * 24 * 60 * 60 * 1000;
             const seenIds = new Set();
             const queueRows = [];
@@ -7834,14 +7891,17 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 const rowEmail = (row.account_email || '').toLowerCase().trim();
                 if (rowEmail && !emailSet.has(rowEmail)) continue;
                 const mt = (row.message_type || '').toLowerCase();
-                if (mt !== 'connect' && mt !== 'connection') continue;
+                const isConnect = mt === 'connect' || mt === 'connection';
+                const isMessage = mt === 'message';
+                if (!isConnect && !isMessage) continue;
                 if (!row.pushed_to_heyreach) continue;
                 const pushTs = new Date(row.heyreach_push_date || row.pushed_date || 0).getTime();
                 if (pushTs > 0 && pushTs < cutoff) continue;
                 const url = normalizeHrQueueUrl(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
                 if (!url) continue;
-                if (sentUrlsForBdr.has(url)) continue;
-                inProcess.push(row);
+                if (isConnect && sentUrlsForBdr.has(url)) continue;
+                if (isMessage && sentMessageUrlsForBdr.has(url)) continue;
+                inProcess.push({ ...row, _kind: isConnect ? 'connect' : 'message' });
             }
 
             inProcess.sort((a, b) => {
@@ -7849,17 +7909,23 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 const tb = new Date(b.heyreach_push_date || b.pushed_date || 0).getTime();
                 return tb - ta;
             });
-            const seenUrls = new Set();
+            const seenKeys = new Set();
             let deduplicated = [];
             for (const row of inProcess) {
                 const url = normalizeHrQueueUrl(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
-                if (url && seenUrls.has(url)) continue;
-                if (url) seenUrls.add(url);
+                const key = `${row._kind}::${url}`;
+                if (url && seenKeys.has(key)) continue;
+                if (url) seenKeys.add(key);
                 deduplicated.push(row);
             }
 
+            const emptyResult = (extra = {}) => ({
+                pending: 0, pendingConnect: 0, pendingMessage: 0,
+                verified: true, preEligibilityCount: 0, excludedByLiveStatus: 0, ...extra,
+            });
+
             if (!deduplicated.length) {
-                return { pending: 0, verified: true, preEligibilityCount: 0, excludedByLiveStatus: 0 };
+                return emptyResult();
             }
 
             // ── Live HeyReach status cross-check ──────────────────────────────
@@ -7887,7 +7953,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             }
 
             if (!deduplicated.length) {
-                return { pending: 0, verified: true, preEligibilityCount: 0, excludedByLiveStatus };
+                return emptyResult({ excludedByLiveStatus });
             }
 
             // ── Trust the live campaign lead list over the fragile single-lead check ──
@@ -7913,8 +7979,27 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 console.log(`[bdr-dashboard] ${bdrAuthEmail}: ${confirmedPresentRows.length} row(s) confirmed present+pending directly via live HeyReach campaign data (skipping single-lead check); ${needsEligibilityCheck.length} still need the prospect-list/GetLead check.`);
             }
 
+            const splitCounts = (rows) => {
+                let pendingConnect = 0, pendingMessage = 0;
+                for (const r of rows) {
+                    if (r._kind === 'message') pendingMessage++;
+                    else pendingConnect++;
+                }
+                return {
+                    pending: pendingConnect + pendingMessage,
+                    pendingConnect,
+                    pendingMessage,
+                };
+            };
+
             if (!needsEligibilityCheck.length) {
-                return { pending: confirmedPresentRows.length, verified: true, preEligibilityCount: deduplicated.length, confirmedViaLiveApi: confirmedPresentRows.length, excludedByLiveStatus };
+                return {
+                    ...splitCounts(confirmedPresentRows),
+                    verified: true,
+                    preEligibilityCount: deduplicated.length,
+                    confirmedViaLiveApi: confirmedPresentRows.length,
+                    excludedByLiveStatus,
+                };
             }
 
             // The eligibility endpoint does a *live* HeyReach lookup per lead (concurrency 8
@@ -7960,16 +8045,28 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             console.log(`[bdr-dashboard] ${bdrAuthEmail}: eligibility summary for the ${allIds.length} unconfirmed row(s) —`, summary, `prospectLeadUrlCount=${prospectLeadUrlCount}`);
 
             if (!anyBatchOk) {
-                return { pending: confirmedPresentRows.length + needsEligibilityCheck.length, verified: false, preEligibilityCount: deduplicated.length, confirmedViaLiveApi: confirmedPresentRows.length, excludedByLiveStatus, error: lastError || 'eligibility check failed' };
+                const failOpen = confirmedPresentRows.concat(needsEligibilityCheck);
+                return {
+                    ...splitCounts(failOpen),
+                    verified: false,
+                    preEligibilityCount: deduplicated.length,
+                    confirmedViaLiveApi: confirmedPresentRows.length,
+                    excludedByLiveStatus,
+                    error: lastError || 'eligibility check failed',
+                };
             }
 
             // Same safety valve as edit_in_process_messages.html: an empty prospect lead list
             // means the data is missing, not that everyone is ineligible — skip the filter
             // rather than zero everyone out.
             const prospectListEmpty = prospectLeadUrlCount === 0 && summary.not_on_prospect_lead_list > 0;
-            const finalCount = confirmedPresentRows.length + (prospectListEmpty ? needsEligibilityCheck.length : keepIds.length);
+            const keepSet = new Set(keepIds);
+            const keptNeeds = prospectListEmpty
+                ? needsEligibilityCheck
+                : needsEligibilityCheck.filter(r => keepSet.has(r.id));
+            const finalRows = confirmedPresentRows.concat(keptNeeds);
             return {
-                pending: finalCount,
+                ...splitCounts(finalRows),
                 verified: true,
                 preEligibilityCount: deduplicated.length,
                 confirmedViaLiveApi: confirmedPresentRows.length,
@@ -8027,6 +8124,8 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                     body: JSON.stringify({
                         bdrEmail: primaryEmail,
                         pending: result.pending,
+                        pendingConnect: result.pendingConnect,
+                        pendingMessage: result.pendingMessage,
                         verified: true,
                         excludedByLiveStatus: result.excludedByLiveStatus,
                     }),
@@ -8037,27 +8136,36 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         }
 
         function applyRefinedPendingToRow(primaryEmail, result) {
-            const cell = document.querySelector(`td[data-pending-cell="${cssAttrEscape(primaryEmail)}"]`);
-            if (!cell) return;
+            const connectCell = document.querySelector(`td[data-pending-connect-cell="${cssAttrEscape(primaryEmail)}"]`)
+                || document.querySelector(`td[data-pending-cell="${cssAttrEscape(primaryEmail)}"]`);
+            const messageCell = document.querySelector(`td[data-pending-message-cell="${cssAttrEscape(primaryEmail)}"]`);
+            if (!connectCell) return;
             const totalCell = document.querySelector(`td[data-total-cell="${cssAttrEscape(primaryEmail)}"]`);
-            const reserve = parseInt(cell.dataset.reserve || '0', 10) || 0;
+            const reserve = parseInt(connectCell.dataset.reserve || '0', 10) || 0;
             const emailAttr = escapeHtmlLocal(primaryEmail || '');
             const reverifyBtn = `<button type="button" class="verify-pending-btn" data-bdr-email="${emailAttr}" title="Re-verify" style="margin-left:6px;border:none;background:none;color:#0284c7;cursor:pointer;font-size:0.85em;padding:0;"><i class="fas fa-rotate"></i></button>`;
+
+            const pendingConnect = result.pendingConnect ?? result.pending ?? 0;
+            const pendingMessage = result.pendingMessage ?? 0;
 
             if (result.verified) {
                 const partialNote = result.partial
                     ? `<span style="display:block;font-size:0.68em;color:var(--gray-500,#94a3b8);margin-top:2px;" title="One or more batches failed and were kept unfiltered — count may be slightly high">
                         <i class="fas fa-triangle-exclamation"></i> partial check</span>`
                     : '';
-                cell.innerHTML = `<strong style="color:#0ea5e9;" title="Verified against the prospect lead list + live HeyReach lookup — matches edit_in_process_messages.html">${result.pending.toLocaleString()} <i class="fas fa-check-circle" style="font-size:0.7em;color:var(--success,#10b981);"></i></strong>${reverifyBtn}${partialNote}`;
+                connectCell.innerHTML = `<strong style="color:#0ea5e9;" title="Verified against the prospect lead list + live HeyReach lookup">${Number(pendingConnect).toLocaleString()} <i class="fas fa-check-circle" style="font-size:0.7em;color:var(--success,#10b981);"></i></strong>${reverifyBtn}${partialNote}`;
             } else {
-                cell.innerHTML = `<strong style="color:#0ea5e9;">${result.pending.toLocaleString()}</strong>${reverifyBtn}
+                connectCell.innerHTML = `<strong style="color:#0ea5e9;">${Number(pendingConnect).toLocaleString()}</strong>${reverifyBtn}
                     <span style="display:block;font-size:0.72em;color:var(--gray-500,#94a3b8);margin-top:2px;" title="${escapeHtmlLocal(result.error || 'eligibility check failed')}">
                         <i class="fas fa-exclamation-triangle"></i> unverified estimate</span>`;
             }
 
+            if (messageCell) {
+                messageCell.innerHTML = `<strong style="color:#8b5cf6;">${Number(pendingMessage).toLocaleString()}</strong>`;
+            }
+
             if (totalCell) {
-                totalCell.innerHTML = `<strong>${(result.pending + reserve).toLocaleString()}</strong>`;
+                totalCell.innerHTML = `<strong>${(Number(result.pending || 0) + reserve).toLocaleString()}</strong>`;
             }
         }
 
@@ -8152,7 +8260,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             const emailsToQuery = [...new Set([lower, bdrAuthEmail, linkedInEmail].filter(Boolean))];
 
             const seenIds = new Set();
-            let queue1 = 0, queue2 = 0;
+            let queue1Connect = 0, queue1Message = 0, queue2Connect = 0, queue2Message = 0;
             for (const em of emailsToQuery) {
                 const snap = await getDocs(query(collection(emailDB, 'connect_queue'), where('account_email', '==', em)));
                 snap.forEach(d => {
@@ -8166,12 +8274,22 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                     // already-sent messages stay flagged as "pending" forever. Anything already
                     // pushed has effectively left both queues regardless of the stale status field.
                     if (data.pushed_to_heyreach) return;
+                    const mt = (data.message_type || 'connect').toLowerCase();
+                    const isMessage = mt === 'message';
+                    const isConnect = mt === 'connect' || mt === 'connection';
+                    if (!isConnect && !isMessage) return;
                     const rs = data.reviewStatus || 'pending_admin_review';
-                    if (rs === 'pending_admin_review') queue1++;
-                    else if (rs === 'pending_customer_review') queue2++;
+                    if (rs === 'pending_admin_review') {
+                        if (isMessage) queue1Message++;
+                        else queue1Connect++;
+                    } else if (rs === 'pending_customer_review') {
+                        if (isMessage) queue2Message++;
+                        else queue2Connect++;
+                    }
                 });
             }
-            return { queue1, queue2 };
+            return { queue1Connect, queue1Message, queue2Connect, queue2Message,
+                     queue1: queue1Connect + queue1Message, queue2: queue2Connect + queue2Message };
         }
 
         function applyQueue1Queue2ToRow(primaryEmail, counts) {
@@ -8183,8 +8301,20 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 if (q2Cell) q2Cell.innerHTML = errHtml;
                 return;
             }
-            if (q1Cell) q1Cell.innerHTML = `<strong style="color:#7c3aed;">${counts.queue1.toLocaleString()}</strong>`;
-            if (q2Cell) q2Cell.innerHTML = `<strong style="color:#db2777;">${counts.queue2.toLocaleString()}</strong>`;
+            const c1 = counts.queue1Connect ?? counts.queue1 ?? 0;
+            const m1 = counts.queue1Message ?? 0;
+            const c2 = counts.queue2Connect ?? counts.queue2 ?? 0;
+            const m2 = counts.queue2Message ?? 0;
+            if (q1Cell) {
+                q1Cell.innerHTML = `<strong style="color:#7c3aed;">${Number(c1).toLocaleString()}</strong>`
+                    + `<span style="color:var(--gray-400);margin:0 3px;">/</span>`
+                    + `<strong style="color:#8b5cf6;">${Number(m1).toLocaleString()}</strong>`;
+            }
+            if (q2Cell) {
+                q2Cell.innerHTML = `<strong style="color:#db2777;">${Number(c2).toLocaleString()}</strong>`
+                    + `<span style="color:var(--gray-400);margin:0 3px;">/</span>`
+                    + `<strong style="color:#8b5cf6;">${Number(m2).toLocaleString()}</strong>`;
+            }
         }
 
         async function loadQueue1Queue2CountsForAllBdrs(enriched) {
@@ -8512,11 +8642,13 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             }
 
             // Enrich with computed fields, sort by "Still in HeyReach Queue" high→low.
-            // Total Queue = heyreachPending (webhook-actual) + reservePending.
+            // Total Queue = heyreachPending (connect + message) + reservePending.
             const enriched = bdrs.map(bdr => {
                 const { name, primaryEmail, totalPushed30, daysQueued, meetings,
-                        heyreachPending, heyreachFailedExcluded, heyreachLiveExcluded, heyreachStaleExcluded,
-                        heyreachPendingVerified, heyreachPendingVerifiedAt } = bdr;
+                        heyreachPending, heyreachPendingConnect, heyreachPendingMessage,
+                        heyreachFailedExcluded, heyreachLiveExcluded, heyreachStaleExcluded,
+                        heyreachPendingVerified, heyreachPendingVerifiedAt,
+                        queue1Connect, queue1Message, queue2Connect, queue2Message } = bdr;
                 const reservePending  = (reserveCounts[(primaryEmail || '').toLowerCase()] || {}).pending || 0;
                 const bdrTarget       = bdrTargets[(primaryEmail || '').toLowerCase()] || {};
                 const targetDailyConnections   = bdrTarget.targetDailyConnections   ?? 10;
@@ -8524,23 +8656,37 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 const targetMonthlyReplies     = bdrTarget.targetMonthlyReplies     ?? 10;
                 const targetMonthlyMeetings    = bdrTarget.targetMonthlyMeetings    ?? 5;
                 const heyreachPendingVal = heyreachPending ?? null;
+                // Prefer explicit split fields; fall back to treating the whole total as connect
+                // for caches computed before the connect/message split existed.
+                const pendingConnectVal = (heyreachPendingConnect != null)
+                    ? heyreachPendingConnect
+                    : (heyreachPendingVal != null ? heyreachPendingVal : null);
+                const pendingMessageVal = (heyreachPendingMessage != null) ? heyreachPendingMessage : null;
                 const failedExcluded     = heyreachFailedExcluded || 0;
                 const liveExcluded       = heyreachLiveExcluded || 0;
                 const staleExcluded      = heyreachStaleExcluded || 0;
-                // Total Queue = webhook-confirmed pending + reserve queue
                 const totalQueue = (heyreachPendingVal !== null ? heyreachPendingVal : 0) + (reservePending || 0);
+                const hasCachedQueues = queue1Connect != null || queue1Message != null
+                    || queue2Connect != null || queue2Message != null;
                 return { name, primaryEmail, totalPushed30, daysQueued, meetings,
                          heyreachPending: heyreachPendingVal,
+                         heyreachPendingConnect: pendingConnectVal,
+                         heyreachPendingMessage: pendingMessageVal,
                          heyreachFailedExcluded: failedExcluded,
                          heyreachLiveExcluded: liveExcluded,
                          heyreachStaleExcluded: staleExcluded,
                          heyreachPendingVerified: !!heyreachPendingVerified,
                          heyreachPendingVerifiedAt,
+                         queue1Connect: queue1Connect ?? null,
+                         queue1Message: queue1Message ?? null,
+                         queue2Connect: queue2Connect ?? null,
+                         queue2Message: queue2Message ?? null,
+                         hasCachedQueues,
                          reservePending, targetDailyConnections, targetMonthlyConnections,
                          targetMonthlyReplies, targetMonthlyMeetings, totalQueue };
             });
 
-            // Sort by "Still in HeyReach Queue" descending; null values go to the bottom
+            // Sort by total "Still in HeyReach Queue" descending; null values go to the bottom
             enriched.sort((a, b) => {
                 const ap = a.heyreachPending ?? -1;
                 const bp = b.heyreachPending ?? -1;
@@ -8553,45 +8699,65 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                         <tr>
                             <th class="num-head">#</th>
                             <th>BDR</th>
-                            <th class="num-head" title="Connections pushed to HeyReach (last 30d, deduplicated by LinkedIn URL) that HeyReach's live per-lead status confirms have not yet been sent. Contacts that HeyReach already sent/finished/failed, or that are no longer found in the live campaign at all, are excluded from this count (shown in red below the number). Recalculates 4×/weekday + nightly, or on demand via Recalculate."><i class="fas fa-satellite-dish" style="color:#0ea5e9;margin-right:5px;"></i>Still in HeyReach Queue</th>
+                            <th class="num-head" title="Connection requests (message_type connect/connection) pushed to HeyReach in the last 30d that have not yet been sent on LinkedIn. Live-verified against HeyReach's per-lead status."><i class="fas fa-user-plus" style="color:#0ea5e9;margin-right:5px;"></i>In HR · Connect</th>
+                            <th class="num-head" title="Follow-up / harvest messages (message_type message) pushed to HeyReach in the last 30d that have not yet been sent on LinkedIn."><i class="fas fa-comment" style="color:#8b5cf6;margin-right:5px;"></i>In HR · Messages</th>
                             <th class="num-head"><i class="fas fa-layer-group" style="color:#f97316;margin-right:5px;"></i>Reserve Queue</th>
                             <th class="num-head"><i class="fas fa-database" style="color:var(--primary);margin-right:5px;"></i>Total Queue</th>
                             <th class="num-head"><i class="fas fa-paper-plane" style="color:#3b82f6;margin-right:5px;"></i>Pushed (30d)</th>
                             <th class="num-head"><i class="fas fa-calendar-check" style="color:var(--accent);margin-right:5px;"></i>Meetings</th>
-                            <th class="num-head" title="Messages awaiting admin review in fast_connect_review.html — not yet approved to push to HeyReach. Excludes deleted and already-pushed messages."><i class="fas fa-inbox" style="color:#7c3aed;margin-right:5px;"></i>Queue 1</th>
-                            <th class="num-head" title="Admin-approved messages awaiting the BDR's own review/approval before they're pushed to HeyReach (fast_connect_review.html). Excludes deleted and already-pushed messages — for Auto/Time-based BDRs, reviewStatus stays 'pending_customer_review' even after sending, so already-pushed rows are filtered out here."><i class="fas fa-user-check" style="color:#db2777;margin-right:5px;"></i>Queue 2</th>
+                            <th class="num-head" title="Messages awaiting admin review — shown as connect / message counts. Cached with the dashboard recalculation (no per-page Firestore scan)."><i class="fas fa-inbox" style="color:#7c3aed;margin-right:5px;"></i>Queue 1<br><span style="font-weight:500;font-size:0.7em;color:var(--gray-500);">conn / msg</span></th>
+                            <th class="num-head" title="Admin-approved messages awaiting BDR review — shown as connect / message counts. Cached with the dashboard recalculation."><i class="fas fa-user-check" style="color:#db2777;margin-right:5px;"></i>Queue 2<br><span style="font-weight:500;font-size:0.7em;color:var(--gray-500);">conn / msg</span></th>
                         </tr>
                     </thead>
                     <tbody>`;
 
             enriched.forEach(({ name, primaryEmail, totalPushed30, meetings,
-                                 heyreachPending, heyreachPendingVerified,
-                                 heyreachPendingVerifiedAt,
+                                 heyreachPending, heyreachPendingConnect, heyreachPendingMessage,
+                                 heyreachPendingVerified, heyreachPendingVerifiedAt,
+                                 queue1Connect, queue1Message, queue2Connect, queue2Message,
+                                 hasCachedQueues,
                                  reservePending, totalQueue }, i) => {
                 const emailAttr = escapeHtmlLocal(primaryEmail || '');
-                // Always render the verify/re-verify button when we know the BDR's
-                // email, regardless of the cached pending count — a stale/incorrect
-                // "0" needs the same on-demand recalculation option as any other
-                // number (previously this was hidden whenever heyreachPending <= 0).
                 const verifyIcon = heyreachPendingVerified ? 'fa-rotate' : 'fa-shield-halved';
                 const verifyTitle = heyreachPendingVerified
-                    ? 'Already live-verified since the last full Recalculate — click to re-verify'
+                    ? 'Already live-verified since the last full Recalculate — click to re-verify connect + message counts'
                     : 'Verify against the prospect lead list + live HeyReach lookup (matches edit_in_process_messages.html) — may take a few seconds';
                 const verifyBtn = primaryEmail
                     ? `<button type="button" class="verify-pending-btn" data-bdr-email="${emailAttr}" title="${verifyTitle}" style="margin-left:6px;border:none;background:none;color:#0284c7;cursor:pointer;font-size:0.85em;padding:0;"><i class="fas ${verifyIcon}"></i></button>`
                     : '';
-                // A persisted verified count (written by the server-side rotation cron,
-                // or a prior shield click) shows the same checkmark
-                // applyRefinedPendingToRow() uses, plus WHEN it was last verified —
-                // the rotation re-checks each BDR roughly every 90 minutes during
-                // business hours, so the timestamp shows how fresh the number is.
                 const verifiedAgo = heyreachPendingVerified ? verifiedAgoText(heyreachPendingVerifiedAt) : '';
                 const verifiedCheck = heyreachPendingVerified
                     ? ` <i class="fas fa-check-circle" style="font-size:0.7em;color:var(--success,#10b981);" title="Live-verified${verifiedAgo ? ' ' + verifiedAgo : ''}"></i>${verifiedAgo ? `<span style="display:block;font-size:0.65em;color:var(--success,#10b981);">verified ${verifiedAgo}</span>` : ''}`
                     : '';
-                const pendingDisplay = heyreachPending === null || heyreachPending === undefined
-                    ? `<span style="color:var(--gray-400);font-size:0.8em;">—</span>${verifyBtn}`
-                    : `<strong style="color:#0ea5e9;">${heyreachPending.toLocaleString()}</strong>${verifiedCheck}${verifyBtn}`;
+
+                const fmtPending = (val, color) => {
+                    if (val === null || val === undefined) {
+                        return `<span style="color:var(--gray-400);font-size:0.8em;">—</span>`;
+                    }
+                    return `<strong style="color:${color};">${Number(val).toLocaleString()}</strong>`;
+                };
+                // Put the verify button next to the connect column (primary in-process metric)
+                const connectDisplay = `${fmtPending(heyreachPendingConnect, '#0ea5e9')}${verifiedCheck}${verifyBtn}`;
+                const messageDisplay = fmtPending(heyreachPendingMessage, '#8b5cf6');
+
+                const fmtQueueSplit = (c, m) => {
+                    if (c == null && m == null) {
+                        return `<i class="fas fa-spinner fa-spin" style="color:var(--gray-400);"></i>`;
+                    }
+                    return `<strong style="color:#7c3aed;">${Number(c || 0).toLocaleString()}</strong>`
+                        + `<span style="color:var(--gray-400);margin:0 3px;">/</span>`
+                        + `<strong style="color:#8b5cf6;">${Number(m || 0).toLocaleString()}</strong>`;
+                };
+                // Queue 2 uses pink for the connect half to match the column accent
+                const fmtQueue2Split = (c, m) => {
+                    if (c == null && m == null) {
+                        return `<i class="fas fa-spinner fa-spin" style="color:var(--gray-400);"></i>`;
+                    }
+                    return `<strong style="color:#db2777;">${Number(c || 0).toLocaleString()}</strong>`
+                        + `<span style="color:var(--gray-400);margin:0 3px;">/</span>`
+                        + `<strong style="color:#8b5cf6;">${Number(m || 0).toLocaleString()}</strong>`;
+                };
+
                 html += `
                         <tr>
                             <td class="bdr-table-rank">${i + 1}</td>
@@ -8599,13 +8765,14 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                                 <div class="bdr-table-name"><i class="fas fa-user-circle" style="color:var(--primary);margin-right:6px;"></i>${name || 'Unnamed BDR'}</div>
                                 <div class="bdr-table-email">${primaryEmail || ''}</div>
                             </td>
-                            <td class="num-cell" style="background:rgba(14,165,233,0.06);" data-pending-cell="${emailAttr}" data-reserve="${reservePending || 0}">${pendingDisplay}</td>
+                            <td class="num-cell" style="background:rgba(14,165,233,0.06);" data-pending-cell="${emailAttr}" data-pending-connect-cell="${emailAttr}" data-reserve="${reservePending || 0}">${connectDisplay}</td>
+                            <td class="num-cell" style="background:rgba(139,92,246,0.06);" data-pending-message-cell="${emailAttr}">${messageDisplay}</td>
                             <td class="num-cell reserve-cell">${reservePending}</td>
                             <td class="num-cell total-cell" data-total-cell="${emailAttr}"><strong>${totalQueue}</strong></td>
                             <td class="num-cell">${totalPushed30}</td>
                             <td class="num-cell meetings-cell">${meetings}</td>
-                            <td class="num-cell" data-queue1-cell="${emailAttr}"><i class="fas fa-spinner fa-spin" style="color:var(--gray-400);"></i></td>
-                            <td class="num-cell" data-queue2-cell="${emailAttr}"><i class="fas fa-spinner fa-spin" style="color:var(--gray-400);"></i></td>
+                            <td class="num-cell" data-queue1-cell="${emailAttr}">${hasCachedQueues ? fmtQueueSplit(queue1Connect, queue1Message) : `<i class="fas fa-spinner fa-spin" style="color:var(--gray-400);"></i>`}</td>
+                            <td class="num-cell" data-queue2-cell="${emailAttr}">${hasCachedQueues ? fmtQueue2Split(queue2Connect, queue2Message) : `<i class="fas fa-spinner fa-spin" style="color:var(--gray-400);"></i>`}</td>
                         </tr>`;
             });
 
@@ -8619,9 +8786,13 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             html += `<div style="margin-top:16px;font-size:0.8rem;color:var(--gray-600);text-align:right;">
                 <i class="fas fa-clock" style="margin-right:4px;"></i>
                 Calculated: ${calcAt} &nbsp;·&nbsp; refreshes 4× daily on weekdays + nightly at 2:30 AM MT
-                &nbsp;·&nbsp; <span style="color:#0ea5e9;"><i class="fas fa-satellite-dish"></i> "Still in HeyReach Queue"</span> = pushes last 30d (deduped by LinkedIn URL), live-verified against the prospect lead list + HeyReach's actual per-lead status (re-verified automatically on the server throughout the business day, one BDR at a time ≈ every 90 min each — <i class="fas fa-check-circle" style="color:var(--success,#10b981);"></i> shows when it was last confirmed)
-                &nbsp;·&nbsp; click <i class="fas fa-shield-halved" style="color:#0284c7;"></i> / <i class="fas fa-rotate" style="color:#0284c7;"></i> next to a number to re-verify it on demand (same check as <a href="edit_in_process_messages.html" style="color:#0284c7;">Edit in-process messages</a>)
-                &nbsp;·&nbsp; <span style="color:#7c3aed;">Queue 1</span> / <span style="color:#db2777;">Queue 2</span> = live counts from <a href="fast_connect_review.html" style="color:#0284c7;">fast_connect_review.html</a>'s admin review / BDR review queues
+                &nbsp;·&nbsp; <span style="color:#0ea5e9;"><i class="fas fa-user-plus"></i> In HR · Connect</span> /
+                <span style="color:#8b5cf6;"><i class="fas fa-comment"></i> Messages</span>
+                = pushes last 30d (deduped by LinkedIn URL), live-verified against HeyReach
+                (re-verified on the server throughout the business day ≈ every 90 min each —
+                <i class="fas fa-check-circle" style="color:var(--success,#10b981);"></i> shows when last confirmed)
+                &nbsp;·&nbsp; click <i class="fas fa-shield-halved" style="color:#0284c7;"></i> / <i class="fas fa-rotate" style="color:#0284c7;"></i> to re-verify on demand
+                &nbsp;·&nbsp; <span style="color:#7c3aed;">Queue 1</span> / <span style="color:#db2777;">Queue 2</span> = cached connect/message counts from the last Recalculate (no live Firestore scan on page open)
             </div>`;
 
             // Reset the shared eligibility context on every fresh render so an on-demand
@@ -8632,10 +8803,12 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
 
             container.innerHTML = html;
             bindVerifyButtons(container);
-            loadQueue1Queue2CountsForAllBdrs(enriched);
-            // Auto-verification of every BDR was moved server-side (rotation cron in
-            // RailwayCLemail) — the numbers rendered above already carry the latest
-            // live-verified values from the cache, so nothing else to kick off here.
+            // Only fall back to a live Firestore scan when the cached dashboard doc
+            // predates the Queue 1/2 fields (legacy cache before this change).
+            const needLiveQueueScan = enriched.some(b => !b.hasCachedQueues);
+            if (needLiveQueueScan) {
+                loadQueue1Queue2CountsForAllBdrs(enriched.filter(b => !b.hasCachedQueues));
+            }
         }
 
         async function fetchReserveCounts(token) {
