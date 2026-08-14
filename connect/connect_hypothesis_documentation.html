@@ -991,6 +991,65 @@
             line-height: 1;
         }
         .card-split-btn:hover { background: var(--accent); color: white; }
+        .card-locate-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            padding: 0.28rem 0.65rem;
+            background: white;
+            color: var(--primary);
+            border: 1.5px solid var(--primary);
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+            font-family: inherit;
+            line-height: 1;
+        }
+        .card-locate-btn:hover { background: var(--primary); color: white; }
+
+        /* ── Locate Contacts Modal ── */
+        .locate-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 1.25rem;
+        }
+        .locate-stat-box {
+            background: var(--gray-50, #f9fafb);
+            border: 1.5px solid var(--border);
+            border-radius: 10px;
+            padding: 0.85rem 1rem;
+            text-align: center;
+        }
+        .locate-stat-val { font-size: 1.5rem; font-weight: 800; color: var(--gray-800, #1f2937); line-height: 1.1; }
+        .locate-stat-label { font-size: 0.72rem; font-weight: 600; color: var(--gray-500); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 0.25rem; }
+        .locate-progress-track {
+            width: 100%;
+            height: 8px;
+            background: var(--gray-100, #f3f4f6);
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 0.5rem 0 1.25rem;
+        }
+        .locate-progress-fill { height: 100%; transition: width 0.3s; }
+        .locate-owner-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        .locate-owner-table th {
+            text-align: left;
+            padding: 0.5rem 0.75rem;
+            background: var(--gray-50, #f9fafb);
+            border-bottom: 1.5px solid var(--border);
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--gray-500);
+        }
+        .locate-owner-table td {
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+        .locate-owner-table tr:last-child td { border-bottom: none; }
 
         /* ── Split in Half Tab ── */
         .split-half-balance-bar {
@@ -2462,6 +2521,28 @@
     </div>
 </div><!-- end split modal -->
 
+<!-- ── Locate Contacts Modal ── -->
+<div id="locateModal" class="modal-overlay hidden">
+    <div class="modal" style="max-width:760px;">
+        <div class="modal-header">
+            <h2><i class="fas fa-map-marker-alt"></i> Where Are These Contacts?</h2>
+            <button class="modal-close" onclick="closeLocateModal()"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="modal-body" style="padding:1.75rem 2rem;max-height:80vh;overflow-y:auto;">
+            <p id="locateGroupLabel" style="font-size:0.88rem;color:var(--gray-600);margin-bottom:1.25rem;"></p>
+            <div id="locateContent">
+                <div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Scanning every BDR's prospect_contacts for matches…</div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeLocateModal()">Close</button>
+            <button class="btn btn-outline" id="locateExportBtn" onclick="exportLocateReport()" style="display:none;">
+                <i class="fas fa-download"></i> Download Full Report (CSV)
+            </button>
+        </div>
+    </div>
+</div><!-- end locate modal -->
+
 <!-- ══════════════════════════════════════════════════════════════════
      TEMP DEBUG SECTION — All Hypothesis Groups (Unfiltered)
      Remove this section once the missing group is recovered.
@@ -3435,6 +3516,9 @@
                     </div>
                     ${coverageHtml}
                     <div class="group-card-actions">
+                        <button class="card-locate-btn" onclick="event.stopPropagation(); openLocateModal('${g.id}')" title="Find out which BDR/company owns each of this group's tagged contacts">
+                            <i class="fas fa-map-marker-alt"></i> Locate
+                        </button>
                         <button class="card-split-btn" onclick="event.stopPropagation(); openSplitModal('${g.id}')">
                             <i class="fas fa-code-branch"></i> Split
                         </button>
@@ -9020,6 +9104,205 @@
 
     window.closeSplitModal = function() {
         document.getElementById('splitModal').classList.add('hidden');
+    };
+
+    // ── Locate Contacts Modal ──────────────────────────────────────────────
+    // Answers "where did these tagged contacts go?" by matching every URL in
+    // this group's tagged list against EVERY BDR's prospect_contacts (system-wide,
+    // not just the selected company) — a contact tagged onto a group is only a
+    // LinkedIn URL sitting in hypothesis_group_chunks until it's actually been
+    // imported as a prospect_contacts record and assigned to a BDR. This surfaces
+    // which BDR (if any) currently owns each tagged contact, and flags the ones
+    // that were never imported at all.
+    let _locateGroupId = null;
+    let _locateReport  = null; // cached rows for CSV export: [{url, status, bdrName, bdrEmail, company}]
+
+    window.openLocateModal = async function(groupId) {
+        _locateGroupId = groupId;
+        _locateReport  = null;
+        const group = allGroups.find(g => g.id === groupId);
+        if (!group) { showAlert('Group not found. Please reload.', 'error'); return; }
+
+        document.getElementById('locateExportBtn').style.display = 'none';
+        document.getElementById('locateGroupLabel').textContent =
+            `Loading "${group.name || 'Unnamed Group'}"'s tagged contact list…`;
+        document.getElementById('locateContent').innerHTML =
+            `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Loading group's tagged contacts…</div>`;
+        document.getElementById('locateModal').classList.remove('hidden');
+
+        try {
+            if (!allBdrs.length) {
+                document.getElementById('locateContent').innerHTML =
+                    `<div class="alert alert-warning"><i class="fas fa-exclamation-circle"></i> BDR list hasn't loaded yet — close this and try again in a moment.</div>`;
+                return;
+            }
+
+            // 1. Load the full tagged URL list (handles chunked groups transparently)
+            const ref  = doc(db, 'hypothesis_groups', groupId);
+            const snap = await getDoc(ref);
+            if (!snap.exists) { showAlert('Group not found in Firestore.', 'error'); closeLocateModal(); return; }
+            const data = snap.data();
+            const { urls } = await _readGroupContacts(ref, data);
+            const totalTagged = urls.length;
+
+            if (!totalTagged) {
+                document.getElementById('locateContent').innerHTML =
+                    `<div class="alert alert-warning"><i class="fas fa-exclamation-circle"></i> This group has no tagged contacts yet.</div>`;
+                return;
+            }
+
+            // Canonical key (slug preferred, normalized URL fallback) → original raw URL, deduped
+            const keyToUrl = new Map();
+            urls.forEach(u => {
+                const key = liSlug(u) || normalizeUrl(u);
+                if (key && !keyToUrl.has(key)) keyToUrl.set(key, u);
+            });
+            const uniqueKeys = [...keyToUrl.keys()];
+
+            document.getElementById('locateContent').innerHTML =
+                `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Scanning ${allBdrs.length} BDR${allBdrs.length !== 1 ? 's' : ''}' prospect_contacts for ${uniqueKeys.length.toLocaleString()} unique tagged contact${uniqueKeys.length !== 1 ? 's' : ''}…</div>`;
+
+            // 2. Query every BDR's prospect_contacts across all 4 owner-field
+            // spellings used elsewhere on this page, system-wide — a contact could
+            // have been misassigned to the wrong company's BDR, not just missing.
+            const ownerFields = ['userEmail', 'account_email', 'accountEmail', 'bdrEmail'];
+            const keyOwner = new Map(); // canonicalKey → { bdrEmail, bdrName, company, docId }
+
+            await Promise.all(allBdrs.map(async bdr => {
+                const email = (bdr.primaryEmail || bdr.id || '').toLowerCase();
+                if (!email) return;
+                const seenIds = new Set();
+                await Promise.all(ownerFields.map(async field => {
+                    const fsnap = await getDocs(
+                        query(collection(db, 'prospect_contacts'), where(field, '==', email))
+                    ).catch(() => null);
+                    if (!fsnap) return;
+                    fsnap.forEach(d => {
+                        if (seenIds.has(d.id)) return;
+                        seenIds.add(d.id);
+                        const cdata = d.data();
+                        const rawUrl = cdata.linkedInUrl || cdata.linkedin_url ||
+                            cdata.prospect_li_url || cdata.contact_linkedin_url || cdata.profileUrl || '';
+                        if (!rawUrl) return;
+                        const key = liSlug(rawUrl) || normalizeUrl(rawUrl);
+                        if (key && keyToUrl.has(key) && !keyOwner.has(key)) {
+                            keyOwner.set(key, {
+                                bdrEmail: email,
+                                bdrName:  bdr.name || email,
+                                company:  bdr._company || 'Other',
+                                docId:    d.id
+                            });
+                        }
+                    });
+                }));
+            }));
+
+            // 3. Summarize + render
+            const foundCount    = keyOwner.size;
+            const notFoundCount = uniqueKeys.length - foundCount;
+            const pct = Math.round(foundCount / uniqueKeys.length * 100);
+
+            const byOwner = new Map(); // "bdrName||company" → count
+            keyOwner.forEach(info => {
+                const k = `${info.bdrName}||${info.company}`;
+                byOwner.set(k, (byOwner.get(k) || 0) + 1);
+            });
+            const ownerRows = [...byOwner.entries()]
+                .map(([k, count]) => { const [name, company] = k.split('||'); return { name, company, count }; })
+                .sort((a, b) => b.count - a.count);
+
+            _locateReport = uniqueKeys.map(key => {
+                const info = keyOwner.get(key);
+                return {
+                    url:      keyToUrl.get(key),
+                    status:   info ? 'found' : 'not_found',
+                    bdrName:  info?.bdrName  || '',
+                    bdrEmail: info?.bdrEmail || '',
+                    company:  info?.company  || ''
+                };
+            });
+
+            document.getElementById('locateGroupLabel').innerHTML =
+                `<strong>${escHtml(group.name || 'Unnamed Group')}</strong> — ${totalTagged.toLocaleString()} tagged contact${totalTagged !== 1 ? 's' : ''}` +
+                `${uniqueKeys.length !== totalTagged ? ` (${uniqueKeys.length.toLocaleString()} unique)` : ''}, checked against ${allBdrs.length} BDR${allBdrs.length !== 1 ? 's' : ''}' <code>prospect_contacts</code> system-wide.`;
+
+            document.getElementById('locateContent').innerHTML = `
+                <div class="locate-summary-grid">
+                    <div class="locate-stat-box">
+                        <div class="locate-stat-val" style="color:#10b981;">${foundCount.toLocaleString()}</div>
+                        <div class="locate-stat-label">Found &amp; Owned</div>
+                    </div>
+                    <div class="locate-stat-box">
+                        <div class="locate-stat-val" style="color:${notFoundCount ? '#ef4444' : 'inherit'};">${notFoundCount.toLocaleString()}</div>
+                        <div class="locate-stat-label">Never Imported</div>
+                    </div>
+                    <div class="locate-stat-box">
+                        <div class="locate-stat-val">${ownerRows.length}</div>
+                        <div class="locate-stat-label">BDR${ownerRows.length !== 1 ? 's' : ''} Holding Contacts</div>
+                    </div>
+                </div>
+                <div class="locate-progress-track">
+                    <div class="locate-progress-fill" style="width:${pct}%;background:${pct > 60 ? '#10b981' : pct > 30 ? '#f59e0b' : '#ef4444'};"></div>
+                </div>
+                ${ownerRows.length ? `
+                <table class="locate-owner-table">
+                    <thead><tr><th>BDR</th><th>Company</th><th style="text-align:right;">Contacts Found</th></tr></thead>
+                    <tbody>
+                        ${ownerRows.map(r => `<tr>
+                            <td>${escHtml(r.name)}</td>
+                            <td>${escHtml(r.company)}</td>
+                            <td style="text-align:right;font-weight:700;">${r.count.toLocaleString()}</td>
+                        </tr>`).join('')}
+                    </tbody>
+                </table>` : `<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> None of this group's tagged contacts were found under any BDR — they've all only ever existed as a tagged URL list.</div>`}
+                ${notFoundCount > 0 ? `
+                <div class="alert alert-warning" style="margin-top:1.25rem;">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <strong>${notFoundCount.toLocaleString()}</strong> tagged contact${notFoundCount !== 1 ? 's' : ''}
+                    ${notFoundCount !== 1 ? "don't" : "doesn't"} have a matching <code>prospect_contacts</code> record under
+                    <em>any</em> BDR, company, or workspace — they were tagged onto this hypothesis group (via AI scan, batch
+                    import, or manual tagging) but never actually imported as workable contact records. They can't appear in the
+                    Monthly Research Plan, Outcomes, or the outreach queue until they're imported and assigned to a BDR.
+                    Download the full report below to see exactly which URLs are missing.
+                </div>` : ''}
+                <div style="margin-top:1rem;font-size:0.78rem;color:var(--gray-500);">
+                    <i class="fas fa-info-circle"></i> Matching uses each contact's LinkedIn URL (slug-based, robust to
+                    formatting differences) across every BDR's <code>prospect_contacts</code> — the same technique used on
+                    <a href="outcomes.html" target="_blank" style="color:var(--primary);">Outcomes</a> and
+                    <a href="monthly_research_plan.html" target="_blank" style="color:var(--primary);">Monthly Research Plan</a>.
+                </div>
+            `;
+            document.getElementById('locateExportBtn').style.display = '';
+        } catch(e) {
+            document.getElementById('locateContent').innerHTML =
+                `<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> Failed to locate contacts: ${e.message}</div>`;
+        }
+    };
+
+    window.closeLocateModal = function() {
+        document.getElementById('locateModal').classList.add('hidden');
+    };
+
+    window.exportLocateReport = function() {
+        if (!_locateReport || !_locateReport.length) return;
+        const group = allGroups.find(g => g.id === _locateGroupId);
+        const header = ['LinkedIn URL', 'Status', 'Owning BDR', 'BDR Email', 'Company'];
+        const rows = _locateReport.map(r => [
+            r.url, r.status === 'found' ? 'Found' : 'Never Imported', r.bdrName, r.bdrEmail, r.company
+        ]);
+        const csv = [header, ...rows]
+            .map(row => row.map(cell => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(','))
+            .join('\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const safeName = (group?.name || 'hypothesis-group').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+        a.href = url;
+        a.download = `locate-contacts-${safeName}-${new Date().toISOString().slice(0, 10)}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
     };
 
     const _splitTabSuffix = { half: 'Half', ai: 'AI', batch: 'Batch', bdr: 'Bdr', date: 'Date' };
