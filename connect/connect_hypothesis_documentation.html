@@ -9142,7 +9142,7 @@
             const snap = await getDoc(ref);
             if (!snap.exists) { showAlert('Group not found in Firestore.', 'error'); closeLocateModal(); return; }
             const data = snap.data();
-            const { urls } = await _readGroupContacts(ref, data);
+            const { urls, tagged } = await _readGroupContacts(ref, data);
             const totalTagged = urls.length;
 
             if (!totalTagged) {
@@ -9158,6 +9158,22 @@
                 if (key && !keyToUrl.has(key)) keyToUrl.set(key, u);
             });
             const uniqueKeys = [...keyToUrl.keys()];
+
+            // taggedContacts is captured at tagging time (name/title/org pulled from the
+            // AI scan, batch, or date-range tool that added the contact) — it's the one
+            // enrichment source that already lives on this group doc, independent of
+            // whatever happened to the contact's prospect_contacts record since. Use it
+            // to fill in identity details for the report even when a contact is missing
+            // everywhere else.
+            const keyToTagged = new Map();
+            (tagged || []).forEach(c => {
+                const rawUrl = c.linkedInUrl || c.url || '';
+                if (!rawUrl) return;
+                const key = liSlug(rawUrl) || normalizeUrl(rawUrl);
+                if (key && !keyToTagged.has(key)) {
+                    keyToTagged.set(key, { name: c.name || '', title: c.title || '', org: c.org || c.organization || '' });
+                }
+            });
 
             document.getElementById('locateContent').innerHTML =
                 `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Scanning ${allBdrs.length} BDR${allBdrs.length !== 1 ? 's' : ''}' prospect_contacts for ${uniqueKeys.length.toLocaleString()} unique tagged contact${uniqueKeys.length !== 1 ? 's' : ''}…</div>`;
@@ -9197,34 +9213,124 @@
                 }));
             }));
 
-            // 3. Summarize + render
-            const foundCount    = keyOwner.size;
-            const notFoundCount = uniqueKeys.length - foundCount;
+            // 3. For anything NOT found in prospect_contacts, cross-check
+            // heyreach_contacts — HeyReach's own synced connection/lead records.
+            // This collection lives independently of prospect_contacts (it's synced
+            // FROM HeyReach, not derived from our data), so a contact can still show up
+            // here with real name/title/company even after its prospect_contacts doc
+            // was deleted — this is the most likely "enrichment table" recovery path.
+            const stillMissingKeys = uniqueKeys.filter(k => !keyOwner.has(k));
+            const keyHeyreach = new Map(); // canonicalKey → { bdrEmail, bdrName, company, docId, name, title, org }
+
+            if (stillMissingKeys.length) {
+                document.getElementById('locateContent').innerHTML =
+                    `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> ${keyOwner.size.toLocaleString()} found in prospect_contacts — cross-checking heyreach_contacts for the remaining ${stillMissingKeys.length.toLocaleString()}…</div>`;
+
+                const missingKeySet = new Set(stillMissingKeys);
+                const heyreachFields = ['accountEmail', 'bdrEmail', 'linkedInAccountEmail'];
+                await Promise.all(allBdrs.map(async bdr => {
+                    const email = (bdr.primaryEmail || bdr.id || '').toLowerCase();
+                    if (!email) return;
+                    const seenIds = new Set();
+                    await Promise.all(heyreachFields.map(async field => {
+                        const fsnap = await getDocs(
+                            query(collection(db, 'heyreach_contacts'), where(field, '==', email))
+                        ).catch(() => null);
+                        if (!fsnap) return;
+                        fsnap.forEach(d => {
+                            if (seenIds.has(d.id)) return;
+                            seenIds.add(d.id);
+                            const cdata = d.data();
+                            const rawUrl = cdata.linkedin_url || cdata.profileUrl || cdata.leadProfileUrl || cdata.linkedInUrl || '';
+                            if (!rawUrl) return;
+                            const key = liSlug(rawUrl) || normalizeUrl(rawUrl);
+                            if (key && missingKeySet.has(key) && !keyHeyreach.has(key)) {
+                                const name = [cdata.firstName || cdata.first_name || cdata.leadFirstName || '',
+                                              cdata.lastName  || cdata.last_name  || cdata.leadLastName  || ''].join(' ').trim();
+                                keyHeyreach.set(key, {
+                                    bdrEmail: email,
+                                    bdrName:  bdr.name || email,
+                                    company:  bdr._company || 'Other',
+                                    docId:    d.id,
+                                    name:     name,
+                                    title:    cdata.title || cdata.position || cdata.headline || cdata.occupation || '',
+                                    org:      cdata.company || cdata.companyName || cdata.currentCompany || ''
+                                });
+                            }
+                        });
+                    }));
+                }));
+            }
+
+            // 4. For whatever's STILL unaccounted for, check linkedin_profile_cache —
+            // a server-side Apify profile cache (about/experience/education), keyed by
+            // LinkedIn URL and populated independently of prospect_contacts whenever
+            // ANY contact's profile gets scraped (see prospect_cleanup.html's AI
+            // Profile Cleanup tool). This is the richest recovery source: it can have
+            // full profile data for a URL even if that contact's prospect_contacts doc
+            // was deleted long ago. The API only returns an aggregate count here (no
+            // per-URL detail) — the real per-contact breakdown comes back when
+            // recoverFromApifyCache() actually submits them for enrichment.
+            const missingKeys2 = uniqueKeys.filter(k => !keyOwner.has(k) && !keyHeyreach.has(k));
+            let apifyCachedCount = 0;
+            if (missingKeys2.length) {
+                document.getElementById('locateContent').innerHTML =
+                    `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Checking the Apify profile cache for the remaining ${missingKeys2.length.toLocaleString()}…</div>`;
+                try {
+                    const cacheResp = await fetch(`${RAILWAY_BASE}/api/ai-profile-cleanup/cache-coverage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ urls: missingKeys2.map(k => keyToUrl.get(k)) })
+                    });
+                    if (cacheResp.ok) {
+                        const cacheData = await cacheResp.json();
+                        apifyCachedCount = cacheData.cachedCount || 0;
+                    }
+                } catch(e) { console.warn('[openLocateModal] cache-coverage check failed:', e.message); }
+            }
+
+            // 5. Summarize + render
+            const foundCount       = keyOwner.size;
+            const recoverableCount = keyHeyreach.size;
+            const missingCount     = uniqueKeys.length - foundCount - recoverableCount;
+            const trulyGoneCount   = missingCount - apifyCachedCount;
             const pct = Math.round(foundCount / uniqueKeys.length * 100);
 
-            const byOwner = new Map(); // "bdrName||company" → count
+            const byOwner = new Map(); // "bdrName||company||source" → count
             keyOwner.forEach(info => {
-                const k = `${info.bdrName}||${info.company}`;
+                const k = `${info.bdrName}||${info.company}||prospect_contacts`;
+                byOwner.set(k, (byOwner.get(k) || 0) + 1);
+            });
+            keyHeyreach.forEach(info => {
+                const k = `${info.bdrName}||${info.company}||heyreach_contacts`;
                 byOwner.set(k, (byOwner.get(k) || 0) + 1);
             });
             const ownerRows = [...byOwner.entries()]
-                .map(([k, count]) => { const [name, company] = k.split('||'); return { name, company, count }; })
+                .map(([k, count]) => { const [name, company, source] = k.split('||'); return { name, company, source, count }; })
                 .sort((a, b) => b.count - a.count);
 
             _locateReport = uniqueKeys.map(key => {
-                const info = keyOwner.get(key);
+                const owned    = keyOwner.get(key);
+                const recov    = keyHeyreach.get(key);
+                const tag      = keyToTagged.get(key);
+                const status   = owned ? 'found' : (recov ? 'recoverable' : 'missing');
+                const src      = owned || recov || {};
                 return {
-                    url:      keyToUrl.get(key),
-                    status:   info ? 'found' : 'not_found',
-                    bdrName:  info?.bdrName  || '',
-                    bdrEmail: info?.bdrEmail || '',
-                    company:  info?.company  || ''
+                    url:         keyToUrl.get(key),
+                    status,
+                    source:      owned ? 'prospect_contacts' : (recov ? 'heyreach_contacts' : ''),
+                    bdrName:     src.bdrName  || '',
+                    bdrEmail:    src.bdrEmail || '',
+                    company:     src.company  || '',
+                    name:        recov?.name  || tag?.name  || '',
+                    title:       recov?.title || tag?.title || '',
+                    org:         recov?.org   || tag?.org   || ''
                 };
             });
 
             document.getElementById('locateGroupLabel').innerHTML =
                 `<strong>${escHtml(group.name || 'Unnamed Group')}</strong> — ${totalTagged.toLocaleString()} tagged contact${totalTagged !== 1 ? 's' : ''}` +
-                `${uniqueKeys.length !== totalTagged ? ` (${uniqueKeys.length.toLocaleString()} unique)` : ''}, checked against ${allBdrs.length} BDR${allBdrs.length !== 1 ? 's' : ''}' <code>prospect_contacts</code> system-wide.`;
+                `${uniqueKeys.length !== totalTagged ? ` (${uniqueKeys.length.toLocaleString()} unique)` : ''}, checked against ${allBdrs.length} BDR${allBdrs.length !== 1 ? 's' : ''}' <code>prospect_contacts</code> and <code>heyreach_contacts</code> system-wide.`;
 
             document.getElementById('locateContent').innerHTML = `
                 <div class="locate-summary-grid">
@@ -9233,8 +9339,16 @@
                         <div class="locate-stat-label">Found &amp; Owned</div>
                     </div>
                     <div class="locate-stat-box">
-                        <div class="locate-stat-val" style="color:${notFoundCount ? '#ef4444' : 'inherit'};">${notFoundCount.toLocaleString()}</div>
-                        <div class="locate-stat-label">Never Imported</div>
+                        <div class="locate-stat-val" style="color:${recoverableCount ? '#f59e0b' : 'inherit'};">${recoverableCount.toLocaleString()}</div>
+                        <div class="locate-stat-label">Recoverable (HeyReach)</div>
+                    </div>
+                    <div class="locate-stat-box">
+                        <div class="locate-stat-val" style="color:${apifyCachedCount ? '#0369a1' : 'inherit'};">~${apifyCachedCount.toLocaleString()}</div>
+                        <div class="locate-stat-label">Recoverable (Apify Cache)</div>
+                    </div>
+                    <div class="locate-stat-box">
+                        <div class="locate-stat-val" style="color:${trulyGoneCount ? '#ef4444' : 'inherit'};">~${trulyGoneCount.toLocaleString()}</div>
+                        <div class="locate-stat-label">Truly Gone</div>
                     </div>
                     <div class="locate-stat-box">
                         <div class="locate-stat-val">${ownerRows.length}</div>
@@ -9246,28 +9360,51 @@
                 </div>
                 ${ownerRows.length ? `
                 <table class="locate-owner-table">
-                    <thead><tr><th>BDR</th><th>Company</th><th style="text-align:right;">Contacts Found</th></tr></thead>
+                    <thead><tr><th>BDR</th><th>Company</th><th>Source</th><th style="text-align:right;">Contacts</th></tr></thead>
                     <tbody>
                         ${ownerRows.map(r => `<tr>
                             <td>${escHtml(r.name)}</td>
                             <td>${escHtml(r.company)}</td>
+                            <td><span style="font-size:0.72rem;font-weight:700;padding:0.1rem 0.4rem;border-radius:4px;background:${r.source === 'prospect_contacts' ? '#dcfce7;color:#166534' : '#fef3c7;color:#92400e'};">${r.source === 'prospect_contacts' ? 'prospect_contacts' : 'heyreach_contacts'}</span></td>
                             <td style="text-align:right;font-weight:700;">${r.count.toLocaleString()}</td>
                         </tr>`).join('')}
                     </tbody>
                 </table>` : `<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> None of this group's tagged contacts were found under any BDR — they've all only ever existed as a tagged URL list.</div>`}
-                ${notFoundCount > 0 ? `
+                ${recoverableCount > 0 ? `
                 <div class="alert alert-warning" style="margin-top:1.25rem;">
+                    <i class="fas fa-life-ring"></i>
+                    <strong>${recoverableCount.toLocaleString()}</strong> contact${recoverableCount !== 1 ? 's' : ''} ${recoverableCount !== 1 ? "don't" : "doesn't"} have a
+                    <code>prospect_contacts</code> record anymore, but <strong>are</strong> still sitting in <code>heyreach_contacts</code>
+                    (HeyReach's own synced connection data) with usable name/title/company — these can be recreated as real
+                    <code>prospect_contacts</code> records.
+                    <div style="margin-top:0.6rem;">
+                        <button class="btn btn-sm btn-primary" onclick="recoverFromHeyreach(this)">
+                            <i class="fas fa-life-ring"></i> Recover ${recoverableCount.toLocaleString()} Contact${recoverableCount !== 1 ? 's' : ''} from HeyReach
+                        </button>
+                    </div>
+                </div>` : ''}
+                ${missingCount > 0 ? `
+                <div class="alert alert-error" style="margin-top:1.25rem;">
                     <i class="fas fa-exclamation-triangle"></i>
-                    <strong>${notFoundCount.toLocaleString()}</strong> tagged contact${notFoundCount !== 1 ? 's' : ''}
-                    ${notFoundCount !== 1 ? "don't" : "doesn't"} have a matching <code>prospect_contacts</code> record under
-                    <em>any</em> BDR, company, or workspace — they were tagged onto this hypothesis group (via AI scan, batch
-                    import, or manual tagging) but never actually imported as workable contact records. They can't appear in the
-                    Monthly Research Plan, Outcomes, or the outreach queue until they're imported and assigned to a BDR.
-                    Download the full report below to see exactly which URLs are missing.
+                    <strong>${missingCount.toLocaleString()}</strong> tagged contact${missingCount !== 1 ? 's' : ''}
+                    ${missingCount !== 1 ? "aren't" : "isn't"} in <code>prospect_contacts</code> <em>or</em> <code>heyreach_contacts</code> under
+                    any BDR — most likely they were tagged onto this hypothesis group (via AI scan, batch import, or manual
+                    tagging) but never actually imported/queued as workable contact records, so no downstream system ever
+                    captured them independently.
+                    ${apifyCachedCount > 0 ? ` Good news: about <strong>${apifyCachedCount.toLocaleString()}</strong> of them have a full cached profile (about / experience / education) sitting in the Apify profile cache from a previous scrape — that can be pulled in for free.` : ''}
+                    ${[...keyToTagged.values()].filter(t => t.name).length ? ` The exported report still includes whatever name/title/org was captured on this group at tagging time for these, where available.` : ''}
+                    Download the full report below for the exact list.
+                    ${apifyCachedCount > 0 ? `
+                    <div style="margin-top:0.6rem;">
+                        <button class="btn btn-sm btn-primary" onclick="recoverFromApifyCache(this)">
+                            <i class="fas fa-cloud-download-alt"></i> Recreate ${missingCount.toLocaleString()} Contact${missingCount !== 1 ? 's' : ''} &amp; Pull Cached Profiles
+                        </button>
+                    </div>` : ''}
                 </div>` : ''}
                 <div style="margin-top:1rem;font-size:0.78rem;color:var(--gray-500);">
                     <i class="fas fa-info-circle"></i> Matching uses each contact's LinkedIn URL (slug-based, robust to
-                    formatting differences) across every BDR's <code>prospect_contacts</code> — the same technique used on
+                    formatting differences) across every BDR's <code>prospect_contacts</code> and <code>heyreach_contacts</code> —
+                    the same technique used on
                     <a href="outcomes.html" target="_blank" style="color:var(--primary);">Outcomes</a> and
                     <a href="monthly_research_plan.html" target="_blank" style="color:var(--primary);">Monthly Research Plan</a>.
                 </div>
@@ -9283,12 +9420,14 @@
         document.getElementById('locateModal').classList.add('hidden');
     };
 
+    const _locateStatusLabel = { found: 'Found', recoverable: 'Recoverable (HeyReach)', missing: 'Truly Missing' };
+
     window.exportLocateReport = function() {
         if (!_locateReport || !_locateReport.length) return;
         const group = allGroups.find(g => g.id === _locateGroupId);
-        const header = ['LinkedIn URL', 'Status', 'Owning BDR', 'BDR Email', 'Company'];
+        const header = ['LinkedIn URL', 'Status', 'Source', 'Owning/Recoverable BDR', 'BDR Email', 'Company', 'Name', 'Title', 'Organization'];
         const rows = _locateReport.map(r => [
-            r.url, r.status === 'found' ? 'Found' : 'Never Imported', r.bdrName, r.bdrEmail, r.company
+            r.url, _locateStatusLabel[r.status] || r.status, r.source, r.bdrName, r.bdrEmail, r.company, r.name, r.title, r.org
         ]);
         const csv = [header, ...rows]
             .map(row => row.map(cell => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(','))
@@ -9303,6 +9442,164 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+    };
+
+    // Recreates real prospect_contacts records for every 'recoverable' row in the
+    // current locate report — i.e. contacts whose original prospect_contacts doc is
+    // gone, but which are still verifiably present in heyreach_contacts (so we have a
+    // trustworthy name/title/company + the BDR who actually holds the LinkedIn
+    // connection). Assigns each new record to that same BDR, since they're the one
+    // with the real relationship. Never touches the 'missing' bucket — there's no
+    // independent source to safely recreate those from.
+    window.recoverFromHeyreach = async function(btn) {
+        if (!_locateReport) return;
+        const rows = _locateReport.filter(r => r.status === 'recoverable');
+        if (!rows.length) { showAlert('Nothing to recover.', 'warning'); return; }
+
+        const byBdr = new Map();
+        rows.forEach(r => { byBdr.set(r.bdrEmail, (byBdr.get(r.bdrEmail) || 0) + 1); });
+        const breakdown = [...byBdr.entries()].map(([email, n]) => `  • ${email}: ${n}`).join('\n');
+
+        const ok = confirm(
+            `Recreate ${rows.length.toLocaleString()} prospect_contacts record${rows.length !== 1 ? 's' : ''} from heyreach_contacts data?\n\n` +
+            `Each will be assigned to the BDR who currently holds that LinkedIn connection:\n${breakdown}\n\n` +
+            `This writes new documents — it does not touch or delete anything existing. Continue?`
+        );
+        if (!ok) return;
+
+        const group = allGroups.find(g => g.id === _locateGroupId);
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Recovering…'; }
+
+        let success = 0, failed = 0;
+        const now = new Date().toISOString();
+        for (const r of rows) {
+            try {
+                const [firstName, ...rest] = (r.name || '').split(' ');
+                await addDoc(collection(db, 'prospect_contacts'), {
+                    linkedInUrl:          r.url,
+                    firstName:            firstName || '',
+                    lastName:             rest.join(' ') || '',
+                    name:                 r.name || '',
+                    title:                r.title || '',
+                    company:              r.org || '',
+                    userEmail:            r.bdrEmail,
+                    account_email:        r.bdrEmail,
+                    hypothesisGroupId:    _locateGroupId,
+                    recoveredFrom:        'heyreach_contacts',
+                    recoveredVia:         'connect_hypothesis_documentation.html:Locate',
+                    recoveredAt:          now,
+                    uploaded_date:        now,
+                    contactSource:        `Recovered from heyreach_contacts — original prospect_contacts record for this hypothesis group ("${group?.name || _locateGroupId}") was missing.`
+                });
+                success++;
+            } catch(e) {
+                console.warn('[recoverFromHeyreach] failed for', r.url, e.message);
+                failed++;
+            }
+        }
+
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-life-ring"></i> Recover'; }
+        showAlert(
+            `Recovered ${success.toLocaleString()} contact${success !== 1 ? 's' : ''}` +
+            (failed ? `, ${failed} failed — check console.` : '.') +
+            ` Re-open Locate on this group to confirm.`,
+            failed ? 'warning' : 'success'
+        );
+        closeLocateModal();
+    };
+
+    // Recreates prospect_contacts records for every 'missing' row — contacts with no
+    // trace in prospect_contacts or heyreach_contacts under any BDR. Unlike
+    // recoverFromHeyreach, there's no existing owner to inherit, so new records are
+    // assigned to this hypothesis group's own BDR(s). After creating the bare record
+    // (URL + whatever name/title/org was tagged), it asks the Railway
+    // /api/ai-profile-cleanup/enrich-from-cache endpoint to backfill full profile data
+    // (about/experience/education) from linkedin_profile_cache — the server-side Apify
+    // scrape cache — wherever a cached hit exists, for free. Contacts with no cache hit
+    // still get recreated as bare records; they'd need Profile Enrichment or a fresh
+    // Apify fetch to fill in the rest.
+    window.recoverFromApifyCache = async function(btn) {
+        if (!_locateReport) return;
+        const rows = _locateReport.filter(r => r.status === 'missing');
+        if (!rows.length) { showAlert('Nothing to recover.', 'warning'); return; }
+
+        const group = allGroups.find(g => g.id === _locateGroupId);
+        const groupBdrEmails = (group?.bdrEmails?.length ? group.bdrEmails : (group?.bdrEmail ? [group.bdrEmail] : []))
+            .filter(Boolean);
+        const targetBdrEmail = (groupBdrEmails[0] || '').toLowerCase();
+        if (!targetBdrEmail) {
+            showAlert('This hypothesis group has no assigned BDR to own the recovered contacts — assign a BDR to the group first.', 'error');
+            return;
+        }
+        const targetBdr = allBdrs.find(b => (b.primaryEmail || b.id || '').toLowerCase() === targetBdrEmail);
+
+        const ok = confirm(
+            `Recreate ${rows.length.toLocaleString()} prospect_contacts record${rows.length !== 1 ? 's' : ''} and pull any cached Apify profile data (about/experience/education) for them?\n\n` +
+            `All will be assigned to ${targetBdr?.name || targetBdrEmail} — this group's BDR` +
+            `${groupBdrEmails.length > 1 ? ' (the group has multiple BDRs; reassign individually later via Monthly Research Plan if needed)' : ''}.\n\n` +
+            `Contacts NOT found in the Apify cache will still be recreated (with whatever name/title/org was tagged on the group), just without rich profile data. Continue?`
+        );
+        if (!ok) return;
+
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Recreating…'; }
+
+        let created = 0, createFailed = 0;
+        const now = new Date().toISOString();
+        const newDocs = [];
+        for (const r of rows) {
+            try {
+                const [firstName, ...rest] = (r.name || '').split(' ');
+                const docRef = await addDoc(collection(db, 'prospect_contacts'), {
+                    linkedInUrl:          r.url,
+                    firstName:            firstName || '',
+                    lastName:             rest.join(' ') || '',
+                    name:                 r.name || '',
+                    title:                r.title || '',
+                    company:              r.org || '',
+                    userEmail:            targetBdrEmail,
+                    account_email:        targetBdrEmail,
+                    hypothesisGroupId:    _locateGroupId,
+                    recoveredFrom:        'linkedin_profile_cache',
+                    recoveredVia:         'connect_hypothesis_documentation.html:Locate',
+                    recoveredAt:          now,
+                    uploaded_date:        now,
+                    contactSource:        `Recovered — original prospect_contacts record for this hypothesis group ("${group?.name || _locateGroupId}") was missing. Re-created from tagged data; profile enrichment pulled from the Apify cache where available.`
+                });
+                newDocs.push({ id: docRef.id, linkedInUrl: r.url });
+                created++;
+            } catch(e) {
+                console.warn('[recoverFromApifyCache] create failed for', r.url, e.message);
+                createFailed++;
+            }
+        }
+
+        let enrichedFromCache = 0, stillNeeded = newDocs.length;
+        if (newDocs.length) {
+            if (btn) btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Pulling cached profiles…';
+            try {
+                const resp = await fetch(`${RAILWAY_BASE}/api/ai-profile-cleanup/enrich-from-cache`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prospects: newDocs })
+                });
+                if (resp.ok) {
+                    const data = await resp.json();
+                    enrichedFromCache = data.written || 0;
+                    stillNeeded = data.stillNeeded?.length ?? (newDocs.length - enrichedFromCache);
+                }
+            } catch(e) {
+                console.warn('[recoverFromApifyCache] enrich-from-cache failed:', e.message);
+            }
+        }
+
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-cloud-download-alt"></i> Recover'; }
+        showAlert(
+            `Recreated ${created.toLocaleString()} contact${created !== 1 ? 's' : ''}` +
+            (createFailed ? `, ${createFailed} failed — check console.` : '.') +
+            (newDocs.length ? ` ${enrichedFromCache.toLocaleString()} got full profile data (about/experience/education) from the Apify cache; ${stillNeeded.toLocaleString()} still need enrichment (run Profile Enrichment or a fresh Apify fetch for those).` : ''),
+            createFailed ? 'warning' : 'success'
+        );
+        closeLocateModal();
     };
 
     const _splitTabSuffix = { half: 'Half', ai: 'AI', batch: 'Batch', bdr: 'Bdr', date: 'Date' };
