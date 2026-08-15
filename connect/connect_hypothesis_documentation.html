@@ -9269,6 +9269,14 @@
             // queue doc as linkedin_profile, completely independent of prospect_contacts.
             // Unlike the Apify cache below, this is queryable client-side with full detail
             // per contact (no separate enrich call needed), so we check it first.
+            //
+            // Kept intentionally lean: connect_queue is by far the largest collection this
+            // page touches (some BDRs have 3-5k+ docs), so unlike the prospect_contacts and
+            // heyreach_contacts checks above, this one queries only bdr_auth_email (the
+            // field generate_messages.html always sets to the BDR's own email — the same
+            // doc's account_email is the separate HeyReach-seat email and would just
+            // duplicate matches), caps each query so one huge BDR queue can't blow up the
+            // whole scan, and fails fast per-BDR instead of hanging on the default 60s retry.
             const stillMissingKeysQ = uniqueKeys.filter(k => !keyOwner.has(k) && !keyHeyreach.has(k));
             const keyQueueProfile = new Map(); // canonicalKey → { bdrEmail, bdrName, company, docId, name, title, org, profile }
 
@@ -9277,38 +9285,35 @@
                     `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Cross-checking connect_queue profile snapshots for the remaining ${stillMissingKeysQ.length.toLocaleString()}…</div>`;
 
                 const missingKeySetQ = new Set(stillMissingKeysQ);
-                const queueEmailFields = ['account_email', 'bdr_auth_email'];
+                const QUEUE_SCAN_LIMIT = 1500;
+                const QUEUE_SCAN_TIMEOUT_MS = 20000;
                 await Promise.all(allBdrs.map(async bdr => {
                     const email = (bdr.primaryEmail || bdr.id || '').toLowerCase();
                     if (!email) return;
-                    const seenIds = new Set();
-                    await Promise.all(queueEmailFields.map(async field => {
-                        const fsnap = await getDocs(
-                            query(collection(db, 'connect_queue'), where(field, '==', email))
-                        ).catch(() => null);
-                        if (!fsnap) return;
-                        fsnap.forEach(d => {
-                            if (seenIds.has(d.id)) return;
-                            seenIds.add(d.id);
-                            const cdata = d.data();
-                            if (!cdata.linkedin_profile) return; // only care about docs with a profile snapshot
-                            const rawUrl = cdata.prospect_li_url || cdata.contact_linkedin_url || cdata.linkedin_url || '';
-                            if (!rawUrl) return;
-                            const key = liSlug(rawUrl) || normalizeUrl(rawUrl);
-                            if (key && missingKeySetQ.has(key) && !keyQueueProfile.has(key)) {
-                                keyQueueProfile.set(key, {
-                                    bdrEmail: email,
-                                    bdrName:  bdr.name || email,
-                                    company:  bdr._company || 'Other',
-                                    docId:    d.id,
-                                    name:     cdata.prospect_name || cdata.contact || '',
-                                    title:    cdata.prospect_title || cdata.title || '',
-                                    org:      cdata.prospect_company || cdata.company || '',
-                                    profile:  cdata.linkedin_profile
-                                });
-                            }
-                        });
-                    }));
+                    const fsnap = await getDocs(
+                        query(collection(db, 'connect_queue'), where('bdr_auth_email', '==', email), limit(QUEUE_SCAN_LIMIT)),
+                        { timeoutMs: QUEUE_SCAN_TIMEOUT_MS }
+                    ).catch(e => { console.warn('[openLocateModal] connect_queue scan skipped for', email, '—', e.message); return null; });
+                    if (!fsnap) return;
+                    fsnap.forEach(d => {
+                        const cdata = d.data();
+                        if (!cdata.linkedin_profile) return; // only care about docs with a profile snapshot
+                        const rawUrl = cdata.prospect_li_url || cdata.contact_linkedin_url || cdata.linkedin_url || '';
+                        if (!rawUrl) return;
+                        const key = liSlug(rawUrl) || normalizeUrl(rawUrl);
+                        if (key && missingKeySetQ.has(key) && !keyQueueProfile.has(key)) {
+                            keyQueueProfile.set(key, {
+                                bdrEmail: email,
+                                bdrName:  bdr.name || email,
+                                company:  bdr._company || 'Other',
+                                docId:    d.id,
+                                name:     cdata.prospect_name || cdata.contact || '',
+                                title:    cdata.prospect_title || cdata.title || '',
+                                org:      cdata.prospect_company || cdata.company || '',
+                                profile:  cdata.linkedin_profile
+                            });
+                        }
+                    });
                 }));
             }
 
