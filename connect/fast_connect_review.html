@@ -1795,6 +1795,49 @@
             padding: 0;
         }
 
+        .qte-model-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            margin-bottom: 0.55rem;
+        }
+        .qte-model-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            background: white;
+            border: 1.5px solid #6ee7b7;
+            border-radius: 20px;
+            padding: 0.25rem 0.6rem 0.25rem 0.7rem;
+            flex-shrink: 0;
+        }
+        .qte-model-pill label {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: #065f46;
+            white-space: nowrap;
+            cursor: pointer;
+        }
+        .qte-model-pill select {
+            border: none;
+            outline: none;
+            font-size: 0.78rem;
+            font-weight: 500;
+            color: #065f46;
+            background: transparent;
+            cursor: pointer;
+            padding: 0;
+            max-width: 280px;
+        }
+        .qte-model-note {
+            font-size: 0.76rem;
+            color: #047857;
+            line-height: 1.4;
+            flex: 1;
+            min-width: 180px;
+        }
+
         /* ── Opus Saved Prompts Panel ──────────────────────────────────── */
         .opus-saved-panel {
             margin-top: 0.5rem;
@@ -2873,6 +2916,15 @@
                         <i class="fas fa-pencil-alt" style="color:#059669;"></i> Text Edit Instructions
                         <span style="font-weight:400;color:#6b7280;font-size:0.78rem;">— tell the model exactly how to rewrite the message text. This is the ONLY instruction Quick Text Edit uses.</span>
                     </label>
+                    <div class="qte-model-row">
+                        <span class="qte-model-pill" title="Model used only for Quick Text Edit rewrites">
+                            <label for="qteModelSelect"><i class="fas fa-microchip"></i> Edit model:</label>
+                            <select id="qteModelSelect">
+                                <option value="meta-llama/llama-4-maverick" selected>Llama 4 Maverick</option>
+                            </select>
+                        </span>
+                        <span id="qteModelNote" class="qte-model-note">Meta's workhorse model — proven, fast, and a long-time default for filtering tools.</span>
+                    </div>
                     <textarea id="qteInstructions" class="opus-prompt-textarea" style="min-height:110px;border-color:#6ee7b7;"
                         placeholder="e.g. Shorten every message to under 300 characters while keeping the greeting and CTA. Fix any grammar issues. Remove any mention of pricing. Make the tone more casual and first-name friendly."></textarea>
                     <div style="margin-top:0.4rem; font-size:0.78rem; color:#047857; background:#ecfdf5; border:1px solid #a7f3d0; border-radius:6px; padding:0.5rem 0.7rem; line-height:1.5;">
@@ -3376,6 +3428,8 @@
     <script src="../js/auth.js"></script>
     <!-- CLEmail Secure API Wrapper -->
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <!-- Shared AI model catalog (managed on ai_models_admin.html) -->
+    <script src="../js/ai-model-catalog.js"></script>
     <!-- Shared Final AI Review rules store (Firestore-backed, localStorage cache) -->
     <script src="final-ai-review-rules-store.js"></script>
     <!-- Shared Message Filtering Logic -->
@@ -11146,8 +11200,55 @@
 
         // ── Quick Text Edit ──────────────────────────────────────────────────
         // Sends only the essential contact context (name, org, title, char count,
-        // message) to Llama Maverick and applies text edits only — no approvals
-        // or deletions are ever made.
+        // message) to the model chosen in #qteModelSelect and applies text edits
+        // only — no approvals or deletions are ever made.
+        const QTE_MODEL_LS_KEY = 'qteModel_v1';
+        const QTE_DEFAULT_MODEL = 'meta-llama/llama-4-maverick';
+
+        function getQteModel() {
+            return document.getElementById('qteModelSelect')?.value || QTE_DEFAULT_MODEL;
+        }
+
+        function updateQteModelNote(models) {
+            const noteEl = document.getElementById('qteModelNote');
+            const sel = document.getElementById('qteModelSelect');
+            if (!noteEl || !sel || !window.AiModelCatalog) return;
+            noteEl.textContent = window.AiModelCatalog.noteFor(models || [], sel.value) || '';
+        }
+
+        async function initQteModelSelect() {
+            const sel = document.getElementById('qteModelSelect');
+            if (!sel) return;
+
+            let saved = '';
+            try { saved = localStorage.getItem(QTE_MODEL_LS_KEY) || ''; } catch (e) { /* ignore */ }
+            const preferred = saved || sel.value || QTE_DEFAULT_MODEL;
+
+            if (window.AiModelCatalog) {
+                try {
+                    if (window.firebaseReady) await window.firebaseReady;
+                    const models = await window.AiModelCatalog.load();
+                    window.AiModelCatalog.populateSelect(sel, models, { selected: preferred });
+                    updateQteModelNote(models);
+                } catch (e) {
+                    console.warn('[QuickTextEdit] Model catalog wiring skipped:', e.message);
+                }
+            } else if (saved) {
+                sel.value = saved;
+            }
+
+            if (!sel.dataset.qteModelBound) {
+                sel.dataset.qteModelBound = '1';
+                sel.addEventListener('change', () => {
+                    try { localStorage.setItem(QTE_MODEL_LS_KEY, sel.value); } catch (e) { /* ignore */ }
+                    if (window.AiModelCatalog) {
+                        window.AiModelCatalog.load().then(updateQteModelNote).catch(() => {});
+                    }
+                });
+            }
+        }
+        window.initQteModelSelect = initQteModelSelect;
+
         async function runQuickTextEditReview() {
             const prompt = document.getElementById('qteInstructions')?.value?.trim();
             if (!prompt) {
@@ -11193,8 +11294,9 @@
             let batchErrors = 0;
             let token = await auth.currentUser.getIdToken();
 
+            const qteModel = getQteModel();
             const _reviewStart = Date.now();
-            console.group(`[QuickTextEdit] Starting — messages: ${total}`);
+            console.group(`[QuickTextEdit] Starting — messages: ${total}, model: ${qteModel}`);
 
             try {
                 const batches = [];
@@ -11232,7 +11334,7 @@
 
                     let results;
                     try {
-                        results = await opusCallApi(token, payload, prompt, 'llama-maverick');
+                        results = await opusCallApi(token, payload, prompt, qteModel);
                     } catch (batchErr) {
                         console.error(`[QuickTextEdit] Batch ${processed + 1}–${Math.min(processed + batch.length, total)} failed after retries, skipping:`, batchErr);
                         batchErrors++;
@@ -11336,7 +11438,10 @@
                 });
             }
             updateOnlyApprovedDependentUI();
+            initQteModelSelect();
         });
+        // Module has a top-level await, so DOMContentLoaded may already have fired.
+        initQteModelSelect();
 
         // ── Opus Saved Prompts (per-BDR, stored in localStorage) ────────────
         const OPUS_PROMPTS_LS_PREFIX = 'opusPrompts_v1_';
