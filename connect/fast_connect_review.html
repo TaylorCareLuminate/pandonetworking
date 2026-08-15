@@ -540,6 +540,30 @@
             background: #fffbeb;
         }
 
+        .stale-story-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: .35rem;
+            background: #fff7ed;
+            border: 1px solid #ea580c;
+            color: #9a3412;
+            border-radius: 6px;
+            padding: .25rem .55rem;
+            font-size: .75rem;
+            font-weight: 600;
+            margin-top: .45rem;
+        }
+        .stale-story-badge i { font-size: .72rem; }
+
+        .message-card.stale-story-delete {
+            border-left-color: #ea580c;
+            background: #fff7ed;
+        }
+
+        .news-date.stale-story {
+            background: linear-gradient(135deg, #9a3412, #ea580c);
+        }
+
         .message-card.checked-group-only {
             border-left-color: var(--accent);
             background: #f5f3ff;
@@ -2772,6 +2796,16 @@
                     </div>
                     <div style="font-size:0.76rem; color:var(--gray); margin-top:2px;">Leave blank to show all. Updates instantly on loaded cards.</div>
                 </div>
+                <div class="control-group" id="maxStoryAgeGroup" style="display:none;">
+                    <label for="maxStoryAgeMonths"><i class="fas fa-newspaper" style="color:#d97706;"></i> Don't push stories older than <span id="maxStoryAgeLabel">3</span> months</label>
+                    <div style="display:flex; gap:8px; align-items:center;">
+                        <input type="range" id="maxStoryAgeMonths" min="0" max="12" value="3" step="1"
+                               style="flex:1; accent-color:#d97706; cursor:pointer;"
+                               title="News/story-triggered messages older than this many months are auto-marked for deletion so they are not pushed. Set to 0 to disable.">
+                        <span id="maxStoryAgeValue" style="min-width:2.8rem; text-align:right; font-weight:700; font-size:0.9rem; color:#d97706;">3mo</span>
+                    </div>
+                    <div style="font-size:0.76rem; color:var(--gray); margin-top:2px;">Uses the story date on the card. Slide to 0 to disable. Changes apply instantly to loaded cards.</div>
+                </div>
                 <div class="control-group">
                     <label for="fcrHypothesisSelect"><i class="fas fa-flask" style="color:#C9973D;"></i> Hypothesis Group <span style="font-size:0.78rem; font-weight:600; color:#7c3aed;">(optional)</span></label>
                     <div style="display:flex; gap:6px; align-items:center;">
@@ -2924,6 +2958,9 @@
                             </select>
                         </span>
                         <span id="qteModelNote" class="qte-model-note">Meta's workhorse model — proven, fast, and a long-time default for filtering tools.</span>
+                    </div>
+                    <div id="qteSlowModelWarn" style="display:none;margin-bottom:0.5rem;font-size:0.78rem;color:#92400e;background:#fffbeb;border:1px solid #fcd34d;border-radius:6px;padding:0.45rem 0.65rem;line-height:1.45;">
+                        <i class="fas fa-exclamation-triangle"></i> This is a slow reasoning model. Quick Text Edit will time out or take hours (Qwen 3.8 Max recently ran 4 hours and mostly 502’d). Use <strong>Llama 4 Maverick</strong>, <strong>Gemini Flash</strong>, or <strong>DeepSeek</strong> for this tool.
                     </div>
                     <textarea id="qteInstructions" class="opus-prompt-textarea" style="min-height:110px;border-color:#6ee7b7;"
                         placeholder="e.g. Shorten every message to under 300 characters while keeping the greeting and CTA. Fix any grammar issues. Remove any mention of pricing. Make the tone more casual and first-name friendly."></textarea>
@@ -3105,6 +3142,10 @@
                         <i class="fas fa-spinner fa-spin"></i>
                         <span id="opusProgressText">Reviewing…</span>
                     </span>
+                    <button type="button" id="qteStopBtn" onclick="stopQuickTextEdit()"
+                        style="display:none;background:#991b1b;color:white;border:none;border-radius:7px;padding:0.3rem 0.75rem;font-size:0.8rem;font-weight:600;cursor:pointer;">
+                        <i class="fas fa-stop"></i> Stop edit
+                    </button>
                 </div>
             </div>
         </div>
@@ -4294,7 +4335,7 @@
 
             function syncMessagesOnlyControls(type) {
                 const isMsg = type === 'message';
-                ['recentContactDaysGroup', 'daysSinceMessageGroup'].forEach(id => {
+                ['recentContactDaysGroup', 'daysSinceMessageGroup', 'maxStoryAgeGroup'].forEach(id => {
                     const el = document.getElementById(id);
                     if (el) el.style.display = isMsg ? '' : 'none';
                 });
@@ -4898,6 +4939,8 @@
                 autoDeleteRecentlyContacted();
                 // Re-apply review-status auto-delete (Scheduled / Declined / Wrong Contact).
                 autoDeleteReviewStatusContacts();
+                // Re-apply stale-story auto-delete (news/post older than max story age).
+                autoDeleteStaleStories();
                 // Re-apply Messages-only card filters.
                 applyMessagesOnlyFilters();
                 updateConnectionsScanButton();
@@ -4971,6 +5014,10 @@
 
         // ── Review-status auto-delete (Scheduled / Declined / Wrong Contact) ──
         const reviewStatusDeleted = new Set();
+
+        // ── Stale-story auto-delete (news/post older than max story age) ──
+        const staleStoryDeleted = new Set();
+        const staleStoryUserKept = new Set(); // reviewer explicitly kept a stale story
 
         // Resolve the most-recent BDR-sent message timestamp for a prospect,
         // checking both the Firestore queue and HeyReach conversation history.
@@ -5100,6 +5147,170 @@
                     card.style.display = '';
                 }
             });
+        }
+
+        function getMaxStoryAgeMonths() {
+            const input = document.getElementById('maxStoryAgeMonths');
+            if (!input) return 3;
+            const n = parseInt(input.value, 10);
+            return isNaN(n) ? 3 : n;
+        }
+
+        function getStoryAgeCutoffDate(months) {
+            const cutoff = new Date();
+            cutoff.setMonth(cutoff.getMonth() - months);
+            return cutoff;
+        }
+
+        // Parse story dates from news_data / post_date. Handles ISO strings,
+        // "July 2026", "2026-07", and Firestore timestamps.
+        function parseStoryDate(raw) {
+            if (!raw) return null;
+            if (raw instanceof Date) return isNaN(raw.getTime()) ? null : raw;
+            if (typeof raw === 'object') {
+                if (typeof raw.toDate === 'function') {
+                    try { return raw.toDate(); } catch { return null; }
+                }
+                if (typeof raw.seconds === 'number') return new Date(raw.seconds * 1000);
+            }
+            const str = String(raw).trim();
+            if (!str || str === 'null' || str === 'N/A' || str === 'undefined') return null;
+
+            const monthYear = str.match(/^(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[.]?\s+(\d{4})$/i);
+            if (monthYear) {
+                const d = new Date(`${monthYear[1]} 1, ${monthYear[2]}`);
+                return isNaN(d.getTime()) ? null : d;
+            }
+
+            const ym = str.match(/^(\d{4})[-\/](\d{1,2})$/);
+            if (ym) {
+                const d = new Date(parseInt(ym[1], 10), parseInt(ym[2], 10) - 1, 1);
+                return isNaN(d.getTime()) ? null : d;
+            }
+
+            const d = new Date(str);
+            return isNaN(d.getTime()) ? null : d;
+        }
+
+        function extractNewsDateFromParsed(parsed) {
+            if (!parsed) return null;
+            const items = Array.isArray(parsed) ? parsed : [parsed];
+            for (const item of items) {
+                const d = parseStoryDate(item && item.date);
+                if (d) return d;
+            }
+            return null;
+        }
+
+        function getMessageStoryDate(message, parsedNewsOverride) {
+            if (parsedNewsOverride) {
+                const fromParsed = extractNewsDateFromParsed(parsedNewsOverride);
+                if (fromParsed) return fromParsed;
+            }
+
+            let newsData = message.news_data || message.newsData || null;
+            let parsed = null;
+            if (newsData && typeof newsData === 'string') {
+                try { parsed = JSON.parse(newsData); } catch { parsed = null; }
+            } else if (newsData && typeof newsData === 'object') {
+                parsed = newsData;
+            }
+            const fromNews = extractNewsDateFromParsed(parsed);
+            if (fromNews) return fromNews;
+
+            const fromHarvest = parseStoryDate(
+                message.harvest_news_date || message.news_date || message.news_article_date
+            );
+            if (fromHarvest) return fromHarvest;
+
+            return parseStoryDate(message.post_date || message.postedAt);
+        }
+
+        function formatStoryAge(storyDate) {
+            if (!storyDate) return '';
+            const days = Math.floor((Date.now() - storyDate.getTime()) / 86400000);
+            if (days < 30) {
+                return days <= 0 ? 'today' : days === 1 ? '1 day old' : `${days} days old`;
+            }
+            const months = Math.floor(days / 30.44);
+            return months === 1 ? '1 month old' : `${months} months old`;
+        }
+
+        function isStoryOlderThanMax(storyDate, maxMonths) {
+            if (!storyDate || !maxMonths || maxMonths <= 0) return false;
+            return storyDate < getStoryAgeCutoffDate(maxMonths);
+        }
+
+        // Auto-mark news/story-triggered messages whose story is older than the
+        // configured max age (default 3 months) so they are not pushed.
+        // Users can un-delete a card or slide the filter to 0 to disable.
+        function autoDeleteStaleStories() {
+            if (messageTypeSelect?.value !== 'message') return;
+            const maxMonths = getMaxStoryAgeMonths();
+            if (!maxMonths || maxMonths <= 0) return;
+
+            (loadedMessages || []).forEach(message => {
+                const card = document.querySelector(`.message-card[data-message-id="${message.id}"]`);
+                if (!card) return;
+
+                if (staleStoryUserKept.has(message.id)) return;
+
+                const existingAction = messageSelections.get(message.id);
+                const wasAutoSet = staleStoryDeleted.has(message.id) || autoDeletedMessages.has(message.id);
+                if (existingAction && !wasAutoSet && existingAction !== 'approve') return;
+
+                const storyDate = getMessageStoryDate(message);
+                if (!storyDate || !isStoryOlderThanMax(storyDate, maxMonths)) return;
+
+                const ageLabel = formatStoryAge(storyDate);
+                const dateLabel = storyDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short' });
+
+                const deleteCheckbox = card.querySelector('#delete_' + message.id);
+                if (deleteCheckbox && !deleteCheckbox.checked) {
+                    const approveCb = card.querySelector('#approve_' + message.id);
+                    if (approveCb) approveCb.checked = false;
+                    deleteCheckbox.checked = true;
+                    messageSelections.set(message.id, 'delete');
+                    staleStoryDeleted.add(message.id);
+                    card.classList.remove('checked-approve', 'checked-exclude', 'checked-group-only');
+                    card.classList.add('checked-delete', 'stale-story-delete');
+                } else if (deleteCheckbox && deleteCheckbox.checked) {
+                    staleStoryDeleted.add(message.id);
+                    card.classList.add('stale-story-delete');
+                }
+
+                const existingBadge = card.querySelector('.stale-story-badge');
+                if (existingBadge) existingBadge.remove();
+                const badge = document.createElement('div');
+                badge.className = 'stale-story-badge';
+                badge.innerHTML = `<i class="fas fa-newspaper"></i> Story dated ${dateLabel} (${ageLabel}) — older than ${maxMonths} month${maxMonths === 1 ? '' : 's'}, auto-marked for deletion so it is not pushed`;
+                const firstChild = card.firstElementChild;
+                if (firstChild) {
+                    card.insertBefore(badge, firstChild.nextSibling || firstChild);
+                } else {
+                    card.appendChild(badge);
+                }
+
+                card.querySelectorAll('.news-date').forEach(el => el.classList.add('stale-story'));
+            });
+
+            updateStats();
+        }
+
+        function clearStaleStoryAutoDeletes() {
+            staleStoryDeleted.forEach(msgId => {
+                if (messageSelections.get(msgId) !== 'delete') return;
+                const card = document.querySelector(`.message-card[data-message-id="${msgId}"]`);
+                if (!card) return;
+                const cb = card.querySelector('#delete_' + msgId);
+                if (cb) cb.checked = false;
+                messageSelections.delete(msgId);
+                card.classList.remove('checked-delete', 'stale-story-delete');
+                const badge = card.querySelector('.stale-story-badge');
+                if (badge) badge.remove();
+                card.querySelectorAll('.news-date.stale-story').forEach(el => el.classList.remove('stale-story'));
+            });
+            staleStoryDeleted.clear();
         }
 
         // ── Auto-delete contacts already Scheduled, Declined, or Wrong Contact ──
@@ -5415,6 +5626,8 @@
                 autoDeletedMessages.clear();
                 deletedAsDuplicate.clear();
                 reviewStatusDeleted.clear();
+                staleStoryDeleted.clear();
+                staleStoryUserKept.clear();
 
                 // Reset diversify variations
                 messageVariations.clear();
@@ -5774,6 +5987,8 @@
                     autoDeleteRecentlyContacted();
                     // Auto-delete Scheduled / Declined / Wrong Contact contacts (Messages only).
                     autoDeleteReviewStatusContacts();
+                    // Auto-delete stories older than the max story age (default 3 months).
+                    autoDeleteStaleStories();
                     // Apply Messages-only card filters (days since last message).
                     applyMessagesOnlyFilters();
                     updateConnectionsScanButton();
@@ -5783,6 +5998,9 @@
                     // Auto-apply any Opus review results Railway already computed during Full AI
                     // Generate, so pre-reviewed messages show up rated/improved/excluded immediately.
                     applyStoredOpusReviews();
+                    // Opus stored reviews can mark approve; re-apply so stale stories stay unpushed
+                    // unless the reviewer later un-deletes them.
+                    autoDeleteStaleStories();
 
                     // Lazy DNC check — runs in background while reviewer is looking at messages
                     checkDNCInBackground().catch(e => console.warn('DNC check failed:', e));
@@ -6768,6 +6986,12 @@
                 parsedNews = newsData;
                 console.log('📰 News data (already object):', parsedNews);
             }
+
+            const storyDate = getMessageStoryDate(message, parsedNews);
+            const maxStoryMonths = getMaxStoryAgeMonths();
+            const storyIsStale = isStoryOlderThanMax(storyDate, maxStoryMonths);
+            const storyAgeText = storyDate ? formatStoryAge(storyDate) : '';
+            card.dataset.storyDateMs = storyDate ? String(storyDate.getTime()) : '';
             
             // Links - Use prospect_li_url from message data
             const linkedInUrl = message.prospect_li_url || message.linkedInUrl || message.contact_linkedin_url || message.linkedin_url || message.li_url || '#';
@@ -7414,7 +7638,7 @@
                             <div style="display: flex; flex-direction: column; gap: 10px;">
                                 ${parsedNews ? `
                                     <div class="news-article">
-                                        ${parsedNews.date ? `<div class="news-date"><i class="fas fa-calendar-alt"></i> ${escapeHtml(parsedNews.date)}</div>` : ''}
+                                        ${parsedNews.date ? `<div class="news-date${storyIsStale ? ' stale-story' : ''}"><i class="fas fa-calendar-alt"></i> ${escapeHtml(parsedNews.date)}${storyIsStale && storyAgeText ? ` · ${escapeHtml(storyAgeText)}` : ''}</div>` : ''}
                                         ${parsedNews.headline ? `<div class="news-headline">${escapeHtml(parsedNews.headline)}</div>` : ''}
                                         ${parsedNews.content ? `<div class="news-content">${escapeHtml(parsedNews.content)}</div>` : ''}
                                         ${parsedNews.url ? `
@@ -7442,10 +7666,14 @@
                             // parsedNews can be a single {headline,content,url,date} object
                             // OR an array of such objects (from R-generated org complement)
                             const newsArr = Array.isArray(parsedNews) ? parsedNews : [parsedNews];
-                            const renderArticle = (item, idx) => `
+                            const renderArticle = (item, idx) => {
+                                const itemDate = parseStoryDate(item.date);
+                                const itemStale = isStoryOlderThanMax(itemDate, maxStoryMonths);
+                                const itemAge = itemStale && itemDate ? formatStoryAge(itemDate) : '';
+                                return `
                                 <div class="news-article" style="${newsArr.length > 1 ? 'margin-bottom: 10px;' : ''}">
                                     ${newsArr.length > 1 ? `<div style="font-size: 0.72rem; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Source ${idx + 1}</div>` : ''}
-                                    ${item.date ? `<div class="news-date"><i class="fas fa-calendar-alt"></i> ${escapeHtml(item.date)}</div>` : ''}
+                                    ${item.date ? `<div class="news-date${itemStale ? ' stale-story' : ''}"><i class="fas fa-calendar-alt"></i> ${escapeHtml(item.date)}${itemAge ? ` · ${escapeHtml(itemAge)}` : ''}</div>` : ''}
                                     ${item.headline ? `<div class="news-headline">${escapeHtml(item.headline)}</div>` : ''}
                                     ${(item.content || item.description) ? `<div class="news-content">${escapeHtml(item.content || item.description)}</div>` : ''}
                                     ${item.url && item.url !== 'null' && item.url !== 'N/A' ? `
@@ -7456,6 +7684,7 @@
                                         </div>
                                     ` : ''}
                                 </div>`;
+                            };
                             return newsArr.map(renderArticle).join('');
                         })() : isFromInternetSearch && newsData ? `
                             <div class="post-text">
@@ -8285,6 +8514,7 @@
                         autoDeletedMessages.delete(messageId);
                         recentlyContactedDeleted.delete(messageId);
                         deletedAsDuplicate.delete(messageId);
+                        staleStoryDeleted.delete(messageId);
                     }
                 });
                 
@@ -8297,6 +8527,12 @@
                     autoDeletedMessages.delete(messageId);
                     recentlyContactedDeleted.delete(messageId);
                     deletedAsDuplicate.delete(messageId);
+                    staleStoryDeleted.delete(messageId);
+                    staleStoryUserKept.delete(messageId);
+                }
+                if (event.isTrusted && (action === 'approve' || action === 'exclude')) {
+                    staleStoryUserKept.add(messageId);
+                    staleStoryDeleted.delete(messageId);
                 }
                 
                 // Track approval timing if this is an approval
@@ -8341,6 +8577,8 @@
                     autoDeletedMessages.delete(messageId);
                     recentlyContactedDeleted.delete(messageId);
                     deletedAsDuplicate.delete(messageId);
+                    staleStoryDeleted.delete(messageId);
+                    if (event.isTrusted) staleStoryUserKept.add(messageId);
                 }
                 
                 // Remove timing data if unchecked
@@ -9266,6 +9504,8 @@
             manualReserveSelections.clear();
             autoDeletedMessages.clear();
             deletedAsDuplicate.clear();
+            staleStoryDeleted.clear();
+            staleStoryUserKept.clear();
             messageVariations.clear();
             _fcrMsgVariationMap.clear();
             
@@ -11204,16 +11444,132 @@
         // only — no approvals or deletions are ever made.
         const QTE_MODEL_LS_KEY = 'qteModel_v1';
         const QTE_DEFAULT_MODEL = 'meta-llama/llama-4-maverick';
+        // Small batches + a short timeout: Railway returns a 502 (no CORS headers)
+        // if OpenRouter thinks too long. Reasoning models like Qwen 3.8 Max take
+        // 2–18 minutes per batch and almost always 502.
+        const QTE_BATCH_SIZE = 4;
+        const QTE_CONCURRENCY = 3;
+        const QTE_FETCH_TIMEOUT_MS = 75 * 1000;
+        const QTE_MAX_RETRIES = 1;
+
+        let _qteAbort = false;
+        function stopQuickTextEdit() { _qteAbort = true; }
+        window.stopQuickTextEdit = stopQuickTextEdit;
 
         function getQteModel() {
             return document.getElementById('qteModelSelect')?.value || QTE_DEFAULT_MODEL;
         }
 
+        function qteIsSlowModel(slug) {
+            return /qwen3\.8-max|opus|reasoning|gpt-5\.5|claude-opus-4/i.test(slug || '');
+        }
+
+        function qteParseResults(raw) {
+            if (!raw) return [];
+            let cleaned = String(raw).trim();
+            const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+            if (fence) cleaned = fence[1].trim();
+            const start = cleaned.indexOf('[');
+            if (start !== -1) {
+                let depth = 0, end = -1;
+                for (let i = start; i < cleaned.length; i++) {
+                    if (cleaned[i] === '[') depth++;
+                    else if (cleaned[i] === ']') { depth--; if (depth === 0) { end = i; break; } }
+                }
+                if (end !== -1) cleaned = cleaned.slice(start, end + 1);
+            }
+            try {
+                const parsed = JSON.parse(cleaned);
+                return Array.isArray(parsed) ? parsed : [];
+            } catch (e) {
+                console.warn('[QuickTextEdit] Could not parse model JSON:', cleaned.slice(0, 300));
+                return [];
+            }
+        }
+
+        // Uses the production OpenRouter proxy (/api/ai-profile-eval) instead of
+        // opus-batch-review. That review endpoint sends a huge 3-step prompt and
+        // routinely times out on catalog/reasoning models, which Railway returns
+        // as a 502 without CORS headers.
+        async function qteCallApi(token, payloadMessages, prompt, model) {
+            const userPrompt =
+`Rewrite each LinkedIn outreach message using the instructions below.
+Return a JSON array only — no markdown, no analysis, no extra keys.
+
+INSTRUCTIONS:
+${prompt}
+
+MESSAGES:
+${payloadMessages.map((m, i) =>
+    `[${i + 1}] ID: ${m.id}\nContact: ${m.contactName} (${m.contactTitle}) at ${m.orgName}\nCurrent (${m.charCount} chars):\n${m.message_to_contact}`
+).join('\n\n')}
+
+Return ONLY:
+[{"id":"<message_id>","improvedMessage":"<full rewritten text>"}]
+
+Rules:
+- Include every input id exactly once
+- improvedMessage is the complete rewritten message, not a comment about it`;
+
+            let lastErr;
+            const _apiCallStart = Date.now();
+            console.log(`[QuickTextEdit] Sending ${payloadMessages.length} message(s) to ${model} via ai-profile-eval`);
+            for (let attempt = 0; attempt <= QTE_MAX_RETRIES; attempt++) {
+                if (_qteAbort) throw new Error('Stopped');
+                if (attempt > 0) await new Promise(r => setTimeout(r, 4000));
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), QTE_FETCH_TIMEOUT_MS);
+                try {
+                    const resp = await fetch(`${RAILWAY_BASE}/api/ai-profile-eval`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                        body: JSON.stringify({
+                            provider: 'openrouter',
+                            model,
+                            prompt: userPrompt,
+                            temperature: 0.2,
+                            max_tokens: 4000,
+                            lowReasoning: true
+                        }),
+                        signal: controller.signal
+                    });
+                    clearTimeout(timeoutId);
+                    if (!resp.ok) {
+                        const body = await resp.text();
+                        throw new Error(`API error ${resp.status}: ${body.slice(0, 200)}`);
+                    }
+                    const data = await resp.json();
+                    const raw = (data.message || data.rawResponse || data.response || '').trim();
+                    const results = qteParseResults(raw);
+                    console.log(`[QuickTextEdit] Success in ${((Date.now() - _apiCallStart) / 1000).toFixed(1)}s — ${results.length} result(s) from ${model}`);
+                    if (!results.length) {
+                        throw new Error(`Model ${model} returned no parseable edits. Raw: ${raw.slice(0, 180) || '(empty)'}`);
+                    }
+                    return results;
+                } catch (fetchErr) {
+                    clearTimeout(timeoutId);
+                    lastErr = fetchErr;
+                    const isTimeout = fetchErr.name === 'AbortError';
+                    const isNetwork = fetchErr.message === 'Failed to fetch' || /502|504/.test(fetchErr.message);
+                    console.warn(`[QuickTextEdit] Attempt ${attempt + 1} failed: ${fetchErr.message}`);
+                    if (attempt < QTE_MAX_RETRIES && (isTimeout || isNetwork || fetchErr.message.includes('429'))) continue;
+                    if (isTimeout || isNetwork) {
+                        throw new Error(`Timed out talking to ${model}. Use Llama 4 Maverick, Gemini Flash, or DeepSeek — reasoning models (Qwen 3.8 Max) hit Railway's 502 limit.`);
+                    }
+                    throw fetchErr;
+                }
+            }
+            throw lastErr;
+        }
+
         function updateQteModelNote(models) {
             const noteEl = document.getElementById('qteModelNote');
             const sel = document.getElementById('qteModelSelect');
-            if (!noteEl || !sel || !window.AiModelCatalog) return;
-            noteEl.textContent = window.AiModelCatalog.noteFor(models || [], sel.value) || '';
+            const warnEl = document.getElementById('qteSlowModelWarn');
+            if (noteEl && sel && window.AiModelCatalog) {
+                noteEl.textContent = window.AiModelCatalog.noteFor(models || [], sel.value) || '';
+            }
+            if (warnEl && sel) warnEl.style.display = qteIsSlowModel(sel.value) ? '' : 'none';
         }
 
         async function initQteModelSelect() {
@@ -11249,6 +11605,47 @@
         }
         window.initQteModelSelect = initQteModelSelect;
 
+        function qteExtractText(r) {
+            if (!r || typeof r !== 'object') return '';
+            return String(r.improvedMessage || r.editedText || r.message || r.text || r.rewritten || '').trim();
+        }
+
+        function qteFindSource(r, batch, idx) {
+            if (r?.id) {
+                const exact = batch.find(m => m.id === r.id);
+                if (exact) return exact;
+                const loose = batch.find(m => m.id.endsWith(r.id) || r.id.endsWith(m.id) || m.id.includes(r.id) || r.id.includes(m.id));
+                if (loose) return loose;
+            }
+            if (typeof idx === 'number' && batch[idx]) return batch[idx];
+            return null;
+        }
+
+        function qteApplyResults(results, batch) {
+            let applied = 0;
+            (results || []).forEach((r, idx) => {
+                const newText = qteExtractText(r);
+                if (!newText) return;
+                const srcMsg = qteFindSource(r, batch, idx);
+                if (!srcMsg) return;
+                const originalText = (editedMessages.get(srcMsg.id) || srcMsg.message_to_contact || '').trim();
+                if (newText === originalText) return;
+                const card = document.querySelector(`.message-card[data-message-id="${srcMsg.id}"]`);
+                const textarea = card?.querySelector('.message-textarea');
+                if (textarea) {
+                    _aiIsWritingToTextarea = true;
+                    textarea.value = newText;
+                    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                    _aiIsWritingToTextarea = false;
+                    applied++;
+                } else if (typeof editedMessages?.set === 'function') {
+                    editedMessages.set(srcMsg.id, newText);
+                    applied++;
+                }
+            });
+            return applied;
+        }
+
         async function runQuickTextEditReview() {
             const prompt = document.getElementById('qteInstructions')?.value?.trim();
             if (!prompt) {
@@ -11279,104 +11676,111 @@
                 return;
             }
 
+            const qteModel = getQteModel();
+            if (qteIsSlowModel(qteModel) && toEdit.length > 12) {
+                const ok = confirm(
+                    `${qteModel} is a slow reasoning model.\n\n` +
+                    `The last Qwen 3.8 Max run took hours, most batches 502'd, and almost no text changed.\n\n` +
+                    `OK = continue anyway. Cancel = stop so you can pick Llama 4 Maverick, Gemini Flash, or DeepSeek.`
+                );
+                if (!ok) return;
+            }
+
             document.querySelectorAll('.opus-banner').forEach(el => el.remove());
 
             const btn          = document.getElementById('runOpusReviewBtn');
             const progressEl   = document.getElementById('opusProgress');
             const progressText = document.getElementById('opusProgressText');
+            const stopBtn      = document.getElementById('qteStopBtn');
             btn.disabled = true;
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Quick Text Editing…';
             progressEl.style.display = 'flex';
+            if (stopBtn) stopBtn.style.display = '';
 
             let editedCount = 0;
             const total = toEdit.length;
             let processed = 0;
             let batchErrors = 0;
+            let consecutiveFails = 0;
             let token = await auth.currentUser.getIdToken();
+            _qteAbort = false;
 
-            const qteModel = getQteModel();
             const _reviewStart = Date.now();
-            console.group(`[QuickTextEdit] Starting — messages: ${total}, model: ${qteModel}`);
+            console.group(`[QuickTextEdit] Starting — messages: ${total}, model: ${qteModel}, via ai-profile-eval`);
+
+            const updateProgress = () => {
+                if (progressText) {
+                    progressText.textContent = `Edited ${editedCount} · ${processed}/${total} with ${qteModel}` +
+                        (batchErrors ? ` · ${batchErrors} batch fail${batchErrors === 1 ? '' : 's'}` : '') +
+                        (_qteAbort ? ' · stopping…' : '');
+                }
+            };
 
             try {
                 const batches = [];
-                for (let i = 0; i < toEdit.length; i += OPUS_BATCH_SIZE) {
-                    batches.push(toEdit.slice(i, i + OPUS_BATCH_SIZE));
+                for (let i = 0; i < toEdit.length; i += QTE_BATCH_SIZE) {
+                    batches.push(toEdit.slice(i, i + QTE_BATCH_SIZE));
                 }
 
-                for (const batch of batches) {
-                    try {
-                        if (auth?.currentUser) token = await auth.currentUser.getIdToken();
-                    } catch (tokenErr) {
-                        console.warn('[QuickTextEdit] Token refresh failed, reusing previous token:', tokenErr.message);
-                    }
-
-                    const payload = batch.map(m => {
-                        const currentText = editedMessages.get(m.id) || m.message_to_contact || '';
-                        const _qteCache   = _profileDataCache.get(m.id) || null;
-                        const orgName     = _qteCache?.company || m.contactCompany || m.prospect_company || m.company || m.company_name || m.org_name || '';
-                        const contactName = [
-                            m.contactFirstName || m.prospect_first_name || '',
-                            m.contactLastName  || m.prospect_last_name  || ''
-                        ].filter(Boolean).join(' ') || 'Unknown';
-                        const contactTitle = m.contactTitle || m.prospect_title || m.contact_title || m.title || '';
-                        return {
-                            id: m.id,
-                            message_to_contact: currentText,
-                            contactName,
-                            orgName,
-                            contactTitle,
-                            charCount: currentText.length
-                        };
-                    });
-
-                    progressText.textContent = `Editing ${processed + 1}–${Math.min(processed + batch.length, total)} of ${total}…`;
-
-                    let results;
-                    try {
-                        results = await opusCallApi(token, payload, prompt, qteModel);
-                    } catch (batchErr) {
-                        console.error(`[QuickTextEdit] Batch ${processed + 1}–${Math.min(processed + batch.length, total)} failed after retries, skipping:`, batchErr);
-                        batchErrors++;
-                        processed += batch.length;
-                        continue;
-                    }
-
-                    results.forEach(r => {
-                        // The backend (/api/connect/opus-batch-review) always responds in the
-                        // "new" format — the edited text comes back as improvedMessage, NOT
-                        // editedText (editedText is only the old legacy format). Quick Text Edit
-                        // was only ever checking editedText, so it silently found nothing to
-                        // apply on every run even though the API had already rewritten the text.
-                        const { newText } = opusInterpretResult(r);
-                        if (!newText) return;
-                        const srcMsg = batch.find(m => m.id === r.id);
-                        if (!srcMsg) return;
-                        const originalText = editedMessages.get(r.id) || srcMsg.message_to_contact || '';
-                        if (newText === originalText) return;
-                        const card = document.querySelector(`.message-card[data-message-id="${r.id}"]`);
-                        const textarea = card?.querySelector('.message-textarea');
-                        if (textarea) {
-                            _aiIsWritingToTextarea = true;
-                            textarea.value = newText;
-                            textarea.dispatchEvent(new Event('input', { bubbles: true }));
-                            _aiIsWritingToTextarea = false;
-                            editedCount++;
+                let next = 0;
+                const worker = async () => {
+                    while (next < batches.length && !_qteAbort) {
+                        const batch = batches[next++];
+                        try {
+                            if (auth?.currentUser) token = await auth.currentUser.getIdToken();
+                        } catch (tokenErr) {
+                            console.warn('[QuickTextEdit] Token refresh failed, reusing previous token:', tokenErr.message);
                         }
-                    });
 
-                    processed += batch.length;
-                    console.log(`[QuickTextEdit] Batch ${processed}/${total} done — edited so far: ${editedCount}`);
-                }
+                        const payload = batch.map(m => {
+                            const currentText = editedMessages.get(m.id) || m.message_to_contact || '';
+                            const _qteCache   = _profileDataCache.get(m.id) || null;
+                            const orgName     = _qteCache?.company || m.contactCompany || m.prospect_company || m.company || m.company_name || m.org_name || '';
+                            const contactName = [
+                                m.contactFirstName || m.prospect_first_name || '',
+                                m.contactLastName  || m.prospect_last_name  || ''
+                            ].filter(Boolean).join(' ') || 'Unknown';
+                            const contactTitle = m.contactTitle || m.prospect_title || m.contact_title || m.title || '';
+                            return {
+                                id: m.id,
+                                message_to_contact: currentText,
+                                contactName,
+                                orgName,
+                                contactTitle,
+                                charCount: currentText.length
+                            };
+                        });
+
+                        try {
+                            const results = await qteCallApi(token, payload, prompt, qteModel);
+                            editedCount += qteApplyResults(results, batch);
+                            consecutiveFails = 0;
+                        } catch (batchErr) {
+                            console.error(`[QuickTextEdit] Batch failed:`, batchErr);
+                            batchErrors++;
+                            consecutiveFails++;
+                            if (consecutiveFails >= 3) {
+                                _qteAbort = true;
+                                showAlert(`Quick Text Edit stopped after 3 failed batches in a row (${batchErr.message}). Switch to Llama 4 Maverick / Gemini Flash / DeepSeek and re-run.`, 'danger');
+                            }
+                        }
+                        processed += batch.length;
+                        updateProgress();
+                        console.log(`[QuickTextEdit] ${processed}/${total} — edited so far: ${editedCount}, fails: ${batchErrors}`);
+                    }
+                };
+
+                await Promise.all(Array.from({ length: Math.min(QTE_CONCURRENCY, batches.length) }, () => worker()));
 
                 progressEl.style.display = 'none';
                 const skippedNote = batchErrors > 0
-                    ? ` ⚠️ ${batchErrors} batch${batchErrors > 1 ? 'es' : ''} failed and were skipped — re-run to retry them.`
+                    ? ` ⚠️ ${batchErrors} batch${batchErrors > 1 ? 'es' : ''} failed — re-run to retry those.`
                     : '';
+                const stoppedNote = _qteAbort && processed < total ? ' Stopped early.' : '';
                 const _totalMs = Date.now() - _reviewStart;
                 showAlert(
-                    `✅ Quick Text Edit complete (${total} message${total !== 1 ? 's' : ''}): ${editedCount} edited. No approvals or deletions were changed.${skippedNote}`,
-                    batchErrors > 0 ? 'warning' : 'success'
+                    `✅ Quick Text Edit ${stoppedNote ? 'stopped' : 'complete'} (${processed}/${total}): ${editedCount} edited.${skippedNote}${stoppedNote}`,
+                    (batchErrors > 0 || stoppedNote) ? 'warning' : 'success'
                 );
                 console.log(`[QuickTextEdit] Complete in ${(_totalMs / 1000).toFixed(1)}s — edited: ${editedCount}, batchErrors: ${batchErrors}`);
                 console.groupEnd();
@@ -11387,6 +11791,8 @@
                 progressEl.style.display = 'none';
                 showAlert(`Quick Text Edit failed: ${err.message}. Check console for details.`, 'danger');
             } finally {
+                _qteAbort = false;
+                if (stopBtn) stopBtn.style.display = 'none';
                 btn.disabled = false;
                 btn.innerHTML = '<i class="fas fa-pencil-alt"></i> Run Quick Text Edit';
             }
@@ -12839,6 +13245,37 @@
                     if (loadedMessages && loadedMessages.length > 0) applyMessagesOnlyFilters();
                 });
             }
+        })();
+
+        // ── Messages-only: max story age slider ──
+        (function () {
+            const slider = document.getElementById('maxStoryAgeMonths');
+            const valueLabel = document.getElementById('maxStoryAgeValue');
+            const monthsLabel = document.getElementById('maxStoryAgeLabel');
+            if (!slider) return;
+
+            function syncLabel(v) {
+                const display = v <= 0 ? 'Off' : `${v}mo`;
+                if (valueLabel) valueLabel.textContent = display;
+                if (monthsLabel) monthsLabel.textContent = v <= 0 ? '— (disabled)' : v;
+                if (valueLabel) valueLabel.style.color = v <= 0 ? 'var(--gray)' : '#d97706';
+            }
+
+            slider.addEventListener('input', () => syncLabel(parseInt(slider.value, 10)));
+
+            slider.addEventListener('change', () => {
+                const months = parseInt(slider.value, 10);
+                syncLabel(months);
+
+                if (!loadedMessages || loadedMessages.length === 0) return;
+
+                staleStoryUserKept.clear();
+                clearStaleStoryAutoDeletes();
+                if (months > 0) autoDeleteStaleStories();
+                updateStats();
+            });
+
+            syncLabel(parseInt(slider.value, 10));
         })();
 
         // Load hypothesis groups button (filter bar)
