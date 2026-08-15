@@ -6342,8 +6342,10 @@
                     o.value = g.id;
                     o.textContent = `🔬 ${g.name || g.id}  (${cnt.toLocaleString()} contacts)`;
                     sel.appendChild(o);
-                    // Pre-cache non-chunked groups immediately
-                    if (!g._chunked && g.contactLinkedInUrls) {
+                    // Pre-cache non-chunked groups that actually have URLs. An empty
+                    // list must not be cached — Full Pipeline may have stamped contacts
+                    // that still need to be discovered via hypothesisGroupId.
+                    if (!g._chunked && g.contactLinkedInUrls?.length) {
                         _hypothesisGroupUrlCache.set(g.id,
                             new Set((g.contactLinkedInUrls).map(_normalizeHypUrl)));
                     }
@@ -6388,15 +6390,14 @@
         }
         window.refilterHypothesisSelectForBdr = refilterHypothesisSelectForBdr;
 
-        // Returns a Set<normalizedUrl> for the given groupId (loads chunks if needed), or null if none selected.
-        async function getHypothesisGroupUrls(groupId) {
-            if (!groupId) return null;
-            if (_hypothesisGroupUrlCache.has(groupId)) return _hypothesisGroupUrlCache.get(groupId);
+        // Group-doc URL list only (chunks included). Does not look at prospect_contacts stamps.
+        async function _getHypothesisGroupDocUrls(groupId) {
+            if (!groupId) return new Set();
             try {
-                const { doc: docFn, getDoc: gdoc, collection: col, getDocs: gd } = window.clemailFirestore;
+                const { doc: docFn, getDoc: gdoc } = window.clemailFirestore;
                 const ref  = docFn(db, 'hypothesis_groups', groupId);
                 const snap = await gdoc(ref);
-                if (!snap.exists && !snap.exists?.()) return null;
+                if (!snap.exists && !snap.exists?.()) return new Set();
                 const data = snap.data();
                 let urls = data.contactLinkedInUrls || [];
                 if (data._chunked && data._chunkCount) {
@@ -6407,19 +6408,149 @@
                         } catch (_) {}
                     }
                 }
-                const urlSet = new Set(urls.map(_normalizeHypUrl));
-                _hypothesisGroupUrlCache.set(groupId, urlSet);
-                return urlSet;
+                return new Set(urls.map(_normalizeHypUrl));
             } catch (err) {
-                console.error('getHypothesisGroupUrls error:', err);
-                return null;
+                console.error('_getHypothesisGroupDocUrls error:', err);
+                return new Set();
             }
+        }
+
+        // Full Pipeline stamps hypothesisGroupId on prospect_contacts but, until the
+        // group-URL write landed, did not append those URLs to contactLinkedInUrls.
+        // Membership for Generate must include the stamp, not just the group URL list.
+        async function getStampedHypothesisGroupContacts(groupId) {
+            const contacts = [];
+            if (!groupId) return contacts;
+            try {
+                const { collection: col, query: q, where: wh, getDocs: gd, getAllDocs: gad } = window.clemailFirestore;
+                const fetchFn = gad || gd;
+                const snap = await fetchFn(
+                    q(col(db, 'prospect_contacts'), wh('hypothesisGroupId', '==', groupId)),
+                    { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 }
+                );
+                snap.forEach(d => contacts.push({ id: d.id, ...d.data() }));
+            } catch (err) {
+                console.warn('getStampedHypothesisGroupContacts:', err.message);
+            }
+            return contacts;
+        }
+
+        const _HYP_CONTACT_CHUNK_LIMIT = 700 * 1024;
+
+        async function _readHypGroupContacts(groupId, data) {
+            if (!data?._chunked) {
+                return { urls: data?.contactLinkedInUrls || [], tagged: data?.taggedContacts || [] };
+            }
+            const { doc: docFn, getDoc: gdoc } = window.clemailFirestore;
+            const urls = [], tagged = [];
+            for (let i = 0; i < (data._chunkCount || 0); i++) {
+                try {
+                    const cs = await gdoc(docFn(db, 'hypothesis_group_chunks', `${groupId}_${i}`));
+                    if (cs.exists || cs.exists?.()) {
+                        const d = cs.data();
+                        urls.push(...(d.contactLinkedInUrls || []));
+                        tagged.push(...(d.taggedContacts || []));
+                    }
+                } catch (_) {}
+            }
+            return { urls, tagged };
+        }
+
+        async function _writeHypGroupContacts(groupId, urls, tagged) {
+            const { doc: docFn, updateDoc: ud, setDoc: sd } = window.clemailFirestore;
+            const ref = docFn(db, 'hypothesis_groups', groupId);
+            const trySize = JSON.stringify({ contactLinkedInUrls: urls, taggedContacts: tagged }).length;
+            if (trySize <= _HYP_CONTACT_CHUNK_LIMIT) {
+                await ud(ref, {
+                    contactLinkedInUrls: urls,
+                    taggedContacts: tagged,
+                    _chunked: false,
+                    _chunkCount: 0,
+                    _totalContactCount: urls.length,
+                    updatedAt: new Date()
+                });
+                return;
+            }
+            const chunks = [];
+            let cu = [], ct = [];
+            for (let i = 0; i < urls.length; i++) {
+                cu.push(urls[i]);
+                if (tagged[i]) ct.push(tagged[i]);
+                if (JSON.stringify({ contactLinkedInUrls: cu, taggedContacts: ct }).length >= _HYP_CONTACT_CHUNK_LIMIT) {
+                    cu.pop();
+                    if (tagged[i]) ct.pop();
+                    chunks.push({ contactLinkedInUrls: [...cu], taggedContacts: [...ct] });
+                    cu = [urls[i]];
+                    ct = tagged[i] ? [tagged[i]] : [];
+                }
+            }
+            if (cu.length) chunks.push({ contactLinkedInUrls: cu, taggedContacts: ct });
+            for (let i = 0; i < chunks.length; i++) {
+                await sd(docFn(db, 'hypothesis_group_chunks', `${groupId}_${i}`), chunks[i]);
+            }
+            await ud(ref, {
+                contactLinkedInUrls: [],
+                taggedContacts: [],
+                _chunked: true,
+                _chunkCount: chunks.length,
+                _totalContactCount: urls.length,
+                updatedAt: new Date()
+            });
+        }
+
+        // Union the group's URL list with contacts stamped hypothesisGroupId === groupId.
+        // If the stamp found URLs the group is missing, write them onto the group so
+        // the dropdown stops showing "(0 contacts)" after a Full Pipeline run.
+        async function loadHypothesisGroupMembership(groupId, addLog) {
+            if (!groupId) return null;
+            if (_hypothesisGroupUrlCache.has(groupId)) return _hypothesisGroupUrlCache.get(groupId);
+            const fromGroup = await _getHypothesisGroupDocUrls(groupId);
+            const stamped = await getStampedHypothesisGroupContacts(groupId);
+            const urlSet = new Set(fromGroup);
+            const newTagged = [];
+            for (const c of stamped) {
+                const raw = (c.linkedInUrl || c.li_url || c.linkedin_url || c.profile_url || '').trim();
+                const norm = _normalizeHypUrl(raw);
+                if (!norm || urlSet.has(norm)) continue;
+                urlSet.add(norm);
+                newTagged.push({
+                    name: c.fullName || [c.firstName, c.lastName].filter(Boolean).join(' ') || '',
+                    linkedInUrl: raw || norm,
+                    title: c.title || c.jobTitle || '',
+                    org: c.company || c.organization || '',
+                    orgLinkedInUrl: c.searchedOrganizationLinkedInUrl || c.orgLinkedInUrl || ''
+                });
+            }
+            if (newTagged.length) {
+                addLog?.(`🔬 Found ${newTagged.length} contact(s) stamped with this group that were not on the group's URL list — adding them.`, 'info');
+                try {
+                    const { doc: docFn, getDoc: gdoc } = window.clemailFirestore;
+                    const snap = await gdoc(docFn(db, 'hypothesis_groups', groupId));
+                    const data = (snap.exists || snap.exists?.()) ? (snap.data() || {}) : {};
+                    const { urls, tagged } = await _readHypGroupContacts(groupId, data);
+                    await _writeHypGroupContacts(
+                        groupId,
+                        [...urls, ...newTagged.map(t => t.linkedInUrl)],
+                        [...tagged, ...newTagged]
+                    );
+                } catch (e) {
+                    addLog?.(`⚠️ Could not write stamped contacts onto the hypothesis group (${e.message}). Generate will still use them for this run.`, 'warning');
+                }
+            }
+            if (urlSet.size > 0) _hypothesisGroupUrlCache.set(groupId, urlSet);
+            return urlSet;
+        }
+
+        // Public loader used by every Generate tab. Includes Full Pipeline stamps, not
+        // just hypothesis_groups.contactLinkedInUrls.
+        async function getHypothesisGroupUrls(groupId) {
+            return loadHypothesisGroupMembership(groupId);
         }
         window.getHypothesisGroupUrls = getHypothesisGroupUrls;
 
         // Returns true if the contact's LinkedIn URL is in the hypothesis group (or no group selected).
         function contactInHypothesisGroup(linkedInUrl, urlSet) {
-            if (!urlSet) return true;
+            if (!urlSet || urlSet.size === 0) return true;
             if (!linkedInUrl) return false;
             return urlSet.has(_normalizeHypUrl(linkedInUrl));
         }
@@ -15418,12 +15549,17 @@
                     // applied the teammate-outreach check. Membership filtering would wrongly drop
                     // brand-new workspace contacts that aren't already tagged on the group.
                 } else if (fullAiHypGroupId) {
-                    // BDR-list mode: load hypothesis group URLs BEFORE the server call so the
-                    // server can filter before applying the count cap.
+                    // BDR-list mode: load hypothesis group membership BEFORE the server call
+                    // so the server can filter before applying the count cap. Include contacts
+                    // stamped with this groupId (Full Pipeline) even if the group's URL list
+                    // was never updated — an empty list must not mean "exclude everyone."
                     addLog(`🔬 Loading hypothesis group URLs: ${fullAiHypGroupName}...`, 'info');
-                    fullAiHypUrlSet = await getHypothesisGroupUrls(fullAiHypGroupId);
-                    if (fullAiHypUrlSet) {
+                    fullAiHypUrlSet = await loadHypothesisGroupMembership(fullAiHypGroupId, addLog);
+                    if (fullAiHypUrlSet && fullAiHypUrlSet.size > 0) {
                         addLog(`🔬 Hypothesis group loaded: ${fullAiHypUrlSet.size} contacts — passing to server for pre-filter`, 'info');
+                    } else {
+                        fullAiHypUrlSet = null;
+                        addLog(`⚠️ Hypothesis group has 0 tagged contacts (URL list and stamps). Membership filter is off so this run is not an empty-set exclude-all.`, 'warning');
                     }
                 }
 
@@ -15552,7 +15688,7 @@
                         ...(scanJobId    ? { scanJobId, importBatchStartTime, importBatchEndTime } : {}),
                         ...(moveBatchId  ? { moveBatchId }  : {}),
                         ...(groupBatchId ? { groupBatchId } : {}),
-                        ...(fullAiHypUrlSet ? { hypothesisGroupUrls: [...fullAiHypUrlSet], hypothesisGroupName: fullAiHypGroupName, hypothesisGroupId: fullAiHypGroupId } : {})
+                        ...(fullAiHypUrlSet && fullAiHypUrlSet.size ? { hypothesisGroupUrls: [...fullAiHypUrlSet], hypothesisGroupName: fullAiHypGroupName, hypothesisGroupId: fullAiHypGroupId } : {})
                     })
                 });
                 if (!initRes.ok) {
@@ -15602,10 +15738,13 @@
                         const url = normalizeLinkedInUrl(rawUrl);
                         if (!url) return false;
                         if (clientExcludedUrls.has(url)) return false;
-                        // Hyp sets are keyed by _normalizeHypUrl; accept either form
-                        if (fullAiHypUrlSet) {
+                        // Hyp sets are keyed by _normalizeHypUrl; accept either form.
+                        // Also keep contacts Full Pipeline stamped with this groupId even if
+                        // their URL is missing from the group's list. An empty Set is not a filter.
+                        if (fullAiHypUrlSet && fullAiHypUrlSet.size > 0) {
                             const hypForm = _normalizeHypUrl(rawUrl);
-                            if (!fullAiHypUrlSet.has(url) && !fullAiHypUrlSet.has(hypForm)) return false;
+                            const stamped = fullAiHypGroupId && (p.hypothesisGroupId === fullAiHypGroupId);
+                            if (!stamped && !fullAiHypUrlSet.has(url) && !fullAiHypUrlSet.has(hypForm)) return false;
                         }
                         return true;
                     });

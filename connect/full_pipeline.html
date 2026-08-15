@@ -2901,12 +2901,79 @@
             addLog(`   🗑️ ${dropped.length} rule-dropped contact(s) moved to prospect_contacts_deleted.`, 'dim');
         }
 
+        // Same 1 MB Firestore workaround as connect_hypothesis_documentation.html:
+        // large contactLinkedInUrls lists live in hypothesis_group_chunks.
+        const FP_CONTACT_CHUNK_LIMIT = 700 * 1024;
+
+        async function fpReadGroupContacts(ref, data) {
+            if (!data?._chunked) {
+                return { urls: data?.contactLinkedInUrls || [], tagged: data?.taggedContacts || [] };
+            }
+            const gid = ref.id;
+            const count = data._chunkCount || 0;
+            const urls = [], tagged = [];
+            for (let i = 0; i < count; i++) {
+                try {
+                    const snap = await getDoc(doc(db, 'hypothesis_group_chunks', `${gid}_${i}`));
+                    if (snap.exists || snap.exists?.()) {
+                        const d = snap.data();
+                        urls.push(...(d.contactLinkedInUrls || []));
+                        tagged.push(...(d.taggedContacts || []));
+                    }
+                } catch (e) {
+                    addLog(`   ⚠️ Could not read hypothesis group chunk ${i} (${e.message}).`, 'warning');
+                }
+            }
+            return { urls, tagged };
+        }
+
+        async function fpWriteGroupContacts(ref, urls, tagged) {
+            const gid = ref.id;
+            const trySize = JSON.stringify({ contactLinkedInUrls: urls, taggedContacts: tagged }).length;
+            if (trySize <= FP_CONTACT_CHUNK_LIMIT) {
+                await updateDoc(ref, {
+                    contactLinkedInUrls: urls,
+                    taggedContacts: tagged,
+                    _chunked: false,
+                    _chunkCount: 0,
+                    _totalContactCount: urls.length,
+                    updatedAt: new Date()
+                });
+                return;
+            }
+            const chunks = [];
+            let cu = [], ct = [];
+            for (let i = 0; i < urls.length; i++) {
+                cu.push(urls[i]);
+                if (tagged[i]) ct.push(tagged[i]);
+                if (JSON.stringify({ contactLinkedInUrls: cu, taggedContacts: ct }).length >= FP_CONTACT_CHUNK_LIMIT) {
+                    cu.pop();
+                    if (tagged[i]) ct.pop();
+                    chunks.push({ contactLinkedInUrls: [...cu], taggedContacts: [...ct] });
+                    cu = [urls[i]];
+                    ct = tagged[i] ? [tagged[i]] : [];
+                }
+            }
+            if (cu.length) chunks.push({ contactLinkedInUrls: cu, taggedContacts: ct });
+            for (let i = 0; i < chunks.length; i++) {
+                await setDoc(doc(db, 'hypothesis_group_chunks', `${gid}_${i}`), chunks[i]);
+            }
+            await updateDoc(ref, {
+                contactLinkedInUrls: [],
+                taggedContacts: [],
+                _chunked: true,
+                _chunkCount: chunks.length,
+                _totalContactCount: urls.length,
+                updatedAt: new Date()
+            });
+        }
+
         // ── Kept contacts: tagged with the hypothesis group they were scanned for ──
         // Every contact that PASSES the Target Contact / Exclude Rules stays in
-        // prospect_contacts (whether or not it ends up with a generated message), but
-        // now gets stamped with the hypothesis group so it's traceable later — same
-        // group doc shape used by Connect Hypothesis Documentation (hypothesis_groups,
-        // fields: id/name).
+        // prospect_contacts (whether or not it ends up with a generated message).
+        // Stamp hypothesisGroupId/Name on the contact AND append its LinkedIn URL to
+        // hypothesis_groups.contactLinkedInUrls — Generate Messages / Prospect Contacts
+        // treat that URL list as group membership. Stamping the contact alone is not enough.
         async function fpTagKeptContactsWithHypothesisGroup({ kept, groupId, groupName }) {
             if (!kept || kept.length === 0 || !groupId) return;
             const taggedAt = new Date().toISOString();
@@ -2927,6 +2994,44 @@
                     addLog(`   ⚠️ Could not tag ${chunk.length} contact(s) with the hypothesis group (${e.message}).`, 'warning');
                 }
             }
+            try {
+                const added = await fpAddKeptContactsToHypothesisGroup({ kept, groupId });
+                if (added > 0) {
+                    addLog(`   🔬 Added ${added} contact(s) to hypothesis group "${groupName || groupId}".`, 'success');
+                }
+            } catch (e) {
+                addLog(`   ⚠️ Contacts were stamped with the hypothesis group, but could not be added to the group's URL list (${e.message}). Generate Messages will still find them via the stamp.`, 'warning');
+            }
+        }
+
+        async function fpAddKeptContactsToHypothesisGroup({ kept, groupId }) {
+            const groupRef = doc(db, 'hypothesis_groups', groupId);
+            const snap = await getDoc(groupRef);
+            if (!(snap.exists || snap.exists?.())) {
+                throw new Error('hypothesis group document not found');
+            }
+            const data = snap.data() || {};
+            const { urls: existingUrls, tagged: existingTagged } = await fpReadGroupContacts(groupRef, data);
+            const haveSet = new Set(existingUrls.map(u => fpNormalizeUrl(u)).filter(Boolean));
+            const newUrls = [];
+            const newTagged = [];
+            for (const c of kept) {
+                const raw = (c.linkedInUrl || c.li_url || c.linkedin_url || c.profile_url || '').trim();
+                const norm = fpNormalizeUrl(raw);
+                if (!norm || haveSet.has(norm)) continue;
+                haveSet.add(norm);
+                newUrls.push(raw || norm);
+                newTagged.push({
+                    name: c.fullName || [c.firstName, c.lastName].filter(Boolean).join(' ') || '',
+                    linkedInUrl: raw || norm,
+                    title: c.title || c.jobTitle || '',
+                    org: c.company || c.organization || '',
+                    orgLinkedInUrl: c.searchedOrganizationLinkedInUrl || c.orgLinkedInUrl || ''
+                });
+            }
+            if (!newUrls.length) return 0;
+            await fpWriteGroupContacts(groupRef, [...existingUrls, ...newUrls], [...existingTagged, ...newTagged]);
+            return newUrls.length;
         }
 
         // Organization Type Classification — classifies exactly ONE organization at a
