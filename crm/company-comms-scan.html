@@ -4645,6 +4645,16 @@ Given our conversation before, I was hoping to ask your thoughts on the question
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+  // Races an arbitrary (non-fetch) promise against a timeout so a stalled
+  // Firestore write (e.g. during a network blip) can't hang the caller forever
+  // with no error and no log — used for the setDoc calls below.
+  function withTimeout(promise, ms, label = 'operation') {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+    ]);
+  }
+
   function fmtDate(iso) {
     if (!iso) return '—';
     const d = new Date(iso);
@@ -4740,18 +4750,28 @@ Given our conversation before, I was hoping to ask your thoughts on the question
   async function fuSetNeverEngaged(accounts, value) {
     try {
       await waitForWrapper();
-      const { doc, setDoc } = window.clemailFirestore;
-      const nowIso = new Date().toISOString();
-      for (const a of accounts) {
-        const existing = scanState[a.id] || {};
-        const updated = value
-          ? { ...existing, neverEngaged: true, neverEngagedAt: nowIso }
-          : { ...existing, neverEngaged: false, neverEngagedAt: null, reEngagedAt: nowIso };
-        await setDoc(doc(window.clemailDb, 'company_comms_scans', a.id), updated);
-        scanState[a.id] = updated;
-      }
     } catch (e) {
-      console.warn('fuSetNeverEngaged failed:', e.message);
+      console.warn('fuSetNeverEngaged: wrapper unavailable:', e.message);
+      return;
+    }
+    const { doc, setDoc } = window.clemailFirestore;
+    const nowIso = new Date().toISOString();
+    for (const a of accounts) {
+      const existing = scanState[a.id] || {};
+      const updated = value
+        ? { ...existing, neverEngaged: true, neverEngagedAt: nowIso }
+        : { ...existing, neverEngaged: false, neverEngagedAt: null, reEngagedAt: nowIso };
+      try {
+        await withTimeout(
+          setDoc(doc(window.clemailDb, 'company_comms_scans', a.id), updated),
+          10000,
+          `Firestore write for ${a.name || a.id}`
+        );
+        scanState[a.id] = updated;
+      } catch (e) {
+        console.warn('fuSetNeverEngaged: write failed/timed out for', a.name || a.id, e.message);
+        fuLog(`  ⚠ Could not save "Never Engaged" flag for ${a.name || a.id} (${e.message}) — continuing`, 'warning');
+      }
     }
   }
 
@@ -4765,10 +4785,15 @@ Given our conversation before, I was hoping to ask your thoughts on the question
       const { doc, setDoc } = window.clemailFirestore;
       const existing = scanState[account.id] || {};
       const updated = { ...existing, notApplicable: true, notApplicableAt: new Date().toISOString(), notApplicableReason: reason || '' };
-      await setDoc(doc(window.clemailDb, 'company_comms_scans', account.id), updated);
+      await withTimeout(
+        setDoc(doc(window.clemailDb, 'company_comms_scans', account.id), updated),
+        10000,
+        `Firestore write for ${account.name || account.id}`
+      );
       scanState[account.id] = updated;
     } catch (e) {
       console.warn('fuSetNotApplicable failed:', e.message);
+      fuLog(`  ⚠ Could not save "NA" flag for ${account.name || account.id} (${e.message}) — continuing`, 'warning');
     }
   }
 
