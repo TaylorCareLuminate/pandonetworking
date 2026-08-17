@@ -6366,6 +6366,27 @@
         // bucket, instead of looking like two different BDRs each talking to the same lead),
         // then keep whichever alert is "more useful" — able to receive a reply
         // (has a linkedInAccountId), then most messages, then most recently active.
+        // Raw (pre-dedup) active alerts from the last fetch. Dismiss has to
+        // hit every twin the UI collapsed, not just the card that was shown.
+        let _liRawAlerts = [];
+
+        function _liAlertDedupeKey(a) {
+            const url = (a.leadProfileUrl || '').toLowerCase().trim();
+            const name = (a.leadName || '').toLowerCase().trim();
+            const canonicalBdr = _liAlertCanonicalEmail.get(a.id) || (a.bdrEmail || '').toLowerCase().trim();
+            const baseKey = url || name || a.id;
+            return canonicalBdr ? `${baseKey}__${canonicalBdr}` : baseKey;
+        }
+
+        function _liSiblingAlertIds(alertId) {
+            const target = (_liRawAlerts || []).find(a => a.id === alertId)
+                || (_liAlerts || []).find(a => a.id === alertId);
+            if (!target) return [alertId];
+            const key = _liAlertDedupeKey(target);
+            const ids = (_liRawAlerts || []).filter(a => _liAlertDedupeKey(a) === key).map(a => a.id);
+            return ids.length ? [...new Set(ids)] : [alertId];
+        }
+
         function _liDedupeAlerts(alerts) {
             const isBetter = (a, b) => {
                 const aReplyable = !!a.linkedInAccountId, bReplyable = !!b.linkedInAccountId;
@@ -6378,11 +6399,7 @@
 
             const byKey = new Map();
             (alerts || []).forEach(a => {
-                const url = (a.leadProfileUrl || '').toLowerCase().trim();
-                const name = (a.leadName || '').toLowerCase().trim();
-                const canonicalBdr = _liAlertCanonicalEmail.get(a.id) || (a.bdrEmail || '').toLowerCase().trim();
-                const baseKey = url || name || a.id;
-                const key = canonicalBdr ? `${baseKey}__${canonicalBdr}` : baseKey;
+                const key = _liAlertDedupeKey(a);
 
                 const existing = byKey.get(key);
                 if (!existing) {
@@ -6409,6 +6426,7 @@
                 // work-email alert and LinkedIn-login-email alert for the same lead collapse
                 // into a single card instead of looking like two different BDRs.
                 await _liPreloadBdrProfiles(rawAlerts);
+                _liRawAlerts = rawAlerts;
                 _liAlerts = _liDedupeAlerts(rawAlerts);
                 await _liRepairMissingLeadNames(_liAlerts);
                 _liRenderBanner(data.meta);
@@ -6754,20 +6772,30 @@
             try {
                 const currentUser = window.auth?.currentUser;
                 const email = currentUser?.email || 'unknown';
-                const resp = await fetch(`${RAILWAY_BASE}/api/linkedin-reply-alerts/${encodeURIComponent(alertId)}/dismiss`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ dismissedBy: email })
-                });
-                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                // The card on screen is one of potentially several alert docs for
+                // the same lead+BDR (two LinkedIn seats → two inbox docs). Dismiss
+                // every twin or the hidden one comes back on the next 5-min poll.
+                const ids = _liSiblingAlertIds(alertId);
+                const results = await Promise.all(ids.map(id =>
+                    fetch(`${RAILWAY_BASE}/api/linkedin-reply-alerts/${encodeURIComponent(id)}/dismiss`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ dismissedBy: email })
+                    })
+                ));
+                const failed = results.find(resp => !resp.ok);
+                if (failed) throw new Error(`HTTP ${failed.status}`);
                 // Remove from local list and re-render
-                _liAlerts = _liAlerts.filter(a => a.id !== alertId);
+                _liAlerts = _liAlerts.filter(a => !ids.includes(a.id));
+                _liRawAlerts = (_liRawAlerts || []).filter(a => !ids.includes(a.id));
                 const card = document.getElementById(`li-card-${alertId}`);
                 if (card) {
                     card.style.opacity = '0.4';
                     card.style.transform = 'scale(0.98)';
                     card.style.transition = 'all 0.3s';
                     setTimeout(() => { _liRenderBanner(null); }, 350);
+                } else {
+                    _liRenderBanner(null);
                 }
             } catch (err) {
                 console.error('[LiAlerts] Dismiss error:', err);
