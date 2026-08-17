@@ -9176,146 +9176,114 @@
             });
 
             document.getElementById('locateContent').innerHTML =
-                `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Scanning ${allBdrs.length} BDR${allBdrs.length !== 1 ? 's' : ''}' prospect_contacts for ${uniqueKeys.length.toLocaleString()} unique tagged contact${uniqueKeys.length !== 1 ? 's' : ''}…</div>`;
+                `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Starting a full ownership-agnostic scan of prospect_contacts, heyreach_contacts &amp; connect_queue (all BDRs, all customer workspaces) for ${uniqueKeys.length.toLocaleString()} unique tagged contact${uniqueKeys.length !== 1 ? 's' : ''}…</div>`;
 
-            // 2. Query every BDR's prospect_contacts across all 4 owner-field
-            // spellings used elsewhere on this page, system-wide — a contact could
-            // have been misassigned to the wrong company's BDR, not just missing.
-            const ownerFields = ['userEmail', 'account_email', 'accountEmail', 'bdrEmail'];
-            const keyOwner = new Map(); // canonicalKey → { bdrEmail, bdrName, company, docId }
+            // 2. Kick off the server-side Locate Scan job — a full, ownership-agnostic
+            // pass over prospect_contacts / heyreach_contacts / connect_queue that
+            // matches purely by LinkedIn URL. Unlike a per-BDR query loop, this also
+            // surfaces contacts whose owner field is empty, set to a customer
+            // workspace sentinel (__ws__:<id> — not tied to any individual BDR), or
+            // set to an email outside the current BDR roster (e.g. a departed
+            // employee, or a personal address used for a HeyReach seat). Runs as a
+            // background job server-side because a full scan of 600K+ docs across 3
+            // collections can take 1-2 minutes.
+            const startResp = await fetch(`${RAILWAY_BASE}/api/hypothesis/locate-scan/start`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ urls: uniqueKeys.map(k => keyToUrl.get(k)) })
+            });
+            if (!startResp.ok) throw new Error(`Failed to start locate scan (HTTP ${startResp.status})`);
+            const startData = await startResp.json();
+            if (!startData.success || !startData.jobId) throw new Error(startData.error || 'Failed to start locate scan');
+            const locateJobId = startData.jobId;
 
-            await Promise.all(allBdrs.map(async bdr => {
-                const email = (bdr.primaryEmail || bdr.id || '').toLowerCase();
-                if (!email) return;
-                const seenIds = new Set();
-                await Promise.all(ownerFields.map(async field => {
-                    const fsnap = await getDocs(
-                        query(collection(db, 'prospect_contacts'), where(field, '==', email))
-                    ).catch(() => null);
-                    if (!fsnap) return;
-                    fsnap.forEach(d => {
-                        if (seenIds.has(d.id)) return;
-                        seenIds.add(d.id);
-                        const cdata = d.data();
-                        const rawUrl = cdata.linkedInUrl || cdata.linkedin_url ||
-                            cdata.prospect_li_url || cdata.contact_linkedin_url || cdata.profileUrl || '';
-                        if (!rawUrl) return;
-                        const key = liSlug(rawUrl) || normalizeUrl(rawUrl);
-                        if (key && keyToUrl.has(key) && !keyOwner.has(key)) {
-                            keyOwner.set(key, {
-                                bdrEmail: email,
-                                bdrName:  bdr.name || email,
-                                company:  bdr._company || 'Other',
-                                docId:    d.id
-                            });
-                        }
+            let locateJob = null;
+            const POLL_INTERVAL_MS = 3000;
+            const POLL_MAX_MS = 6 * 60 * 1000; // 6 minutes
+            const pollStart = Date.now();
+            while (true) {
+                await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+                const jobResp = await fetch(`${RAILWAY_BASE}/api/hypothesis/locate-scan/job/${locateJobId}?includeResults=false`).catch(() => null);
+                const jobData = jobResp && jobResp.ok ? await jobResp.json().catch(() => null) : null;
+                if (!jobData || !jobData.success) {
+                    if (Date.now() - pollStart > POLL_MAX_MS) throw new Error('Locate scan timed out waiting for a status update.');
+                    continue;
+                }
+                locateJob = jobData.job;
+                if (locateJob.status === 'complete' || locateJob.status === 'error') break;
+                const p = locateJob.progress || {};
+                document.getElementById('locateContent').innerHTML =
+                    `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> ${escHtml(p.message || 'Scanning…')}</div>`;
+                if (Date.now() - pollStart > POLL_MAX_MS) throw new Error('Locate scan timed out after 6 minutes — try again, or check server logs.');
+            }
+            if (!locateJob || locateJob.status === 'error') throw new Error(locateJob?.error || 'Locate scan failed.');
+
+            document.getElementById('locateContent').innerHTML =
+                `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Scan complete — loading results…</div>`;
+            const resultsResp = await fetch(`${RAILWAY_BASE}/api/hypothesis/locate-scan/job/${locateJobId}?includeResults=true`);
+            const resultsData = await resultsResp.json();
+            if (!resultsData.success) throw new Error(resultsData.error || 'Failed to load locate scan results');
+            const scanResults = resultsData.job.results || { prospectContacts: [], heyreachContacts: [], connectQueue: [] };
+
+            // 3. Categorize prospect_contacts hits: "Found & Owned" if the owner
+            // resolves to a BDR currently on the roster (or any real email, even if
+            // off-roster); "Found — Unowned/Workspace" if there's no owner at all or
+            // the owner is a customer workspace sentinel — these are real, fully
+            // enriched records that just need to be claimed, not recreated.
+            const bdrByEmail = new Map(allBdrs.map(b => [(b.primaryEmail || b.id || '').toLowerCase(), b]));
+            const keyOwner   = new Map(); // canonicalKey → { bdrEmail, bdrName, company, docId }
+            const keyUnowned = new Map(); // canonicalKey → { docId, ownerType, workspaceName, name, title, org, hasEnrichment }
+
+            scanResults.prospectContacts.forEach(row => {
+                if (row.ownerType === 'bdr') {
+                    const bdr = bdrByEmail.get(row.ownerEmail);
+                    keyOwner.set(row.key, {
+                        bdrEmail: row.ownerEmail,
+                        bdrName:  bdr?.name || row.ownerEmail,
+                        company:  bdr?._company || (bdr ? 'Other' : 'Unrecognized owner'),
+                        docId:    row.docId
                     });
-                }));
-            }));
+                } else {
+                    keyUnowned.set(row.key, {
+                        docId: row.docId,
+                        ownerType: row.ownerType,
+                        workspaceName: row.workspaceName || null,
+                        name: row.name || '', title: row.title || '', org: row.company || '',
+                        hasEnrichment: row.hasEnrichment
+                    });
+                }
+            });
 
-            // 3. For anything NOT found in prospect_contacts, cross-check
-            // heyreach_contacts — HeyReach's own synced connection/lead records.
-            // This collection lives independently of prospect_contacts (it's synced
-            // FROM HeyReach, not derived from our data), so a contact can still show up
-            // here with real name/title/company even after its prospect_contacts doc
-            // was deleted — this is the most likely "enrichment table" recovery path.
-            const stillMissingKeys = uniqueKeys.filter(k => !keyOwner.has(k));
+            // 4. heyreach_contacts / connect_queue hits — recoverable via re-creation
+            // regardless of who currently "owns" that record, same as before. Skipped
+            // for keys already resolved by a real prospect_contacts hit above (owned
+            // or unowned) since that's a richer, already-existing record.
             const keyHeyreach = new Map(); // canonicalKey → { bdrEmail, bdrName, company, docId, name, title, org }
+            scanResults.heyreachContacts.forEach(row => {
+                if (keyOwner.has(row.key) || keyUnowned.has(row.key)) return;
+                const bdr = row.ownerEmail ? bdrByEmail.get(row.ownerEmail) : null;
+                keyHeyreach.set(row.key, {
+                    bdrEmail: row.ownerEmail || '',
+                    bdrName:  bdr?.name || row.ownerEmail || 'Unknown owner',
+                    company:  bdr?._company || 'Other',
+                    docId:    row.docId,
+                    name:     row.name || '', title: row.title || '', org: row.company || ''
+                });
+            });
 
-            if (stillMissingKeys.length) {
-                document.getElementById('locateContent').innerHTML =
-                    `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> ${keyOwner.size.toLocaleString()} found in prospect_contacts — cross-checking heyreach_contacts for the remaining ${stillMissingKeys.length.toLocaleString()}…</div>`;
-
-                const missingKeySet = new Set(stillMissingKeys);
-                const heyreachFields = ['accountEmail', 'bdrEmail', 'linkedInAccountEmail'];
-                await Promise.all(allBdrs.map(async bdr => {
-                    const email = (bdr.primaryEmail || bdr.id || '').toLowerCase();
-                    if (!email) return;
-                    const seenIds = new Set();
-                    await Promise.all(heyreachFields.map(async field => {
-                        const fsnap = await getDocs(
-                            query(collection(db, 'heyreach_contacts'), where(field, '==', email))
-                        ).catch(() => null);
-                        if (!fsnap) return;
-                        fsnap.forEach(d => {
-                            if (seenIds.has(d.id)) return;
-                            seenIds.add(d.id);
-                            const cdata = d.data();
-                            const rawUrl = cdata.linkedin_url || cdata.profileUrl || cdata.leadProfileUrl || cdata.linkedInUrl || '';
-                            if (!rawUrl) return;
-                            const key = liSlug(rawUrl) || normalizeUrl(rawUrl);
-                            if (key && missingKeySet.has(key) && !keyHeyreach.has(key)) {
-                                const name = [cdata.firstName || cdata.first_name || cdata.leadFirstName || '',
-                                              cdata.lastName  || cdata.last_name  || cdata.leadLastName  || ''].join(' ').trim();
-                                keyHeyreach.set(key, {
-                                    bdrEmail: email,
-                                    bdrName:  bdr.name || email,
-                                    company:  bdr._company || 'Other',
-                                    docId:    d.id,
-                                    name:     name,
-                                    title:    cdata.title || cdata.position || cdata.headline || cdata.occupation || '',
-                                    org:      cdata.company || cdata.companyName || cdata.currentCompany || ''
-                                });
-                            }
-                        });
-                    }));
-                }));
-            }
-
-            // 4. For anything STILL unaccounted for, cross-check connect_queue —
-            // whenever generate_messages.html builds a "profile-based" outreach message,
-            // it snapshots the ENTIRE processed LinkedIn profile (about, experience &
-            // education as readable paragraphs, current title/company) directly onto the
-            // queue doc as linkedin_profile, completely independent of prospect_contacts.
-            // Unlike the Apify cache below, this is queryable client-side with full detail
-            // per contact (no separate enrich call needed), so we check it first.
-            //
-            // Kept intentionally lean: connect_queue is by far the largest collection this
-            // page touches (some BDRs have 3-5k+ docs), so unlike the prospect_contacts and
-            // heyreach_contacts checks above, this one queries only bdr_auth_email (the
-            // field generate_messages.html always sets to the BDR's own email — the same
-            // doc's account_email is the separate HeyReach-seat email and would just
-            // duplicate matches), caps each query so one huge BDR queue can't blow up the
-            // whole scan, and fails fast per-BDR instead of hanging on the default 60s retry.
-            const stillMissingKeysQ = uniqueKeys.filter(k => !keyOwner.has(k) && !keyHeyreach.has(k));
             const keyQueueProfile = new Map(); // canonicalKey → { bdrEmail, bdrName, company, docId, name, title, org, profile }
-
-            if (stillMissingKeysQ.length) {
-                document.getElementById('locateContent').innerHTML =
-                    `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Cross-checking connect_queue profile snapshots for the remaining ${stillMissingKeysQ.length.toLocaleString()}…</div>`;
-
-                const missingKeySetQ = new Set(stillMissingKeysQ);
-                const QUEUE_SCAN_LIMIT = 1500;
-                const QUEUE_SCAN_TIMEOUT_MS = 20000;
-                await Promise.all(allBdrs.map(async bdr => {
-                    const email = (bdr.primaryEmail || bdr.id || '').toLowerCase();
-                    if (!email) return;
-                    const fsnap = await getDocs(
-                        query(collection(db, 'connect_queue'), where('bdr_auth_email', '==', email), limit(QUEUE_SCAN_LIMIT)),
-                        { timeoutMs: QUEUE_SCAN_TIMEOUT_MS }
-                    ).catch(e => { console.warn('[openLocateModal] connect_queue scan skipped for', email, '—', e.message); return null; });
-                    if (!fsnap) return;
-                    fsnap.forEach(d => {
-                        const cdata = d.data();
-                        if (!cdata.linkedin_profile) return; // only care about docs with a profile snapshot
-                        const rawUrl = cdata.prospect_li_url || cdata.contact_linkedin_url || cdata.linkedin_url || '';
-                        if (!rawUrl) return;
-                        const key = liSlug(rawUrl) || normalizeUrl(rawUrl);
-                        if (key && missingKeySetQ.has(key) && !keyQueueProfile.has(key)) {
-                            keyQueueProfile.set(key, {
-                                bdrEmail: email,
-                                bdrName:  bdr.name || email,
-                                company:  bdr._company || 'Other',
-                                docId:    d.id,
-                                name:     cdata.prospect_name || cdata.contact || '',
-                                title:    cdata.prospect_title || cdata.title || '',
-                                org:      cdata.prospect_company || cdata.company || '',
-                                profile:  cdata.linkedin_profile
-                            });
-                        }
-                    });
-                }));
-            }
+            scanResults.connectQueue.forEach(row => {
+                if (keyOwner.has(row.key) || keyUnowned.has(row.key) || keyHeyreach.has(row.key)) return;
+                const bdr = row.ownerEmail ? bdrByEmail.get(row.ownerEmail) : null;
+                keyQueueProfile.set(row.key, {
+                    bdrEmail: row.ownerEmail || '',
+                    bdrName:  bdr?.name || row.ownerEmail || 'Unknown owner',
+                    company:  bdr?._company || 'Other',
+                    docId:    row.docId,
+                    name:     row.name || '', title: row.title || '', org: row.company || '',
+                    profile:  row.profile
+                });
+            });
 
             // 5. For whatever's STILL unaccounted for, check linkedin_profile_cache —
             // a server-side Apify profile cache (about/experience/education), keyed by
@@ -9326,7 +9294,7 @@
             // was deleted long ago. The API only returns an aggregate count here (no
             // per-URL detail) — the real per-contact breakdown comes back when
             // recoverFromApifyCache() actually submits them for enrichment.
-            const missingKeys2 = uniqueKeys.filter(k => !keyOwner.has(k) && !keyHeyreach.has(k) && !keyQueueProfile.has(k));
+            const missingKeys2 = uniqueKeys.filter(k => !keyOwner.has(k) && !keyUnowned.has(k) && !keyHeyreach.has(k) && !keyQueueProfile.has(k));
             let apifyCachedCount = 0;
             if (missingKeys2.length) {
                 document.getElementById('locateContent').innerHTML =
@@ -9349,11 +9317,14 @@
 
             // 6. Summarize + render
             const foundCount       = keyOwner.size;
+            const unownedCount     = keyUnowned.size;
             const recoverableCount = keyHeyreach.size;
             const queueRecoverableCount = keyQueueProfile.size;
-            const missingCount     = uniqueKeys.length - foundCount - recoverableCount - queueRecoverableCount;
+            const missingCount     = uniqueKeys.length - foundCount - unownedCount - recoverableCount - queueRecoverableCount;
             const trulyGoneCount   = missingCount - apifyCachedCount;
-            const pct = Math.round(foundCount / uniqueKeys.length * 100);
+            // "Accounted for" bar reflects everything that already exists somewhere
+            // (owned + unowned/workspace), not just contacts owned by an active BDR.
+            const pct = Math.round((foundCount + unownedCount) / uniqueKeys.length * 100);
 
             const byOwner = new Map(); // "bdrName||company||source" → count
             keyOwner.forEach(info => {
@@ -9372,36 +9343,54 @@
                 .map(([k, count]) => { const [name, company, source] = k.split('||'); return { name, company, source, count }; })
                 .sort((a, b) => b.count - a.count);
 
+            // Breakdown of the unowned/workspace bucket — grouped by "no owner set"
+            // vs. each individual workspace name, so it's clear WHERE each contact
+            // sits even though nobody individually owns it yet.
+            const byUnowned = new Map(); // label → count
+            keyUnowned.forEach(info => {
+                const label = info.ownerType === 'workspace' ? `Workspace: ${info.workspaceName || 'Unknown'}` : 'No owner set';
+                byUnowned.set(label, (byUnowned.get(label) || 0) + 1);
+            });
+            const unownedRows = [...byUnowned.entries()]
+                .map(([label, count]) => ({ label, count }))
+                .sort((a, b) => b.count - a.count);
+
             _locateReport = uniqueKeys.map(key => {
                 const owned    = keyOwner.get(key);
+                const unowned  = keyUnowned.get(key);
                 const recov    = keyHeyreach.get(key);
                 const recovQ   = keyQueueProfile.get(key);
                 const tag      = keyToTagged.get(key);
-                const status   = owned ? 'found' : (recov ? 'recoverable' : (recovQ ? 'recoverable_queue' : 'missing'));
+                const status   = owned ? 'found' : (unowned ? 'unowned' : (recov ? 'recoverable' : (recovQ ? 'recoverable_queue' : 'missing')));
                 const src      = owned || recov || recovQ || {};
                 return {
                     url:         keyToUrl.get(key),
                     status,
-                    source:      owned ? 'prospect_contacts' : (recov ? 'heyreach_contacts' : (recovQ ? 'connect_queue' : '')),
+                    source:      owned ? 'prospect_contacts' : (unowned ? 'prospect_contacts (unowned)' : (recov ? 'heyreach_contacts' : (recovQ ? 'connect_queue' : ''))),
+                    docId:       owned?.docId || unowned?.docId || null,
                     bdrName:     src.bdrName  || '',
                     bdrEmail:    src.bdrEmail || '',
-                    company:     src.company  || '',
-                    name:        recov?.name  || recovQ?.name  || tag?.name  || '',
-                    title:       recov?.title || recovQ?.title || tag?.title || '',
-                    org:         recov?.org   || recovQ?.org   || tag?.org   || '',
+                    company:     src.company  || (unowned?.ownerType === 'workspace' ? `Workspace: ${unowned.workspaceName || 'Unknown'}` : (unowned ? 'Unowned' : '')),
+                    name:        unowned?.name  || recov?.name  || recovQ?.name  || tag?.name  || '',
+                    title:       unowned?.title || recov?.title || recovQ?.title || tag?.title || '',
+                    org:         unowned?.org   || recov?.org   || recovQ?.org   || tag?.org   || '',
                     profile:     recovQ?.profile || null
                 };
             });
 
             document.getElementById('locateGroupLabel').innerHTML =
                 `<strong>${escHtml(group.name || 'Unnamed Group')}</strong> — ${totalTagged.toLocaleString()} tagged contact${totalTagged !== 1 ? 's' : ''}` +
-                `${uniqueKeys.length !== totalTagged ? ` (${uniqueKeys.length.toLocaleString()} unique)` : ''}, checked against ${allBdrs.length} BDR${allBdrs.length !== 1 ? 's' : ''}' <code>prospect_contacts</code>, <code>heyreach_contacts</code> and <code>connect_queue</code> system-wide.`;
+                `${uniqueKeys.length !== totalTagged ? ` (${uniqueKeys.length.toLocaleString()} unique)` : ''}, checked against <code>prospect_contacts</code>, <code>heyreach_contacts</code> and <code>connect_queue</code> in full — every BDR and every customer workspace, ownership-agnostic.`;
 
             document.getElementById('locateContent').innerHTML = `
                 <div class="locate-summary-grid">
                     <div class="locate-stat-box">
                         <div class="locate-stat-val" style="color:#10b981;">${foundCount.toLocaleString()}</div>
                         <div class="locate-stat-label">Found &amp; Owned</div>
+                    </div>
+                    <div class="locate-stat-box">
+                        <div class="locate-stat-val" style="color:${unownedCount ? '#0d9488' : 'inherit'};">${unownedCount.toLocaleString()}</div>
+                        <div class="locate-stat-label">Found — Unowned/Workspace</div>
                     </div>
                     <div class="locate-stat-box">
                         <div class="locate-stat-val" style="color:${recoverableCount ? '#f59e0b' : 'inherit'};">${recoverableCount.toLocaleString()}</div>
@@ -9443,6 +9432,20 @@
                         </tr>`; }).join('')}
                     </tbody>
                 </table>` : `<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> None of this group's tagged contacts were found under any BDR — they've all only ever existed as a tagged URL list.</div>`}
+                ${unownedCount > 0 ? `
+                <div class="alert" style="margin-top:1.25rem;background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;">
+                    <i class="fas fa-unlock"></i>
+                    <strong>${unownedCount.toLocaleString()}</strong> contact${unownedCount !== 1 ? 's' : ''} already ${unownedCount !== 1 ? 'have' : 'has'} a full <code>prospect_contacts</code>
+                    record sitting in the database right now — with real enrichment data — but ${unownedCount !== 1 ? "aren't" : "isn't"} tied to any BDR:
+                    ${unownedRows.map(r => `<strong>${r.count.toLocaleString()}</strong> ${escHtml(r.label)}`).join(', ')}.
+                    These aren't missing at all — they were just never claimed by an individual BDR. Claiming them updates the existing
+                    record in place (no duplicates, no data loss).
+                    <div style="margin-top:0.6rem;">
+                        <button class="btn btn-sm btn-primary" style="background:#0d9488;border-color:#0d9488;" onclick="claimUnownedContacts(this)">
+                            <i class="fas fa-unlock"></i> Claim ${unownedCount.toLocaleString()} Contact${unownedCount !== 1 ? 's' : ''} for This Group's BDR
+                        </button>
+                    </div>
+                </div>` : ''}
                 ${recoverableCount > 0 ? `
                 <div class="alert alert-warning" style="margin-top:1.25rem;">
                     <i class="fas fa-life-ring"></i>
@@ -9475,9 +9478,10 @@
                     <i class="fas fa-exclamation-triangle"></i>
                     <strong>${missingCount.toLocaleString()}</strong> tagged contact${missingCount !== 1 ? 's' : ''}
                     ${missingCount !== 1 ? "aren't" : "isn't"} in <code>prospect_contacts</code>, <code>heyreach_contacts</code>,
-                    <em>or</em> a <code>connect_queue</code> snapshot under any BDR — most likely they were tagged onto this
-                    hypothesis group (via AI scan, batch import, or manual tagging) but never actually imported/queued as
-                    workable contact records, so no downstream system ever captured them independently.
+                    <em>or</em> a <code>connect_queue</code> snapshot ANYWHERE — this scan checked every BDR and every customer
+                    workspace, not just the current roster, so this is a much stronger signal than before. Most likely they were
+                    tagged onto this hypothesis group (via AI scan, batch import, or manual tagging) but never actually
+                    imported/queued as workable contact records, so no downstream system ever captured them independently.
                     ${apifyCachedCount > 0 ? ` Good news: about <strong>${apifyCachedCount.toLocaleString()}</strong> of them have a full cached profile (about / experience / education) sitting in the Apify profile cache from a previous scrape — that can be pulled in for free.` : ''}
                     ${[...keyToTagged.values()].filter(t => t.name).length ? ` The exported report still includes whatever name/title/org was captured on this group at tagging time for these, where available.` : ''}
                     Download the full report below for the exact list.
@@ -9490,8 +9494,10 @@
                 </div>` : ''}
                 <div style="margin-top:1rem;font-size:0.78rem;color:var(--gray-500);">
                     <i class="fas fa-info-circle"></i> Matching uses each contact's LinkedIn URL (slug-based, robust to
-                    formatting differences) across every BDR's <code>prospect_contacts</code>, <code>heyreach_contacts</code> and
-                    <code>connect_queue</code> — the same technique used on
+                    formatting differences) against a full, ownership-agnostic scan of <code>prospect_contacts</code>,
+                    <code>heyreach_contacts</code> and <code>connect_queue</code> — every document in each collection, not just
+                    the ones tied to a current BDR email, so contacts with no owner or a customer-workspace owner are still
+                    found. The URL-matching technique itself is the same one used on
                     <a href="outcomes.html" target="_blank" style="color:var(--primary);">Outcomes</a> and
                     <a href="monthly_research_plan.html" target="_blank" style="color:var(--primary);">Monthly Research Plan</a>.
                 </div>
@@ -9507,7 +9513,7 @@
         document.getElementById('locateModal').classList.add('hidden');
     };
 
-    const _locateStatusLabel = { found: 'Found', recoverable: 'Recoverable (HeyReach)', recoverable_queue: 'Recoverable (Queue Snapshot)', missing: 'Truly Missing' };
+    const _locateStatusLabel = { found: 'Found', unowned: 'Found — Unowned/Workspace', recoverable: 'Recoverable (HeyReach)', recoverable_queue: 'Recoverable (Queue Snapshot)', missing: 'Truly Missing' };
 
     window.exportLocateReport = function() {
         if (!_locateReport || !_locateReport.length) return;
@@ -9529,6 +9535,60 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+    };
+
+    // Claims every 'unowned' row in the current locate report — real
+    // prospect_contacts records the ownership-agnostic scan found with no BDR owner
+    // (or a customer-workspace sentinel owner) — by updating the EXISTING doc's
+    // owner fields to this group's assigned BDR. Unlike the recover* functions
+    // below, this never creates a new document: the record and its enrichment
+    // already exist, it just needed correct attribution to become visible to the
+    // rest of the app's per-BDR views (Monthly Research Plan, Profile Enrichment, etc).
+    window.claimUnownedContacts = async function(btn) {
+        if (!_locateReport) return;
+        const rows = _locateReport.filter(r => r.status === 'unowned' && r.docId);
+        if (!rows.length) { showAlert('Nothing to claim.', 'warning'); return; }
+
+        const group = allGroups.find(g => g.id === _locateGroupId);
+        const groupBdrEmails = (group?.bdrEmails?.length ? group.bdrEmails : (group?.bdrEmail ? [group.bdrEmail] : []))
+            .filter(Boolean);
+        const targetBdrEmail = (groupBdrEmails[0] || '').toLowerCase();
+        if (!targetBdrEmail) {
+            showAlert("This hypothesis group has no assigned BDR to claim these contacts for — assign a BDR to the group first.", 'error');
+            return;
+        }
+        const targetBdr = allBdrs.find(b => (b.primaryEmail || b.id || '').toLowerCase() === targetBdrEmail);
+
+        const ok = confirm(
+            `Reassign ${rows.length.toLocaleString()} existing prospect_contacts record${rows.length !== 1 ? 's' : ''} (currently unowned or workspace-owned) to ${targetBdr?.name || targetBdrEmail}?\n\n` +
+            `This updates the existing records in place (userEmail / account_email) — it does NOT create duplicates and does not touch any of their other data (name, title, enrichment, etc). Continue?`
+        );
+        if (!ok) return;
+
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Claiming…'; }
+        try {
+            const resp = await fetch(`${RAILWAY_BASE}/api/hypothesis/locate-scan/claim`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    docIds: rows.map(r => r.docId),
+                    targetBdrEmail,
+                    hypothesisGroupId: _locateGroupId
+                })
+            });
+            const data = await resp.json();
+            if (!data.success) throw new Error(data.error || 'Claim failed');
+            showAlert(
+                `Claimed ${data.updated.toLocaleString()} contact${data.updated !== 1 ? 's' : ''} for ${targetBdr?.name || targetBdrEmail}` +
+                (data.failed ? `, ${data.failed} failed — check server logs.` : '.') +
+                ` Re-open Locate on this group to confirm.`,
+                data.failed ? 'warning' : 'success'
+            );
+            closeLocateModal();
+        } catch(e) {
+            showAlert(`Claim failed: ${e.message}`, 'error');
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-unlock"></i> Claim'; }
+        }
     };
 
     // Recreates real prospect_contacts records for every 'recoverable' row in the

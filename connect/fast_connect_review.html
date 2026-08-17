@@ -3509,6 +3509,9 @@
         let pushedConnectionUrls = new Map(); // normalizedUrl -> { date, activityId } for contacts already pushed as connections
         let currentlyConnectedUrls = new Set(); // normalized LinkedIn URLs of prospects already connected to this BDR
         let messageSelections = new Map(); // id -> { approve, exclude, delete }
+        // When Submit First N is in flight, submitBatch / Final AI Review must only
+        // touch these IDs — even if remaining selections get written back early.
+        let _submitOnlyIds = null;
         // Messages manually flagged (via the "Send to Reserve" checkbox) to route to the Reserve Queue
         // when approved, independent of the backend-computed autoSendToReserve (<500 connections) flag.
         let manualReserveSelections = new Set();
@@ -12104,6 +12107,14 @@ Rules:
         }
 
         async function submitBatch() {
+            // Submit First N: drop any selections that were restored (or re-checked)
+            // while the Final AI Review modal was open, so we never process more than N.
+            if (_submitOnlyIds) {
+                for (const id of [...messageSelections.keys()]) {
+                    if (!_submitOnlyIds.has(id)) messageSelections.delete(id);
+                }
+            }
+
             if (messageSelections.size === 0) {
                 showAlert('No messages selected. Please check boxes to approve, exclude, or delete messages.', 'warning');
                 return;
@@ -15306,7 +15317,21 @@ Rules:
         document.getElementById('farOverlay').classList.remove('open');
     }
 
-    document.getElementById('farCancelBtn').addEventListener('click', closeFarModal);
+    // Resolves the Promise patchedSubmitBatch() waits on while the Final AI Review
+    // modal is open. Submit First N must not restore leftover selections until this
+    // fires — otherwise Proceed submits the restored "all" set instead of first N.
+    let _farSubmitWaitResolve = null;
+    function resolveFarSubmitWait(result) {
+        const done = _farSubmitWaitResolve;
+        _farSubmitWaitResolve = null;
+        if (typeof done === 'function') done(result);
+    }
+
+    document.getElementById('farCancelBtn').addEventListener('click', () => {
+        closeFarModal();
+        _farProceedCallback = null;
+        resolveFarSubmitWait('cancelled');
+    });
 
     document.getElementById('farProceedBtn').addEventListener('click', async () => {
         closeFarModal();
@@ -15338,7 +15363,12 @@ Rules:
     // Submit Without AI Review — close the modal and fire the callback immediately,
     // bypassing all review results (same as if the user had never opened the modal).
     document.getElementById('farSkipReviewBtn').addEventListener('click', async () => {
-        if (!confirm('Submit all approved messages without completing the AI review? Flagged concerns will be ignored.')) return;
+        const approvedInScope = [...messageSelections.entries()].filter(([id, action]) => {
+            if (action !== 'approve') return false;
+            if (_submitOnlyIds && !_submitOnlyIds.has(id)) return false;
+            return true;
+        }).length;
+        if (!confirm(`Submit ${approvedInScope} approved message${approvedInScope !== 1 ? 's' : ''} without completing the AI review? Flagged concerns will be ignored.`)) return;
         closeFarModal();
         if (auth?.currentUser) {
             try { await auth.currentUser.getIdToken(true); } catch {}
@@ -15360,10 +15390,12 @@ Rules:
             return submitBatch();
         }
 
-        // Only run reviews on messages that are approved
+        // Only run reviews on messages that are approved (and in the First N
+        // scope, if Submit First N is the caller).
         const toReview = [];
         messageSelections.forEach((action, id) => {
             if (action !== 'approve') return;
+            if (_submitOnlyIds && !_submitOnlyIds.has(id)) return;
             const msg = loadedMessages.find(m => m.id === id);
             if (msg) toReview.push(msg);
         });
@@ -15430,15 +15462,23 @@ Rules:
 
             const anyFlagged = [...reviewResultsMap.values()].some(v => v.flagged);
 
-            // Show results — if nothing flagged, auto-proceed after brief display
-            showFinalReviewModal(reviewResultsMap, toReview, () => {
-                submitBatch();
-            });
+            // Wait until the user proceeds or cancels. Returning here used to let
+            // Submit First N restore leftover selections before submitBatch ran,
+            // so the confirm dialog (and the submit) processed every selected card.
+            return await new Promise((resolve) => {
+                _farSubmitWaitResolve = resolve;
+                showFinalReviewModal(reviewResultsMap, toReview, async () => {
+                    try {
+                        await submitBatch();
+                    } finally {
+                        resolveFarSubmitWait('submitted');
+                    }
+                });
 
-            if (!anyFlagged) {
-                // Auto-proceed after showing "all clear"
-                document.getElementById('farProceedBtn').disabled = false;
-            }
+                if (!anyFlagged) {
+                    document.getElementById('farProceedBtn').disabled = false;
+                }
+            });
 
         } catch (err) {
             console.error('[FinalAIReview] Failed:', err);
@@ -15527,7 +15567,15 @@ Rules:
                 return;
             }
 
+            if (!confirm(
+                `Submit the first ${n} of ${orderedSelected.length} selected messages?\n\n` +
+                `The remaining ${orderedSelected.length - n} will stay marked so you can submit them later.`
+            )) {
+                return;
+            }
+
             const remainingIds = orderedSelected.slice(n);
+            const firstNIds    = orderedSelected.slice(0, n);
 
             // Snapshot the remaining selections and edits before narrowing the Map
             const remainingSelections = new Map();
@@ -15546,8 +15594,20 @@ Rules:
             }
             updateStats();
 
-            // Run the full patched submit (includes Final AI Review if enabled)
-            await patchedSubmitBatch();
+            // Belt-and-suspenders: even if remaining selections are written back
+            // while the Final AI Review modal is open, submitBatch will ignore them.
+            _submitOnlyIds = new Set(firstNIds);
+            _firstNBtn.disabled = true;
+
+            let submitResult = 'submitted';
+            try {
+                // Wait until Final AI Review is dismissed AND submitBatch finishes
+                // (or the user cancels the modal). Do not restore leftovers before that.
+                submitResult = await patchedSubmitBatch();
+            } finally {
+                _submitOnlyIds = null;
+                _firstNBtn.disabled = false;
+            }
 
             // After submitBatch completes it calls loadMessages(), which re-renders all
             // remaining queue cards.  Re-apply the saved selections onto the new cards.
@@ -15581,12 +15641,14 @@ Rules:
 
             if (restoredCount > 0) {
                 updateStats();
-                showAlert(
-                    `✅ Submitted first ${n} messages. ` +
-                    `Restored ${restoredCount} remaining selection${restoredCount !== 1 ? 's' : ''} — ` +
-                    `continue reviewing from where you left off.`,
-                    'success'
-                );
+                if (submitResult !== 'cancelled') {
+                    showAlert(
+                        `✅ Submitted first ${n} messages. ` +
+                        `Restored ${restoredCount} remaining selection${restoredCount !== 1 ? 's' : ''} — ` +
+                        `continue reviewing from where you left off.`,
+                        'success'
+                    );
+                }
             }
         });
     }
