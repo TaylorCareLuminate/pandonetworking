@@ -9298,11 +9298,11 @@
             // ANY contact's profile gets scraped (see prospect_cleanup.html's AI
             // Profile Cleanup tool). This is the richest recovery source: it can have
             // full profile data for a URL even if that contact's prospect_contacts doc
-            // was deleted long ago. The API only returns an aggregate count here (no
-            // per-URL detail) — the real per-contact breakdown comes back when
-            // recoverFromApifyCache() actually submits them for enrichment.
+            // was deleted long ago. includeDetails:true gets back WHICH urls hit — with
+            // a name/title/company preview pulled straight from the cached profile — not
+            // just an aggregate count, so this bucket is a named list, not a mystery number.
             const missingKeys2 = uniqueKeys.filter(k => !keyOwner.has(k) && !keyUnowned.has(k) && !keyHeyreach.has(k) && !keyQueueProfile.has(k));
-            let apifyCachedCount = 0;
+            const keyApifyCache = new Map(); // canonicalKey → { name, title, company, cachedAt }
             if (missingKeys2.length) {
                 document.getElementById('locateContent').innerHTML =
                     `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Checking the Apify profile cache for the remaining ${missingKeys2.length.toLocaleString()}…</div>`;
@@ -9313,14 +9313,18 @@
                         // ignoreExpiry: these contacts have been missing for a while, so any
                         // historical cache hit is useful for recovery even past the normal
                         // 30-day freshness window used elsewhere for re-scrape decisions.
-                        body: JSON.stringify({ urls: missingKeys2.map(k => keyToUrl.get(k)), ignoreExpiry: true })
+                        body: JSON.stringify({ urls: missingKeys2.map(k => keyToUrl.get(k)), ignoreExpiry: true, includeDetails: true })
                     });
                     if (cacheResp.ok) {
                         const cacheData = await cacheResp.json();
-                        apifyCachedCount = cacheData.cachedCount || 0;
+                        (cacheData.cached || []).forEach(r => {
+                            const key = liSlug(r.url) || normalizeUrl(r.url);
+                            if (key) keyApifyCache.set(key, { name: r.name || '', title: r.title || '', company: r.company || '', cachedAt: r.cachedAt || null });
+                        });
                     }
                 } catch(e) { console.warn('[openLocateModal] cache-coverage check failed:', e.message); }
             }
+            const apifyCachedCount = keyApifyCache.size;
 
             // 6. Summarize + render
             const foundCount       = keyOwner.size;
@@ -9367,20 +9371,21 @@
                 const unowned  = keyUnowned.get(key);
                 const recov    = keyHeyreach.get(key);
                 const recovQ   = keyQueueProfile.get(key);
+                const cached   = keyApifyCache.get(key);
                 const tag      = keyToTagged.get(key);
-                const status   = owned ? 'found' : (unowned ? 'unowned' : (recov ? 'recoverable' : (recovQ ? 'recoverable_queue' : 'missing')));
+                const status   = owned ? 'found' : (unowned ? 'unowned' : (recov ? 'recoverable' : (recovQ ? 'recoverable_queue' : (cached ? 'apify_cached' : 'missing'))));
                 const src      = owned || recov || recovQ || {};
                 return {
                     url:         keyToUrl.get(key),
                     status,
-                    source:      owned ? 'prospect_contacts' : (unowned ? 'prospect_contacts (unowned)' : (recov ? 'heyreach_contacts' : (recovQ ? 'connect_queue' : ''))),
+                    source:      owned ? 'prospect_contacts' : (unowned ? 'prospect_contacts (unowned)' : (recov ? 'heyreach_contacts' : (recovQ ? 'connect_queue' : (cached ? 'linkedin_profile_cache' : '')))),
                     docId:       owned?.docId || unowned?.docId || null,
                     bdrName:     src.bdrName  || '',
                     bdrEmail:    src.bdrEmail || '',
                     company:     src.company  || (unowned?.ownerType === 'workspace' ? `Workspace: ${unowned.workspaceName || 'Unknown'}` : (unowned ? 'Unowned' : '')),
-                    name:        unowned?.name  || recov?.name  || recovQ?.name  || tag?.name  || '',
-                    title:       unowned?.title || recov?.title || recovQ?.title || tag?.title || '',
-                    org:         unowned?.org   || recov?.org   || recovQ?.org   || tag?.org   || '',
+                    name:        unowned?.name  || recov?.name  || recovQ?.name  || cached?.name  || tag?.name  || '',
+                    title:       unowned?.title || recov?.title || recovQ?.title || cached?.title || tag?.title || '',
+                    org:         unowned?.org   || recov?.org   || recovQ?.org   || cached?.company || tag?.org || '',
                     profile:     recovQ?.profile || null
                 };
             });
@@ -9493,6 +9498,23 @@
                     ${[...keyToTagged.values()].filter(t => t.name).length ? ` The exported report still includes whatever name/title/org was captured on this group at tagging time for these, where available.` : ''}
                     Download the full report below for the exact list.
                     ${apifyCachedCount > 0 ? `
+                    <div style="margin-top:0.75rem;">
+                        <div style="font-size:0.78rem;font-weight:700;margin-bottom:0.35rem;">Who's in the cache (first ${Math.min(15, keyApifyCache.size)} of ${apifyCachedCount.toLocaleString()}):</div>
+                        <div style="max-height:180px;overflow-y:auto;border:1px solid #fecaca;border-radius:8px;">
+                            <table class="locate-owner-table" style="margin:0;">
+                                <thead><tr><th>Name</th><th>Title</th><th>Company</th></tr></thead>
+                                <tbody>
+                                    ${[...keyApifyCache.values()].slice(0, 15).map(c => `<tr>
+                                        <td>${escHtml(c.name || '(name not in cached profile)')}</td>
+                                        <td>${escHtml(c.title)}</td>
+                                        <td>${escHtml(c.company)}</td>
+                                    </tr>`).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                        ${apifyCachedCount > 15 ? `<div style="font-size:0.76rem;color:var(--gray-500);margin-top:0.3rem;">Use <strong>Search All Contacts</strong> below and filter by "Recoverable (Apify Cache)" to see the full list.</div>` : ''}
+                    </div>` : ''}
+                    ${apifyCachedCount > 0 ? `
                     <div style="margin-top:0.6rem;">
                         <button class="btn btn-sm btn-primary" onclick="recoverFromApifyCache(this)">
                             <i class="fas fa-cloud-download-alt"></i> Recreate ${missingCount.toLocaleString()} Contact${missingCount !== 1 ? 's' : ''} &amp; Pull Cached Profiles
@@ -9532,7 +9554,7 @@
         window.open(`contact_universe_search.html?${params.toString()}`, '_blank');
     };
 
-    const _locateStatusLabel = { found: 'Found', unowned: 'Found — Unowned/Workspace', recoverable: 'Recoverable (HeyReach)', recoverable_queue: 'Recoverable (Queue Snapshot)', missing: 'Truly Missing' };
+    const _locateStatusLabel = { found: 'Found', unowned: 'Found — Unowned/Workspace', recoverable: 'Recoverable (HeyReach)', recoverable_queue: 'Recoverable (Queue Snapshot)', apify_cached: 'Recoverable (Apify Cache)', missing: 'Truly Missing' };
 
     window.exportLocateReport = function() {
         if (!_locateReport || !_locateReport.length) return;
@@ -9757,7 +9779,10 @@
     // Apify fetch to fill in the rest.
     window.recoverFromApifyCache = async function(btn) {
         if (!_locateReport) return;
-        const rows = _locateReport.filter(r => r.status === 'missing');
+        // Includes both 'apify_cached' (has a cache hit) and 'missing' (truly gone) —
+        // this button recreates the WHOLE bucket the "Truly Gone" alert covers; the two
+        // sub-statuses just distinguish which ones will come back with rich profile data.
+        const rows = _locateReport.filter(r => r.status === 'missing' || r.status === 'apify_cached');
         if (!rows.length) { showAlert('Nothing to recover.', 'warning'); return; }
 
         const group = allGroups.find(g => g.id === _locateGroupId);

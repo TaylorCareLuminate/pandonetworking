@@ -74,6 +74,7 @@
         .badge-unowned   { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
         .badge-heyreach  { background: #fef3c7; color: #92400e; }
         .badge-queue     { background: #ede9fe; color: #5b21b6; }
+        .badge-cached    { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
         .badge-missing   { background: #fee2e2; color: #991b1b; }
 
         .loading-spinner { text-align: center; padding: 2rem; color: var(--gray); }
@@ -247,7 +248,7 @@
         return data.job.results || { prospectContacts: [], heyreachContacts: [], connectQueue: [] };
     }
 
-    function categorize(scanResults, keyToUrl, keyToTagged) {
+    async function categorize(scanResults, keyToUrl, keyToTagged) {
         const bdrByEmail = new Map(allBdrs.map(b => [(b.primaryEmail || b.id || '').toLowerCase(), b]));
         const keyOwner = new Map(), keyUnowned = new Map();
         scanResults.prospectContacts.forEach(row => {
@@ -271,17 +272,39 @@
             keyQueue.set(row.key, { bdrEmail: row.ownerEmail || '', bdrName: bdr?.name || row.ownerEmail || 'Unknown owner', company: bdr?._company || 'Other', docId: row.docId, name: row.name || '', title: row.title || '', org: row.company || '' });
         });
 
+        // Whatever's left after prospect_contacts/heyreach/queue also gets checked
+        // against the Apify profile cache (linkedin_profile_cache) — same source the
+        // Locate popup calls "Recoverable (Apify Cache)" — so "Truly Gone" here only
+        // means no rich profile data exists anywhere, not just no owned record.
+        const keyApifyCache = new Map();
+        const missingKeys = [...keyToUrl.keys()].filter(k => !keyOwner.has(k) && !keyUnowned.has(k) && !keyHeyreach.has(k) && !keyQueue.has(k));
+        if (missingKeys.length) {
+            try {
+                const resp = await fetch(`${RAILWAY_BASE}/api/ai-profile-cleanup/cache-coverage`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ urls: missingKeys.map(k => keyToUrl.get(k)), ignoreExpiry: true, includeDetails: true })
+                });
+                if (resp.ok) {
+                    const data = await resp.json();
+                    (data.cached || []).forEach(r => {
+                        const key = liSlug(r.url) || normalizeUrl(r.url);
+                        if (key) keyApifyCache.set(key, { name: r.name || '', title: r.title || '', company: r.company || '' });
+                    });
+                }
+            } catch(e) { console.warn('categorize: cache-coverage check failed:', e.message); }
+        }
+
         return [...keyToUrl.keys()].map(key => {
-            const owned = keyOwner.get(key), unowned = keyUnowned.get(key), recov = keyHeyreach.get(key), recovQ = keyQueue.get(key);
+            const owned = keyOwner.get(key), unowned = keyUnowned.get(key), recov = keyHeyreach.get(key), recovQ = keyQueue.get(key), cached = keyApifyCache.get(key);
             const tag = keyToTagged.get(key);
-            const status = owned ? 'found' : (unowned ? 'unowned' : (recov ? 'recoverable' : (recovQ ? 'recoverable_queue' : 'missing')));
+            const status = owned ? 'found' : (unowned ? 'unowned' : (recov ? 'recoverable' : (recovQ ? 'recoverable_queue' : (cached ? 'apify_cached' : 'missing'))));
             const src = owned || recov || recovQ || {};
             return {
                 url: keyToUrl.get(key), status,
                 bdrName: src.bdrName || '', company: src.company || (unowned?.ownerType === 'workspace' ? `Workspace: ${unowned.workspaceName || 'Unknown'}` : (unowned ? 'Unowned' : '')),
-                name: unowned?.name || recov?.name || recovQ?.name || tag?.name || '',
-                title: unowned?.title || recov?.title || recovQ?.title || tag?.title || '',
-                org: unowned?.org || recov?.org || recovQ?.org || tag?.org || ''
+                name: unowned?.name || recov?.name || recovQ?.name || cached?.name || tag?.name || '',
+                title: unowned?.title || recov?.title || recovQ?.title || cached?.title || tag?.title || '',
+                org: unowned?.org || recov?.org || recovQ?.org || cached?.company || tag?.org || ''
             };
         });
     }
@@ -291,6 +314,7 @@
         unowned:            { label: 'Found — Unowned/Workspace',  badge: 'badge-unowned' },
         recoverable:        { label: 'Recoverable (HeyReach)',     badge: 'badge-heyreach' },
         recoverable_queue:  { label: 'Recoverable (Queue Snapshot)', badge: 'badge-queue' },
+        apify_cached:       { label: 'Recoverable (Apify Cache)',   badge: 'badge-cached' },
         missing:            { label: 'Truly Gone',                 badge: 'badge-missing' }
     };
 
@@ -346,6 +370,7 @@
                     <option value="unowned">Found — Unowned/Workspace</option>
                     <option value="recoverable">Recoverable (HeyReach)</option>
                     <option value="recoverable_queue">Recoverable (Queue Snapshot)</option>
+                    <option value="apify_cached">Recoverable (Apify Cache)</option>
                     <option value="missing">Truly Gone</option>
                 </select>
                 <select id="filterCompany">
@@ -412,7 +437,8 @@
                 jobId = await startScanJob([...keyToUrl.values()]);
             }
             const scanResults = await loadJobResults(jobId);
-            allRows = categorize(scanResults, keyToUrl, keyToTagged);
+            document.getElementById('groupTableWrap').innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Checking the Apify profile cache for any remaining unmatched contacts…</div>`;
+            allRows = await categorize(scanResults, keyToUrl, keyToTagged);
             renderTableShell();
         } catch(e) {
             document.getElementById('groupTableWrap').innerHTML = `<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> ${escHtml(e.message)}</div>`;
