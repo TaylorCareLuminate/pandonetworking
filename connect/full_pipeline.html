@@ -126,6 +126,24 @@
             display: flex; align-items: center; justify-content: space-between; cursor: pointer; user-select: none;
             background: var(--gray-100); border-radius: 8px; padding: 9px 13px; margin-bottom: 10px;
         }
+        .opus-review-box {
+            margin-top: 12px; background: linear-gradient(180deg, #faf5ff 0%, #ffffff 60px);
+            border: 1px solid #e9d5ff; border-radius: 10px; padding: 16px 20px; font-size: 13.5px;
+            color: var(--gray-800); line-height: 1.6; max-height: 640px; overflow-y: auto;
+        }
+        .opus-review-box h2 {
+            font-size: 14.5px; font-weight: 800; color: #6d28d9; margin: 18px 0 8px;
+            display: flex; align-items: center; gap: 6px;
+        }
+        .opus-review-box h2:first-child { margin-top: 0; }
+        .opus-review-box h3 { font-size: 13.5px; font-weight: 700; color: var(--gray-800); margin: 12px 0 6px; }
+        .opus-review-box ul { margin: 4px 0 10px; padding-left: 22px; }
+        .opus-review-box li { margin-bottom: 5px; }
+        .opus-review-box p { margin: 6px 0; }
+        .opus-review-box code {
+            background: var(--gray-100); border-radius: 4px; padding: 1px 5px; font-size: 12px;
+            font-family: 'SF Mono', Consolas, monospace;
+        }
     </style>
 </head>
 <body>
@@ -538,6 +556,22 @@
             </div>
             <div id="fpProgressLog"></div>
             <div id="fpReportLink" style="margin-top: 10px; font-size: 13px;"></div>
+
+            <div style="margin-top: 18px; border-top: 1px solid var(--gray-200); padding-top: 16px;">
+                <div class="section-title" style="font-size: 14.5px;"><i class="fas fa-brain" style="color:#7c3aed;"></i> Ask Opus to Review This Run</div>
+                <p class="section-help" style="margin-left: 0;">
+                    Sends the complete run log exactly as printed above, this run's search criteria/scan rules/models/cost settings,
+                    and the totals this run computed to Claude Opus, and asks it for plain-English feedback grounded in this specific
+                    run — what's working, what's not, and what to fix, ranked by impact. You can run this any time after the run
+                    starts producing log lines; it doesn't have to wait for the run to finish.
+                </p>
+                <div style="display:flex; gap:10px; align-items:flex-start; flex-wrap:wrap;">
+                    <input type="text" id="fpOpusReviewFocus" placeholder="Optional: anything specific you want Opus to focus on (e.g. &quot;why so few messages from health systems&quot;)" style="flex:1; min-width:280px;">
+                    <button class="btn btn-primary" id="fpOpusReviewBtn" onclick="fpAskOpusToReview()"><i class="fas fa-brain"></i> Ask Opus to Review</button>
+                </div>
+                <div id="fpOpusReviewStatus" style="font-size:12.5px; color:var(--gray-500); margin-top:8px;"></div>
+                <div id="fpOpusReviewResult" class="opus-review-box" style="display:none;"></div>
+            </div>
         </div>
     </div>
 
@@ -2223,10 +2257,18 @@
             addLog('\n⛔ Stop requested from the button — finishing the current step, then stopping. Nothing is lost: every organization completed so far is saved, and re-running with the same Scan Name will pick up where this left off (already-scanned orgs are skipped/pushed to the back of the queue).', 'warning');
         }
 
+        // Full plain-text transcript of every log line this run has produced, in order —
+        // kept in sync with the on-screen log by addLog/addLogHtml below and reset when a
+        // new run starts. This is what fpAskOpusToReview() sends to the backend so Opus sees
+        // exactly what the operator sees, not a reconstruction.
+        let fpFullLogText = [];
+
         function addLog(msg, type = 'info') {
+            const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            fpFullLogText.push(line);
             const el = document.createElement('div');
             el.className = `log-entry ${type}`;
-            el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            el.textContent = line;
             const log = document.getElementById('fpProgressLog');
             log.appendChild(el);
             log.scrollTop = log.scrollHeight;
@@ -2238,6 +2280,9 @@
             const el = document.createElement('div');
             el.className = `log-entry ${type}`;
             el.innerHTML = html;
+            // el.textContent reads back the rendered plain text of the HTML we just built,
+            // so the Opus transcript stays readable even though the on-screen version has markup.
+            fpFullLogText.push(el.textContent);
             const log = document.getElementById('fpProgressLog');
             log.appendChild(el);
             log.scrollTop = log.scrollHeight;
@@ -3486,6 +3531,9 @@
             document.getElementById('fpProgressSection').style.display = 'block';
             document.getElementById('fpProgressLog').innerHTML = '';
             document.getElementById('fpReportLink').innerHTML = '';
+            fpFullLogText = [];
+            document.getElementById('fpOpusReviewResult').style.display = 'none';
+            document.getElementById('fpOpusReviewStatus').textContent = '';
             document.getElementById('fpRunBtn').disabled = true;
             document.getElementById('fpRunBtn').innerHTML = '<i class="fas fa-spinner fa-spin"></i> Running…';
             const stopBtn = document.getElementById('fpStopBtn');
@@ -3527,6 +3575,9 @@
                     // system, so this is call-count × a flat per-call estimate, not a measurement).
                     realCostBreakdown: null }
             };
+            // Exposed globally (same object reference, mutated throughout the run) so
+            // fpAskOpusToReview() can read live settings/totals without re-deriving them.
+            window.fpLastReport = report;
             const saveReport = async () => {
                 try { await setDoc(doc(db, 'full_pipeline_runs', runId), report); }
                 catch (e) { console.warn('Report save failed:', e.message); }
@@ -4626,6 +4677,101 @@
                 runBtn.innerHTML = '<i class="fas fa-rocket"></i> Run Full Pipeline';
                 document.getElementById('fpStopBtn').style.display = 'none';
                 fpUpdateRunButton();
+            }
+        };
+
+        // ── "Ask Opus to Review This Run" ───────────────────────────────────
+        // Feeds the complete run log + this run's search criteria/scan rules/models/cost
+        // settings + computed totals to Claude Opus via the backend and renders its
+        // feedback in the page. Can be called mid-run (whatever log exists so far) or
+        // after the run finishes.
+        function fpRenderReviewMarkdown(md) {
+            // Small, self-contained markdown→HTML pass — just enough for the section
+            // headers/bullets/bold/code Opus is instructed to use. Escapes raw HTML first
+            // so nothing in the model's response can inject markup.
+            const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const lines = esc(md).replace(/\r\n/g, '\n').split('\n');
+            let html = '';
+            let inList = false;
+            const closeList = () => { if (inList) { html += '</ul>'; inList = false; } };
+            const inlineFmt = (s) => s
+                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                .replace(/`(.+?)`/g, '<code>$1</code>');
+            for (const raw of lines) {
+                const line = raw.trim();
+                if (!line) { closeList(); continue; }
+                if (/^##\s+/.test(line)) { closeList(); html += `<h2>${inlineFmt(line.replace(/^##\s+/, ''))}</h2>`; continue; }
+                if (/^#{1,3}\s+/.test(line) && !/^##\s+/.test(line)) { closeList(); html += `<h3>${inlineFmt(line.replace(/^#{1,3}\s+/, ''))}</h3>`; continue; }
+                if (/^[-*]\s+/.test(line)) {
+                    if (!inList) { html += '<ul>'; inList = true; }
+                    html += `<li>${inlineFmt(line.replace(/^[-*]\s+/, ''))}</li>`;
+                    continue;
+                }
+                if (/^\d+\.\s+/.test(line)) {
+                    if (!inList) { html += '<ul>'; inList = true; }
+                    html += `<li>${inlineFmt(line.replace(/^\d+\.\s+/, ''))}</li>`;
+                    continue;
+                }
+                closeList();
+                html += `<p>${inlineFmt(line)}</p>`;
+            }
+            closeList();
+            return html;
+        }
+
+        window.fpAskOpusToReview = async function() {
+            const statusEl = document.getElementById('fpOpusReviewStatus');
+            const resultEl = document.getElementById('fpOpusReviewResult');
+            const btn = document.getElementById('fpOpusReviewBtn');
+
+            if (!fpFullLogText.length) {
+                alert('No run log yet — start (or run) the pipeline first so there\'s something for Opus to read.');
+                return;
+            }
+
+            const focusQuestion = document.getElementById('fpOpusReviewFocus').value.trim();
+            const report = window.fpLastReport || {};
+
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Opus is reading the log…';
+            statusEl.style.color = 'var(--gray-500)';
+            statusEl.textContent = `Sending ${fpFullLogText.length.toLocaleString()} log line(s) to Opus — this can take a minute for a long run…`;
+            resultEl.style.display = 'none';
+
+            try {
+                const token = await auth.currentUser.getIdToken();
+                const resp = await fetch(`${RAILWAY_API}/api/connect/full-pipeline-opus-review`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({
+                        runId: report.runId,
+                        hypothesisGroupName: report.hypothesisGroupName,
+                        startedAt: report.startedAt,
+                        finishedAt: report.finishedAt,
+                        status: report.status,
+                        settings: report.settings,
+                        models: report.models,
+                        bdrPlan: report.bdrPlan,
+                        totals: report.totals,
+                        stats: fpStats,
+                        log: fpFullLogText.join('\n'),
+                        focusQuestion
+                    })
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok || !data.success) throw new Error(data.error || `HTTP ${resp.status}`);
+
+                resultEl.innerHTML = fpRenderReviewMarkdown(data.review);
+                resultEl.style.display = 'block';
+                statusEl.style.color = 'var(--gray-500)';
+                statusEl.textContent = `✓ Reviewed by ${data.model}` +
+                    (data.logTruncated ? ` — log was truncated to fit context (sent ${data.logCharsSent.toLocaleString()} of ${data.logCharsOriginal.toLocaleString()} characters, keeping the start and end).` : ` — full ${fpFullLogText.length.toLocaleString()}-line log sent.`);
+            } catch (e) {
+                statusEl.style.color = 'var(--danger)';
+                statusEl.textContent = `Failed: ${e.message}`;
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-brain"></i> Ask Opus to Review';
             }
         };
 
