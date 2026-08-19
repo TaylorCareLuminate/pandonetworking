@@ -1831,9 +1831,9 @@
                     <i class="fas fa-file-excel"></i>
                     Export All Contacts &amp; Conversations
                 </button>
-                <button id="followUpScanBtn" onclick="openFollowUpScanModal()" style="background: linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%); box-shadow: 0 4px 12px rgba(124,58,237,0.35); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 10px; font-weight: 600; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem;">
-                    <i class="fas fa-robot"></i>
-                    Scan for Follow-up Opportunities
+                <button id="followUpCountScanBtn" onclick="scanForNumberOfFollowUps()" style="background: linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%); box-shadow: 0 4px 12px rgba(124,58,237,0.35); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 10px; font-weight: 600; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem;" title="Reads each conversation's full transcript and asks the AI to count how many separate meeting invitations (follow-ups) the BDR has sent, then saves that number to the card. Skips anything marked Scheduled or Wrong Contact.">
+                    <i class="fas fa-list-ol"></i>
+                    Scan for Number of Follow-Ups
                 </button>
                 <button id="sequenceScanBtn" onclick="triggerFollowUpSequenceScan()" style="background: linear-gradient(135deg, #0d9488 0%, #0f766e 100%); box-shadow: 0 4px 12px rgba(13,148,136,0.35); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 10px; font-weight: 600; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem;" title="Categorizes any conversation that hasn't been scanned (or has new messages) into 1/2/3/0, then drafts the next meeting invitation for any conversation that's due one — up to 1 invite for 'Response', 2 for 'Response Engaged', 3 for 'Response Willing to Meet', none for 'Declined to Meet'. Invitations are spaced at least 2 weeks apart. Drafts appear on the card (via kimi-k3) for your review — nothing is sent automatically.">
                     <i class="fas fa-list-check"></i>
@@ -2014,10 +2014,6 @@
                         <strong id="followUpDateCount" style="color: #7c3aed;">0</strong> conversations scheduled
                     </p>
                 </div>
-                <button onclick="runAiFollowUpScan()" id="aiFollowUpScanBtn"
-                    style="background: linear-gradient(135deg, #7c3aed, #8A6B2E); color: white; border: none; padding: 0.6rem 1.1rem; border-radius: 10px; font-size: 0.85rem; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 0.5rem; white-space: nowrap; flex-shrink: 0; box-shadow: 0 3px 10px rgba(124,58,237,0.25); transition: all 0.2s;">
-                    <i class="fas fa-robot"></i> AI Scan All
-                </button>
             </div>
             <div style="display: flex; gap: 0.6rem; flex-wrap: wrap;">
                 <button class="followup-filter-btn active" id="fuDateAll" onclick="setFollowUpDateFilter('all')">
@@ -8248,6 +8244,214 @@
                 if (input) input.value = conversation.followUpInvitesSent || 0;
             }
         };
+
+        // =====================================================================
+        // SCAN FOR NUMBER OF FOLLOW-UPS
+        // Reads each conversation's full transcript, asks the AI to count how
+        // many SEPARATE meeting invitations (follow-ups) the BDR has sent, and
+        // saves that number to followUpInvitesSent (same endpoint the manual
+        // card input uses, so a stale draft is cleared automatically).
+        // Excluded: Response Category == 'Scheduled', anything marked as
+        // Qualified Wrong Contact, and conversations with no BDR messages.
+        // =====================================================================
+
+        // TEMP TEST MODE: cap each run at this many conversations so the results
+        // can be spot-checked by hand. Set to null to scan everything.
+        const FOLLOWUP_COUNT_SCAN_TEST_LIMIT = 10;
+
+        window.scanForNumberOfFollowUps = async function() {
+            const button = document.getElementById('followUpCountScanBtn');
+            const originalBtnHtml = button ? button.innerHTML : '';
+
+            const eligible = allConversations.filter(conv => {
+                if ((conv.responseCategory || '') === 'Scheduled') return false;
+                if ((conv.followUpCategory || 'No Follow Up') === 'Qualified Wrong Contact') return false;
+                const msgs = conv.messages || conv.rawData?.messages || [];
+                if (!msgs.length) return false;
+                return msgs.some(m => m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound');
+            });
+
+            if (eligible.length === 0) {
+                alert('No eligible conversations to scan (everything is Scheduled, marked Wrong Contact, or has no BDR messages).');
+                return;
+            }
+
+            const toScan = FOLLOWUP_COUNT_SCAN_TEST_LIMIT ? eligible.slice(0, FOLLOWUP_COUNT_SCAN_TEST_LIMIT) : eligible;
+            const testNote = FOLLOWUP_COUNT_SCAN_TEST_LIMIT
+                ? `\n\n🧪 TEST MODE: only the first ${toScan.length} of ${eligible.length} eligible conversation(s) will be scanned so you can verify the results.`
+                : '';
+            if (!confirm(`Scan ${toScan.length} conversation(s) for the number of follow-ups sent?\n\nThe AI reads each full transcript and counts how many separate times the BDR invited the contact to meet. The count is saved to each card's "Follow-Ups Sent" field.${testNote}`)) {
+                return;
+            }
+
+            if (button) { button.disabled = true; }
+
+            const fetchJsonWithTimeout = async (url, options, timeoutMs) => {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), timeoutMs);
+                try {
+                    const res = await fetch(url, { ...options, signal: controller.signal });
+                    return await res.json();
+                } catch (e) {
+                    if (e.name === 'AbortError') throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+                    throw e;
+                } finally {
+                    clearTimeout(timer);
+                }
+            };
+
+            const fmtTs = (raw) => {
+                try {
+                    if (!raw) return '';
+                    if (raw.toDate) return raw.toDate().toISOString();
+                    if (typeof raw === 'object' && raw._seconds) return new Date(raw._seconds * 1000).toISOString();
+                    return String(raw);
+                } catch { return ''; }
+            };
+
+            const results = [];
+            for (let i = 0; i < toScan.length; i++) {
+                const conv = toScan[i];
+                if (button) button.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Scanning ${i + 1}/${toScan.length}…`;
+                const label = {
+                    name: conv.leadName || 'Unknown',
+                    company: conv.companyName || '',
+                    bdr: conv.bdrEmail || '',
+                    oldCount: conv.followUpInvitesSent || 0
+                };
+                try {
+                    const msgs = conv.messages || conv.rawData?.messages || [];
+                    const bdrLabel = conv.bdrEmail || 'BDR';
+                    const leadName = conv.leadName || 'Prospect';
+                    const transcript = msgs.map((m, idx) => {
+                        const isBdr = m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound';
+                        const ts = fmtTs(m.createdAt || m.timestamp || m.date);
+                        const body = m.body || m.text || m.message || '';
+                        return `[${idx}] ${isBdr ? `${bdrLabel} (BDR)` : `${leadName} (Prospect)`}${ts ? ` (${ts})` : ''}: ${body}`;
+                    }).join('\n\n');
+
+                    const prompt = `Here is a LinkedIn conversation between "${bdrLabel}" (our BDR) and prospect "${leadName}", with each message numbered in brackets:
+
+${transcript}
+
+Count how many SEPARATE times "${bdrLabel}" (the BDR) invited "${leadName}" to meet — e.g. sharing a calendar/scheduling link, proposing a call, or asking for a good time to connect.
+
+Rules:
+- Only count messages sent by "${bdrLabel}" — ignore anything "${leadName}" said.
+- Do NOT count plain outreach/connection messages, thank-yous, or replies that don't actually ask to meet.
+- If the SAME invitation is repeated within one message, that's still just 1.
+- If the BDR asked to meet in more than one separate message (e.g. an initial ask, then a later nudge), count each separately.
+
+Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer — total separate meeting invitations the BDR has sent>, "reasoning": "brief 1-2 sentence explanation citing the message numbers you counted"}`;
+
+                    const aiData = await fetchJsonWithTimeout(`${RAILWAY_URL}/api/ai-profile-eval`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            provider: 'openrouter',
+                            model: 'moonshotai/kimi-k3',
+                            prompt,
+                            temperature: 0.1,
+                            max_tokens: 300
+                        })
+                    }, 60000);
+
+                    if (aiData.success === false) throw new Error(aiData.error || 'AI call failed');
+                    const raw = (aiData.message || aiData.response || '').trim();
+                    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+                    const match = cleaned.match(/\{[\s\S]*\}/);
+                    if (!match) throw new Error('AI did not return JSON');
+                    const parsed = JSON.parse(match[0]);
+                    const count = Number.isInteger(parsed.count) ? Math.max(0, parsed.count) : null;
+                    if (count === null) throw new Error('AI did not return a valid count');
+
+                    const { collection, docId } = resolveConversationDocRef(conv);
+                    const saveResult = await fetchJsonWithTimeout(`${RAILWAY_URL}/heyreach/inbox/set-followup-invites-sent`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ collection, docId, invitesSent: count })
+                    }, 30000);
+                    if (!saveResult.success) throw new Error(saveResult.error || 'Failed to save count');
+
+                    conv.followUpInvitesSent = count;
+                    conv.followUpSequence = null;
+                    const cardInput = document.getElementById(`invitesSentInput-${conv.id}`);
+                    if (cardInput) cardInput.value = count;
+
+                    results.push({ ...label, newCount: count, reasoning: parsed.reasoning || '', ok: true });
+                } catch (error) {
+                    console.error(`❌ Follow-up count scan failed for ${conv.id}:`, error);
+                    results.push({ ...label, ok: false, error: error.message });
+                }
+            }
+
+            if (button) { button.disabled = false; button.innerHTML = originalBtnHtml; }
+            updateFollowUpDraftCount();
+            updateCategoryGrid();
+            applyAllFilters();
+            showFollowUpCountScanResults(results, eligible.length);
+        };
+
+        // Pop-up listing exactly which conversations were scanned and what the AI
+        // decided, so each one can be opened and verified by hand while the scan
+        // is still in test mode.
+        function showFollowUpCountScanResults(results, eligibleTotal) {
+            const existing = document.getElementById('fuCountScanResultsModal');
+            if (existing) existing.remove();
+
+            const okResults = results.filter(r => r.ok);
+            const failed = results.filter(r => !r.ok);
+            const changed = okResults.filter(r => r.newCount !== r.oldCount);
+
+            const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+            const rowsHtml = results.map(r => {
+                if (!r.ok) {
+                    return `<div style="padding: 0.75rem 1rem; border-bottom: 1px solid #f3f4f6; background: #fef2f2;">
+                        <div style="font-weight: 600; color: #111827;">${esc(r.name)}${r.company ? ` — ${esc(r.company)}` : ''}</div>
+                        <div style="font-size: 0.85rem; color: #b91c1c;">❌ Failed: ${esc(r.error)}</div>
+                    </div>`;
+                }
+                const changedBadge = r.newCount !== r.oldCount
+                    ? `<span style="background: #ede9fe; color: #5b21b6; font-weight: 700; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem;">${r.oldCount} → ${r.newCount}</span>`
+                    : `<span style="background: #f3f4f6; color: #374151; font-weight: 600; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem;">${r.newCount} (unchanged)</span>`;
+                return `<div style="padding: 0.75rem 1rem; border-bottom: 1px solid #f3f4f6;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;">
+                        <div style="font-weight: 600; color: #111827;">${esc(r.name)}${r.company ? ` — ${esc(r.company)}` : ''}</div>
+                        ${changedBadge}
+                    </div>
+                    ${r.bdr ? `<div style="font-size: 0.78rem; color: #6b7280;">BDR: ${esc(r.bdr)}</div>` : ''}
+                    ${r.reasoning ? `<div style="font-size: 0.83rem; color: #4b5563; margin-top: 0.25rem;">🧠 ${esc(r.reasoning)}</div>` : ''}
+                </div>`;
+            }).join('');
+
+            const testModeNote = FOLLOWUP_COUNT_SCAN_TEST_LIMIT
+                ? `<div style="background: #fffbeb; border: 1px solid #fde68a; color: #92400e; font-size: 0.85rem; padding: 0.6rem 1rem; border-radius: 8px; margin-bottom: 0.75rem;">🧪 <strong>Test mode:</strong> scanned the first ${results.length} of ${eligibleTotal} eligible conversation(s). Look these up below to verify the counts, then we'll turn the limit off.</div>`
+                : '';
+
+            const modal = document.createElement('div');
+            modal.id = 'fuCountScanResultsModal';
+            modal.style.cssText = 'position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 10000; display: flex; align-items: center; justify-content: center; padding: 1.5rem;';
+            modal.innerHTML = `
+                <div style="background: white; border-radius: 14px; max-width: 640px; width: 100%; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(0,0,0,0.3);">
+                    <div style="padding: 1.1rem 1.25rem; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center;">
+                        <h3 style="margin: 0; font-size: 1.05rem; color: #111827;"><i class="fas fa-list-ol" style="color: #7c3aed;"></i> Follow-Up Count Scan Results</h3>
+                        <button onclick="document.getElementById('fuCountScanResultsModal').remove()" style="background: none; border: none; font-size: 1.3rem; color: #6b7280; cursor: pointer; line-height: 1;">&times;</button>
+                    </div>
+                    <div style="padding: 1rem 1.25rem; overflow-y: auto;">
+                        ${testModeNote}
+                        <div style="font-size: 0.88rem; color: #374151; margin-bottom: 0.75rem;">
+                            ✅ ${okResults.length} scanned &amp; saved · ✏️ ${changed.length} count(s) changed${failed.length ? ` · ❌ ${failed.length} failed` : ''}
+                        </div>
+                        <div style="border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden;">${rowsHtml}</div>
+                    </div>
+                    <div style="padding: 0.9rem 1.25rem; border-top: 1px solid #e5e7eb; text-align: right;">
+                        <button onclick="document.getElementById('fuCountScanResultsModal').remove()" style="background: #7c3aed; color: white; border: none; padding: 0.55rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer;">Close</button>
+                    </div>
+                </div>`;
+            modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+            document.body.appendChild(modal);
+        }
 
         // Accept EVERY currently-loaded AI suggestion in one shot, instead of clicking "Accept"
         // one-by-one on each card. Only touches conversations that are actually loaded right now
