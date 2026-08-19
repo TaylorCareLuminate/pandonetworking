@@ -8467,12 +8467,20 @@
                 } catch { return ''; }
             };
 
+            // Same fallback chain the CSV export uses — some sources only populate
+            // lead_name or first/last name fields, which previously showed "Unknown".
+            const resolveLeadName = (conv) => {
+                const fn = (conv.leadFirstName || '').trim();
+                const ln = (conv.leadLastName || '').trim();
+                return conv.lead_name || conv.leadName || (fn && ln ? `${fn} ${ln}` : fn || ln) || '';
+            };
+
             const results = [];
             for (let i = 0; i < toScan.length; i++) {
                 const conv = toScan[i];
                 if (button) button.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Scanning ${i + 1}/${toScan.length}…`;
                 const label = {
-                    name: conv.leadName || 'Unknown',
+                    name: resolveLeadName(conv) || 'Unknown',
                     company: conv.companyName || '',
                     bdr: conv.bdrEmail || '',
                     oldCount: conv.followUpInvitesSent || 0
@@ -8480,7 +8488,7 @@
                 try {
                     const msgs = conv.messages || conv.rawData?.messages || [];
                     const bdrLabel = conv.bdrEmail || 'BDR';
-                    const leadName = conv.leadName || 'Prospect';
+                    const leadName = resolveLeadName(conv) || 'Prospect';
                     const transcript = msgs.map((m, idx) => {
                         const isBdr = m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound';
                         const ts = fmtTs(m.createdAt || m.timestamp || m.date);
@@ -8502,24 +8510,44 @@ Rules:
 
 Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer — total separate meeting invitations the BDR has sent>, "reasoning": "brief 1-2 sentence explanation citing the message numbers you counted"}`;
 
-                    const aiData = await fetchJsonWithTimeout(`${RAILWAY_URL}/api/ai-profile-eval`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            provider: 'openrouter',
-                            model: 'moonshotai/kimi-k3',
-                            prompt,
-                            temperature: 0.1,
-                            max_tokens: 300
-                        })
-                    }, 60000);
+                    // Up to 2 attempts per conversation — retries once on timeouts,
+                    // empty responses, or malformed JSON before recording a failure.
+                    let parsed = null;
+                    let lastError = null;
+                    for (let attempt = 1; attempt <= 2 && !parsed; attempt++) {
+                        try {
+                            const aiData = await fetchJsonWithTimeout(`${RAILWAY_URL}/api/ai-profile-eval`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    provider: 'openrouter',
+                                    // Dated GA route — cheaper than the rolling
+                                    // deepseek/deepseek-v4-pro alias ($0.66/$1.98 vs $1.44/$2.88 per 1M)
+                                    model: 'deepseek/deepseek-v4-pro-0813',
+                                    prompt,
+                                    temperature: 0.1,
+                                    // Generous cap so any hidden reasoning tokens can't starve
+                                    // the actual answer (the old 300 cap caused finish_reason=length)
+                                    max_tokens: 1000,
+                                    lowReasoning: true
+                                })
+                            }, 120000);
 
-                    if (aiData.success === false) throw new Error(aiData.error || 'AI call failed');
-                    const raw = (aiData.message || aiData.response || '').trim();
-                    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-                    const match = cleaned.match(/\{[\s\S]*\}/);
-                    if (!match) throw new Error('AI did not return JSON');
-                    const parsed = JSON.parse(match[0]);
+                            if (aiData.success === false) throw new Error(aiData.error || 'AI call failed');
+                            const raw = (aiData.message || aiData.response || '').trim();
+                            const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+                            const match = cleaned.match(/\{[\s\S]*\}/);
+                            if (!match) throw new Error('AI did not return JSON');
+                            parsed = JSON.parse(match[0]);
+                        } catch (attemptError) {
+                            lastError = attemptError;
+                            if (attempt < 2) {
+                                console.warn(`⚠️ Follow-up count attempt ${attempt} failed for ${conv.id} — retrying:`, attemptError.message);
+                                await new Promise(r => setTimeout(r, 2000));
+                            }
+                        }
+                    }
+                    if (!parsed) throw lastError || new Error('AI call failed');
                     const count = Number.isInteger(parsed.count) ? Math.max(0, parsed.count) : null;
                     if (count === null) throw new Error('AI did not return a valid count');
 
