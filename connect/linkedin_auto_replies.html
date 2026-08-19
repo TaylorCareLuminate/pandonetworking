@@ -508,6 +508,9 @@
             <button class="btn btn-primary" id="refreshBtn" onclick="loadAll()">
                 <i class="fas fa-sync-alt"></i> Refresh
             </button>
+            <button class="btn btn-danger" id="deleteAllBtn" onclick="deleteAllRecords()">
+                <i class="fas fa-trash"></i> Delete All
+            </button>
         </div>
     </div>
 
@@ -999,6 +1002,48 @@
         }
     };
 
+    // Bulk cleanup — this only clears tracking/draft records in this review app.
+    // It never touches anything that was actually sent (sending only ever happens
+    // through the explicit per-record "Send" button). Deleting a record just makes
+    // its underlying conversation eligible to be re-evaluated on the next Run Now.
+    window.deleteAllRecords = async function () {
+        const total = allRecords.length;
+        if (total === 0) { showToast('No records to delete', 'success'); return; }
+
+        const scopeToCurrentFilter = activeFilter !== 'all' &&
+            confirm(`You're currently filtered to "${activeFilter}" (${document.getElementById('tableBody').children.length} shown).\n\nClick OK to delete only records matching this filter, or Cancel to choose deleting ALL ${total} records instead.`);
+
+        const confirmMsg = scopeToCurrentFilter
+            ? `Delete all records with status "${activeFilter}"? This cannot be undone.`
+            : `Delete ALL ${total} auto-reply records? This cannot be undone. (This only clears drafts/history in this review tool — nothing that was actually sent is affected.)`;
+        if (!confirm(confirmMsg)) return;
+
+        const btn = document.getElementById('deleteAllBtn');
+        btn.disabled = true;
+        try {
+            // The "queued" tab groups both 'queued' and 'processing' statuses (see
+            // renderTable's filter) — mirror that here so a scoped delete matches what's shown.
+            const statuses = scopeToCurrentFilter
+                ? (activeFilter === 'queued' ? ['queued', 'processing'] : [activeFilter])
+                : [null];
+
+            let deleted = 0;
+            for (const status of statuses) {
+                const params = status ? `?status=${encodeURIComponent(status)}` : '';
+                const res = await fetch(`${RAILWAY_URL}/api/linkedin-auto-reply/records${params}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (!data.success) throw new Error(data.error);
+                deleted += data.deleted;
+            }
+            showToast(`Deleted ${deleted} record(s)`, 'success');
+            await loadAll();
+        } catch (err) {
+            showToast('Error: ' + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    };
+
     // ── Run Now Modal ─────────────────────────────────────────────────────────
     window.openRunModal = function () {
         document.getElementById('runModal').classList.add('open');
@@ -1012,6 +1057,15 @@
         if (e.target === document.getElementById('runModal')) closeRunModal();
     };
 
+    // A scan can take several minutes for a large batch (each new solicitor may need
+    // a LinkedIn profile+posts scrape), so the /run endpoint now starts the work in
+    // the background and returns immediately instead of us awaiting the whole thing
+    // (that used to exceed the request timeout, which showed up as a confusing "CORS
+    // blocked" error in the console even though CORS wasn't actually the problem).
+    // We poll /records for a bit afterward so new items appear without a manual
+    // refresh.
+    let runPollInterval = null;
+
     window.runNow = async function () {
         const customerId = document.getElementById('runCustomerId').value.trim() || undefined;
         const backScanDaysRaw = document.getElementById('backScanDays').value.trim();
@@ -1019,7 +1073,7 @@
         const btn = document.getElementById('runSubmitBtn');
 
         btn.disabled = true;
-        btn.innerHTML = '<span class="loading-spinner"></span> Running…';
+        btn.innerHTML = '<span class="loading-spinner"></span> Starting…';
 
         try {
             // Note: this endpoint only drafts + queues candidate replies. Nothing is ever
@@ -1031,13 +1085,12 @@
             });
             const data = await res.json();
             if (data.success) {
-                const r = data.results;
                 showToast(
-                    `Done! Queued for review: ${r.queued} · Skipped known: ${r.skipped_known} · Skipped personalized: ${r.skipped_personalized} · Errors: ${r.errors}. Nothing was sent — review below.`,
+                    'Scan started — it can take several minutes for new leads (LinkedIn scraping). This page will refresh automatically as results come in.',
                     'success'
                 );
                 closeRunModal();
-                await loadAll();
+                startRunPolling();
             } else {
                 showToast('Run failed: ' + data.error, 'error');
             }
@@ -1048,6 +1101,19 @@
             btn.innerHTML = '<i class="fas fa-play"></i> Run Now';
         }
     };
+
+    // Refreshes the table every 10s for 5 minutes after starting a run, so newly
+    // queued/skipped items appear without the user having to click Refresh.
+    function startRunPolling() {
+        if (runPollInterval) clearInterval(runPollInterval);
+        let ticks = 0;
+        const maxTicks = 30; // 30 * 10s = 5 min
+        runPollInterval = setInterval(async () => {
+            ticks++;
+            await loadAll();
+            if (ticks >= maxTicks) clearInterval(runPollInterval);
+        }, 10000);
+    }
 
     // ── Utilities ─────────────────────────────────────────────────────────────
     function toMs(ts) {
