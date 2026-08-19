@@ -5621,30 +5621,44 @@
         // Load CRM notes for conversations
         async function loadCRMNotes() {
             try {
-                console.log('📝 Loading CRM notes for:', accountEmail);
+                // IMPORTANT: must cover every BDR currently in scope (selectedCompanyBDREmails),
+                // not just the single `accountEmail` — which for a company/"All BDRs" view is
+                // just whichever BDR happens to be first in that group's email list. Querying
+                // only that one BDR silently drops CRM notes for every other BDR in the group.
+                const emailsInScope = (selectedCompanyBDREmails && selectedCompanyBDREmails.length > 0)
+                    ? selectedCompanyBDREmails
+                    : [accountEmail].filter(Boolean);
+                console.log('📝 Loading CRM notes for:', emailsInScope);
                 
                 // Use CLEmail wrapper to query CRM notes
                 const { collection, query, where, getDocs, orderBy } = window.clemailFirestore;
                 const crmRef = collection(emailDB, 'connect_linkedin_crm');
-                const q = query(crmRef, where('bdrEmail', '==', accountEmail), orderBy('createdAt', 'desc'));
-                const snapshot = await getDocs(q);
-                
-                console.log('   Loaded', snapshot.size, 'CRM note documents');
-                
-                // Group notes by conversation ID
+                const snapshots = await Promise.all(emailsInScope.map(email =>
+                    getDocs(query(crmRef, where('bdrEmail', '==', email), orderBy('createdAt', 'desc')))
+                ));
+
+                let totalDocs = 0;
+                const seenNoteIds = new Set();
                 const notesByConversation = new Map();
-                snapshot.forEach(doc => {
-                    const data = doc.data();
-                    if (data.conversationId) {
-                        if (!notesByConversation.has(data.conversationId)) {
-                            notesByConversation.set(data.conversationId, []);
+                snapshots.forEach(snapshot => {
+                    totalDocs += snapshot.size;
+                    snapshot.forEach(doc => {
+                        if (seenNoteIds.has(doc.id)) return;
+                        seenNoteIds.add(doc.id);
+                        const data = doc.data();
+                        if (data.conversationId) {
+                            if (!notesByConversation.has(data.conversationId)) {
+                                notesByConversation.set(data.conversationId, []);
+                            }
+                            notesByConversation.get(data.conversationId).push({
+                                id: doc.id,
+                                ...data
+                            });
                         }
-                        notesByConversation.get(data.conversationId).push({
-                            id: doc.id,
-                            ...data
-                        });
-                    }
+                    });
                 });
+
+                console.log('   Loaded', totalDocs, 'CRM note documents');
                 
                 // Store notes in conversations for rendering
                 allConversations.forEach(conv => {
@@ -5663,19 +5677,34 @@
         // Load category overrides (for webhook conversations that don't have Firestore docs)
         async function loadCategoryOverrides() {
             try {
-                console.log('🔒 Loading category overrides for:', accountEmail);
+                // IMPORTANT: must cover every BDR currently in scope (selectedCompanyBDREmails),
+                // not just the single `accountEmail` — which for a company/"All BDRs" view is
+                // just whichever BDR happens to be first in that group's email list. Querying
+                // only that one BDR silently skips loading ignore/flag/category-lock overrides
+                // that a DIFFERENT BDR in the same group created from their own session — so a
+                // conversation that a BDR intentionally (or accidentally) ignored can look like
+                // it's simply missing when viewed from a company-wide/All-BDRs view, instead of
+                // consistently applying the same ignored state everywhere.
+                const emailsInScope = (selectedCompanyBDREmails && selectedCompanyBDREmails.length > 0)
+                    ? selectedCompanyBDREmails
+                    : [accountEmail].filter(Boolean);
+                console.log('🔒 Loading category overrides for:', emailsInScope);
                 
                 const { collection, query, where, getDocs } = window.clemailFirestore;
                 const overridesRef = collection(emailDB, 'conversation_category_overrides');
-                const q = query(overridesRef, where('bdrEmail', '==', accountEmail));
-                const snapshot = await getDocs(q);
+                const snapshots = await Promise.all(emailsInScope.map(email =>
+                    getDocs(query(overridesRef, where('bdrEmail', '==', email)))
+                ));
                 
-                console.log('   Loaded', snapshot.size, 'category overrides');
-                
+                let totalOverrideDocs = 0;
+                const seenOverrideIds = new Set();
                 let ignoredCount = 0;
                 const conversationsToRemove = [];
                 
-                snapshot.forEach(doc => {
+                snapshots.forEach(snapshot => snapshot.forEach(doc => {
+                    if (seenOverrideIds.has(doc.id)) return;
+                    seenOverrideIds.add(doc.id);
+                    totalOverrideDocs++;
                     const data = doc.data();
                     const conversation = allConversations.find(c => c.id === data.conversationId);
                     if (conversation) {
@@ -5723,7 +5752,9 @@
                             }
                         }
                     }
-                });
+                }));
+                
+                console.log('   Loaded', totalOverrideDocs, 'category overrides');
                 
                 // Remove ignored conversations
                 if (conversationsToRemove.length > 0) {
@@ -5768,6 +5799,133 @@
             historyContainer.innerHTML = notesHTML;
         };
         
+        // ── Debug: find why a specific contact isn't showing up on this board ─────
+        // Call from the browser console (after the page finishes loading) as:
+        //   debugFindConversation("blinda weber")
+        //   debugFindConversation("https://www.linkedin.com/in/blinda-weber")
+        // Checks three things in order:
+        //   1. Is it in the currently-rendered `allConversations` list? (if yes, it's
+        //      probably just hidden by an active filter — flagged/needs-reply/time
+        //      window/BDR filter/etc.)
+        //   2. Is there a matching raw `heyreach_inbox` doc at all, for any of the
+        //      emails currently in scope (selectedCompanyBDREmails, or accountEmail
+        //      if no company is selected)? If found, reports whether it passed the
+        //      two-way (hasBdrMessage && hasLeadMessage) check and whether the raw
+        //      doc's own `ignored` field would have excluded it.
+        //   3. Is there a `conversation_category_overrides` doc (any BDR, not just
+        //      the one currently in scope) that marks it ignored/flagged/locked?
+        window.debugFindConversation = async function(searchTerm) {
+            const term = (searchTerm || '').toLowerCase().trim();
+            if (!term) {
+                console.log('Usage: debugFindConversation("name or LinkedIn URL")');
+                return;
+            }
+            console.log(`\n🔎 ================ debugFindConversation("${term}") ================`);
+
+            const matchesTerm = (name, url) => (name || '').toLowerCase().includes(term) || (url || '').toLowerCase().includes(term);
+
+            // 1) Currently rendered list (post-load, post-dedup, post-override-filter)
+            const shown = (allConversations || []).filter(c =>
+                matchesTerm(c.lead_name || c.leadName, c.leadProfileUrl || c.linkedin_url)
+            );
+            console.log(`1️⃣ In the currently-loaded list (allConversations): ${shown.length} match(es)`);
+            if (shown.length > 0) {
+                shown.forEach(c => console.log('   →', {
+                    id: c.id, name: c.lead_name || c.leadName, bdrEmail: c.bdrEmail,
+                    responseCategory: c.responseCategory, followUpCategory: c.followUpCategory,
+                    ignored: c.ignored, isCurrentlyIgnored: c.isCurrentlyIgnored,
+                    flaggedForClientReview: c.flaggedForClientReview, source: c.source,
+                    messageCount: c.messages?.length
+                }));
+                console.log('   ✅ It IS loaded. If it\'s not visible, an active display filter is hiding it — check the flag/needs-reply/AI-suggestions/follow-up-drafts buttons, the BDR-person filter, the hypothesis-group filter, and the time window (top of page).');
+                return;
+            }
+
+            // 2) Raw heyreach_inbox scan across every email currently in scope
+            const emailsToCheck = (selectedCompanyBDREmails && selectedCompanyBDREmails.length > 0)
+                ? selectedCompanyBDREmails
+                : [accountEmail].filter(Boolean);
+            console.log(`2️⃣ Not in the loaded list. Scanning raw heyreach_inbox for ${emailsToCheck.length} email(s) in scope:`, emailsToCheck);
+
+            const inboxColl = collection(emailDB, 'heyreach_inbox');
+            const fieldNames = ['accountEmail', 'bdrEmail', 'linkedInAccountEmail', 'uploadedByEmail'];
+            const rawMatches = [];
+            const seenIds = new Set();
+            for (const email of emailsToCheck) {
+                for (const fieldName of fieldNames) {
+                    try {
+                        const snap = await getDocs(query(inboxColl, where(fieldName, '==', email), limit(5000)));
+                        snap.forEach(docSnap => {
+                            if (seenIds.has(docSnap.id)) return;
+                            const data = docSnap.data();
+                            const correspondent = data.rawData?.correspondentProfile || {};
+                            const name = data.lead_name || `${data.leadFirstName || correspondent.firstName || ''} ${data.leadLastName || correspondent.lastName || ''}`.trim();
+                            const url = data.leadProfileUrl || correspondent.profileUrl || '';
+                            if (!matchesTerm(name, url)) return;
+                            seenIds.add(docSnap.id);
+                            rawMatches.push({ id: docSnap.id, data, matchedField: fieldName, matchedEmail: email });
+                        });
+                    } catch (err) {
+                        console.warn(`   ⚠️ Query failed for ${fieldName}=${email}:`, err.message);
+                    }
+                }
+            }
+
+            if (rawMatches.length === 0) {
+                console.log('   ❌ No matching heyreach_inbox doc found for any email currently in scope.');
+                console.log('   → Either the conversation belongs to a BDR/company NOT currently selected on this page (try "All BDRs" in the company dropdown), or the accountEmail/bdrEmail/linkedInAccountEmail/uploadedByEmail fields on the doc don\'t match any email you\'d expect for this BDR (check linkedin_accounts / linkedin_email_associations for an alias mismatch).');
+                console.log('================================================================\n');
+                return;
+            }
+
+            for (const { id, data, matchedField, matchedEmail } of rawMatches) {
+                const messages = data.rawData?.messages || [];
+                const hasBdrMessage = messages.some(msg => msg.sender === 'ME' || msg.sender === 'account');
+                const hasLeadMessage = messages.some(msg => msg.sender === 'CORRESPONDENT' || msg.sender === 'lead');
+                console.log(`   → Found raw doc ${id} (matched ${matchedField}=${matchedEmail}):`, {
+                    messageCount: messages.length,
+                    hasBdrMessage, hasLeadMessage,
+                    twoWayCheckPasses: hasBdrMessage && hasLeadMessage,
+                    rawIgnoredField: data.ignored,
+                    lastMessageCountWhenIgnored: data.lastMessageCountWhenIgnored,
+                    lastMessageAt: data.lastMessageAt
+                });
+                if (!(hasBdrMessage && hasLeadMessage)) {
+                    console.log('      ❌ FAILS the two-way conversation check — this is why it\'s excluded. Needs both a sender:"ME"/"account" AND a sender:"CORRESPONDENT"/"lead" message in rawData.messages.');
+                }
+                if (data.ignored && messages.length <= (data.lastMessageCountWhenIgnored || 0)) {
+                    console.log('      ❌ Raw doc\'s own `ignored` field is true and no new message has arrived since — this is why it\'s excluded.');
+                }
+
+                // 3) Check for ANY override doc for this conversation, regardless of which BDR's
+                // session created it (loadCategoryOverrides() only checks the single `accountEmail`
+                // currently in scope, so this catches overrides that would otherwise be invisible here).
+                try {
+                    const overridesRef = collection(emailDB, 'conversation_category_overrides');
+                    const overrideSnap = await getDocs(query(overridesRef, where('conversationId', '==', id)));
+                    if (overrideSnap.empty) {
+                        console.log('      ℹ️ No conversation_category_overrides doc exists for this conversation (from any BDR).');
+                    } else {
+                        overrideSnap.forEach(o => {
+                            const od = o.data();
+                            console.log(`      📄 Override doc ${o.id}:`, {
+                                bdrEmail: od.bdrEmail, ignored: od.ignored,
+                                lastMessageCountWhenIgnored: od.lastMessageCountWhenIgnored,
+                                manualCategoryOverride: od.manualCategoryOverride,
+                                flaggedForClientReview: od.flaggedForClientReview
+                            });
+                            if (od.ignored && messages.length <= (od.lastMessageCountWhenIgnored || 0)) {
+                                console.log(`      ❌ This override (bdrEmail=${od.bdrEmail}) marks it ignored with no new messages since — BUT loadCategoryOverrides() only applies overrides matching the single "accountEmail" currently in scope (${accountEmail}), so this only hides it when viewing AS ${od.bdrEmail} specifically.`);
+                            }
+                        });
+                    }
+                } catch (err) {
+                    console.warn('      ⚠️ Could not check conversation_category_overrides:', err.message);
+                }
+            }
+            console.log('================================================================\n');
+        };
+
         // Load from HeyReach inbox
         async function loadHeyreachInbox(accountEmail) {
             try {
