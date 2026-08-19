@@ -1097,9 +1097,15 @@ async function calculateClientDashboardHelper() {
     const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
     const monthStartTs = admin.firestore.Timestamp.fromDate(monthStart);
 
-    async function loadThisMonth(collectionName, field) {
+    // Only pull the fields the calculation actually reads (below) — heyreach_activity
+    // docs can carry large payloads (message bodies, etc.) that aren't needed here,
+    // and loading full docs for tens of thousands of rows is what was blowing the
+    // function's memory budget (see OOM crashes in the logs once monthly volume grew).
+    async function loadThisMonth(collectionName, field, selectFields) {
         try {
-            const snap = await db.collection(collectionName).where(field, '>=', monthStartTs).get();
+            let query = db.collection(collectionName).where(field, '>=', monthStartTs);
+            if (selectFields) query = query.select(...selectFields);
+            const snap = await query.get();
             const docs = [];
             snap.forEach(d => docs.push({ id: d.id, data: d.data() }));
             return docs;
@@ -1109,14 +1115,17 @@ async function calculateClientDashboardHelper() {
         }
     }
 
+    const HEYREACH_SELECT_FIELDS = ['eventType', 'bdrEmail', 'linkedInAccountEmail', 'accountEmail', 'bdr_email', 'linkedInAccountId'];
+    const ACTIVITY_TRACKING_SELECT_FIELDS = ['activity_type', 'bdr_email', 'bdr_auth_email'];
+
     // heyreach_activity records are written with BOTH `timestamp` and `receivedAt`
     // populated (see HEYREACH_WEBHOOKS_GUIDE.md), so querying on either field alone
     // would miss nothing — but querying both (to be safe against any legacy docs
     // missing one of the two) requires deduping by doc ID, since a doc can satisfy
     // both queries and get returned twice otherwise.
     const [heyreachByTimestamp, heyreachByReceivedAt] = await Promise.all([
-        loadThisMonth('heyreach_activity', 'timestamp'),
-        loadThisMonth('heyreach_activity', 'receivedAt')
+        loadThisMonth('heyreach_activity', 'timestamp', HEYREACH_SELECT_FIELDS),
+        loadThisMonth('heyreach_activity', 'receivedAt', HEYREACH_SELECT_FIELDS)
     ]);
     const seenHeyreachIds = new Set();
     const heyreachActivities = [];
@@ -1127,7 +1136,7 @@ async function calculateClientDashboardHelper() {
     });
 
     // activity_tracking (meetings + follow-ups) is written with `created_at`.
-    const activityTrackingData = (await loadThisMonth('activity_tracking', 'created_at')).map(({ data }) => data);
+    const activityTrackingData = (await loadThisMonth('activity_tracking', 'created_at', ACTIVITY_TRACKING_SELECT_FIELDS)).map(({ data }) => data);
 
     console.log(`📥 Loaded ${heyreachActivities.length} heyreach_activity + ${activityTrackingData.length} activity_tracking docs for ${monthKey}`);
 
@@ -1212,7 +1221,7 @@ async function calculateClientDashboardHelper() {
 exports.nightlyClientDashboardCalc = functions
     .runWith({
         timeoutSeconds: 540,
-        memory: '512MB'
+        memory: '1GB'
     })
     .pubsub.schedule('0 3 * * *') // 3:00 AM daily
     .timeZone(CONFIG.TIMEZONE)    // America/Denver (Mountain Time)
@@ -1238,7 +1247,7 @@ exports.nightlyClientDashboardCalc = functions
 exports.manualCalculateClientDashboard = functions
     .runWith({
         timeoutSeconds: 540,
-        memory: '512MB'
+        memory: '1GB'
     })
     .https.onRequest(async (req, res) => {
         res.set('Access-Control-Allow-Origin', '*');
