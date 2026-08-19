@@ -894,7 +894,6 @@ body {
 </div>
 
 <script type="module">
-import { ref, get } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js';
 import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
 
 console.log('📊 analysis_results.html v1.0 — Connect Success Analysis');
@@ -1055,44 +1054,31 @@ function outcomeChip(outcome) {
 
 /* ══════════════════════════════════════════════════════════════════
    DATA LOADING
+
+   This demo page only ever reads pre-de-identified static files —
+   Connect_Analysis_<date>_deidentified.json — which now have client/company
+   names swapped for "Company_###" on the database side (see
+   connect/connect_analysis/regenerate_manifest.js). That means this page no
+   longer needs to hit live Firebase or rename anything client-side, which is
+   what used to make it slow to load on the huge full payload.
    ══════════════════════════════════════════════════════════════════ */
 
 let PAYLOAD = null;
-let RUN_CANDIDATES = []; // [{run_date, source: 'firebase'|'local', file?}]
+let RUN_CANDIDATES = []; // [{run_date, file}]
 let CURRENT_RUN_DATE = null;
 let CURRENT_SOURCE = null;
 let CURRENT_RESEARCH = null; // research object for the currently-rendered segment; used by the "compare styles" widget
 
 async function fetchLocalManifest() {
     try {
-        const resp = await fetch('../connect/connect_analysis/manifest.json', { cache: 'no-store' });
+        const resp = await fetch('../connect/connect_analysis/manifest_deidentified.json', { cache: 'no-store' });
         if (!resp.ok) return [];
         const data = await resp.json();
-        return (data.runs || []).map(r => ({ run_date: r.run_date, source: 'local', file: r.file }));
+        return (data.runs || []).map(r => ({ run_date: r.run_date, file: r.file }));
     } catch (e) {
-        console.warn('No local analysis manifest found:', e.message);
+        console.warn('No local de-identified analysis manifest found:', e.message);
         return [];
     }
-}
-
-async function fetchFirebaseIndex() {
-    try {
-        if (!window.database) return [];
-        const snap = await get(ref(window.database, 'ConnectAnalysis/index'));
-        if (!snap.exists()) return [];
-        const val = snap.val();
-        return Object.keys(val).map(d => ({ run_date: d, source: 'firebase' })).sort((a, b) => b.run_date.localeCompare(a.run_date));
-    } catch (e) {
-        console.warn('Firebase ConnectAnalysis/index not available:', e.message);
-        return [];
-    }
-}
-
-async function fetchPayloadFromFirebase(runDate) {
-    if (!window.database) return null;
-    const path = runDate ? `ConnectAnalysis/runs/${runDate}` : 'ConnectAnalysis/latest';
-    const snap = await get(ref(window.database, path));
-    return snap.exists() ? snap.val() : null;
 }
 
 async function fetchPayloadFromLocal(entry) {
@@ -1102,89 +1088,25 @@ async function fetchPayloadFromLocal(entry) {
 }
 
 async function loadRunCandidates() {
-    await window.firebaseReady.catch(() => {});
-    const [fbIndex, localList] = await Promise.all([fetchFirebaseIndex(), fetchLocalManifest()]);
-    const byDate = new Map();
-    // Local entries first so we always know a file to fetch; firebase entries can override/add dates.
-    localList.forEach(r => byDate.set(r.run_date, r));
-    fbIndex.forEach(r => { if (!byDate.has(r.run_date)) byDate.set(r.run_date, r); });
-    return [...byDate.values()].sort((a, b) => b.run_date.localeCompare(a.run_date));
+    return await fetchLocalManifest();
 }
 
 async function loadPayloadForRun(entry) {
-    // Prefer live Firebase data; fall back to a local static file for the same date.
-    try {
-        const fb = await fetchPayloadFromFirebase(entry ? entry.run_date : null);
-        if (fb) return { payload: anonymizePayloadForDemo(fb), source: 'firebase' };
-    } catch (e) {
-        console.warn('Firebase RTDB fetch failed, falling back to local file:', e.message);
-    }
-    // No specific historical run requested — the R pipeline keeps this file current,
-    // mirroring the Firebase ConnectAnalysis/latest node, so it's the preferred local fallback.
+    // No specific historical run requested — latest_deidentified.json always
+    // mirrors the newest dated export (regenerate_manifest.js keeps it current).
     if (!entry) {
         try {
-            const resp = await fetch('../connect/connect_analysis/latest.json', { cache: 'no-store' });
-            if (resp.ok) return { payload: anonymizePayloadForDemo(await resp.json()), source: 'local' };
+            const resp = await fetch('../connect/connect_analysis/latest_deidentified.json', { cache: 'no-store' });
+            if (resp.ok) return { payload: await resp.json(), source: 'local' };
         } catch (e) {
-            console.warn('connect_analysis/latest.json not available:', e.message);
+            console.warn('connect_analysis/latest_deidentified.json not available:', e.message);
         }
     }
     if (entry && entry.file) {
-        const payload = anonymizePayloadForDemo(await fetchPayloadFromLocal(entry));
+        const payload = await fetchPayloadFromLocal(entry);
         return { payload, source: 'local' };
     }
-    throw new Error('No analysis data is available yet. Check back after the next weekly run.');
-}
-
-/* ── Demo-only: hide real client / company names as Company 1, Company 2, … ── */
-function anonymizePayloadForDemo(payload) {
-    if (!payload || typeof payload !== 'object') return payload;
-
-    // Clients first (stable alpha order → Company 1, Company 2, …), then any other
-    // company strings found on example/research records.
-    const nameMap = new Map();
-    const clientEntries = Object.entries(payload.clients || {})
-        .filter(([slug]) => slug !== 'unassigned')
-        .sort((a, b) => ((a[1] && a[1].name) || a[0]).localeCompare((b[1] && b[1].name) || b[0]));
-    clientEntries.forEach(([, seg], i) => {
-        if (seg && seg.name) nameMap.set(seg.name, `Company ${i + 1}`);
-    });
-
-    const otherCompanies = new Set();
-    const collectCompanies = (val) => {
-        if (Array.isArray(val)) { val.forEach(collectCompanies); return; }
-        if (!val || typeof val !== 'object') return;
-        if (typeof val.company === 'string' && val.company && !nameMap.has(val.company)) {
-            otherCompanies.add(val.company);
-        }
-        for (const v of Object.values(val)) collectCompanies(v);
-    };
-    collectCompanies(payload);
-
-    let next = nameMap.size + 1;
-    [...otherCompanies].sort((a, b) => a.localeCompare(b)).forEach(name => {
-        nameMap.set(name, `Company ${next++}`);
-    });
-
-    if (nameMap.size === 0) return payload;
-
-    const pairs = [...nameMap.entries()].sort((a, b) => b[0].length - a[0].length);
-    const replaceIn = (val) => {
-        if (typeof val === 'string') {
-            let s = val;
-            for (const [real, anon] of pairs) {
-                if (real && s.includes(real)) s = s.split(real).join(anon);
-            }
-            return s;
-        }
-        if (Array.isArray(val)) return val.map(replaceIn);
-        if (val && typeof val === 'object') {
-            for (const k of Object.keys(val)) val[k] = replaceIn(val[k]);
-            return val;
-        }
-        return val;
-    };
-    return replaceIn(payload);
+    throw new Error('No de-identified analysis data is available yet. Check back after the next export.');
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1288,7 +1210,7 @@ function renderMetaBadges() {
     document.getElementById('metaBadges').innerHTML = `
         <div class="pill"><i class="fas fa-calendar-check"></i> Run: ${escapeHtml(runDate)}</div>
         <div class="pill"><i class="fas fa-database"></i> ${fmtNum(meta.n_contacts)} contacts · ${fmtNum(meta.n_clients)} clients</div>
-        <div class="pill"><i class="fas fa-${CURRENT_SOURCE === 'firebase' ? 'cloud' : 'file-code'}"></i> ${CURRENT_SOURCE === 'firebase' ? 'Live data' : 'Local snapshot'}</div>
+        <div class="pill"><i class="fas fa-shield-halved"></i> De-identified snapshot</div>
     `;
 }
 
@@ -2950,7 +2872,7 @@ trendCardToggleEl.addEventListener('keydown', e => {
 })();
 
 async function switchRun(runDate) {
-    // Empty value = "Latest" (dynamic — Firebase live data, else local latest.json).
+    // Empty value = "Latest" (local latest_deidentified.json).
     const entry = runDate ? RUN_CANDIDATES.find(r => r.run_date === runDate) : null;
     try {
         const { payload, source } = await loadPayloadForRun(entry);
@@ -3265,7 +3187,7 @@ let _adminAiInstructionsInitialized = false;
 
         RUN_CANDIDATES = await loadRunCandidates();
         // Empty/unrecognized ?run= means "Latest" — pass entry=null so loadPayloadForRun
-        // prefers live Firebase data, then the local latest.json snapshot.
+        // reads the local latest_deidentified.json snapshot.
         const entry = state.run ? RUN_CANDIDATES.find(r => r.run_date === state.run) : null;
         if (!entry) state.run = '';
 

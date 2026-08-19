@@ -167,6 +167,63 @@
             </div>
         </div>
 
+        <!-- ══════════ Apify cost-per-result audit (account-wide, not just this app's runs) ══════════ -->
+        <div class="section">
+            <div class="section-title"><i class="fas fa-magnifying-glass-dollar" style="color: var(--primary);"></i> Apify Cost Audit — measured cost per result, by actor</div>
+            <p class="section-help">
+                The run-level cost breakdown below only covers what this pipeline's own ledger captured. This audit instead pulls
+                <strong>every</strong> actor run straight from Apify's account (<code>GET /v2/actor-runs</code>), looks up each run's real
+                result count from its dataset (<code>GET /v2/datasets/:id</code>), and computes <code>cost_per_result = usageTotalUsd / result_count</code>
+                per actor — so nothing run outside this app's attribution, or missed by the formula-based estimates, gets left out.
+            </p>
+            <div class="filter-row">
+                <div class="form-group">
+                    <label for="fpaRangeSelect">Date Range</label>
+                    <select id="fpaRangeSelect">
+                        <option value="7">Last 7 days</option>
+                        <option value="30" selected>Last 30 days</option>
+                        <option value="90">Last 90 days</option>
+                        <option value="month">This month</option>
+                        <option value="year">This year</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <button class="btn btn-primary" id="fpaRunBtn" onclick="fpaRunAudit(false)"><i class="fas fa-play"></i> Run Audit</button>
+                </div>
+                <div class="form-group">
+                    <button class="btn" id="fpaRefreshBtn" onclick="fpaRunAudit(true)" title="Bypass the cached dataset item counts and re-fetch everything from Apify"><i class="fas fa-rotate"></i> Force Refresh</button>
+                </div>
+                <div class="form-group">
+                    <button class="btn btn-sm" id="fpaExportActorBtn" onclick="fpaExportActorCsv()" disabled><i class="fas fa-download"></i> CSV: by actor</button>
+                </div>
+                <div class="form-group">
+                    <button class="btn btn-sm" id="fpaExportRunsBtn" onclick="fpaExportRunsCsv()" disabled><i class="fas fa-download"></i> CSV: raw runs</button>
+                </div>
+                <div class="form-group" style="margin-left:auto;">
+                    <label>&nbsp;</label>
+                    <span id="fpaStatus" style="font-size:12.5px; color: var(--gray-500);">Not run yet — this queries Apify's own API and can take a little while the first time.</span>
+                </div>
+            </div>
+
+            <div id="fpaStats" class="stat-tiles"></div>
+            <div id="fpaBars" style="margin-bottom: 14px;"></div>
+
+            <div style="max-height: 420px; overflow: auto; border: 1px solid var(--gray-200); border-radius: 8px; display:none;" id="fpaTableWrap">
+                <table class="data-table" id="fpaActorTable">
+                    <thead>
+                        <tr>
+                            <th>Actor</th><th>Runs</th><th>Succeeded</th><th>Failed</th>
+                            <th>Total Cost</th><th>Cost Measured</th>
+                            <th>Total Results</th><th>Results Measured</th>
+                            <th>Avg Results/Run</th><th>Avg Cost/Run</th><th>Cost / Result</th>
+                            <th>First Seen</th><th>Last Seen</th>
+                        </tr>
+                    </thead>
+                    <tbody id="fpaActorBody"></tbody>
+                </table>
+            </div>
+        </div>
+
         <!-- ══════════ Aggregate across selected runs ══════════ -->
         <div class="section">
             <div class="section-title"><i class="fas fa-layer-group" style="color: var(--primary);"></i> Aggregate (all runs currently listed above)</div>
@@ -249,6 +306,9 @@
         const escHtml = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         const fmtPct = (n, d) => d > 0 ? Math.round((n / d) * 100) : 0;
         const fmtUsd = n => '$' + (Number(n) || 0).toFixed(2);
+
+        const RAILWAY_API = 'https://railwayclemail-production.up.railway.app';
+        let fpCurrentUser = null;
 
         // Friendly labels for reason-bucket keys used by hypothesisTally + noMessageTally
         const FPD_REASON_LABELS = {
@@ -643,10 +703,162 @@
         };
 
         // ════════════════════════════════════════════════════════════════════
+        // APIFY COST AUDIT — account-wide cost_per_result by actor
+        // Pulls GET /v2/actor-runs + GET /v2/datasets/:id via the Railway backend
+        // (/api/apify-ledger/actor-stats) and renders the results. See section markup above.
+        // ════════════════════════════════════════════════════════════════════
+        let fpaLastResult = null;
+
+        function fpaSinceIso() {
+            const v = document.getElementById('fpaRangeSelect').value;
+            const now = new Date();
+            let since;
+            if (v === 'month') since = new Date(now.getFullYear(), now.getMonth(), 1);
+            else if (v === 'year') since = new Date(now.getFullYear(), 0, 1);
+            else since = new Date(Date.now() - parseInt(v, 10) * 86400000);
+            return since.toISOString();
+        }
+
+        window.fpaRunAudit = async function (forceRefresh) {
+            if (!fpCurrentUser) { alert('Not signed in yet — try again in a moment.'); return; }
+            const runBtn = document.getElementById('fpaRunBtn');
+            const refreshBtn = document.getElementById('fpaRefreshBtn');
+            const statusEl = document.getElementById('fpaStatus');
+            runBtn.disabled = true; refreshBtn.disabled = true;
+            statusEl.textContent = forceRefresh
+                ? '⏳ Re-auditing from scratch (bypassing the dataset item-count cache) — this can take a minute for a large window…'
+                : '⏳ Pulling actor runs from Apify and resolving result counts…';
+            try {
+                const sinceIso = fpaSinceIso();
+                const token = await fpCurrentUser.getIdToken();
+                const params = new URLSearchParams({ since: sinceIso });
+                if (forceRefresh) params.set('refresh', '1');
+                const resp = await fetch(`${RAILWAY_API}/api/apify-ledger/actor-stats?${params.toString()}`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data.success) {
+                    statusEl.textContent = `❌ Audit failed: ${data.error || `HTTP ${resp.status}`}`;
+                    return;
+                }
+                fpaLastResult = data;
+                fpaRender(data);
+                statusEl.textContent = `✅ ${data.totals.runs} run(s) since ${new Date(data.sinceIso).toLocaleDateString()} — ${data.datasetsResolved} dataset(s) checked for result counts.`;
+                document.getElementById('fpaExportActorBtn').disabled = false;
+                document.getElementById('fpaExportRunsBtn').disabled = false;
+            } catch (e) {
+                statusEl.textContent = `❌ Audit error: ${e.message}`;
+            } finally {
+                runBtn.disabled = false; refreshBtn.disabled = false;
+            }
+        };
+
+        function fpaFmtCostPerResult(v) {
+            if (v == null) return '—';
+            return '$' + (v < 0.01 ? v.toFixed(4) : v.toFixed(3));
+        }
+
+        function fpaRender(data) {
+            const t = data.totals;
+            document.getElementById('fpaStats').innerHTML = `
+                <div class="stat-tile"><div class="num">${t.runs}</div><div class="lbl">Total Runs</div></div>
+                <div class="stat-tile"><div class="num">${fmtUsd(t.totalCostUsd)}</div><div class="lbl">Total Cost (${t.runsWithCost}/${t.runs} measured)</div></div>
+                <div class="stat-tile"><div class="num">${t.totalResults.toLocaleString()}</div><div class="lbl">Total Results (${t.runsWithResults}/${t.runs} measured)</div></div>
+                <div class="stat-tile"><div class="num">${fpaFmtCostPerResult(t.costPerResult)}</div><div class="lbl">Overall Cost / Result</div></div>
+                <div class="stat-tile"><div class="num">${(data.byActor || []).length}</div><div class="lbl">Distinct Actors</div></div>
+            `;
+
+            const withCpr = (data.byActor || []).filter(a => a.costPerResult != null);
+            if (withCpr.length) {
+                const max = Math.max(...withCpr.map(a => a.costPerResult));
+                document.getElementById('fpaBars').innerHTML = `
+                    <h4 style="font-size:12.5px; color:var(--gray-700); margin:0 0 8px;">Cost per result by actor (lower is more efficient)</h4>
+                    ${withCpr.sort((a, b) => b.costPerResult - a.costPerResult).map(a => `
+                        <div class="bar-row">
+                            <div class="bar-label" title="${escHtml(a.actorId)}">${escHtml(a.actorId)}</div>
+                            <div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, Math.round(a.costPerResult / max * 100))}%; background:#2563eb;"></div></div>
+                            <div class="bar-value">${fpaFmtCostPerResult(a.costPerResult)}</div>
+                        </div>
+                    `).join('')}
+                `;
+            } else {
+                document.getElementById('fpaBars').innerHTML = '<div class="empty-hint">No actor had both a measured cost and a measured result count in this window.</div>';
+            }
+
+            document.getElementById('fpaTableWrap').style.display = 'block';
+            document.getElementById('fpaActorBody').innerHTML = (data.byActor || []).map(a => `
+                <tr>
+                    <td><code>${escHtml(a.actorId)}</code></td>
+                    <td>${a.runs}</td>
+                    <td>${a.succeededRuns}</td>
+                    <td>${a.failedRuns}</td>
+                    <td><strong>${fmtUsd(a.totalCostUsd)}</strong></td>
+                    <td>${a.runsWithCost}/${a.runs}</td>
+                    <td>${a.totalResults.toLocaleString()}</td>
+                    <td>${a.runsWithResults}/${a.runs}</td>
+                    <td>${a.avgResultsPerRun ?? '—'}</td>
+                    <td>${a.avgCostPerRun != null ? fmtUsd(a.avgCostPerRun) : '—'}</td>
+                    <td><strong>${fpaFmtCostPerResult(a.costPerResult)}</strong></td>
+                    <td style="font-size:11px;">${a.firstStartedAt ? new Date(a.firstStartedAt).toLocaleDateString() : '—'}</td>
+                    <td style="font-size:11px;">${a.lastStartedAt ? new Date(a.lastStartedAt).toLocaleDateString() : '—'}</td>
+                </tr>
+            `).join('') || '<tr><td colspan="13" class="empty-hint">No actor runs found in this window.</td></tr>';
+        }
+
+        function fpaCsvEscape(v) {
+            const s = String(v ?? '');
+            return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        }
+        function fpaDownloadCsv(filename, rows, cols) {
+            const header = cols.map(c => c.label).join(',');
+            const body = rows.map(r => cols.map(c => fpaCsvEscape(c.get(r))).join(',')).join('\n');
+            const blob = new Blob([header + '\n' + body], { type: 'text/csv' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob); a.download = filename;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            URL.revokeObjectURL(a.href);
+        }
+
+        window.fpaExportActorCsv = function () {
+            if (!fpaLastResult) return;
+            fpaDownloadCsv(`apify_cost_by_actor_${new Date().toISOString().split('T')[0]}.csv`, fpaLastResult.byActor, [
+                { label: 'Actor', get: r => r.actorId },
+                { label: 'Runs', get: r => r.runs },
+                { label: 'Succeeded', get: r => r.succeededRuns },
+                { label: 'Failed', get: r => r.failedRuns },
+                { label: 'Total Cost USD', get: r => r.totalCostUsd },
+                { label: 'Runs With Cost', get: r => r.runsWithCost },
+                { label: 'Total Results', get: r => r.totalResults },
+                { label: 'Runs With Results', get: r => r.runsWithResults },
+                { label: 'Avg Results Per Run', get: r => r.avgResultsPerRun },
+                { label: 'Avg Cost Per Run', get: r => r.avgCostPerRun },
+                { label: 'Cost Per Result', get: r => r.costPerResult },
+                { label: 'First Started At', get: r => r.firstStartedAt },
+                { label: 'Last Started At', get: r => r.lastStartedAt }
+            ]);
+        };
+
+        window.fpaExportRunsCsv = function () {
+            if (!fpaLastResult) return;
+            fpaDownloadCsv(`apify_runs_raw_${new Date().toISOString().split('T')[0]}.csv`, fpaLastResult.runs, [
+                { label: 'Run ID', get: r => r.runId },
+                { label: 'Actor', get: r => r.actorId },
+                { label: 'Started At', get: r => r.startedAt },
+                { label: 'Finished At', get: r => r.finishedAt },
+                { label: 'Status', get: r => r.status },
+                { label: 'Usage Total USD', get: r => r.usageTotalUsd },
+                { label: 'Default Dataset ID', get: r => r.defaultDatasetId },
+                { label: 'Result Count', get: r => r.resultCount },
+                { label: 'Cost Per Result', get: r => r.costPerResult }
+            ]);
+        };
+
+        // ════════════════════════════════════════════════════════════════════
         // INIT
         // ════════════════════════════════════════════════════════════════════
         onAuthStateChanged(auth, async (user) => {
             if (!user) return;
+            fpCurrentUser = user;
             await fpdLoadRuns();
         });
     </script>
