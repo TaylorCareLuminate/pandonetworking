@@ -172,6 +172,7 @@ Exclude individual contributors with no sales or leadership scope, purely B2C/re
                 <select id="aiModelSelect">
                     <option value="">— Select a model —</option>
                 </select>
+                <div style="font-size:0.74rem;color:var(--gray);margin-top:3px;max-width:280px;">Reasoning effort is capped low automatically so the model spends its budget on the JSON answer, not hidden "thinking".</div>
             </div>
             <div>
                 <label>Limit this run to first N unscored (blank = no limit)</label>
@@ -535,28 +536,50 @@ Respond with ONLY a valid JSON array, one object per candidate, IN THE SAME ORDE
 [{"i":0,"keep":true,"seniority":"VP+","b2bSalesEvidence":"short evidence phrase","reason":"short reason, especially if excluded"}]`;
     }
 
-    async function callAiProfileEval(prompt, model, { timeoutMs = 45000 } = {}) {
+    // Retries a few times before giving up — the backend route can transiently 500
+    // (e.g. a "thinking" model burning its whole token budget on hidden reasoning
+    // and returning empty content) or the connection can drop mid-request (which
+    // Chrome surfaces as a misleading CORS error since no response ever came back).
+    // `lowReasoning: true` asks the backend to cap hidden reasoning effort for ANY
+    // model (the backend only does this automatically for a few model families),
+    // which is the main fix for the empty-response 500s.
+    async function callAiProfileEval(prompt, model, { timeoutMs = 60000, maxAttempts = 3 } = {}) {
         const RAILWAY_BASE = 'https://railwayclemail-production.up.railway.app';
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-        try {
-            const resp = await fetch(`${RAILWAY_BASE}/api/ai-profile-eval`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ provider: 'openrouter', model, prompt, temperature: 0.1, max_tokens: 2200 }),
-                signal: controller.signal
-            });
-            if (!resp.ok) throw new Error(`API error ${resp.status}`);
-            const data = await resp.json();
-            if (!data.success) throw new Error(data.error || 'AI eval failed');
-            const text = (data.message || data.rawResponse || '').trim();
-            const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-            const match = cleaned.match(/\[[\s\S]*\]/);
-            if (!match) throw new Error('AI response was not valid JSON');
-            return JSON.parse(match[0]);
-        } finally {
-            clearTimeout(timer);
+        let lastErr;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const resp = await fetch(`${RAILWAY_BASE}/api/ai-profile-eval`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        provider: 'openrouter',
+                        model,
+                        prompt,
+                        temperature: 0.1,
+                        max_tokens: 3000,
+                        lowReasoning: true
+                    }),
+                    signal: controller.signal
+                });
+                const data = await resp.json().catch(() => null);
+                if (!resp.ok || !data) throw new Error((data && data.error) ? data.error : `API error ${resp.status}`);
+                if (!data.success) throw new Error(data.error || 'AI eval failed');
+                const text = (data.message || data.rawResponse || '').trim();
+                const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+                const match = cleaned.match(/\[[\s\S]*\]/);
+                if (!match) throw new Error(`AI response was not valid JSON (got: "${text.slice(0, 140)}")`);
+                return JSON.parse(match[0]);
+            } catch (e) {
+                lastErr = e.name === 'AbortError' ? new Error(`Timed out after ${timeoutMs / 1000}s`) : e;
+                console.warn(`[Open to Work Finder] AI eval attempt ${attempt}/${maxAttempts} failed: ${lastErr.message}`);
+                if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 1200 * attempt));
+            } finally {
+                clearTimeout(timer);
+            }
         }
+        throw lastErr;
     }
 
     function chunk(arr, n) { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; }
@@ -596,7 +619,7 @@ Respond with ONLY a valid JSON array, one object per candidate, IN THE SAME ORDE
                 .slice(0, limitVal);
         }
 
-        const BATCH = 6, CONCURRENCY = 3;
+        const BATCH = 4, CONCURRENCY = 2;
         const batches = chunk(pool, BATCH);
         const btn = document.getElementById('btnRunAi');
         btn.disabled = true;
