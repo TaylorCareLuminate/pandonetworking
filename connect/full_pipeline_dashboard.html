@@ -208,15 +208,16 @@
             <div id="fpaStats" class="stat-tiles"></div>
             <div id="fpaBars" style="margin-bottom: 14px;"></div>
 
-            <div style="max-height: 420px; overflow: auto; border: 1px solid var(--gray-200); border-radius: 8px; display:none;" id="fpaTableWrap">
+            <div style="max-height: 480px; overflow: auto; border: 1px solid var(--gray-200); border-radius: 8px; display:none;" id="fpaTableWrap">
                 <table class="data-table" id="fpaActorTable">
                     <thead>
                         <tr>
-                            <th>Actor</th><th>Runs</th><th>Succeeded</th><th>Failed</th>
+                            <th style="width:20px;"></th>
+                            <th>Actor Name</th><th>Actor ID</th><th>Runs</th><th>Succeeded</th><th>Failed</th>
                             <th>Total Cost</th><th>Cost Measured</th>
                             <th>Total Results</th><th>Results Measured</th>
-                            <th>Avg Results/Run</th><th>Avg Cost/Run</th><th>Cost / Result</th>
-                            <th>First Seen</th><th>Last Seen</th>
+                            <th>Cost Model (cost ≈ fixed + $/record)</th><th>Fit</th>
+                            <th>Cost / Result</th>
                         </tr>
                     </thead>
                     <tbody id="fpaActorBody"></tbody>
@@ -424,7 +425,7 @@
 
         // ── Aggregation helper — sums numeric totals + reason tallies across a list of runs ──
         function fpdAggregate(runs) {
-            const totals = { orgs: 0, contactsScanned: 0, matched: 0, dropped: 0, messages: 0, costUsd: 0, costKnownRuns: 0 };
+            const totals = { orgs: 0, contactsScanned: 0, matched: 0, dropped: 0, messages: 0, costUsd: 0, costKnownRuns: 0, modeledCostUsd: 0, modeledCostKnownRuns: 0 };
             const hypTally = {}, noMsgTally = {}, postTypeTally = {};
             for (const r of runs) {
                 const t = r.totals || {};
@@ -435,6 +436,10 @@
                 totals.messages += t.messages || 0;
                 const cost = fpdRunCostUsd(r);
                 if (cost != null) { totals.costUsd += cost; totals.costKnownRuns++; }
+                // Data-driven adjustment (see Apify Cost Audit section) — only populated once
+                // that audit has been run this session and covers this run's contact-search actor.
+                const modeled = fpaModeledContactSearchCost(t);
+                if (modeled) { totals.modeledCostUsd += modeled.modeledUsd; totals.modeledCostKnownRuns++; }
                 for (const [k, v] of Object.entries(t.hypothesisTally || {})) hypTally[k] = (hypTally[k] || 0) + (v || 0);
                 for (const [k, v] of Object.entries(t.noMessageTally || {})) noMsgTally[k] = (noMsgTally[k] || 0) + (v || 0);
                 for (const [k, v] of Object.entries(t.postTypeTally || {})) postTypeTally[k] = (postTypeTally[k] || 0) + (v || 0);
@@ -468,6 +473,7 @@
                 <div class="stat-tile"><div class="num">${agg.totals.messages}</div><div class="lbl">Messages Saved</div></div>
                 <div class="stat-tile ${conv < 50 ? 'warn' : ''}"><div class="num">${conv}%</div><div class="lbl">Matched → Messaged</div></div>
                 <div class="stat-tile"><div class="num">${fmtUsd(agg.totals.costUsd)}</div><div class="lbl">Cost (${agg.totals.costKnownRuns}/${fpdFilteredRuns.length} runs measured)</div></div>
+                ${fpaLastResult ? `<div class="stat-tile"><div class="num">${fmtUsd(agg.totals.modeledCostUsd)}</div><div class="lbl">Modeled Contact-Search Cost (${agg.totals.modeledCostKnownRuns}/${fpdFilteredRuns.length} runs, from Cost Audit)</div></div>` : ''}
             `;
             fpdRenderBars('fpdAggHypBars', agg.hypTally, '#f59e0b');
             fpdRenderBars('fpdAggNoMsgBars', agg.noMsgTally, '#ef4444');
@@ -502,9 +508,23 @@
             fpdRenderBars('fpdRunNoMsgBars', t.noMessageTally, '#ef4444');
             fpdRenderBars('fpdRunPostTypeBars', t.postTypeTally, '#2563eb', fpdPostTypeLabel);
 
+            fpdRenderCostBreakdown();
+
+            fpdOrgSort = 'order';
+            fpdRenderOrgsTable();
+        };
+
+        // Renders the static (ledger-derived) cost breakdown plus, when the Apify Cost Audit
+        // above has been run, a data-driven "modeled" adjustment for the contact-search bucket.
+        // Called both when a run is first selected and whenever the audit is (re)run, so the
+        // modeled panel reflects whichever audit window is currently loaded.
+        function fpdRenderCostBreakdown() {
+            if (!fpdSelectedRun) return;
+            const t = fpdSelectedRun.totals || {};
             const rb = t.realCostBreakdown;
+            let html;
             if (rb) {
-                document.getElementById('fpdCostBreakdown').innerHTML = `
+                html = `
                     <div class="detail-panel">
                         <h4>Cost breakdown</h4>
                         <table class="mini-table">
@@ -516,12 +536,10 @@
                         </table>
                     </div>`;
             } else {
-                document.getElementById('fpdCostBreakdown').innerHTML = '<div class="empty-hint">No cost breakdown saved for this run.</div>';
+                html = '<div class="empty-hint">No cost breakdown saved for this run.</div>';
             }
-
-            fpdOrgSort = 'order';
-            fpdRenderOrgsTable();
-        };
+            document.getElementById('fpdCostBreakdown').innerHTML = html + fpaModeledCostHtml(t);
+        }
 
         function fpdOrgConversion(org) {
             return fmtPct(org.messagesGenerated || 0, org.matched || 0);
@@ -746,6 +764,8 @@
                 statusEl.textContent = `✅ ${data.totals.runs} run(s) since ${new Date(data.sinceIso).toLocaleDateString()} — ${data.datasetsResolved} dataset(s) checked for result counts.`;
                 document.getElementById('fpaExportActorBtn').disabled = false;
                 document.getElementById('fpaExportRunsBtn').disabled = false;
+                fpdRenderCostBreakdown(); // refresh the selected run's modeled-cost panel, if one is open
+                fpdRenderAggregate();     // refresh the aggregate's modeled-cost tile
             } catch (e) {
                 statusEl.textContent = `❌ Audit error: ${e.message}`;
             } finally {
@@ -786,9 +806,13 @@
             }
 
             document.getElementById('fpaTableWrap').style.display = 'block';
-            document.getElementById('fpaActorBody').innerHTML = (data.byActor || []).map(a => `
-                <tr>
-                    <td><code>${escHtml(a.actorId)}</code></td>
+            document.getElementById('fpaActorBody').innerHTML = (data.byActor || []).map((a, idx) => {
+                const rowId = `fpa-actor-${idx}`;
+                return `
+                <tr onclick="fpaToggleChart('${rowId}')" style="cursor:pointer;">
+                    <td><i class="fas fa-caret-right" id="${rowId}-caret"></i></td>
+                    <td>${escHtml(a.actorName)}</td>
+                    <td><code style="font-size:11px;">${escHtml(a.actorId)}</code></td>
                     <td>${a.runs}</td>
                     <td>${a.succeededRuns}</td>
                     <td>${a.failedRuns}</td>
@@ -796,13 +820,70 @@
                     <td>${a.runsWithCost}/${a.runs}</td>
                     <td>${a.totalResults.toLocaleString()}</td>
                     <td>${a.runsWithResults}/${a.runs}</td>
-                    <td>${a.avgResultsPerRun ?? '—'}</td>
-                    <td>${a.avgCostPerRun != null ? fmtUsd(a.avgCostPerRun) : '—'}</td>
+                    <td style="font-size:12px;">${fpaModelFormula(a)}</td>
+                    <td style="font-size:11px;">${a.modelR2 != null ? `R²=${a.modelR2} (n=${a.modelSampleSize})` : '—'}</td>
                     <td><strong>${fpaFmtCostPerResult(a.costPerResult)}</strong></td>
-                    <td style="font-size:11px;">${a.firstStartedAt ? new Date(a.firstStartedAt).toLocaleDateString() : '—'}</td>
-                    <td style="font-size:11px;">${a.lastStartedAt ? new Date(a.lastStartedAt).toLocaleDateString() : '—'}</td>
                 </tr>
-            `).join('') || '<tr><td colspan="13" class="empty-hint">No actor runs found in this window.</td></tr>';
+                <tr id="${rowId}" style="display:none;"><td colspan="13">${fpaCostCurveChart(a)}</td></tr>
+            `; }).join('') || '<tr><td colspan="13" class="empty-hint">No actor runs found in this window.</td></tr>';
+        }
+
+        function fpaModelFormula(a) {
+            if (a.costPerRecordUsd == null) return '<span class="empty-hint">not enough data (need 2+ runs)</span>';
+            return `${fmtUsd(a.fixedCostUsd)} + ${fpaFmtCostPerResult(a.costPerRecordUsd)}/record`;
+        }
+
+        window.fpaToggleChart = function (rowId) {
+            const row = document.getElementById(rowId);
+            const caret = document.getElementById(`${rowId}-caret`);
+            if (!row) return;
+            const show = row.style.display === 'none';
+            row.style.display = show ? '' : 'none';
+            if (caret) caret.className = show ? 'fas fa-caret-down' : 'fas fa-caret-right';
+        };
+
+        // Renders an inline SVG scatter plot of (resultCount, usageTotalUsd) for one actor's
+        // runs, plus its fitted cost-curve line — the "cost curve" visualization.
+        function fpaCostCurveChart(a) {
+            const points = (fpaLastResult?.runs || [])
+                .filter(r => r.actorId === a.actorId && r.usageTotalUsd != null && r.resultCount != null)
+                .map(r => ({ x: r.resultCount, y: r.usageTotalUsd }));
+            if (points.length < 2) {
+                return '<div class="empty-hint" style="padding:8px 0;">Not enough runs with both a measured cost and a measured result count to plot a curve.</div>';
+            }
+            const W = 560, H = 220, PAD = 40;
+            const maxX = Math.max(...points.map(p => p.x), 1);
+            const maxY = Math.max(...points.map(p => p.y), a.fixedCostUsd || 0, 0.01);
+            const sx = x => PAD + (x / maxX) * (W - PAD * 2);
+            const sy = y => H - PAD - (y / maxY) * (H - PAD * 2);
+
+            const dots = points.map(p => `<circle cx="${sx(p.x).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="3.5" fill="#2563eb" fill-opacity="0.55"></circle>`).join('');
+
+            let lineSvg = '';
+            if (a.costPerRecordUsd != null) {
+                const y0 = a.fixedCostUsd;
+                const y1 = a.fixedCostUsd + a.costPerRecordUsd * maxX;
+                lineSvg = `<line x1="${sx(0).toFixed(1)}" y1="${sy(y0).toFixed(1)}" x2="${sx(maxX).toFixed(1)}" y2="${sy(y1).toFixed(1)}" stroke="#ef4444" stroke-width="2"></line>`;
+            }
+
+            return `
+                <div class="detail-panel">
+                    <h4>📈 Cost curve — ${escHtml(a.actorName)} <span style="font-weight:400; color:var(--gray-500); text-transform:none;">(${escHtml(a.actorId)})</span></h4>
+                    <svg viewBox="0 0 ${W} ${H}" style="width:100%; max-width:${W}px; height:${H}px; background:white; border:1px solid var(--gray-200); border-radius:6px;">
+                        <line x1="${PAD}" y1="${H - PAD}" x2="${W - PAD}" y2="${H - PAD}" stroke="var(--gray-300)"></line>
+                        <line x1="${PAD}" y1="${PAD}" x2="${PAD}" y2="${H - PAD}" stroke="var(--gray-300)"></line>
+                        <text x="${PAD}" y="${H - 8}" font-size="10" fill="var(--gray-500)">0</text>
+                        <text x="${W - PAD}" y="${H - 8}" font-size="10" fill="var(--gray-500)" text-anchor="end">${maxX.toLocaleString()} records</text>
+                        <text x="4" y="${PAD}" font-size="10" fill="var(--gray-500)">${fmtUsd(maxY)}</text>
+                        <text x="4" y="${H - PAD}" font-size="10" fill="var(--gray-500)">$0</text>
+                        ${dots}
+                        ${lineSvg}
+                    </svg>
+                    <div style="font-size:12px; color:var(--gray-600); margin-top:6px;">
+                        Blue dots = actual runs (result count vs. measured cost). Red line = fitted model:
+                        <strong>${fpaModelFormula(a)}</strong>, R² = ${a.modelR2 ?? '—'} over ${a.modelSampleSize ?? 0} run(s).
+                    </div>
+                </div>`;
         }
 
         function fpaCsvEscape(v) {
@@ -822,7 +903,8 @@
         window.fpaExportActorCsv = function () {
             if (!fpaLastResult) return;
             fpaDownloadCsv(`apify_cost_by_actor_${new Date().toISOString().split('T')[0]}.csv`, fpaLastResult.byActor, [
-                { label: 'Actor', get: r => r.actorId },
+                { label: 'Actor Name', get: r => r.actorName },
+                { label: 'Actor ID', get: r => r.actorId },
                 { label: 'Runs', get: r => r.runs },
                 { label: 'Succeeded', get: r => r.succeededRuns },
                 { label: 'Failed', get: r => r.failedRuns },
@@ -833,10 +915,65 @@
                 { label: 'Avg Results Per Run', get: r => r.avgResultsPerRun },
                 { label: 'Avg Cost Per Run', get: r => r.avgCostPerRun },
                 { label: 'Cost Per Result', get: r => r.costPerResult },
+                { label: 'Fixed Cost USD (model)', get: r => r.fixedCostUsd },
+                { label: 'Cost Per Record USD (model)', get: r => r.costPerRecordUsd },
+                { label: 'Model R2', get: r => r.modelR2 },
+                { label: 'Model Sample Size', get: r => r.modelSampleSize },
                 { label: 'First Started At', get: r => r.firstStartedAt },
                 { label: 'Last Started At', get: r => r.lastStartedAt }
             ]);
         };
+
+        // ── Adjust the run's own contact-search cost using the fitted actor cost curve ──
+        // The report's own "contact search" bucket comes from either the Harvest actor
+        // (harvestapi~linkedin-company-employees) or its Bebity fallback
+        // (bebity~linkedin-premium-actor) — report.totals.scanJob{Harvest,Bebity}Usd tells us
+        // which one this specific run actually used. If the Apify Cost Audit above has fitted
+        // that same actor's cost curve, recompute the bucket as fixedCostUsd + costPerRecordUsd
+        // × contactsScanned instead of the flat per-1000 formula, and show both side by side.
+        const FPA_CONTACT_SEARCH_ACTORS = {
+            harvest: 'harvestapi~linkedin-company-employees',
+            bebity:  'bebity~linkedin-premium-actor'
+        };
+        const FPA_MIN_MODEL_SAMPLE = 3;
+
+        function fpaModeledContactSearchCost(t) {
+            if (!fpaLastResult) return null;
+            const usedHarvest = (t.scanJobHarvestUsd || 0) > 0;
+            const usedBebity  = (t.scanJobBebityUsd  || 0) > 0;
+            const actorId = usedHarvest ? FPA_CONTACT_SEARCH_ACTORS.harvest
+                          : (usedBebity ? FPA_CONTACT_SEARCH_ACTORS.bebity : null);
+            if (!actorId) return null;
+            const model = (fpaLastResult.byActor || []).find(a => a.actorId === actorId);
+            if (!model || model.costPerRecordUsd == null || (model.modelSampleSize || 0) < FPA_MIN_MODEL_SAMPLE) return null;
+            const contactsScanned = t.contactsScanned || 0;
+            const modeledUsd = Math.max(0, model.fixedCostUsd + model.costPerRecordUsd * contactsScanned);
+            return { actorId, actorName: model.actorName, model, contactsScanned, modeledUsd };
+        }
+
+        function fpaModeledCostHtml(t) {
+            const m = fpaModeledContactSearchCost(t);
+            if (!m) {
+                return `<div class="detail-panel"><h4>📈 Data-driven cost model</h4>
+                    <div class="empty-hint">${fpaLastResult
+                        ? 'The loaded Apify Cost Audit doesn\'t have 3+ measured runs of this run\'s contact-search actor yet — try a wider date range and re-run the audit.'
+                        : 'Run the Apify Cost Audit above to compare this run\'s contact-search cost against a data-driven model.'}</div>
+                </div>`;
+            }
+            const shownUsd = t.realCostBreakdown?.contactSearchDisplayUsd;
+            const delta = shownUsd != null ? m.modeledUsd - shownUsd : null;
+            return `
+                <div class="detail-panel">
+                    <h4>📈 Data-driven cost model — adjusted contact-search estimate</h4>
+                    <table class="mini-table">
+                        <tr><td>Actor used this run</td><td>${escHtml(m.actorName)} <span class="badge badge-gray">${escHtml(m.actorId)}</span></td></tr>
+                        <tr><td>Fitted cost curve</td><td>${fpaModelFormula(m.model)} (R²=${m.model.modelR2 ?? '—'}, n=${m.model.modelSampleSize ?? 0})</td></tr>
+                        <tr><td>Contacts scanned this run</td><td>${m.contactsScanned.toLocaleString()}</td></tr>
+                        <tr><td>Currently shown cost (fallback formula/measured)</td><td>${shownUsd != null ? fmtUsd(shownUsd) : '—'}</td></tr>
+                        <tr><td><strong>Modeled cost (from Apify Cost Audit)</strong></td><td><strong>${fmtUsd(m.modeledUsd)}</strong>${delta != null ? ` <span class="badge ${delta > 0 ? 'badge-red' : 'badge-green'}">${delta > 0 ? '+' : ''}${fmtUsd(delta)}</span>` : ''}</td></tr>
+                    </table>
+                </div>`;
+        }
 
         window.fpaExportRunsCsv = function () {
             if (!fpaLastResult) return;
