@@ -1270,6 +1270,7 @@
         }
         /* ── "Due for follow-up right now" circle — computed instantly from dates/counts, no AI ── */
         .followups-due-circle {
+            position: relative;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -1284,6 +1285,24 @@
             box-shadow: 0 4px 14px rgba(13, 148, 136, 0.35);
             transition: transform 0.15s ease, box-shadow 0.15s ease;
             flex-shrink: 0;
+        }
+        .followups-due-circle-blocked-badge {
+            position: absolute;
+            top: -6px;
+            right: -6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 22px;
+            height: 22px;
+            padding: 0 5px;
+            border-radius: 999px;
+            background: #f59e0b;
+            color: white;
+            font-size: 0.7rem;
+            font-weight: 800;
+            border: 2px solid white;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.25);
         }
         .followups-due-circle:hover {
             transform: scale(1.05);
@@ -2140,6 +2159,7 @@
                 <div class="followups-due-circle followups-due-circle-empty" id="followUpsDueCircle" onclick="showFollowUpsDueNowList()" title="Nothing is due for a follow-up right now">
                     <span class="followups-due-circle-count" id="followUpsDueCircleCount">0</span>
                     <span class="followups-due-circle-label">due for<br>follow-up</span>
+                    <span class="followups-due-circle-blocked-badge" id="followUpsDueCircleBlockedBadge" style="display:none;">0</span>
                 </div>
                 <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 0.5rem; padding-top: 0.25rem;">
                     <button class="btn-export-pdf" id="exportPDFBtn" onclick="exportPDFReport()">
@@ -7291,6 +7311,7 @@
         // sent (first follow-up is always human-written) never show up here.
         function computeFollowUpsDueNow(conversations) {
             const due = [];
+            const blocked = [];
             (conversations || []).forEach(conv => {
                 const followUpCategory = conv.followUpCategory || 'No Follow Up';
                 if (followUpCategory === 'Qualified Wrong Contact') return;
@@ -7308,6 +7329,16 @@
 
                 if (conv.followUpSequence?.status === 'pending_review') return; // already drafted, awaiting review
 
+                // Respect a manually-set Follow-Up Scheduler date (localStorage, see
+                // getFollowUpForConv() below) — if the user deferred this contact to a future
+                // date, it isn't "due" yet even if the 14/10-day spacing rule would otherwise allow it.
+                const scheduled = typeof getFollowUpForConv === 'function' ? getFollowUpForConv(conv.id) : null;
+                if (scheduled && scheduled.date) {
+                    const n = new Date();
+                    const todayStr = `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
+                    if (scheduled.date > todayStr) return; // scheduler day hasn't passed yet
+                }
+
                 const nextStep = invitesSent + 1;
                 const isWillingToMeetStep2 = responseCategory === 'Response Willing to Meet' && nextStep === 2;
                 const lastMessageDate = getConvLastMessageDate(conv);
@@ -7324,7 +7355,7 @@
                 const contactName = (conv.leadFirstName && conv.leadLastName)
                     ? `${conv.leadFirstName} ${conv.leadLastName}`
                     : (conv.lead_name || conv.leadFirstName || 'Unknown');
-                due.push({
+                const item = {
                     id: conv.id,
                     contactName,
                     company: conv.companyName || conv.leadCompany || conv.company || '',
@@ -7335,22 +7366,62 @@
                     nextStep,
                     daysSinceAnchor: daysSinceAnchor != null ? Math.floor(daysSinceAnchor) : null,
                     anchorLabel: isWillingToMeetStep2 ? 'last message' : 'last invitation'
-                });
+                };
+
+                // Mirrors the backend's per-BDR setup gates exactly (see scanOneBdr() in
+                // server.js) — a missing calendar link blocks BOTH sequences entirely (every
+                // message template references it), and missing EA outreach settings
+                // specifically blocks "Response Willing to Meet" (its messages are written as
+                // the BDR's executive assistant). Without this, the circle would count contacts
+                // as "due" that the actual scan will silently skip until the BDR's profile is
+                // filled in — which is exactly the confusion this circle is meant to prevent.
+                const canonicalBdrEmail = typeof resolveCanonicalBdrEmail === 'function'
+                    ? resolveCanonicalBdrEmail(conv.bdrEmail || '')
+                    : (conv.bdrEmail || '');
+                const bdrProfile = (typeof bdrProfileCache !== 'undefined' && bdrProfileCache.get)
+                    ? bdrProfileCache.get((canonicalBdrEmail || '').toLowerCase())
+                    : null;
+                if (!bdrProfile || !bdrProfile.calendarLink) {
+                    item.blockedReason = `${conv.bdrEmail || 'This BDR'} has no calendar link saved yet — add one in About Me first`;
+                    blocked.push(item);
+                    return;
+                }
+                if (responseCategory === 'Response Willing to Meet' && !bdrProfile.eaOutreach) {
+                    item.blockedReason = `${conv.bdrEmail || 'This BDR'} has no executive-assistant outreach settings saved yet — add them in About Me first`;
+                    blocked.push(item);
+                    return;
+                }
+
+                due.push(item);
             });
-            return due;
+            return { due, blocked };
         }
 
         function updateFollowUpsDueNowCircle(conversationsInScope) {
             const circle = document.getElementById('followUpsDueCircle');
             const countEl = document.getElementById('followUpsDueCircleCount');
+            const blockedBadge = document.getElementById('followUpsDueCircleBlockedBadge');
             if (!circle || !countEl) return;
-            const due = computeFollowUpsDueNow(conversationsInScope);
+            const { due, blocked } = computeFollowUpsDueNow(conversationsInScope);
             window._followUpsDueNow = due;
+            window._followUpsBlockedByBdrSetup = blocked;
             countEl.textContent = due.length;
             circle.classList.toggle('followups-due-circle-empty', due.length === 0);
+            const blockedNote = blocked.length
+                ? ` — ${blocked.length} more would be due but blocked (BDR missing calendar link / EA settings)`
+                : '';
             circle.title = due.length
-                ? `${due.length} conversation${due.length === 1 ? '' : 's'} due for a follow-up right now (dates/counts only, no AI) — click to see which`
-                : 'Nothing is due for a follow-up right now';
+                ? `${due.length} conversation${due.length === 1 ? '' : 's'} due for a follow-up right now (dates/counts only, no AI)${blockedNote} — click to see which`
+                : `Nothing is due for a follow-up right now${blockedNote}`;
+            if (blockedBadge) {
+                if (blocked.length > 0) {
+                    blockedBadge.style.display = 'flex';
+                    blockedBadge.textContent = blocked.length;
+                    blockedBadge.title = `${blocked.length} more would be due, but the BDR's profile is missing a calendar link (or EA settings) — click the circle for details`;
+                } else {
+                    blockedBadge.style.display = 'none';
+                }
+            }
         }
 
         window.showFollowUpsDueNowList = function() {
@@ -7358,16 +7429,34 @@
             if (existing) existing.remove();
 
             const due = window._followUpsDueNow || [];
+            const blocked = window._followUpsBlockedByBdrSetup || [];
             const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-            const rowsHtml = due.map(item => `
+            const dueRowHtml = (item) => `
                 <div style="padding: 0.75rem 1rem; border-bottom: 1px solid #f3f4f6;">
                     <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
                         <div style="font-weight: 600; color: #111827;">${esc(item.contactName)}${item.company ? ` — ${esc(item.company)}` : ''}</div>
                         <span style="background: #0d948820; color: #0d9488; font-weight: 700; padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.78rem; white-space: nowrap;">invite ${item.nextStep}/${item.totalInvites} due</span>
                     </div>
                     <div style="font-size: 0.78rem; color: #6b7280;">${esc(item.responseCategory)} · ${item.invitesSent} sent so far${item.bdrEmail ? ` · BDR: ${esc(item.bdrEmail)}` : ''}${item.daysSinceAnchor != null ? ` · ${item.daysSinceAnchor}d since ${esc(item.anchorLabel)}` : ''}</div>
-                </div>`).join('') || '<div style="padding: 1.5rem; text-align: center; color: #6b7280;">Nothing is due for a follow-up right now.</div>';
+                </div>`;
+
+            const blockedRowHtml = (item) => `
+                <div style="padding: 0.75rem 1rem; border-bottom: 1px solid #f3f4f6;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+                        <div style="font-weight: 600; color: #111827;">${esc(item.contactName)}${item.company ? ` — ${esc(item.company)}` : ''}</div>
+                        <span style="background: #f5900020; color: #b45309; font-weight: 700; padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.78rem; white-space: nowrap;">blocked</span>
+                    </div>
+                    <div style="font-size: 0.78rem; color: #6b7280;">${esc(item.responseCategory)} · ${item.invitesSent} sent so far · invite ${item.nextStep}/${item.totalInvites} would be due</div>
+                    <div style="font-size: 0.78rem; color: #b45309; margin-top: 0.15rem;"><i class="fas fa-triangle-exclamation"></i> ${esc(item.blockedReason)}</div>
+                </div>`;
+
+            const rowsHtml = due.map(dueRowHtml).join('') || '<div style="padding: 1.5rem; text-align: center; color: #6b7280;">Nothing is due for a follow-up right now.</div>';
+            const blockedHtml = blocked.length ? `
+                <div style="margin-top: 1rem;">
+                    <div style="font-size: 0.85rem; font-weight: 700; color: #b45309; margin-bottom: 0.5rem;"><i class="fas fa-triangle-exclamation"></i> Would be due, but blocked (${blocked.length}) — BDR profile needs setup</div>
+                    <div style="border: 1px solid #fde68a; border-radius: 10px; overflow: hidden;">${blocked.map(blockedRowHtml).join('')}</div>
+                </div>` : '';
 
             const modal = document.createElement('div');
             modal.id = 'followUpsDueNowModal';
@@ -7383,6 +7472,7 @@
                             Computed instantly from dates/counts already on file — no AI involved. Click <strong>"Draft Follow-Up Sequences"</strong> to actually generate these.
                         </div>
                         <div style="border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden;">${rowsHtml}</div>
+                        ${blockedHtml}
                     </div>
                     <div style="padding: 0.9rem 1.25rem; border-top: 1px solid #e5e7eb; text-align: right;">
                         <button onclick="document.getElementById('followUpsDueNowModal').remove()" style="background: #0d9488; color: white; border: none; padding: 0.55rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer;">Close</button>
