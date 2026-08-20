@@ -170,6 +170,26 @@
         <p>Upload contacts without LinkedIn URLs — Bebity finds their profiles by name &amp; company</p>
     </div>
 
+    <!-- ── Job Recovery — always accessible, independent of the upload/map/search steps below,
+         so a crashed browser/computer never strands a batch that's still running or finished
+         server-side. ── -->
+    <div class="section" id="secRecover">
+        <div class="section-title" style="cursor:pointer;" onclick="toggleRecoverPanel()">
+            <i class="fas fa-clock-rotate-left"></i> Recover a Previous Job
+            <span style="margin-left:auto;font-size:0.78rem;font-weight:400;color:var(--gray);" id="recoverToggleLabel">(click to expand)</span>
+        </div>
+        <div id="recoverBody" style="display:none;">
+            <p style="font-size:0.82rem;color:var(--gray);margin-bottom:0.9rem;">
+                Searches run on the server in the background, so a closed tab or a restarted computer doesn't stop them.
+                Check here for any job — running, finished, or lost after a server restart (recovered from a local backup) — and pull its results back in.
+            </p>
+            <div class="btn-row" style="margin-top:0;">
+                <button class="btn btn-ghost btn-sm" onclick="refreshJobList()"><i class="fas fa-sync"></i> Check for jobs</button>
+            </div>
+            <div id="jobListWrap" style="margin-top:1rem;"></div>
+        </div>
+    </div>
+
     <!-- Step indicator -->
     <div class="steps">
         <div class="step active" id="stepDot1"><i class="fas fa-upload"></i>Upload CSV</div>
@@ -783,6 +803,187 @@ function clearJobCheckpoint(jobId) {
         }
     } catch (e) { /* localStorage unavailable — non-fatal */ }
 })();
+
+// ── Job recovery panel ──────────────────────────────────────────────────────
+// Lets the user see every job the server still knows about (in-memory only,
+// so this list is empty after a server restart) merged with whatever this
+// browser has checkpointed to localStorage, and pull any of them — running,
+// finished, or otherwise orphaned — straight into the Review/Save steps
+// without re-uploading a CSV or re-running the search.
+function toggleRecoverPanel() {
+    const body = document.getElementById('recoverBody');
+    const isOpen = body.style.display !== 'none';
+    body.style.display = isOpen ? 'none' : '';
+    document.getElementById('recoverToggleLabel').textContent = isOpen ? '(click to expand)' : '(click to collapse)';
+    if (!isOpen) refreshJobList();
+}
+
+function getLocalCheckpoints() {
+    const out = [];
+    try {
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (!key || !key.startsWith('urlFinderJob_')) continue;
+            try {
+                const cp = JSON.parse(localStorage.getItem(key));
+                if (cp && cp.results) out.push({ jobId: key.slice('urlFinderJob_'.length), local: cp });
+            } catch (e) { /* corrupt entry, skip */ }
+        }
+    } catch (e) { /* localStorage unavailable */ }
+    return out;
+}
+
+async function refreshJobList() {
+    const wrap = document.getElementById('jobListWrap');
+    wrap.innerHTML = '<p style="color:var(--gray);font-size:0.85rem;"><i class="fas fa-spinner fa-spin"></i> Checking server + local backups…</p>';
+
+    const localCps  = getLocalCheckpoints();
+    const localById = new Map(localCps.map(c => [c.jobId, c.local]));
+
+    let serverJobs = [];
+    let serverReachable = true;
+    try {
+        const resp = await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/jobs`);
+        const data = await resp.json();
+        if (data.success) serverJobs = data.jobs;
+    } catch (e) { serverReachable = false; }
+
+    // Server jobs first (source of truth while the process is alive), then any
+    // local-only checkpoints whose job the server no longer knows about (it
+    // restarted since that batch ran).
+    const merged = serverJobs.map(j => ({
+        jobId: j.jobId, status: j.status, total: j.total, processed: j.processed,
+        matched: j.matched, startedAt: j.startedAt, error: j.error,
+        hasLocalBackup: localById.has(j.jobId), onServer: true
+    }));
+    localCps.forEach(c => {
+        if (merged.some(m => m.jobId === c.jobId)) return;
+        merged.push({
+            jobId: c.jobId, status: 'lost (server restarted)', total: null,
+            processed: c.local.results.length, matched: c.local.results.filter(r => r.match).length,
+            startedAt: null, savedAt: c.local.savedAt, hasLocalBackup: true, onServer: false
+        });
+    });
+    merged.sort((a, b) => (b.startedAt ? Date.parse(b.startedAt) : (b.savedAt || 0)) - (a.startedAt ? Date.parse(a.startedAt) : (a.savedAt || 0)));
+
+    if (merged.length === 0) {
+        wrap.innerHTML = `<p style="color:var(--gray);font-size:0.85rem;">No jobs found on the server${serverReachable ? '' : ' (unreachable)'} or in this browser's local backups.</p>`;
+        return;
+    }
+
+    wrap.innerHTML = `
+        <div style="overflow-x:auto;">
+        <table class="results-table">
+            <thead><tr>
+                <th>Job ID</th><th>Started</th><th>Status</th><th>Progress</th><th>Matched</th><th>Backup</th><th></th>
+            </tr></thead>
+            <tbody>${merged.map(renderJobRow).join('')}</tbody>
+        </table>
+        </div>
+        ${!serverReachable ? '<p class="form-help" style="color:var(--danger);">Could not reach the server — showing local backups only.</p>' : ''}`;
+}
+
+function renderJobRow(j) {
+    const pct = j.total ? Math.round((j.processed / j.total) * 100) : null;
+    const progressText = j.total ? `${j.processed}/${j.total} (${pct}%)` : `${j.processed} row${j.processed === 1 ? '' : 's'}`;
+    const badgeCls = j.status === 'completed' ? 'conf-high' : j.status === 'running' ? 'conf-medium' : j.status === 'failed' ? 'conf-low' : 'conf-none';
+    const startedTxt = j.startedAt ? new Date(j.startedAt).toLocaleString()
+        : (j.savedAt ? new Date(j.savedAt).toLocaleString() + ' (local backup)' : '—');
+    return `<tr>
+        <td style="font-family:'Consolas',monospace;font-size:0.76rem;">${escHtml(j.jobId)}</td>
+        <td style="white-space:nowrap;font-size:0.8rem;">${escHtml(startedTxt)}</td>
+        <td><span class="conf-badge ${badgeCls}">${escHtml(j.status)}</span></td>
+        <td>${progressText}</td>
+        <td>${j.matched}</td>
+        <td style="text-align:center;">${j.hasLocalBackup ? '<i class="fas fa-check" style="color:var(--success);" title="Local backup available"></i>' : '—'}</td>
+        <td style="white-space:nowrap;">
+            <button class="btn btn-teal btn-sm" onclick="recoverJob('${j.jobId}', ${j.onServer})"><i class="fas fa-download"></i> Recover</button>
+            ${j.status === 'running' ? `<button class="btn btn-ghost btn-sm" onclick="watchJob('${j.jobId}')"><i class="fas fa-eye"></i> Watch live</button>` : ''}
+        </td>
+    </tr>`;
+}
+
+// Pulls a job's results (from the server if it's still tracking it, else from
+// this browser's local checkpoint) straight into the Review/Save steps.
+async function recoverJob(jobId, onServer) {
+    let results, jobMeta = null;
+
+    if (onServer) {
+        try {
+            const resp = await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/job/${jobId}`);
+            const data = await resp.json();
+            if (!data.success) throw new Error(data.error || 'Job not found on server');
+            results = data.results || [];
+            jobMeta = data;
+        } catch (e) {
+            const cp = loadJobCheckpoint(jobId);
+            if (!cp) { alert(`Could not fetch that job from the server (${e.message}), and no local backup was found.`); return; }
+            results = cp.results;
+        }
+    } else {
+        const cp = loadJobCheckpoint(jobId);
+        if (!cp) { alert('Local backup not found — it may have been pruned (backups older than 24h are cleared automatically).'); return; }
+        results = cp.results;
+    }
+
+    if (!results || results.length === 0) { alert('That job has no results to recover.'); return; }
+
+    contacts = results.map(r => r.contact);
+    mergeMatchResults(results.map(r => ({
+        contact: r.contact, match: r.match || null, aiReason: r.aiReason || '', selected: !!r.match
+    })));
+    renderResults();   // unlocks + scrolls to the Review/Save steps
+    updateSaveCount();
+
+    if (jobMeta && jobMeta.status === 'running') {
+        alert(`Recovered ${results.length} of ${jobMeta.total} rows so far — this job is still running on the server. Use "Watch live" in the job list to keep it updating, or come back and recover again later for more results.`);
+    }
+}
+
+// Resumes polling a job that's still running on the server (e.g. one that
+// outlived a browser crash) using the same polling logic as a freshly
+// started search, without starting a new job.
+async function watchJob(jobId) {
+    if (activeJobId) { alert('Already watching or running a job — wait for it to finish first.'); return; }
+    activeJobId = jobId;
+
+    document.getElementById('pipeline').style.display = '';
+    document.getElementById('logBox').innerHTML = '';
+    document.getElementById('logBox').style.display = '';
+    setPipe('pipeStart', 'done');
+    setPipe('pipeRun', 'active');
+    setPipe('pipeDone', '');
+    activateStep(3);
+    log(`▶ Watching existing job ${jobId}…`, 'log-info');
+
+    try {
+        const results = await pollJobUntilDone(jobId);
+        setPipe('pipeRun', 'done');
+        setPipe('pipeDone', 'done');
+        contacts = results.map(r => r.contact);
+        mergeMatchResults(results.map(r => ({
+            contact: r.contact, match: r.match || null, aiReason: r.aiReason || '', selected: !!r.match
+        })));
+        renderResults();
+        updateSaveCount();
+        clearJobCheckpoint(jobId);
+    } catch (err) {
+        setPipe('pipeRun', 'error');
+        log(`❌ ${err.message}`, 'log-err');
+        const cp = loadJobCheckpoint(jobId);
+        if (cp && cp.results && cp.results.length) {
+            contacts = cp.results.map(r => r.contact);
+            mergeMatchResults(cp.results.map(r => ({
+                contact: r.contact, match: r.match || null, aiReason: r.aiReason || '', selected: !!r.match
+            })));
+            renderResults();
+            updateSaveCount();
+            log(`♻ Recovered ${cp.results.length} rows from local checkpoint.`, 'log-ok');
+        }
+    } finally {
+        activeJobId = null;
+    }
+}
 
 // Starts a job on the backend, retrying with backoff if the server is
 // unreachable or mid-restart (e.g. Railway redeploying). Throws a friendly
