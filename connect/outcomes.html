@@ -313,6 +313,14 @@
             transition: color 0.4s;
         }
         .save-bar.saved-state .save-bar-sub { color: #047857; }
+        .save-bar.warn-state {
+            background: linear-gradient(135deg, #fffbeb, #fef3c7);
+            border-color: #fcd34d;
+            box-shadow: 0 2px 12px rgba(217,119,6,0.12);
+        }
+        .save-bar.warn-state .save-bar-icon  { background: var(--warning); }
+        .save-bar.warn-state .save-bar-title { color: #92400e; }
+        .save-bar.warn-state .save-bar-sub   { color: #b45309; }
         .btn-save-cache {
             padding: 0.55rem 1.4rem;
             background: #3b82f6;
@@ -1398,6 +1406,9 @@
         <!-- Alert area -->
         <div id="alertArea"></div>
 
+        <!-- Data-completeness warning (persists independently of alertArea) -->
+        <div id="dataIssuesBanner" style="display:none;"></div>
+
         <!-- Save-to-cache bar (All BDRs only) -->
         <div class="save-bar" id="saveCacheBar" style="display:none;">
             <div class="save-bar-left">
@@ -1745,6 +1756,17 @@
     let _outcomeGroups       = [];       // all hypothesis_groups docs — shared across tabs
     let _hypoBreakdownView   = 'overview'; // 'overview' | 'bdr' | 'month'
     let _hypoLastData        = null;    // cached render data for view switching
+
+    // Data-completeness tracking for the current analysis run — every query that
+    // fails (timeout, backend cold-start, etc.) and gets silently swallowed by a
+    // try/catch elsewhere in the pipeline should also call flagDataIssue() so the
+    // user sees a visible warning instead of a dashboard that quietly under-reports.
+    // Reset at the top of each runAnalysis() call.
+    let _dataLoadIssues = []; // [{source, detail, at}]
+    function flagDataIssue(source, detail) {
+        _dataLoadIssues.push({ source, detail, at: new Date().toISOString() });
+        console.warn(`⚠️ [DATA INCOMPLETE] ${source}: ${detail}`);
+    }
 
     // Holds the most recent All-BDRs run results so the manual Save button can access them
     let _pendingSave = null; // { results, viewLabel, sentCount, rangeLabel }
@@ -2220,10 +2242,14 @@
         btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing…';
 
         document.getElementById('alertArea').innerHTML = '';
+        document.getElementById('dataIssuesBanner').style.display = 'none';
         document.getElementById('resultsSection').style.display = 'none';
         document.getElementById('exportBar').style.display = 'none';
         document.getElementById('loadingPanel').style.display = 'block';
         document.getElementById('loadingSteps').innerHTML = '';
+
+        // Reset data-completeness tracking for this run
+        _dataLoadIssues = [];
 
         try {
             // Support both new bdrEmails[] and legacy single bdrEmail
@@ -2299,7 +2325,10 @@
                             where('account_email', '==', email)
                         ));
                         collectItems(snap);
-                    } catch(e) { console.warn(`connect_queue for ${email}:`, e.message); }
+                    } catch(e) {
+                        flagDataIssue('Group outreach (connect_queue)',
+                            `Query for ${email} failed — that BDR's outreach is missing from this group's totals: ${e.message}`);
+                    }
                 }
 
                 // Also pull every record explicitly stamped with this group's ID,
@@ -2314,7 +2343,7 @@
                         where('hypothesisGroupId', '==', group.id)
                     ));
                     collectItems(stampSnap);
-                } catch(e) { console.warn('connect_queue stamp query:', e.message); }
+                } catch(e) { flagDataIssue('Group outreach (connect_queue)', `Stamp query failed — some group-assigned outreach may be missing: ${e.message}`); }
 
                 // Filter to pushed records
                 sentItems = sentItems.filter(m => m.pushed_to_heyreach);
@@ -2357,7 +2386,7 @@
                         where('hypothesisGroupId', '==', group.id)
                     ));
                     collectItems(stampSnap);
-                } catch(e) { console.warn('connect_queue stamp query:', e.message); }
+                } catch(e) { flagDataIssue('Group outreach (connect_queue)', `Stamp query failed — some group-assigned outreach may be missing: ${e.message}`); }
                 if (hasBatches) {
                     const batchArr = [...targetBatchSet];
                     for (let i = 0; i < batchArr.length; i += 10) {
@@ -2368,7 +2397,7 @@
                                 where('source_batch_id', 'in', chunk)
                             ));
                             collectItems(snap);
-                        } catch(e) { console.warn('connect_queue batch query:', e.message); }
+                        } catch(e) { flagDataIssue('Group outreach (connect_queue)', `Batch query failed — some group-assigned outreach may be missing: ${e.message}`); }
                     }
                 } else if (hasUrls && !sentItems.length) {
                     // URL-only group with no BDRs and no stamped records — we can't
@@ -2499,6 +2528,7 @@
             renderGroupsOutcomesSummary(group, sentItems, funnel, bdrEmailArr);
             renderVariationBreakdown(group, sentItems, acceptedUrlSet, repliedFiltered, scheduledUrlSet);
             showAiGrouperPanel();
+            renderDataIssuesBanner();
             document.getElementById('resultsSection').style.display = 'block';
             document.getElementById('exportBar').style.display = 'flex';
 
@@ -3283,7 +3313,11 @@
         btn.disabled = true;
         btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing…';
 
+        // Reset data-completeness tracking for this run
+        _dataLoadIssues = [];
+
         document.getElementById('alertArea').innerHTML = '';
+        document.getElementById('dataIssuesBanner').style.display = 'none';
         document.getElementById('resultsSection').style.display = 'none';
         document.getElementById('exportBar').style.display = 'none';
         document.getElementById('funnelCard').style.display = '';
@@ -3434,14 +3468,28 @@
                 '| sentItemsAllTime:', sentItemsAllTime.length);
 
             if (!sentItems.length) {
-                showAlert(
-                    `No messages found that were sent to HeyReach for ${viewLabel}. Try a longer date range.`,
-                    'info'
-                );
+                // Don't report a clean "no data" result if the reason the sent-messages
+                // list is empty is that the connect_queue queries themselves failed
+                // (e.g. Railway cold-start timeouts) — that's a backend problem, not an
+                // empty analysis, and reporting it as "no messages found" would hide a
+                // real outage from the user.
+                if (_dataLoadIssues.length > 0) {
+                    showAlert(
+                        `Could not load sent-message data for ${viewLabel} — ${_dataLoadIssues.length} backend request(s) failed. ` +
+                        `This is likely a temporary issue, not an empty result. See details below and try again.`,
+                        'error'
+                    );
+                } else {
+                    showAlert(
+                        `No messages found that were sent to HeyReach for ${viewLabel}. Try a longer date range.`,
+                        'info'
+                    );
+                }
                 document.getElementById('loadingPanel').style.display = 'none';
                 document.getElementById('resultsSection').style.display = 'block';
             document.getElementById('exportBar').style.display = 'flex';
                 renderEmptyResults();
+                renderDataIssuesBanner();
                 return;
             }
 
@@ -3485,6 +3533,7 @@
             // ── Render ──
             renderResults(results, viewLabel, sentItems.length, _computedRangeLabel);
             showAiGrouperPanel();
+            renderDataIssuesBanner();
 
             // ── Hypothesis group breakdown (BDR + Company tabs only) ──
             if (currentTab === 'bdr' || currentTab === 'company') {
@@ -3494,8 +3543,11 @@
 
             // Show save bar for any All BDRs run so the user can explicitly save to cache
             if (isAllBdrs) {
-                _pendingSave = { results, viewLabel, sentCount: sentItems.length, rangeLabel: _computedRangeLabel };
-                showSaveBar('ready');
+                _pendingSave = {
+                    results, viewLabel, sentCount: sentItems.length, rangeLabel: _computedRangeLabel,
+                    dataIssues: [..._dataLoadIssues]
+                };
+                showSaveBar('ready', null, _dataLoadIssues.length);
             } else {
                 document.getElementById('saveCacheBar').style.display = 'none';
                 _pendingSave = null;
@@ -3525,7 +3577,9 @@
                     linkedInAccountIdMapping.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
                 }
             });
-        } catch(e) { console.warn('linkedin_accounts load failed:', e); }
+        } catch(e) {
+            flagDataIssue('LinkedIn account mappings', `linkedin_accounts query failed: ${e.message || e}`);
+        }
 
         try {
             const snap = await getDocs(collection(emailDB, 'linkedin_email_associations'));
@@ -3539,7 +3593,9 @@
                     linkedInEmailAssociations.set(data.primaryEmail.toLowerCase(), data.linkedInEmail.toLowerCase());
                 }
             });
-        } catch(e) { console.warn('linkedin_email_associations load failed:', e); }
+        } catch(e) {
+            flagDataIssue('LinkedIn email associations', `linkedin_email_associations query failed: ${e.message || e}`);
+        }
     }
 
     // ── Load connect_queue ─────────────────────────────────────────────────
@@ -3577,7 +3633,8 @@
                     results.push({ id: d.id, ...data });
                 });
             } catch(e) {
-                console.warn(`connect_queue query failed for ${email}:`, e);
+                flagDataIssue('Sent messages (connect_queue)',
+                    `Query for ${email} failed — that BDR's sent messages are missing from this run: ${e.message || e}`);
             }
         }
         return results;
@@ -3653,16 +3710,21 @@
                 for (let i = 0; i < accountIds.length; i += 30) chunks.push(accountIds.slice(i, i + 30));
                 // No limit() — auto-paginates via getAllDocs so accounts with more
                 // than one page of acceptances aren't silently truncated.
-                const snaps = await Promise.all(chunks.map(chunk => getDocs(query(
+                const snaps = await Promise.all(chunks.map((chunk, i) => getDocs(query(
                     collection(emailDB, 'heyreach_activity'),
                     where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
                     where('linkedInAccountId', 'in', chunk),
                     ...timeConstraints,
                     orderBy('timestamp', 'desc')
-                )).catch(e => { console.warn('heyreach_activity accepted (by account ID) query failed:', e); return null; })));
+                )).catch(e => {
+                    flagDataIssue('Accepted connections',
+                        `heyreach_activity query failed for account-ID batch ${i + 1}/${chunks.length} — some acceptances may be missing: ${e.message || e}`);
+                    return null;
+                })));
                 snaps.forEach(snap => { if (snap) processSnapshot(snap); });
             } else {
-                console.warn('[outcomes] loadAcceptedConnections: no HeyReach account IDs resolved — falling back to unfiltered scan, may miss data on large collections');
+                flagDataIssue('Accepted connections',
+                    'No HeyReach account IDs resolved for these BDR(s) — falling back to an unfiltered scan, which may miss data on large collections.');
                 const baseQuery = query(collection(emailDB, 'heyreach_activity'),
                     where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
                     ...timeConstraints,
@@ -3670,7 +3732,7 @@
                 processSnapshot(await getDocs(baseQuery));
             }
         } catch(e) {
-            console.warn('heyreach_activity accepted load failed:', e);
+            flagDataIssue('Accepted connections', `heyreach_activity query failed: ${e.message || e}`);
         }
         return accepted;
     }
@@ -3714,16 +3776,18 @@
         // ── Path 1: query by heyreachAccountId (numeric linkedInAccountId) ──
         // No limit() — auto-paginates via getAllDocs so high-volume accounts
         // aren't silently truncated to a single page.
+        let path1Failures = 0;
         const idPromises = heyreachAccountIds.map(hid =>
             getDocs(query(
                 collection(emailDB, 'heyreach_activity'),
                 where('linkedInAccountId', '==', hid)
-            )).catch(e => { console.warn(`heyreach_activity linkedInAccountId=${hid} failed:`, e); return null; })
+            )).catch(e => { path1Failures++; console.warn(`heyreach_activity linkedInAccountId=${hid} failed:`, e); return null; })
         );
 
         // ── Path 2: query by accountEmail / bdrEmail (legacy) ────────────
         const emailFields = ['accountEmail', 'bdrEmail'];
         const emailPromises = [];
+        let path2Failures = 0;
         for (const email of emailArr) {
             if (!email) continue;
             for (const field of emailFields) {
@@ -3731,7 +3795,7 @@
                     getDocs(query(
                         collection(emailDB, 'heyreach_activity'),
                         where(field, '==', email)
-                    )).catch(e => { console.warn(`heyreach_activity ${field}=${email} failed:`, e); return null; })
+                    )).catch(e => { path2Failures++; console.warn(`heyreach_activity ${field}=${email} failed:`, e); return null; })
                 );
             }
         }
@@ -3745,6 +3809,12 @@
                 addUrl(data.leadProfileUrl);
             });
         });
+
+        if (path1Failures > 0 || path2Failures > 0) {
+            flagDataIssue('HeyReach queue-sent check',
+                `${path1Failures + path2Failures} of ${idPromises.length + emailPromises.length} heyreach_activity lookups failed — ` +
+                `the "still in queue" filter may under- or over-remove pending connections.`);
+        }
 
         // ── Path 3: server endpoint (50k limit, matches by email or numeric ID) ──
         try {
@@ -3761,8 +3831,12 @@
                         if (match) addUrl(ev.leadProfileUrl);
                     }
                 }
+            } else {
+                flagDataIssue('HeyReach queue-sent check', `Server endpoint responded with HTTP ${res.status}.`);
             }
-        } catch(e) { console.warn('loadActuallySentConnections: server endpoint failed:', e); }
+        } catch(e) {
+            flagDataIssue('HeyReach queue-sent check', `Server endpoint (connection-request-sent-events) failed: ${e.message || e}`);
+        }
 
         console.log('[outcomes] loadActuallySentConnections:',
             sentByHeyreach.size, 'confirmed-sent URLs',
@@ -3794,6 +3868,7 @@
         const inboxFields = ['accountEmail', 'bdrEmail', 'linkedInAccountEmail', 'uploadedByEmail'];
         const promises = [];
 
+        let inboxFailures = 0;
         for (const field of inboxFields) {
             const chunks = [];
             for (let i = 0; i < emailArr.length; i += 30) chunks.push(emailArr.slice(i, i + 30));
@@ -3803,12 +3878,16 @@
                 // more than one page of conversations aren't silently truncated.
                 promises.push(
                     getDocs(query(collection(emailDB, 'heyreach_inbox'), where(field, 'in', chunk)))
-                        .catch(e => { console.warn(`heyreach_inbox ${field} query failed`, e); return null; })
+                        .catch(e => { inboxFailures++; console.warn(`heyreach_inbox ${field} query failed`, e); return null; })
                 );
             }
         }
 
         const results = await Promise.all(promises);
+        if (inboxFailures > 0) {
+            flagDataIssue('Inbox replies',
+                `${inboxFailures} of ${promises.length} heyreach_inbox queries failed — replied/scheduled counts may be understated.`);
+        }
         const seenConvIds = new Set();
 
         results.forEach(snap => {
@@ -3918,7 +3997,10 @@
                     where('activity_type', '==', 'meeting_scheduled'),
                     where('bdr_email', 'in', chunk)
                 );
-                const snap = await getDocs(q).catch(e => null);
+                const snap = await getDocs(q).catch(e => {
+                    flagDataIssue('Scheduled meetings', `activity_tracking query failed for a BDR batch: ${e.message || e}`);
+                    return null;
+                });
                 if (!snap) continue;
                 let rawCount = 0, outOfWindow = 0, noUrl = 0;
                 snap.forEach(d => {
@@ -3937,7 +4019,7 @@
                     '| out of window:', outOfWindow, '| no URL:', noUrl,
                     '| kept:', rawCount - outOfWindow - noUrl);
             }
-        } catch(e) { console.warn('activity_tracking scheduled load failed:', e); }
+        } catch(e) { flagDataIssue('Scheduled meetings', `activity_tracking load failed: ${e.message || e}`); }
 
         // Source 2: inbox conversations with responseCategory = 'Scheduled' — filtered
         // by the conversation's own lastMessageAt so meetings surface in the period the
@@ -3977,7 +4059,10 @@
                     where('bdrEmail', 'in', chunk),
                     where('responseCategory', '==', 'Scheduled')
                 );
-                const snap = await getDocs(q).catch(e => null);
+                const snap = await getDocs(q).catch(e => {
+                    flagDataIssue('Scheduled meetings', `conversation_category_overrides query failed for a BDR batch: ${e.message || e}`);
+                    return null;
+                });
                 if (!snap) continue;
                 snap.forEach(d => {
                     const data = d.data();
@@ -3990,7 +4075,7 @@
                     if (url) scheduledUrls.add(normalizeUrl(url));
                 });
             }
-        } catch(e) { console.warn('conversation_category_overrides load failed:', e); }
+        } catch(e) { flagDataIssue('Scheduled meetings', `conversation_category_overrides load failed: ${e.message || e}`); }
 
         // Correction step: activity_tracking is append-only, so if a meeting was previously
         // scheduled but later un-scheduled (category changed in the inbox), the activity_tracking
@@ -5209,8 +5294,53 @@
         document.getElementById('analyzeBtn').innerHTML = '<i class="fas fa-chart-bar"></i> Analyze';
     }
 
+    // ── Data-completeness banner ─────────────────────────────────────────────
+    // Renders a persistent warning (separate from the transient alertArea) when
+    // one or more backend queries failed during the load pipeline — e.g. Railway
+    // cold-start timeouts on connect_queue/heyreach_activity. Failures like these
+    // are individually caught so one bad request doesn't abort the whole analysis,
+    // but that also means the numbers below may silently under-count without this
+    // banner. `issues` defaults to the current run's _dataLoadIssues; pass an
+    // explicit array (e.g. a cached payload's saved issues) to show a warning for
+    // a load-from-cache view instead.
+    function renderDataIssuesBanner(issues) {
+        const list = issues || _dataLoadIssues;
+        const el = document.getElementById('dataIssuesBanner');
+        if (!list || !list.length) {
+            el.style.display = 'none';
+            el.innerHTML = '';
+            return;
+        }
+        const rows = list.map(i =>
+            `<li><strong>${escapeHtml(i.source)}</strong>: ${escapeHtml(i.detail)}</li>`
+        ).join('');
+        el.innerHTML = `
+            <div class="alert warning" style="flex-direction:column;align-items:stretch;">
+                <div style="display:flex;align-items:flex-start;gap:0.75rem;">
+                    <i class="fas fa-triangle-exclamation" style="margin-top:0.15rem;"></i>
+                    <div>
+                        <strong>Data may be incomplete</strong> — ${list.length} request${list.length === 1 ? '' : 's'}
+                        failed while loading data for this analysis (often a Railway backend cold-start timeout).
+                        The numbers below likely <u>undercount</u> outcomes. Re-run the analysis to retry, or wait
+                        a moment for the backend to warm up.
+                    </div>
+                </div>
+                <details style="margin-top:0.6rem;margin-left:1.9rem;">
+                    <summary style="cursor:pointer;font-size:0.85rem;">Show ${list.length} failed request${list.length === 1 ? '' : 's'}</summary>
+                    <ul style="margin:0.5rem 0 0 1rem;font-size:0.85rem;line-height:1.5;">${rows}</ul>
+                </details>
+            </div>`;
+        el.style.display = '';
+    }
+
+    function escapeHtml(str) {
+        return String(str == null ? '' : str).replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    }
+
     // ── Save-bar helpers ──────────────────────────────────────────────────────
-    function showSaveBar(state, savedAt) {
+    function showSaveBar(state, savedAt, issueCount) {
         const bar   = document.getElementById('saveCacheBar');
         const btn   = document.getElementById('saveCacheBtn');
         const icon  = document.getElementById('saveBarIcon');
@@ -5219,15 +5349,25 @@
         bar.style.display = '';
         if (state === 'ready') {
             bar.classList.remove('saved-state');
-            icon.className  = 'fas fa-cloud-upload-alt';
-            title.textContent = 'Save Results to Cache';
-            sub.textContent   = 'Save these stats so any user can load them instantly — no re-pull needed.';
+            if (issueCount > 0) {
+                bar.classList.add('warn-state');
+                icon.className  = 'fas fa-triangle-exclamation';
+                title.textContent = `Save Results to Cache — ${issueCount} Failed Request${issueCount === 1 ? '' : 's'}`;
+                sub.textContent   = 'This run had incomplete data (see warning above). Saving now will show these possibly-undercounted numbers to every user.';
+                btn.innerHTML = '<i class="fas fa-save"></i> Save Anyway';
+            } else {
+                bar.classList.remove('warn-state');
+                icon.className  = 'fas fa-cloud-upload-alt';
+                title.textContent = 'Save Results to Cache';
+                sub.textContent   = 'Save these stats so any user can load them instantly — no re-pull needed.';
+                btn.innerHTML = '<i class="fas fa-save"></i> Save to Cache';
+            }
             btn.disabled = false;
-            btn.innerHTML = '<i class="fas fa-save"></i> Save to Cache';
         } else if (state === 'saving') {
             btn.disabled = true;
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…';
         } else if (state === 'saved') {
+            bar.classList.remove('warn-state');
             bar.classList.add('saved-state');
             icon.className  = 'fas fa-check-circle';
             title.textContent = 'Results Saved to Cache';
@@ -5240,9 +5380,18 @@
 
     window.saveCurrentResults = async function() {
         if (!_pendingSave) { return; }
+        const issueCount = (_pendingSave.dataIssues || []).length;
+        if (issueCount > 0) {
+            const proceed = confirm(
+                `Heads up: this analysis had ${issueCount} failed data request${issueCount === 1 ? '' : 's'} ` +
+                `(see the warning banner above), so these numbers may undercount actual outcomes.\n\n` +
+                `Save anyway? Every user will see these numbers until the next save.`
+            );
+            if (!proceed) return;
+        }
         showSaveBar('saving');
-        const { results, viewLabel, sentCount, rangeLabel } = _pendingSave;
-        await saveAllBdrsCache(results, viewLabel, sentCount, rangeLabel);
+        const { results, viewLabel, sentCount, rangeLabel, dataIssues } = _pendingSave;
+        await saveAllBdrsCache(results, viewLabel, sentCount, rangeLabel, dataIssues);
         const now = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
         showSaveBar('saved', now);
     };
@@ -5256,7 +5405,7 @@
     // In-memory copy so loadFromCache doesn't need a second read
     let _cachedPayload = null;
 
-    async function saveAllBdrsCache(results, viewLabel, sentCount, rangeLabel) {
+    async function saveAllBdrsCache(results, viewLabel, sentCount, rangeLabel, dataIssues) {
         try {
             const payload = {
                 pulledAt:           new Date().toISOString(),
@@ -5264,7 +5413,10 @@
                 viewLabel,
                 sentCount,
                 rangeLabel,
-                results
+                results,
+                // Preserved so anyone loading this cache later still sees the
+                // "data may be incomplete" warning that applied when it was pulled.
+                dataIssues: dataIssues && dataIssues.length ? dataIssues : []
             };
             const cacheRef = doc(emailDB, CACHE_DOC_PATH[0], CACHE_DOC_PATH[1]);
             await setDoc(cacheRef, payload);
@@ -5303,7 +5455,11 @@
                          + ' at '
                          + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
             const puller = cache.pulledBy ? ` · pulled by ${cache.pulledBy.split('@')[0]}` : '';
-            sub.textContent = `Last pulled: ${label} · ${cache.viewLabel || 'All BDRs'}${puller}`;
+            const issueCount = (cache.dataIssues || []).length;
+            const issueNote = issueCount > 0
+                ? ` · ⚠️ ${issueCount} data request${issueCount === 1 ? '' : 's'} failed on this pull — may be incomplete`
+                : '';
+            sub.textContent = `Last pulled: ${label} · ${cache.viewLabel || 'All BDRs'}${puller}${issueNote}`;
             banner.style.display = '';
             const pill = document.getElementById('tabAllCachePill');
             if (pill) pill.style.display = '';
@@ -5334,6 +5490,7 @@
         document.getElementById('cacheBanner').style.display = 'none';
         document.getElementById('saveCacheBar').style.display = 'none';
         document.getElementById('alertArea').innerHTML = '';
+        document.getElementById('dataIssuesBanner').style.display = 'none';
         document.getElementById('resultsSection').style.display = 'none';
         document.getElementById('exportBar').style.display = 'none';
         document.getElementById('funnelCard').style.display = '';
@@ -5373,6 +5530,10 @@
 
         document.getElementById('resultsSection').style.display = 'block';
             document.getElementById('exportBar').style.display = 'flex';
+
+        // Show the same data-completeness warning that was present when this
+        // snapshot was pulled, so a stale/incomplete cached run doesn't look clean.
+        renderDataIssuesBanner(cache.dataIssues);
 
         document.getElementById('alertArea').innerHTML = `
             <div class="alert info" style="display:flex;align-items:center;gap:0.6rem;">

@@ -149,20 +149,25 @@
                 <div class="form-group">
                     <button class="btn" onclick="fpdLoadRuns()"><i class="fas fa-rotate"></i> Refresh</button>
                 </div>
+                <div class="form-group">
+                    <button class="btn" id="fpdRecomputeBtn" onclick="fpdRecomputeCostsFromLedger()" title="Sum actual apify_run_ledger entries for each run's BDR(s), bounded by that run's own time window — this catches cost for every Apify call a run triggered, including runs stuck at &quot;running&quot; that never got to save their own cost breakdown (e.g. the browser tab was closed mid-run)."><i class="fas fa-magnifying-glass-dollar"></i> Recompute Costs from Ledger</button>
+                </div>
                 <div class="form-group" style="margin-left:auto;">
                     <label>&nbsp;</label>
                     <span id="fpdRunsSummary" style="font-size:12.5px; color: var(--gray-500);"></span>
                 </div>
             </div>
+            <div id="fpdRecomputeStatus" style="font-size:12.5px; color: var(--gray-500); margin: -4px 0 10px;"></div>
             <div style="max-height: 320px; overflow: auto; border: 1px solid var(--gray-200); border-radius: 8px;">
                 <table class="data-table" id="fpdRunsTable">
                     <thead>
                         <tr>
                             <th>Started</th><th>Group</th><th>Scan</th><th>Status</th>
-                            <th>Orgs</th><th>Scanned</th><th>Matched</th><th>Messages</th><th>Conv %</th><th>Cost</th>
+                            <th>Orgs</th><th>Scanned</th><th>Matched</th><th>Messages</th><th>Conv %</th>
+                            <th>Cost (self-reported)</th><th>Cost (ledger, recomputed)</th>
                         </tr>
                     </thead>
-                    <tbody id="fpdRunsBody"><tr><td colspan="10" class="empty-hint">Loading runs…</td></tr></tbody>
+                    <tbody id="fpdRunsBody"><tr><td colspan="11" class="empty-hint">Loading runs…</td></tr></tbody>
                 </table>
             </div>
         </div>
@@ -372,7 +377,8 @@
         let fpdOrgSort = 'order';
 
         async function fpdLoadRuns() {
-            document.getElementById('fpdRunsBody').innerHTML = '<tr><td colspan="10" class="empty-hint">Loading runs…</td></tr>';
+            document.getElementById('fpdRunsBody').innerHTML = '<tr><td colspan="11" class="empty-hint">Loading runs…</td></tr>';
+            document.getElementById('fpdRecomputeStatus').textContent = '';
             try {
                 const q = query(collection(db, 'full_pipeline_runs'), orderBy('startedAt', 'desc'), limit(300));
                 const snap = await getDocs(q);
@@ -384,7 +390,7 @@
                     fpdAllRuns = snap.docs.map(d => ({ id: d.id, ...d.data() }))
                         .sort((a, b) => new Date(b.startedAt || 0) - new Date(a.startedAt || 0));
                 } catch (e2) {
-                    document.getElementById('fpdRunsBody').innerHTML = `<tr><td colspan="10" class="empty-hint">Failed to load runs: ${escHtml(e2.message)}</td></tr>`;
+                    document.getElementById('fpdRunsBody').innerHTML = `<tr><td colspan="11" class="empty-hint">Failed to load runs: ${escHtml(e2.message)}</td></tr>`;
                     return;
                 }
             }
@@ -420,11 +426,33 @@
             return run?.totals?.realCostBreakdown?.grandTotalUsd ?? null;
         }
 
+        // The BDR set a pipeline run's Apify calls should be attributed to. bdrPlan is saved to
+        // the run doc immediately on start (before anything runs), so it survives even runs that
+        // got interrupted mid-way — falls back to orgs[].bdrEmail for older runs saved before
+        // bdrPlan existed.
+        function fpdRunBdrEmails(run) {
+            const fromPlan = (run.bdrPlan || []).map(b => b.bdrEmail).filter(Boolean);
+            if (fromPlan.length) return [...new Set(fromPlan)];
+            return [...new Set((run.orgs || []).map(o => o.bdrEmail).filter(Boolean))];
+        }
+
+        // End of this run's attribution window: its own finishedAt if it has one, otherwise the
+        // start of the next-newer run overall (fpdAllRuns is sorted startedAt desc, so idx-1 is
+        // the next-newer one), otherwise "now" if this is the most recent run loaded. This is how
+        // a "running"-forever/abandoned run (browser tab closed mid-run) still gets a bounded
+        // window instead of hoovering up every ledger entry from its start until the end of time.
+        function fpdEndBoundForRun(run) {
+            if (run.finishedAt) return run.finishedAt;
+            const idx = fpdAllRuns.findIndex(r => r.id === run.id);
+            if (idx > 0) return fpdAllRuns[idx - 1].startedAt;
+            return new Date().toISOString();
+        }
+
         function fpdRenderRunsTable() {
             const body = document.getElementById('fpdRunsBody');
             document.getElementById('fpdRunsSummary').textContent = `${fpdFilteredRuns.length} of ${fpdAllRuns.length} run(s) shown`;
             if (!fpdFilteredRuns.length) {
-                body.innerHTML = '<tr><td colspan="10" class="empty-hint">No runs match these filters.</td></tr>';
+                body.innerHTML = '<tr><td colspan="11" class="empty-hint">No runs match these filters.</td></tr>';
                 return;
             }
             body.innerHTML = fpdFilteredRuns.map(r => {
@@ -432,6 +460,14 @@
                 const conv = fmtPct(t.messages || 0, t.matched || 0);
                 const cost = fpdRunCostUsd(r);
                 const when = r.startedAt ? new Date(r.startedAt).toLocaleString() : '—';
+                const lc = r._ledgerCost;
+                let ledgerCell = '<span style="color:var(--gray-400);">not computed</span>';
+                if (lc && !lc.error) {
+                    const mismatch = cost != null && Math.abs(lc.totalUsd - cost) > 0.01;
+                    ledgerCell = `${fmtUsd(lc.totalUsd)}${mismatch ? ' <span class="badge badge-amber" title="Differs from the self-reported total">≠ self-reported</span>' : ''}`;
+                } else if (lc && lc.error) {
+                    ledgerCell = `<span class="badge badge-red" title="${escHtml(lc.error)}">error</span>`;
+                }
                 return `<tr onclick="fpdSelectRun('${escHtml(r.id)}')">
                     <td>${escHtml(when)}</td>
                     <td>${escHtml(r.hypothesisGroupName || '—')}</td>
@@ -443,13 +479,62 @@
                     <td><strong>${t.messages || 0}</strong></td>
                     <td>${conv}%</td>
                     <td>${cost != null ? fmtUsd(cost) : '—'}</td>
+                    <td>${ledgerCell}</td>
                 </tr>`;
             }).join('');
         }
 
+        // Sums real apify_run_ledger entries for every currently-filtered run, bounded to each
+        // run's own [startedAt, endBound] window and its own BDR(s) — see fpdRunBdrEmails() /
+        // fpdEndBoundForRun(). This is what actually "connects the costs to every Apify call for
+        // every run": unlike the self-reported totals column, it works for runs that never
+        // finished cleanly (e.g. "running" forever because the browser tab was closed).
+        window.fpdRecomputeCostsFromLedger = async function () {
+            if (!fpCurrentUser) { alert('Not signed in yet — try again in a moment.'); return; }
+            if (!fpdFilteredRuns.length) return;
+            const btn = document.getElementById('fpdRecomputeBtn');
+            const statusEl = document.getElementById('fpdRecomputeStatus');
+            btn.disabled = true;
+            statusEl.textContent = `⏳ Recomputing ledger cost for ${fpdFilteredRuns.length} run(s)…`;
+            try {
+                const windows = fpdFilteredRuns.map(r => ({
+                    id: r.id,
+                    sinceIso: r.startedAt,
+                    untilIso: fpdEndBoundForRun(r),
+                    bdrEmails: fpdRunBdrEmails(r)
+                })).filter(w => w.sinceIso && w.untilIso);
+                if (!windows.length) { statusEl.textContent = '❌ None of the shown runs have a usable startedAt to build a window from.'; return; }
+
+                const token = await fpCurrentUser.getIdToken();
+                const resp = await fetch(`${RAILWAY_API}/api/apify-ledger/window-costs`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({ windows })
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data.success) {
+                    statusEl.textContent = `❌ Recompute failed: ${data.error || `HTTP ${resp.status}`}`;
+                    return;
+                }
+                const byId = new Map(data.results.map(r => [r.id, r]));
+                for (const run of fpdAllRuns) {
+                    if (byId.has(run.id)) run._ledgerCost = byId.get(run.id);
+                }
+                const errored = data.results.filter(r => r.error).length;
+                statusEl.textContent = `✅ Recomputed ${data.results.length - errored} run(s)${errored ? `, ${errored} failed` : ''} from apify_run_ledger.`;
+                fpdRenderRunsTable();
+                fpdRenderAggregate();
+                if (fpdSelectedRun) fpdRenderCostBreakdown();
+            } catch (e) {
+                statusEl.textContent = `❌ Recompute error: ${e.message}`;
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
         // ── Aggregation helper — sums numeric totals + reason tallies across a list of runs ──
         function fpdAggregate(runs) {
-            const totals = { orgs: 0, contactsScanned: 0, matched: 0, dropped: 0, messages: 0, costUsd: 0, costKnownRuns: 0, modeledCostUsd: 0, modeledCostKnownRuns: 0 };
+            const totals = { orgs: 0, contactsScanned: 0, matched: 0, dropped: 0, messages: 0, costUsd: 0, costKnownRuns: 0, modeledCostUsd: 0, modeledCostKnownRuns: 0, ledgerCostUsd: 0, ledgerCostKnownRuns: 0 };
             const hypTally = {}, noMsgTally = {}, postTypeTally = {};
             for (const r of runs) {
                 const t = r.totals || {};
@@ -460,6 +545,7 @@
                 totals.messages += t.messages || 0;
                 const cost = fpdRunCostUsd(r);
                 if (cost != null) { totals.costUsd += cost; totals.costKnownRuns++; }
+                if (r._ledgerCost && !r._ledgerCost.error) { totals.ledgerCostUsd += r._ledgerCost.totalUsd; totals.ledgerCostKnownRuns++; }
                 // Data-driven adjustment (see Apify Cost Audit section) — only populated once
                 // that audit has been run this session and covers this run's contact-search actor.
                 const modeled = fpaModeledContactSearchCost(t);
@@ -496,7 +582,8 @@
                 <div class="stat-tile"><div class="num">${agg.totals.matched}</div><div class="lbl">Matched Rules</div></div>
                 <div class="stat-tile"><div class="num">${agg.totals.messages}</div><div class="lbl">Messages Saved</div></div>
                 <div class="stat-tile ${conv < 50 ? 'warn' : ''}"><div class="num">${conv}%</div><div class="lbl">Matched → Messaged</div></div>
-                <div class="stat-tile"><div class="num">${fmtUsd(agg.totals.costUsd)}</div><div class="lbl">Cost (${agg.totals.costKnownRuns}/${fpdFilteredRuns.length} runs measured)</div></div>
+                <div class="stat-tile"><div class="num">${fmtUsd(agg.totals.costUsd)}</div><div class="lbl">Cost, self-reported (${agg.totals.costKnownRuns}/${fpdFilteredRuns.length} runs measured)</div></div>
+                ${agg.totals.ledgerCostKnownRuns ? `<div class="stat-tile"><div class="num">${fmtUsd(agg.totals.ledgerCostUsd)}</div><div class="lbl">Cost, ledger-recomputed (${agg.totals.ledgerCostKnownRuns}/${fpdFilteredRuns.length} runs)</div></div>` : ''}
                 ${fpaLastResult ? `<div class="stat-tile"><div class="num">${fmtUsd(agg.totals.modeledCostUsd)}</div><div class="lbl">Modeled Contact-Search Cost (${agg.totals.modeledCostKnownRuns}/${fpdFilteredRuns.length} runs, from Cost Audit)</div></div>` : ''}
             `;
             fpdRenderBars('fpdAggHypBars', agg.hypTally, '#f59e0b');
@@ -524,7 +611,7 @@
                 <div class="stat-tile"><div class="num">${t.dropped || 0}</div><div class="lbl">Dropped by Rules</div></div>
                 <div class="stat-tile"><div class="num">${t.messages || 0}</div><div class="lbl">Messages Saved</div></div>
                 <div class="stat-tile ${conv < 50 ? 'warn' : ''}"><div class="num">${conv}%</div><div class="lbl">Matched → Messaged</div></div>
-                <div class="stat-tile"><div class="num">${cost != null ? fmtUsd(cost) : '—'}</div><div class="lbl">Total Cost</div></div>
+                <div class="stat-tile"><div class="num">${cost != null ? fmtUsd(cost) : '—'}</div><div class="lbl">Total Cost (self-reported)</div></div>
                 <div class="stat-tile"><div class="num">${fpdStatusBadge(fpdSelectedRun.status)}</div><div class="lbl">Status</div></div>
             `;
 
@@ -560,9 +647,32 @@
                         </table>
                     </div>`;
             } else {
-                html = '<div class="empty-hint">No cost breakdown saved for this run.</div>';
+                html = '<div class="empty-hint">No cost breakdown saved for this run — this happens when a run never reached its "finally" step (e.g. the browser tab was closed while it was still running). Use "Recompute Costs from Ledger" above to reconstruct it from the real Apify billing records instead.</div>';
             }
-            document.getElementById('fpdCostBreakdown').innerHTML = html + fpaModeledCostHtml(t);
+            document.getElementById('fpdCostBreakdown').innerHTML = html + fpdLedgerCostHtml() + fpaModeledCostHtml(t);
+        }
+
+        // Shows the ledger-recomputed cost for the selected run (see fpdRecomputeCostsFromLedger),
+        // when it's been computed this session — bucketed the same way as the self-reported
+        // breakdown above so the two are directly comparable, and prominent when the self-reported
+        // one is missing entirely (interrupted runs).
+        function fpdLedgerCostHtml() {
+            const lc = fpdSelectedRun._ledgerCost;
+            if (!lc) return '';
+            if (lc.error) return `<div class="detail-panel"><h4>Cost breakdown (recomputed from ledger)</h4><div class="empty-hint">❌ ${escHtml(lc.error)}</div></div>`;
+            const b = lc.buckets || {};
+            return `
+                <div class="detail-panel">
+                    <h4>Cost breakdown (recomputed from ledger — window ${new Date(lc.sinceIso).toLocaleString()} → ${new Date(lc.untilIso).toLocaleString()})</h4>
+                    <table class="mini-table">
+                        <tr><td>Apify — contact search</td><td>${fmtUsd(b.contactSearch)} <span class="badge badge-green">measured</span></td></tr>
+                        <tr><td>Apify — profile scrapes</td><td>${fmtUsd(b.profileScrape)} <span class="badge badge-green">measured</span></td></tr>
+                        <tr><td>Apify — post scrapes</td><td>${fmtUsd(b.postScrape)} <span class="badge badge-green">measured</span></td></tr>
+                        <tr><td>Apify — other/unlabeled</td><td>${fmtUsd(b.other)} <span class="badge badge-green">measured</span></td></tr>
+                        <tr><td><strong>Grand total</strong></td><td><strong>${fmtUsd(lc.totalUsd)}</strong></td></tr>
+                    </table>
+                    <div class="empty-hint" style="margin-top:6px;">${lc.docsMatched} ledger entr${lc.docsMatched === 1 ? 'y' : 'ies'} matched this run's BDR(s) in-window (${lc.docsWithCost} with a measured cost, ${lc.docsWithNullCost} still pending).</div>
+                </div>`;
         }
 
         function fpdOrgConversion(org) {
