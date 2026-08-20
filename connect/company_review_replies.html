@@ -1268,6 +1268,46 @@
             flex: 1;
             min-width: 0;
         }
+        /* ── "Due for follow-up right now" circle — computed instantly from dates/counts, no AI ── */
+        .followups-due-circle {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            width: 92px;
+            height: 92px;
+            min-width: 92px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #0d9488, #0f766e);
+            color: white;
+            cursor: pointer;
+            box-shadow: 0 4px 14px rgba(13, 148, 136, 0.35);
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+            flex-shrink: 0;
+        }
+        .followups-due-circle:hover {
+            transform: scale(1.05);
+            box-shadow: 0 6px 18px rgba(13, 148, 136, 0.45);
+        }
+        .followups-due-circle.followups-due-circle-empty {
+            background: linear-gradient(135deg, #9ca3af, #6b7280);
+            box-shadow: 0 4px 14px rgba(107, 114, 128, 0.25);
+        }
+        .followups-due-circle-count {
+            font-size: 1.6rem;
+            font-weight: 800;
+            line-height: 1;
+        }
+        .followups-due-circle-label {
+            font-size: 0.62rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+            text-align: center;
+            line-height: 1.15;
+            margin-top: 0.15rem;
+            opacity: 0.95;
+        }
         .btn-export-groupings {
             display: inline-flex;
             align-items: center;
@@ -2096,6 +2136,10 @@
                         <i class="fas fa-users"></i> <span id="prospectCount">0</span> Prospects Engaged in the Past <span id="timeWindowText">All Time</span>
                     </p>
                     <p style="margin-top: 0.25rem;">Click any cell to filter conversations by category combination</p>
+                </div>
+                <div class="followups-due-circle followups-due-circle-empty" id="followUpsDueCircle" onclick="showFollowUpsDueNowList()" title="Nothing is due for a follow-up right now">
+                    <span class="followups-due-circle-count" id="followUpsDueCircleCount">0</span>
+                    <span class="followups-due-circle-label">due for<br>follow-up</span>
                 </div>
                 <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 0.5rem; padding-top: 0.25rem;">
                     <button class="btn-export-pdf" id="exportPDFBtn" onclick="exportPDFReport()">
@@ -6922,6 +6966,10 @@
                 }
             }
 
+            // Big "due right now" circle — deterministic (dates/counts only, no AI), see
+            // computeFollowUpsDueNow() above.
+            updateFollowUpsDueNowCircle(conversationsToCount);
+
             // Count conversations by category (excluding "Qualified Wrong Contact"), and tally
             // how many "1-2-3" meeting invitations are still due per Response Category — shown
             // as a small badge on each row header so it's visible at a glance on this grid.
@@ -7217,6 +7265,131 @@
             'Response Willing to Meet': 3,
             'Scheduled': 0,
             'Declined to Meet': 0
+        };
+        // Spacing rules — mirror SEQUENCE_MIN_DAYS_BETWEEN_INVITES / SEQUENCE_WILLING_TO_MEET_STEP2_MIN_DAYS
+        // in server.js exactly, so the "due now" circle below never disagrees with what the
+        // actual scan will draft.
+        const SEQUENCE_MIN_DAYS_BETWEEN_INVITES = 14;
+        const SEQUENCE_WILLING_TO_MEET_STEP2_MIN_DAYS = 10;
+
+        function getConvLastMessageDate(conv) {
+            const msgs = (conv.messages && conv.messages.length) ? conv.messages
+                : (conv.rawData?.messages && conv.rawData.messages.length ? conv.rawData.messages : null);
+            if (!msgs) return null;
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const d = safeToDate(msgs[i].createdAt || msgs[i].timestamp || msgs[i].sentAt || msgs[i].date);
+                if (d && !isNaN(d)) return d;
+            }
+            return null;
+        }
+
+        // Deterministic (no-AI) mirror of the exact eligibility rules in processFollowUpSequenceScanJob
+        // (server.js) — everything here is just dates/counts already sitting on each conversation, so
+        // it can run instantly client-side to show what's due right now, without running a scan.
+        // Only "Response Engaged" @ 1 invite sent, "Response Willing to Meet" @ 1 or 2 invites sent
+        // can ever be due — "Response"/Scheduled/Declined/Wrong Contact and anything with 0 invites
+        // sent (first follow-up is always human-written) never show up here.
+        function computeFollowUpsDueNow(conversations) {
+            const due = [];
+            (conversations || []).forEach(conv => {
+                const followUpCategory = conv.followUpCategory || 'No Follow Up';
+                if (followUpCategory === 'Qualified Wrong Contact') return;
+                if (conv.ignored || conv.isCurrentlyIgnored) return;
+
+                const responseCategory = conv.responseCategory || 'Response';
+                if (responseCategory !== 'Response Engaged' && responseCategory !== 'Response Willing to Meet') return;
+
+                const totalInvites = SEQUENCE_TOTAL_INVITES[responseCategory] || 0;
+                const invitesSent = conv.followUpInvitesSent || 0;
+                if (invitesSent === 0 || invitesSent >= totalInvites) return; // human-only first follow-up, or sequence complete
+
+                const msgCount = conv.messages?.length || conv.rawData?.messages?.length || 0;
+                if (conv.followUpWaitingSinceMessageCount != null && conv.followUpWaitingSinceMessageCount >= msgCount) return; // paused, waiting on prospect
+
+                if (conv.followUpSequence?.status === 'pending_review') return; // already drafted, awaiting review
+
+                const nextStep = invitesSent + 1;
+                const isWillingToMeetStep2 = responseCategory === 'Response Willing to Meet' && nextStep === 2;
+                const lastMessageDate = getConvLastMessageDate(conv);
+                const lastInviteDate = safeToDate(conv.followUpLastInviteAt);
+                const anchor = isWillingToMeetStep2 ? (lastMessageDate || lastInviteDate) : (lastInviteDate || lastMessageDate);
+                const minDays = isWillingToMeetStep2 ? SEQUENCE_WILLING_TO_MEET_STEP2_MIN_DAYS : SEQUENCE_MIN_DAYS_BETWEEN_INVITES;
+
+                let daysSinceAnchor = null;
+                if (anchor && !isNaN(anchor)) {
+                    daysSinceAnchor = (Date.now() - anchor.getTime()) / (24 * 60 * 60 * 1000);
+                    if (daysSinceAnchor < minDays) return; // too soon
+                }
+
+                const contactName = (conv.leadFirstName && conv.leadLastName)
+                    ? `${conv.leadFirstName} ${conv.leadLastName}`
+                    : (conv.lead_name || conv.leadFirstName || 'Unknown');
+                due.push({
+                    id: conv.id,
+                    contactName,
+                    company: conv.companyName || conv.leadCompany || conv.company || '',
+                    bdrEmail: conv.bdrEmail || '',
+                    responseCategory,
+                    invitesSent,
+                    totalInvites,
+                    nextStep,
+                    daysSinceAnchor: daysSinceAnchor != null ? Math.floor(daysSinceAnchor) : null,
+                    anchorLabel: isWillingToMeetStep2 ? 'last message' : 'last invitation'
+                });
+            });
+            return due;
+        }
+
+        function updateFollowUpsDueNowCircle(conversationsInScope) {
+            const circle = document.getElementById('followUpsDueCircle');
+            const countEl = document.getElementById('followUpsDueCircleCount');
+            if (!circle || !countEl) return;
+            const due = computeFollowUpsDueNow(conversationsInScope);
+            window._followUpsDueNow = due;
+            countEl.textContent = due.length;
+            circle.classList.toggle('followups-due-circle-empty', due.length === 0);
+            circle.title = due.length
+                ? `${due.length} conversation${due.length === 1 ? '' : 's'} due for a follow-up right now (dates/counts only, no AI) — click to see which`
+                : 'Nothing is due for a follow-up right now';
+        }
+
+        window.showFollowUpsDueNowList = function() {
+            const existing = document.getElementById('followUpsDueNowModal');
+            if (existing) existing.remove();
+
+            const due = window._followUpsDueNow || [];
+            const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+            const rowsHtml = due.map(item => `
+                <div style="padding: 0.75rem 1rem; border-bottom: 1px solid #f3f4f6;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+                        <div style="font-weight: 600; color: #111827;">${esc(item.contactName)}${item.company ? ` — ${esc(item.company)}` : ''}</div>
+                        <span style="background: #0d948820; color: #0d9488; font-weight: 700; padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.78rem; white-space: nowrap;">invite ${item.nextStep}/${item.totalInvites} due</span>
+                    </div>
+                    <div style="font-size: 0.78rem; color: #6b7280;">${esc(item.responseCategory)} · ${item.invitesSent} sent so far${item.bdrEmail ? ` · BDR: ${esc(item.bdrEmail)}` : ''}${item.daysSinceAnchor != null ? ` · ${item.daysSinceAnchor}d since ${esc(item.anchorLabel)}` : ''}</div>
+                </div>`).join('') || '<div style="padding: 1.5rem; text-align: center; color: #6b7280;">Nothing is due for a follow-up right now.</div>';
+
+            const modal = document.createElement('div');
+            modal.id = 'followUpsDueNowModal';
+            modal.style.cssText = 'position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 10000; display: flex; align-items: center; justify-content: center; padding: 1.5rem;';
+            modal.innerHTML = `
+                <div style="background: white; border-radius: 14px; max-width: 640px; width: 100%; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(0,0,0,0.3);">
+                    <div style="padding: 1.1rem 1.25rem; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center;">
+                        <h3 style="margin: 0; font-size: 1.05rem; color: #111827;"><i class="fas fa-circle-exclamation" style="color: #0d9488;"></i> Due for a Follow-Up Right Now</h3>
+                        <button onclick="document.getElementById('followUpsDueNowModal').remove()" style="background: none; border: none; font-size: 1.3rem; color: #6b7280; cursor: pointer; line-height: 1;">&times;</button>
+                    </div>
+                    <div style="padding: 1rem 1.25rem; overflow-y: auto;">
+                        <div style="font-size: 0.85rem; color: #374151; margin-bottom: 0.75rem;">
+                            Computed instantly from dates/counts already on file — no AI involved. Click <strong>"Draft Follow-Up Sequences"</strong> to actually generate these.
+                        </div>
+                        <div style="border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden;">${rowsHtml}</div>
+                    </div>
+                    <div style="padding: 0.9rem 1.25rem; border-top: 1px solid #e5e7eb; text-align: right;">
+                        <button onclick="document.getElementById('followUpsDueNowModal').remove()" style="background: #0d9488; color: white; border: none; padding: 0.55rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer;">Close</button>
+                    </div>
+                </div>`;
+            modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+            document.body.appendChild(modal);
         };
 
         function renderConversationItem(conv) {
