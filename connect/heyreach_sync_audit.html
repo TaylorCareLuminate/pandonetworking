@@ -996,11 +996,19 @@ async function loadBdrList() {
         const sel = document.getElementById('bdrSelect');
         _bdrLeadersCache
             .filter(b => b.primaryEmail)
-            .sort((a, b) => (a.name || a.primaryEmail).localeCompare(b.name || b.primaryEmail))
+            .sort((a, b) => {
+                // Active BDRs first, then alphabetical — keeps duplicate-name
+                // inactive records (BDR moved companies) from being picked by mistake
+                const aActive = a.status === 'active' ? 0 : 1;
+                const bActive = b.status === 'active' ? 0 : 1;
+                if (aActive !== bActive) return aActive - bActive;
+                return (a.name || a.primaryEmail).localeCompare(b.name || b.primaryEmail);
+            })
             .forEach(b => {
                 const o = document.createElement('option');
                 o.value = b.primaryEmail.toLowerCase();
-                o.textContent = b.name ? `${b.name} (${b.primaryEmail})` : b.primaryEmail;
+                const label = b.name ? `${b.name} (${b.primaryEmail})` : b.primaryEmail;
+                o.textContent = b.status === 'active' ? label : `${label} — INACTIVE`;
                 sel.appendChild(o);
             });
     } catch (err) {
@@ -1023,10 +1031,13 @@ async function resolveBdrEmailCandidates(rawEmail) {
         _bdrLeadersCache = [];
         bdrSnap.forEach(d => _bdrLeadersCache.push({ id: d.id, ...d.data() }));
     }
-    const bdrDoc = _bdrLeadersCache.find(dd => {
+    // Among exact matches, prefer the active doc (a BDR who moved companies has
+    // a second, inactive doc whose email variants would expand the wrong identity)
+    const exactMatches = _bdrLeadersCache.filter(dd => {
         const emails = [dd.primaryEmail, dd.linkedInEmail, ...(dd.emailAccountIds || [])].map(e => (e || '').toLowerCase());
         return emails.includes(lower);
     });
+    const bdrDoc = exactMatches.find(dd => dd.status === 'active') || exactMatches[0];
     if (bdrDoc) {
         [bdrDoc.primaryEmail, bdrDoc.linkedInEmail, ...(bdrDoc.emailAccountIds || [])]
             .forEach(e => { if (e) candidates.add(e.toLowerCase()); });
@@ -2715,12 +2726,42 @@ function markRowRepushed(activityId) {
     });
 }
 
+// ── BDR doc chooser ────────────────────────────────────────────────────────────
+// A BDR who changed companies has TWO bdr_leaders docs (old company inactive,
+// new company active) with the same name and often similar emails. Any
+// "first/last match wins" scan can silently resolve to the retired doc and make
+// every downstream check (API key, campaigns, lists) report against the wrong
+// company. This chooser ranks all matches: exact email match beats fuzzy
+// local-part match, and active docs beat inactive ones.
+function chooseBdrDoc(docs, emailLower) {
+    const local = emailLower.split('@')[0];
+    let best = null, bestScore = 0;
+    for (const dd of docs) {
+        const emails = [
+            dd.primaryEmail, dd.linkedInEmail,
+            ...(dd.emailAccountIds || []),
+            ...(dd.linkedInAccounts || []).map(a => a.email || a.bdrEmail || '')
+        ].map(e => (e || '').toLowerCase()).filter(Boolean);
+
+        let score = 0;
+        if (emails.includes(emailLower)) score = 2;
+        else if (emails.some(e => e.split('@')[0] === local || e.includes(local))) score = 1;
+        if (score === 0) continue;
+        if (dd.status === 'active') score += 4;
+
+        if (score > bestScore) { best = dd; bestScore = score; }
+    }
+    return best;
+}
+
 // ── HeyReach API Key lookup ────────────────────────────────────────────────────
 async function getHeyReachApiKey(bdrEmail) {
     try {
         const emailLower = bdrEmail.toLowerCase();
 
         // ── Strategy 1: linkedin_accounts (fastest — has bdrEmail index) ─────
+        // Outdated (retired) accounts are already excluded by the Firestore
+        // wrapper, so docs[0] can't be a soft-deleted seat.
         const accountsRef = collection(emailDB, 'linkedin_accounts');
         const q = query(accountsRef, where('bdrEmail', '==', emailLower));
         const snap = await getDocs(q);
@@ -2736,19 +2777,8 @@ async function getHeyReachApiKey(bdrEmail) {
                 _bdrLeadersCache = [];
                 bdrSnap.forEach(d => _bdrLeadersCache.push({ id: d.id, ...d.data() }));
             }
-            for (const dd of _bdrLeadersCache) {
-                const allEmails = [
-                    dd.primaryEmail, dd.linkedInEmail,
-                    ...(dd.emailAccountIds || []),
-                    ...(dd.linkedInAccounts || []).map(a => a.email || a.bdrEmail || '')
-                ].map(e => (e || '').toLowerCase()).filter(Boolean);
-
-                if (allEmails.includes(emailLower) ||
-                    allEmails.some(e => e.split('@')[0] === emailLower.split('@')[0])) {
-                    customerId = dd.customerId;
-                    break;
-                }
-            }
+            const bdrDoc = chooseBdrDoc(_bdrLeadersCache, emailLower);
+            if (bdrDoc) customerId = bdrDoc.customerId;
         }
 
         if (!customerId) return { success: false, error: `No account/BDR record found for ${bdrEmail}` };
@@ -2866,17 +2896,14 @@ async function runMethod1(profileUrl, apiKey) {
 // Method 2: bdr_leaders → heyreachCampaigns (Firestore source of truth for this BDR's campaigns)
 async function runMethod2(bdrEmail) {
     try {
-        // Find the BDR leader by matching primaryEmail or linkedInEmail
+        // Find the BDR leader by matching primaryEmail or linkedInEmail.
+        // chooseBdrDoc prefers exact-email + active docs so a duplicate BDR
+        // (same person under an old, inactive company) can't win the match.
         const bdrRef = collection(emailDB, 'bdr_leaders');
         const snap = await getDocs(bdrRef);
-        let bdrDoc = null;
-        snap.forEach(d => {
-            const dd = d.data();
-            const emails = [dd.primaryEmail, dd.linkedInEmail, ...(dd.emailAccountIds || [])].map(e => (e||'').toLowerCase());
-            if (emails.some(e => e === bdrEmail || e.includes(bdrEmail.split('@')[0]))) {
-                bdrDoc = { id: d.id, ...dd };
-            }
-        });
+        const allBdrDocs = [];
+        snap.forEach(d => allBdrDocs.push({ id: d.id, ...d.data() }));
+        let bdrDoc = chooseBdrDoc(allBdrDocs, bdrEmail);
         if (!bdrDoc) {
             // Try matching via linkedin_accounts
             const laRef = collection(emailDB, 'linkedin_accounts');
@@ -2909,7 +2936,10 @@ async function runMethod2(bdrEmail) {
                 Campaign ID: <code>${escHtml(String(c.id||'?'))}</code> · List ID: <code>${escHtml(String(c.listId||'?'))}</code>
             </div>`
         ).join('');
-        setMethodState('m2', 'found', `Found BDR doc <code>${escHtml(bdrDoc.id)}</code> with <strong>${campaigns.length} campaign(s)</strong>:<br>${rows}`);
+        const inactiveWarn = bdrDoc.status !== 'active'
+            ? `<div style="color:var(--danger); font-weight:600; margin-bottom:0.4rem;"><i class="fas fa-exclamation-triangle"></i> This BDR doc is <strong>${escHtml(bdrDoc.status || 'missing status')}</strong> — the auto-push job will NOT process it. If this BDR moved companies, an active doc may be missing campaigns.</div>`
+            : '';
+        setMethodState('m2', 'found', `${inactiveWarn}Found BDR doc <code>${escHtml(bdrDoc.id)}</code> with <strong>${campaigns.length} campaign(s)</strong>:<br>${rows}`);
         // Store for Method 3
         window._finderCampaigns = campaigns;
     } catch(e) { setMethodState('m2', 'error', escHtml(e.message)); console.error('Method 2 error:', e); }
@@ -3081,12 +3111,9 @@ async function runMethod6(profileUrl, bdrEmail, apiKey) {
         {
             const bdrRef = collection(emailDB, 'bdr_leaders');
             const snap = await getDocs(bdrRef);
-            let bdrDoc = null;
-            snap.forEach(d => {
-                const dd = d.data();
-                const emails = [dd.primaryEmail, dd.linkedInEmail, ...(dd.emailAccountIds || [])].map(e => (e||'').toLowerCase());
-                if (emails.some(e => e === bdrEmail || e.includes(bdrEmail.split('@')[0]))) bdrDoc = { id: d.id, ...dd };
-            });
+            const allBdrDocs = [];
+            snap.forEach(d => allBdrDocs.push({ id: d.id, ...d.data() }));
+            let bdrDoc = chooseBdrDoc(allBdrDocs, bdrEmail);
             // Fallback: lookup via linkedin_accounts → bdrLeaderId
             if (!bdrDoc) {
                 const laQ = query(collection(emailDB, 'linkedin_accounts'), where('bdrEmail', '==', bdrEmail));
