@@ -4618,11 +4618,27 @@
 
         console.log(`✅ Added ${window.connectMeetings.length} unique Connect meetings (${connectRaw.length - window.connectMeetings.length} were duplicates of campaign meetings)`);
 
-        // Combine: campaign meetings first (sorted by date), then Connect meetings
-        const combined = [...window.allMeetings, ...window.connectMeetings];
+        // Load Post-Call Tracking meetings scheduled OUTSIDE of Connect and dedupe against
+        // everything loaded so far (campaign + Connect).
+        const pctRaw = await loadPostCallTrackingMeetings();
+        window.pctMeetings = [];
+        pctRaw.forEach(rec => {
+          if (meetingMatchesKeySet(rec, campaignDedupKeys)) {
+            console.log(`⚠️ Skipping duplicate Post-Call Tracking meeting (already counted): ${rec.lead_name}`);
+          } else {
+            window.pctMeetings.push(rec);
+            addMeetingKeysToSet(rec, campaignDedupKeys);
+          }
+        });
+
+        console.log(`✅ Added ${window.pctMeetings.length} unique Post-Call Tracking meetings outside of Connect`);
+
+        // Combine: campaign meetings first (sorted by date), then Connect meetings, then
+        // Post-Call Tracking meetings scheduled outside of Connect
+        const combined = [...window.allMeetings, ...window.connectMeetings, ...window.pctMeetings];
         window.allMeetings = combined;
         
-        console.log(`✅ Total meetings: ${window.allMeetings.length} (${window.allMeetings.filter(m => m.source !== 'connect').length} campaign + ${window.connectMeetings.length} Connect)`);
+        console.log(`✅ Total meetings: ${window.allMeetings.length} (${window.allMeetings.filter(m => m.source !== 'connect' && m.source !== 'post_call_tracking').length} campaign + ${window.connectMeetings.length} Connect + ${window.pctMeetings.length} tracked outside Connect)`);
         
         // Update count badge to show ALL meetings
         document.getElementById('meetings-count').textContent = window.allMeetings.length;
@@ -4648,6 +4664,14 @@
     const CONNECT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
     // Deduplicated Connect-only scheduled count, stored by loadMeetingsCount() and read by calculateMetrics()
     let _connectScheduledCount = 0;
+
+    // Cache for Post-Call Tracking meetings scheduled OUTSIDE of Connect (OutcomeMD only — see
+    // loadPostCallTrackingMeetings() below). Deduplicated count stored by loadMeetingsCount()
+    // and read by calculateMetrics(), same pattern as _connectScheduledCount above.
+    let _pctScheduledCache = null;
+    let _pctScheduledCacheTime = 0;
+    let _pctScheduledCount = 0;
+    let _pctScheduledPromise = null;
 
     // Load Connect (LinkedIn) scheduled conversations for OutcomeMD
     // Uses a promise-based cache to prevent duplicate concurrent queries
@@ -4981,6 +5005,132 @@
       }
     }
 
+    // Resolves the BDR emails (primary + LinkedIn account + linkedin_email_associations aliases)
+    // assigned to this OutcomeMD customer — same BDR/customer resolution _doLoadConnectScheduledMeetings
+    // does above, factored out here so loadPostCallTrackingMeetings() can reuse it independently.
+    async function _resolveOutcomeMDBdrEmails() {
+      const { query: fQuery, where } = window.clemailFirestore;
+      const bdrSnapshot = await getDocs(fQuery(
+        collection(window.emailDB, 'bdr_leaders'),
+        where('customerId', '==', window.clientCustomer.id)
+      ));
+
+      const bdrEmails = new Set();
+      bdrSnapshot.forEach(doc => {
+        const d = doc.data();
+        if (d.primaryEmail) bdrEmails.add(d.primaryEmail.toLowerCase().trim());
+        if (d.linkedInEmail && d.linkedInEmail.toLowerCase().trim() !== (d.primaryEmail || '').toLowerCase().trim()) {
+          bdrEmails.add(d.linkedInEmail.toLowerCase().trim());
+        }
+      });
+      if (bdrEmails.size === 0) return bdrEmails;
+
+      try {
+        const assocSnap = await getDocs(collection(window.emailDB, 'linkedin_email_associations'));
+        assocSnap.forEach(doc => {
+          const d = doc.data();
+          if (d.authEmail && d.linkedInEmail) {
+            const authEmail = d.authEmail.toLowerCase().trim();
+            const linkedInEmail = d.linkedInEmail.toLowerCase().trim();
+            if (bdrEmails.has(authEmail) && !bdrEmails.has(linkedInEmail)) {
+              bdrEmails.add(linkedInEmail);
+            }
+          }
+        });
+      } catch (e) {
+        console.warn('⚠️ Could not load linkedin_email_associations:', e.message);
+      }
+      return bdrEmails;
+    }
+
+    // Load Post-Call Tracking meetings scheduled OUTSIDE of Connect — i.e. contacts manually
+    // added on the Post-Call Tracking page (connect/post_call_tracking.html) that never went
+    // through a HeyReach/LinkedIn conversation: phone calls, referrals, inbound leads, etc.
+    // Records with source === 'scheduled_meeting' are skipped since those originated from a
+    // Connect conversation and are already surfaced by loadConnectScheduledMeetings() above —
+    // including them here too would just be re-showing the same meeting twice.
+    // OutcomeMD-only feature, uses a promise-based cache like the Connect loader above.
+    async function loadPostCallTrackingMeetings() {
+      if (_pctScheduledCache && (Date.now() - _pctScheduledCacheTime < CONNECT_CACHE_TTL_MS)) {
+        console.log('📋 Using cached Post-Call Tracking meetings');
+        return _pctScheduledCache;
+      }
+      if (_pctScheduledPromise) {
+        console.log('📋 Waiting for in-flight Post-Call Tracking query...');
+        return _pctScheduledPromise;
+      }
+      _pctScheduledPromise = _doLoadPostCallTrackingMeetings().finally(() => {
+        _pctScheduledPromise = null;
+      });
+      return _pctScheduledPromise;
+    }
+
+    async function _doLoadPostCallTrackingMeetings() {
+      try {
+        console.log('📋 Loading Post-Call Tracking meetings (outside of Connect) for OutcomeMD...');
+        if (!window.clientCustomer) return [];
+
+        const bdrEmails = await _resolveOutcomeMDBdrEmails();
+        if (bdrEmails.size === 0) {
+          console.warn('⚠️ No BDR emails found for OutcomeMD Post-Call Tracking');
+          return [];
+        }
+
+        const { query: fQuery, where } = window.clemailFirestore;
+        const records = new Map();
+        for (const email of [...bdrEmails]) {
+          try {
+            const snap = await getDocs(fQuery(
+              collection(window.emailDB, 'post_call_tracking'),
+              where('bdrEmail', '==', email)
+            ));
+            snap.forEach(doc => {
+              if (!records.has(doc.id)) records.set(doc.id, { id: doc.id, ...doc.data() });
+            });
+          } catch (e) { /* ignore */ }
+        }
+
+        const outsideConnect = [];
+        records.forEach(r => {
+          if (r.archived) return;
+          if (r.source === 'scheduled_meeting') return; // already surfaced via Connect above
+
+          const firstName = r.contactFirstName || '';
+          const lastName = r.contactLastName || '';
+          const leadName = r.contactName || `${firstName} ${lastName}`.trim() || '';
+          if (!leadName && !r.companyName && !r.contactLinkedInUrl) return;
+
+          outsideConnect.push({
+            id: r.id,
+            source: 'post_call_tracking',
+            leadFirstName: firstName,
+            leadLastName: lastName,
+            lead_name: leadName || 'Unknown',
+            firstName,
+            lastName,
+            companyName: r.companyName || '',
+            prospectOrgName: r.companyName || '',
+            leadProfileUrl: (r.contactLinkedInUrl || '').toLowerCase().trim(),
+            email: r.contactEmail || '',
+            bdrEmail: r.bdrEmail || '',
+            scheduledWithBDR: r.bdrName || r.bdrEmail || '',
+            meetingDateTime: r.meetingDateTime || null,
+            lastMessageAt: r.lastActivityAt || r.meetingDateTime || null,
+            customFields: {},
+          });
+        });
+
+        console.log(`✅ Found ${outsideConnect.length} Post-Call Tracking meetings outside of Connect`);
+        _pctScheduledCache = outsideConnect;
+        _pctScheduledCacheTime = Date.now();
+        return outsideConnect;
+
+      } catch (error) {
+        console.error('❌ Error loading Post-Call Tracking meetings:', error);
+        return [];
+      }
+    }
+
     // Returns a Set of all possible deduplication keys for a meeting.
     // Checks LinkedIn URL, email, and name+company — campaign meetings rarely
     // have LinkedIn URLs so we need all three to reliably cross-match.
@@ -5123,16 +5273,19 @@
       const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
       const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
       
-      const campaignCount = window.filteredMeetings.filter(m => m.source !== 'connect').length;
+      const campaignCount = window.filteredMeetings.filter(m => m.source !== 'connect' && m.source !== 'post_call_tracking').length;
       const connectCount = window.filteredMeetings.filter(m => m.source === 'connect').length;
-      const summaryText = connectCount > 0
-        ? `${campaignCount} campaign meeting${campaignCount !== 1 ? 's' : ''} + ${connectCount} via Connect`
-        : `${campaignCount} meeting${campaignCount !== 1 ? 's' : ''}`;
+      const pctCount = window.filteredMeetings.filter(m => m.source === 'post_call_tracking').length;
+      const summaryParts = [`${campaignCount} campaign meeting${campaignCount !== 1 ? 's' : ''}`];
+      if (connectCount > 0) summaryParts.push(`${connectCount} via Connect`);
+      if (pctCount > 0) summaryParts.push(`${pctCount} tracked outside Connect`);
+      const summaryText = summaryParts.join(' + ');
 
       let html = `
         <div style="margin-bottom: 0.75rem; display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
           <span style="font-size: 0.9rem; color: var(--gray);">${summaryText}</span>
           ${connectCount > 0 ? `<span style="background: #0077b5; color: white; padding: 0.2rem 0.6rem; border-radius: 10px; font-size: 0.75rem; font-weight: 600;"><i class="fab fa-linkedin"></i> ${connectCount} Connect</span>` : ''}
+          ${pctCount > 0 ? `<span style="background: #8b5cf6; color: white; padding: 0.2rem 0.6rem; border-radius: 10px; font-size: 0.75rem; font-weight: 600;"><i class="fas fa-clipboard-list"></i> ${pctCount} Tracked</span>` : ''}
         </div>
         <table class="meetings-table">
           <thead>
@@ -5150,6 +5303,7 @@
       
       window.filteredMeetings.forEach(meeting => {
         const isConnect = meeting.source === 'connect';
+        const isPostCallTracking = meeting.source === 'post_call_tracking';
 
         // Support both outreach_sets and Connect field formats
         const firstName = meeting.firstName || meeting.customFields?.first_name || meeting.leadFirstName || '';
@@ -5161,8 +5315,13 @@
 
         let dateCell, statusCell, methodIcon;
 
-        if (isConnect) {
-          // Connect meeting - sourced from LinkedIn conversation (no specific meeting date/time)
+        // Post-Call Tracking records almost always carry a specific meetingDateTime (it defaults
+        // to "now" when a BDR doesn't set one, see post_call_tracking_service.js#createRecord),
+        // so only fall back to the no-specific-date rendering (like Connect) when it's genuinely
+        // missing — this keeps the common case showing a real date/time like a campaign meeting.
+        if (isConnect || (isPostCallTracking && !meeting.meetingDateTime)) {
+          // Sourced from a LinkedIn conversation (or an undated tracked contact) — no specific
+          // meeting date/time, so show "last contact" instead.
           const lastContactDate = meeting.lastMessageAt
             ? (meeting.lastMessageAt.toDate ? meeting.lastMessageAt.toDate() : new Date(meeting.lastMessageAt))
             : null;
@@ -5170,13 +5329,17 @@
             ? lastContactDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
             : 'Date unknown';
 
+          const badgeColor = isConnect ? '#0077b5' : '#8b5cf6';
+          const badgeIcon = isConnect ? '<i class="fab fa-linkedin"></i>' : '<i class="fas fa-clipboard-list"></i>';
+          const badgeLabel = isConnect ? 'Via Connect' : 'Tracked';
+
           dateCell = `
             <div style="display: flex; flex-direction: column; gap: 0.2rem;">
-              <span style="background: #0077b5; color: white; padding: 0.2rem 0.5rem; border-radius: 8px; font-size: 0.75rem; font-weight: 600; white-space: nowrap;"><i class="fab fa-linkedin"></i> Via Connect</span>
+              <span style="background: ${badgeColor}; color: white; padding: 0.2rem 0.5rem; border-radius: 8px; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">${badgeIcon} ${badgeLabel}</span>
               <span style="font-size: 0.75rem; color: var(--gray);">Last contact: ${lastContactStr}</span>
             </div>`;
           statusCell = `<span class="meeting-status-upcoming">Scheduled</span>`;
-          methodIcon = '<span class="meeting-method-icon">🔗</span> Connect';
+          methodIcon = isConnect ? '<span class="meeting-method-icon">🔗</span> Connect' : '<span class="meeting-method-icon">📋</span> Tracked';
         } else {
           const meetingDate = meeting.meetingDateTime.toDate ? meeting.meetingDateTime.toDate() : new Date(meeting.meetingDateTime);
           const dateStr = meetingDate.toLocaleDateString('en-US', { 
@@ -5221,8 +5384,11 @@
           ? `<a href="${linkedInUrl}" target="_blank" style="color: inherit; text-decoration: none;">${fullName}</a>`
           : fullName;
 
+        const rowStyle = isConnect
+          ? ' style="background: linear-gradient(135deg, #f0f7ff, #e8f0fe);"'
+          : (isPostCallTracking ? ' style="background: linear-gradient(135deg, #f5f3ff, #ede9fe);"' : '');
         html += `
-          <tr${isConnect ? ' style="background: linear-gradient(135deg, #f0f7ff, #e8f0fe);"' : ''}>
+          <tr${rowStyle}>
             <td>${dateCell}</td>
             <td>
               <div class="meeting-contact-name">${nameHtml}</div>
@@ -5246,11 +5412,15 @@
 
     // Refresh meetings
     window.refreshMeetings = async function() {
-      // Clear Connect cache so fresh data is loaded
+      // Clear Connect + Post-Call Tracking caches so fresh data is loaded
       _connectScheduledCache = null;
       _connectScheduledCacheTime = 0;
       _connectScheduledPromise = null;
       _connectScheduledCount = 0; // Reset so calculateMetrics() won't use stale count while reloading
+      _pctScheduledCache = null;
+      _pctScheduledCacheTime = 0;
+      _pctScheduledPromise = null;
+      _pctScheduledCount = 0;
       document.getElementById('meetings-container').innerHTML = `
         <div class="loading">
           <i class="fas fa-spinner fa-spin"></i>
@@ -5302,17 +5472,34 @@
         } catch (e) {
           console.warn('⚠️ Could not load Connect count:', e.message);
         }
+
+        // Load Post-Call Tracking ("outside of Connect") meetings and count only those not
+        // already in campaign or Connect
+        let pctCount = 0;
+        try {
+          const pctMeetings = await loadPostCallTrackingMeetings();
+          pctMeetings.forEach(rec => {
+            if (!meetingMatchesKeySet(rec, campaignDedupKeys)) {
+              pctCount++;
+              addMeetingKeysToSet(rec, campaignDedupKeys);
+            }
+          });
+          console.log(`📋 Post-Call Tracking scheduled (after dedup): ${pctCount} of ${pctMeetings.length} total`);
+        } catch (e) {
+          console.warn('⚠️ Could not load Post-Call Tracking count:', e.message);
+        }
         
         // Update the meetings section badge (calendar icon — only meetings with a set date/time)
-        const totalMeetingsCount = campaignMeetings.length + connectCount;
+        const totalMeetingsCount = campaignMeetings.length + connectCount + pctCount;
         document.getElementById('meetings-count').textContent = totalMeetingsCount;
-        console.log(`✅ Total meetings: ${totalMeetingsCount} (${campaignMeetings.length} campaign + ${connectCount} Connect)`);
+        console.log(`✅ Total meetings: ${totalMeetingsCount} (${campaignMeetings.length} campaign + ${connectCount} Connect + ${pctCount} tracked outside Connect)`);
 
-        // Store the Connect-only count and refresh the dashboard summary tile (#scheduled-count).
-        // calculateMetrics() reads _connectScheduledCount and adds it to the campaign scheduled count.
+        // Store the Connect/Post-Call Tracking counts and refresh the dashboard summary tile
+        // (#scheduled-count). calculateMetrics() reads both and adds them to the campaign count.
         _connectScheduledCount = connectCount;
-        if (connectCount > 0) {
-          console.log(`📊 Refreshing dashboard metrics to include ${connectCount} Connect scheduled meetings`);
+        _pctScheduledCount = pctCount;
+        if (connectCount > 0 || pctCount > 0) {
+          console.log(`📊 Refreshing dashboard metrics to include ${connectCount} Connect + ${pctCount} tracked-outside-Connect scheduled meetings`);
           calculateMetrics();
         }
       } catch (error) {
@@ -6872,8 +7059,9 @@
             tbody.innerHTML = html;
             console.log(`✅ Campaign progress table loaded: ${outcomeMDCampaigns.length} campaigns`);
 
-            // Append Connect row (loaded async, non-blocking)
+            // Append Connect + Post-Call Tracking rows (loaded async, non-blocking)
             appendConnectCampaignRow(tbody);
+            appendPostCallTrackingCampaignRow(tbody);
             
           } catch (error) {
             console.error('❌ Error loading campaign progress from cache:', error);
@@ -6893,8 +7081,9 @@
               </td>
             </tr>
           `;
-          // Still show Connect row even when cache unavailable
+          // Still show Connect + Post-Call Tracking rows even when cache unavailable
           appendConnectCampaignRow(tbody);
+          appendPostCallTrackingCampaignRow(tbody);
         }
       } catch (error) {
         console.error('❌ Error loading campaign progress table:', error);
@@ -6971,6 +7160,82 @@
           connectRow.innerHTML = `
             <td colspan="5" style="padding: 1rem; text-align: center; color: var(--danger);">
               <i class="fas fa-exclamation-circle"></i> Error loading Connect data
+            </td>
+          `;
+        }
+      }
+    }
+
+    // Append the Post-Call Tracking ("outside of Connect") row to the campaign progress table —
+    // manually-tracked meetings (phone calls, referrals, inbound leads, etc.) that never went
+    // through a Connect/LinkedIn conversation. OutcomeMD-only.
+    async function appendPostCallTrackingCampaignRow(tbody) {
+      try {
+        const loadingRow = document.createElement('tr');
+        loadingRow.id = 'pct-campaign-row';
+        loadingRow.style.borderBottom = '1px solid #e5e7eb';
+        loadingRow.innerHTML = `
+          <td style="padding: 1rem; font-weight: 600; color: #8b5cf6;">
+            <i class="fas fa-clipboard-list"></i> Tracked Outside Connect
+          </td>
+          <td colspan="4" style="padding: 1rem; text-align: center; color: var(--gray);">
+            <i class="fas fa-spinner fa-spin"></i> Loading tracked meetings...
+          </td>
+        `;
+        tbody.appendChild(loadingRow);
+
+        // Load Post-Call Tracking meetings
+        const pctRaw = await loadPostCallTrackingMeetings();
+
+        // Deduplicate against everything else already known (campaign + Connect)
+        const campaignDedupKeys = new Set();
+        if (window.allMeetings) {
+          window.allMeetings.forEach(m => {
+            if (m.source !== 'post_call_tracking') addMeetingKeysToSet(m, campaignDedupKeys);
+          });
+        }
+
+        let pctCount = 0;
+        const seen = new Set(campaignDedupKeys);
+        pctRaw.forEach(rec => {
+          if (!meetingMatchesKeySet(rec, seen)) {
+            pctCount++;
+            addMeetingKeysToSet(rec, seen);
+          }
+        });
+
+        const pctRow = document.getElementById('pct-campaign-row');
+        if (pctRow) {
+          pctRow.innerHTML = `
+            <td style="padding: 1rem;">
+              <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <span style="font-weight: 600; color: #8b5cf6; font-size: 1rem;">
+                  <i class="fas fa-clipboard-list"></i> Tracked Outside Connect
+                </span>
+                <span style="background: #8b5cf6; color: white; padding: 0.15rem 0.5rem; border-radius: 10px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase;">Manual</span>
+              </div>
+              <div style="font-size: 0.8rem; color: var(--gray); margin-top: 0.2rem;">Manually tracked on Post-Call Tracking</div>
+            </td>
+            <td style="padding: 1rem; text-align: center; font-weight: 500; color: var(--gray);">—</td>
+            <td style="padding: 1rem; text-align: center; color: var(--gray); font-size: 0.85rem;">Manual entry</td>
+            <td style="padding: 1rem; text-align: center;">
+              <span style="background: #ede9fe; color: #6d28d9; padding: 0.25rem 0.75rem; border-radius: 12px; font-weight: 600; font-size: 0.875rem;">
+                ${pctCount}
+              </span>
+            </td>
+            <td style="padding: 1rem; text-align: center; color: var(--gray); font-size: 0.85rem;">—</td>
+          `;
+          pctRow.style.background = 'linear-gradient(135deg, #f5f3ff, #ede9fe)';
+        }
+
+        console.log(`✅ Post-Call Tracking campaign row: ${pctCount} unique scheduled meetings outside of Connect`);
+      } catch (error) {
+        console.error('❌ Error loading Post-Call Tracking campaign row:', error);
+        const pctRow = document.getElementById('pct-campaign-row');
+        if (pctRow) {
+          pctRow.innerHTML = `
+            <td colspan="5" style="padding: 1rem; text-align: center; color: var(--danger);">
+              <i class="fas fa-exclamation-circle"></i> Error loading tracked data
             </td>
           `;
         }
@@ -7444,17 +7709,21 @@
       const interestRate = totalContacts > 0 ? ((totalInterest / totalContacts) * 100).toFixed(1) : 0;
       const scheduleRate = totalContacts > 0 ? ((scheduledCount / totalContacts) * 100).toFixed(1) : 0;
       
-      // Combine campaign scheduled count with Connect scheduled meetings (deduped, set by loadMeetingsCount).
-      // _connectScheduledCount is 0 until loadMeetingsCount() finishes; calculateMetrics() is re-called
-      // by loadMeetingsCount() once the Connect count is known, so the display is always up to date.
-      const totalScheduledCount = scheduledCount + (_connectScheduledCount || 0);
+      // Combine campaign scheduled count with Connect + Post-Call Tracking scheduled meetings
+      // (deduped, set by loadMeetingsCount()). Both counts are 0 until loadMeetingsCount()
+      // finishes; calculateMetrics() is re-called by loadMeetingsCount() once known, so the
+      // display is always up to date.
+      const totalScheduledCount = scheduledCount + (_connectScheduledCount || 0) + (_pctScheduledCount || 0);
 
       // Update UI
       document.getElementById('interest-rate').textContent = interestRate + '%';
       document.getElementById('interest-rate-detail').textContent = `${totalInterest} of ${totalContacts} contacts`;
       
       document.getElementById('schedule-rate').textContent = scheduleRate + '%';
-      const connectNote = _connectScheduledCount > 0 ? ` (incl. ${_connectScheduledCount} Connect)` : '';
+      const connectNoteParts = [];
+      if (_connectScheduledCount > 0) connectNoteParts.push(`${_connectScheduledCount} Connect`);
+      if (_pctScheduledCount > 0) connectNoteParts.push(`${_pctScheduledCount} tracked outside Connect`);
+      const connectNote = connectNoteParts.length ? ` (incl. ${connectNoteParts.join(' + ')})` : '';
       document.getElementById('schedule-rate-detail').textContent = `${totalScheduledCount} meeting${totalScheduledCount !== 1 ? 's' : ''}${connectNote} from ${scheduledContactsCount} contact${scheduledContactsCount !== 1 ? 's' : ''}`;
       
       document.getElementById('total-outcomes').textContent = outcomes.length;
