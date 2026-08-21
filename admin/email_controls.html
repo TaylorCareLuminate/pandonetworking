@@ -64,6 +64,11 @@
     
     // Set up email database reference using the secure wrapper
     window.emailDB = window.clemailDb;
+
+    // This admin page manages retired records, so it must still see LinkedIn
+    // accounts marked { outdated: true } (hidden everywhere else by the wrapper)
+    // in order to display and restore them.
+    window.CLEMAIL_INCLUDE_OUTDATED_ACCOUNTS = true;
     
     console.log('✅ CLEmail secure access configured');
     console.log('🔒 All CLEmail data access routes through authenticated Railway backend');
@@ -5590,6 +5595,9 @@ HealthLuminate
         if (account.preventAutoActivation) {
           statusClass += ' keep-off';
         }
+        if (account.outdated) {
+          statusClass += ' outdated';
+        }
         
         html += `
           <div class="${statusClass}">
@@ -5599,6 +5607,7 @@ HealthLuminate
                   ${account.accountName}
                   <span class="linkedin-status-badge status-${cookieStatus}">${cookieStatus.toUpperCase()}</span>
                   ${account.preventAutoActivation ? `<span class="keep-off-badge"><i class="fas fa-lock"></i> Auto-Activation Disabled</span>` : ''}
+                  ${account.outdated ? `<span class="outdated-badge"><i class="fas fa-box-archive"></i> Outdated &mdash; Hidden from Connect</span>` : ''}
                 </h4>
                 <div class="metric-value">BDR: ${bdrLeader?.name || 'Unassigned'}</div>
                 <div class="metric-value">Customer: ${customer?.name || 'Unknown'}</div>
@@ -5618,6 +5627,12 @@ HealthLuminate
                   title="${account.preventAutoActivation ? 'Click to allow the nightly job to re-enable this account' : 'Click to prevent the nightly job from turning this account back on'}">
                   <i class="fas fa-${account.preventAutoActivation ? 'unlock' : 'lock'}"></i>
                   ${account.preventAutoActivation ? 'Allow Auto-On' : 'Keep Off'}
+                </button>
+                <button onclick="toggleLinkedInOutdated('${account.id}', ${!account.outdated})"
+                  class="btn-small ${account.outdated ? 'btn-success' : 'btn-outdated'}"
+                  title="${account.outdated ? 'Restore this account so Connect pages can see it again' : 'Hide this account from ALL Connect pages without deleting it (reversible)'}">
+                  <i class="fas fa-${account.outdated ? 'box-open' : 'box-archive'}"></i>
+                  ${account.outdated ? 'Restore' : 'Mark Outdated'}
                 </button>
                 <button onclick="deleteLinkedInAccount('${account.id}', '${account.accountName}')" class="btn-small btn-danger">
                   <i class="fas fa-trash"></i> Delete
@@ -5724,7 +5739,15 @@ HealthLuminate
               </div>
             </div>
             
-            ${cookieStatus !== 'valid' ? `
+            ${account.outdated ? `
+              <div class="outdated-notice">
+                <i class="fas fa-box-archive"></i> <strong>Outdated:</strong>
+                This record is preserved for historical reporting but is hidden from every Connect page
+                (dashboards, HeyReach lookups, webhook mappings)${account.outdatedAt ? ` since ${new Date(account.outdatedAt.seconds ? account.outdatedAt.seconds * 1000 : account.outdatedAt).toLocaleDateString()}` : ''}.
+                Use <strong>Restore</strong> to make it visible again.
+              </div>
+            ` : ''}
+            ${cookieStatus !== 'valid' && !account.outdated ? `
               <div class="cookie-validation ${cookieStatus}">
                 <strong>⚠️ Action Required:</strong> 
                 ${cookieStatus === 'expired' ? 'LinkedIn cookie has expired and needs to be updated.' : 
@@ -5972,6 +5995,15 @@ HealthLuminate
       
       if (!accountId) {
         formData.createdAt = new Date();
+      } else {
+        // Full setDoc below replaces the doc — carry over flags the form doesn't edit
+        const existing = window.linkedInAccounts.find(a => a.id === accountId);
+        if (existing) {
+          if (existing.outdated !== undefined) formData.outdated = existing.outdated;
+          if (existing.outdatedAt !== undefined) formData.outdatedAt = existing.outdatedAt;
+          if (existing.preventAutoActivation !== undefined) formData.preventAutoActivation = existing.preventAutoActivation;
+          if (existing.createdAt !== undefined) formData.createdAt = existing.createdAt;
+        }
       }
       formData.updatedAt = new Date();
       
@@ -6044,6 +6076,39 @@ HealthLuminate
         );
       } catch (error) {
         console.error('Error updating LinkedIn account keep-off flag:', error);
+        showAlert('Error updating account: ' + error.message, 'error');
+      }
+    };
+
+    // Toggle "Outdated" — soft-retire an account: keep the record for historical
+    // reporting, but hide it from every Connect page (the clemail-firestore-wrapper
+    // filters { outdated: true } linkedin_accounts docs out of all query results).
+    // Fully reversible via the Restore button on this page.
+    window.toggleLinkedInOutdated = async (accountId, newValue) => {
+      const account = window.linkedInAccounts.find(a => a.id === accountId);
+      if (!account) return;
+
+      const confirmMsg = newValue
+        ? `Mark "${account.accountName}" as OUTDATED?\n\nThe record is kept (nothing is deleted), but ALL Connect pages will stop seeing it — it will no longer feed dashboards, HeyReach account lookups, or webhook mappings.\n\nYou can restore it here at any time.`
+        : `Restore "${account.accountName}"?\n\nConnect pages will start seeing this account again. If another account uses the same LinkedIn email or HeyReach ID, they may conflict.`;
+
+      if (!confirm(confirmMsg)) return;
+
+      try {
+        await updateDoc(doc(window.emailDB, 'linkedin_accounts', accountId), {
+          outdated: newValue,
+          outdatedAt: newValue ? new Date() : null,
+          updatedAt: new Date()
+        });
+        await loadLinkedInAccounts();
+        showAlert(
+          newValue
+            ? `"${account.accountName}" marked outdated — hidden from all Connect pages (record preserved).`
+            : `"${account.accountName}" restored — Connect pages can see it again.`,
+          newValue ? 'warning' : 'success'
+        );
+      } catch (error) {
+        console.error('Error updating LinkedIn account outdated flag:', error);
         showAlert('Error updating account: ' + error.message, 'error');
       }
     };
@@ -8716,6 +8781,45 @@ HealthLuminate
 
     .btn-small.btn-keep-off:hover {
       background: #e8670a;
+    }
+
+    /* Outdated (soft-retired) accounts — kept for reporting, hidden from Connect */
+    .linkedin-card.outdated {
+      border-color: #6c757d !important;
+      background: repeating-linear-gradient(135deg, #f8f9fa, #f8f9fa 12px, #f1f3f5 12px, #f1f3f5 24px) !important;
+      opacity: 0.75;
+    }
+
+    .outdated-badge {
+      background: linear-gradient(135deg, #6c757d, #495057);
+      color: white;
+      font-size: 0.68rem;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+
+    .btn-small.btn-outdated {
+      background: #6c757d;
+      color: white;
+      border: none;
+    }
+
+    .btn-small.btn-outdated:hover {
+      background: #495057;
+    }
+
+    .outdated-notice {
+      margin-top: 0.75rem;
+      padding: 0.6rem 0.9rem;
+      background: #e9ecef;
+      border-left: 4px solid #6c757d;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      color: #495057;
     }
 
     .account-header {

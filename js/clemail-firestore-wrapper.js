@@ -318,6 +318,37 @@ class DocumentSnapshot {
 }
 
 // =====================================================
+// Outdated-Record Filter
+// =====================================================
+//
+// Records marked { outdated: true } are retired-but-kept-for-history (e.g. a
+// LinkedIn seat that moved to a new HeyReach account when a BDR changed
+// companies). They must stop participating in ALL page logic — account-ID →
+// email maps, bdrEmail lookups, API-key resolution — without being deleted,
+// so they can be restored later for reporting.
+//
+// Filtering here (the single data-access chokepoint for every Connect page)
+// means no page needs its own outdated check. Admin pages that manage these
+// records opt back in by setting:
+//
+//   window.CLEMAIL_INCLUDE_OUTDATED_ACCOUNTS = true;
+//
+// Direct doc reads by ID (getDoc) are intentionally NOT filtered — a page
+// that already holds a specific doc ID is doing targeted admin/repair work.
+
+const OUTDATED_FILTERED_COLLECTIONS = new Set(['linkedin_accounts']);
+
+function filterOutdatedDocs(collectionName, docs) {
+  if (window.CLEMAIL_INCLUDE_OUTDATED_ACCOUNTS === true) return docs;
+  if (!OUTDATED_FILTERED_COLLECTIONS.has(collectionName)) return docs;
+  const filtered = docs.filter(d => !(d.data()?.outdated === true));
+  if (filtered.length !== docs.length) {
+    console.log(`🚫 Excluded ${docs.length - filtered.length} outdated ${collectionName} record(s) from query results`);
+  }
+  return filtered;
+}
+
+// =====================================================
 // QuerySnapshot Class
 // =====================================================
 
@@ -515,10 +546,16 @@ class Query {
       ...(options.timeoutMs != null ? { timeoutMs: options.timeoutMs } : {})
     });
     
-    const docs = (result.data || []).map(item => {
+    let docs = (result.data || []).map(item => {
       const { id, ...data } = item; // Separate id from data
       return new DocumentSnapshot(id, data, true, this._collectionName);
     });
+    
+    // getAllDocs passes _skipOutdatedFilter and filters after pagination completes,
+    // so cursor position/termination are computed on the raw page.
+    if (!options._skipOutdatedFilter) {
+      docs = filterOutdatedDocs(this._collectionName, docs);
+    }
     
     return new QuerySnapshot(docs);
   }
@@ -721,7 +758,9 @@ async function getAllDocs(baseQueryRef, options = {}) {
     let snap, lastError;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        snap = await pageQuery.get({ timeoutMs: options.timeoutMs });
+        // Raw page (no outdated filter) — page length and lastDocId must reflect
+        // what the server actually returned or pagination would end early / skip docs.
+        snap = await pageQuery.get({ timeoutMs: options.timeoutMs, _skipOutdatedFilter: true });
         lastError = null;
         break;
       } catch (err) {
@@ -747,11 +786,13 @@ async function getAllDocs(baseQueryRef, options = {}) {
     lastDocId = docs[docs.length - 1].id;
   }
 
+  const finalDocs = filterOutdatedDocs(baseQueryRef._collectionName, allDocs);
+
   return {
-    docs:    allDocs,
-    forEach: fn => allDocs.forEach(fn),
-    size:    allDocs.length,
-    empty:   allDocs.length === 0
+    docs:    finalDocs,
+    forEach: fn => finalDocs.forEach(fn),
+    size:    finalDocs.length,
+    empty:   finalDocs.length === 0
   };
 }
 
