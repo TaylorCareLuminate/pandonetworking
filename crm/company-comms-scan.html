@@ -374,6 +374,12 @@
     }
     .fu-badge-score  { background: #ede9fe; color: #5b21b6; }
     .fu-badge-source { background: #dcfce7; color: #166534; }
+    .fu-badge-need-5 { background: #fef2f2; color: #991b1b; }
+    .fu-badge-need-4 { background: #fff7ed; color: #9a3412; }
+    .fu-badge-need-3 { background: #fffbeb; color: #92400e; }
+    .fu-badge-need-2 { background: #f3f4f6; color: #4b5563; }
+    .fu-badge-need-1 { background: #f1f5f9; color: #64748b; }
+    .fu-model-note { font-size: 0.75em; color: #6b7280; margin-top: 4px; line-height: 1.4; }
     .fu-card-body {
       display: grid; grid-template-columns: 1fr 1fr; gap: 0;
     }
@@ -941,6 +947,7 @@
 
 <!-- CLEmail Firestore Wrapper — must load before the ES module below -->
 <script src="../js/clemail-firestore-wrapper.js"></script>
+<script src="../js/ai-model-catalog.js"></script>
 
 <header>
   <div class="header-container">
@@ -1238,7 +1245,7 @@
         <input type="number" id="fuLookback" value="180" min="7" max="365">
       </div>
       <div class="fu-field">
-        <label title="If the last 1:1 email or LinkedIn is older than this, use the HealthLuminate → Pando reconnect message instead of AI.">Reconnect if last contact older than (days)</label>
+        <label title="If the last 1:1 email or LinkedIn is older than this, use the former-brand → Pando reconnect message instead of AI. The email names only the brand they knew (CareLuminate or HealthLuminate), never both.">Reconnect if last contact older than (days)</label>
         <input type="number" id="fuStaleDays" value="365" min="90" max="3650">
       </div>
       <div class="fu-field">
@@ -1255,6 +1262,13 @@
           <option value="true">Yes — skip</option>
           <option value="false">No — include all</option>
         </select>
+      </div>
+      <div class="fu-field" style="grid-column: 1 / -1;">
+        <label title="Models come from the shared catalog on Connect → AI Models Admin.">AI model for scanning</label>
+        <select id="fuAiModel">
+          <option value="moonshotai/kimi-k3">Kimi K3</option>
+        </select>
+        <div class="fu-model-note" id="fuAiModelNote"></div>
       </div>
     </div>
     <div class="fu-prompt-row">
@@ -1790,6 +1804,8 @@
       loadLiCacheOnce();
       loadConnectionsOnce();
       loadProspectContactsOnce();
+      loadAiModelCatalog();
+      loadFollowupResults().catch(e => console.warn('Could not restore follow-up opportunities:', e));
     } catch (err) {
       console.error('initPage error:', err);
       showToast('Initialization error: ' + err.message, 'error');
@@ -4244,7 +4260,7 @@ NOTE: Ignore any automated, marketing, or bulk emails (newsletters, no-reply sen
 ${hexOnly
   ? 'HEX-ONLY: The only email connection is DRI Monthly Healthcare Executive Exchange (HEX) group meeting emails. They share that group with Taylor; there is no 1:1 sales thread. Say so, and note that a warm HEX-intro follow-up is appropriate.'
   : staleReconnect
-    ? `STALE RECONNECT: Last 1:1 contact was ${fmtDaysAgo(last1to1)}. They knew the firm as HealthLuminate or CareLuminate, which is now Pando Executive Networking. Ignore HEX meeting emails. Recommend a reconnect that explains the rebrand, that we help busy executives with networking (often on LinkedIn), and that we have scheduled hundreds of meetings / coordinated thousands of conversations / tens of thousands of connections for CEOs and Presidents.`
+    ? `STALE RECONNECT: Last 1:1 contact was ${fmtDaysAgo(last1to1)}. They knew the firm as ${detectKnownBrand(otherEmails, liAll)}, which is now Pando Executive Networking. Ignore HEX meeting emails. Recommend a reconnect that explains the rebrand, that we help busy executives with networking (often on LinkedIn), and that we have scheduled hundreds of meetings / coordinated thousands of conversations / tens of thousands of connections for CEOs and Presidents. Mention only the former name they knew — never both CareLuminate and HealthLuminate.`
     : 'Ignore DRI Monthly / Healthcare Executive Exchange (HEX) meeting emails when other 1:1 messages exist — those are group invites, not a relationship.'}
 
 TASK: Write a concise, human-readable narrative summary (3-6 sentences) that captures:
@@ -4261,7 +4277,7 @@ Write in plain prose — no bullet points. Be specific (use names, dates, topics
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider:    'openrouter',
-          model:       'meta-llama/llama-4-maverick',
+          model:       getSelectedAiModel(),
           prompt,
           temperature: 0.4,
           max_tokens:  400,
@@ -4426,22 +4442,103 @@ We provide concierge executive networking services, helping busy executives keep
 
 Either way, great to be connected. Let me know if I can ever be of help.`;
 
-  const STALE_RECONNECT_MESSAGE =
-`It's been a while since we last connected — I wanted to share a quick update. HealthLuminate (and before that, CareLuminate) is now Pando Executive Networking.
+  // Detect which former brand this contact actually saw (CareLuminate or HealthLuminate)
+  // from 1:1 emails / LinkedIn. Never mention both names in outreach — use only this one.
+  function detectKnownBrand(emails, liMsgs) {
+    let lastCare = 0;
+    let lastHealth = 0;
+    const consider = (text, date) => {
+      if (!text) return;
+      const t = String(text).toLowerCase();
+      const ts = date ? new Date(date).getTime() : 0;
+      const n = Number.isFinite(ts) && ts > 0 ? ts : 1;
+      if (t.includes('careluminate')) lastCare = Math.max(lastCare, n);
+      if (t.includes('healthluminate')) lastHealth = Math.max(lastHealth, n);
+    };
+    for (const e of emails || []) {
+      consider([e.subject, e.snippet, e.from, e.to, e.cc, e.oauthAccount].join(' '), e.date);
+    }
+    for (const li of liMsgs || []) {
+      consider([li.lastMessage, li.bdrEmail].join(' '), li.date);
+    }
+    if (lastCare && lastHealth) return lastHealth >= lastCare ? 'HealthLuminate' : 'CareLuminate';
+    if (lastCare) return 'CareLuminate';
+    return 'HealthLuminate';
+  }
+
+  function staleReconnectMessage(knownBrand) {
+    const brand = knownBrand || 'HealthLuminate';
+    return `It's been a while since we last connected — I wanted to share a quick update. ${brand} is now Pando Executive Networking.
 
 We help busy executives with their networking, often on LinkedIn. We do this for multiple CEOs and Presidents, and have scheduled hundreds of meetings, coordinated thousands of conversations, and tens of thousands of connections for our clients.
 
 Let me know if a meeting would be helpful.`;
+  }
 
-  // Used instead of STALE_RECONNECT_MESSAGE when the company works primarily in
+  // Used instead of the rebrand reconnect when the company works primarily in
   // employee benefits — pitches the benefits-leader interview series rather than
   // the general executive-networking rebrand message.
-  const BENEFITS_FOLLOWUP_MESSAGE =
-`It has been quite a while since we last connected.
+  function benefitsFollowupMessage(knownBrand) {
+    const brand = knownBrand || 'HealthLuminate';
+    return `It has been quite a while since we last connected.
 
-HealthLuminate is doing something new and I wanted to connect with you about it. We are conducting interviews with employee benefits leaders, letting these leaders speak out anonymously about what partners are actually making a difference with cost containment and meaningful benefits design.
+${brand} is doing something new and I wanted to connect with you about it. We are conducting interviews with employee benefits leaders, letting these leaders speak out anonymously about what partners are actually making a difference with cost containment and meaningful benefits design.
 
 Given our conversation before, I was hoping to ask your thoughts on the questions and our approach. Let me know if you have a minute we can connect.`;
+  }
+
+  const NEED_SCORE_LABELS = {
+    5: 'Overdue and needed. Prospect was interested and has not received any follow-up.',
+    4: 'Client seems interested and it has been 2 weeks+ since follow-up.',
+    3: 'Some interest and no follow-up in 2+ months.',
+    2: 'No interest shown and no follow-up in 6+ months.',
+    1: 'Prospect has rejected any interest, or has had multiple outreach efforts with no reply.',
+  };
+
+  const NEED_SCORE_RUBRIC =
+`Rate how needed a follow-up reply is on this 1–5 scale (pick exactly one integer):
+5 = Overdue and needed. Prospect was interested and has not received any follow-up.
+4 = Client seems interested and it has been 2 weeks+ since follow-up.
+3 = Some interest and no follow-up in 2+ months.
+2 = No interest shown and no follow-up in 6+ months.
+1 = Prospect has rejected any interest, or has had multiple outreach efforts with no reply.`;
+
+  function clampNeedScore(n) {
+    const v = parseInt(n, 10);
+    if (!Number.isFinite(v)) return null;
+    return Math.max(1, Math.min(5, v));
+  }
+
+  function needBadgeHtml(score, reason) {
+    const s = clampNeedScore(score);
+    if (!s) return '';
+    const title = escHtml(reason || NEED_SCORE_LABELS[s] || '');
+    return `<span class="fu-badge fu-badge-need-${s}" title="${title}">Need ${s}/5</span>`;
+  }
+
+  function getSelectedAiModel() {
+    return document.getElementById('fuAiModel')?.value || 'moonshotai/kimi-k3';
+  }
+
+  async function loadAiModelCatalog() {
+    const sel = document.getElementById('fuAiModel');
+    if (!sel || !window.AiModelCatalog) return;
+    try {
+      const models = await window.AiModelCatalog.load();
+      window.AiModelCatalog.populateSelect(sel, models, { selected: sel.value || 'moonshotai/kimi-k3' });
+      const noteEl = document.getElementById('fuAiModelNote');
+      const updateNote = () => {
+        if (noteEl) noteEl.textContent = window.AiModelCatalog.noteFor(models, sel.value) || '';
+      };
+      if (!sel.dataset.noteBound) {
+        sel.addEventListener('change', updateNote);
+        sel.dataset.noteBound = '1';
+      }
+      updateNote();
+    } catch (e) {
+      console.warn('AI model catalog load failed:', e);
+    }
+  }
 
   function lastCommsDate(emails, liMsgs) {
     let max = 0;
@@ -4711,6 +4808,175 @@ Given our conversation before, I was hoping to ask your thoughts on the question
   let fuScanResults   = [];   // followUp result objects from the last scan
   let fuComposeState  = {};   // current compose modal context
   let fuShouldStop    = false; // set by the Stop button — halts the scan after the current company
+  let fuSaveMeta      = { scanned: 0, savedAt: null };
+
+  const FU_SAVE_LS_KEY = 'company_comms_followup_results';
+  const FU_SAVE_COLL   = 'company_comms_followups';
+  const FU_SAVE_DOC    = 'latest';
+
+  function fuSlimForSave(fu) {
+    const {
+      _emails, _liMsgs, _crmNotes,
+      ...rest
+    } = fu || {};
+    return {
+      ...rest,
+      _emailCount: (fu._emails || []).length,
+      _liCount:    (fu._liMsgs || []).length,
+      _noteCount:  (fu._crmNotes || []).length,
+    };
+  }
+
+  function fuRehydrateFromScan(fu) {
+    const scan = fu._accountId ? scanState[fu._accountId] : null;
+    if (!scan) return fu;
+    return {
+      ...fu,
+      _emails:   fu._emails?.length   ? fu._emails   : (scan.emails || []),
+      _liMsgs:   fu._liMsgs?.length   ? fu._liMsgs   : enrichLiMsgDates(scan.linkedInMessages || []),
+      _crmNotes: fu._crmNotes?.length ? fu._crmNotes : (scan.notes || []),
+    };
+  }
+
+  function fuBuildSavePayload(results, extra = {}) {
+    return JSON.parse(JSON.stringify({
+      savedAt: extra.savedAt || new Date().toISOString(),
+      scanned: extra.scanned ?? fuSaveMeta.scanned ?? results.length,
+      partial: !!extra.partial,
+      results: (results || []).map(fuSlimForSave),
+    }));
+  }
+
+  function fuWriteLocal(payload) {
+    try {
+      localStorage.setItem(FU_SAVE_LS_KEY, JSON.stringify(payload));
+      return true;
+    } catch (e) {
+      try {
+        const slim = {
+          ...payload,
+          results: (payload.results || []).map(r => ({ ...r, transcript: '' })),
+        };
+        localStorage.setItem(FU_SAVE_LS_KEY, JSON.stringify(slim));
+        return true;
+      } catch (e2) {
+        console.warn('localStorage follow-up save failed:', e2);
+        return false;
+      }
+    }
+  }
+
+  function fuSyncMessagesFromDom() {
+    (fuScanResults || []).forEach((fu, idx) => {
+      const ta = document.getElementById(`fu-msg-${idx}`);
+      if (ta) fu.message = ta.value;
+    });
+  }
+
+  function fuSyncComposeBodyToCard() {
+    const idx = fuComposeState?.idx;
+    if (idx == null || !fuScanResults[idx]) return;
+    const bodyEl = document.getElementById(
+      fuComposeState.type === 'linkedin' ? 'liComposeBody' : 'emailComposeBody'
+    );
+    if (!bodyEl) return;
+    fuScanResults[idx].message = bodyEl.value;
+    const ta = document.getElementById(`fu-msg-${idx}`);
+    if (ta) ta.value = bodyEl.value;
+    scheduleSaveFollowupResults();
+  }
+
+  function updateFuCacheNote() {
+    const noteEl = document.getElementById('fuCacheNote');
+    if (!noteEl) return;
+    if (!fuSaveMeta.savedAt && !fuScanResults.length) {
+      noteEl.textContent = '';
+      return;
+    }
+    const ts = fuSaveMeta.savedAt
+      ? new Date(fuSaveMeta.savedAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+      : '';
+    noteEl.textContent = ts
+      ? `Saved ${ts} · ${fuScanResults.length} opportunit${fuScanResults.length === 1 ? 'y' : 'ies'}`
+      : `${fuScanResults.length} opportunit${fuScanResults.length === 1 ? 'y' : 'ies'}`;
+  }
+
+  async function saveFollowupResults({ scanned, partial = false, firestore = true } = {}) {
+    fuSyncMessagesFromDom();
+    const payload = fuBuildSavePayload(fuScanResults, {
+      scanned: scanned ?? fuSaveMeta.scanned ?? fuScanResults.length,
+      partial,
+    });
+    fuSaveMeta = { scanned: payload.scanned, savedAt: payload.savedAt };
+    fuWriteLocal(payload);
+    updateFuCacheNote();
+    if (!firestore) return;
+    try {
+      await waitForWrapper();
+      const { doc, setDoc } = window.clemailFirestore;
+      await withTimeout(
+        setDoc(doc(window.clemailDb, FU_SAVE_COLL, FU_SAVE_DOC), payload),
+        15000,
+        'Save follow-up opportunities'
+      );
+    } catch (e) {
+      console.warn('Firestore follow-up save failed:', e.message);
+    }
+  }
+
+  let _fuSaveTimer = null;
+  function scheduleSaveFollowupResults() {
+    clearTimeout(_fuSaveTimer);
+    _fuSaveTimer = setTimeout(() => { saveFollowupResults(); }, 800);
+  }
+
+  window.onFuMessageEdit = function (idx) {
+    const ta = document.getElementById(`fu-msg-${idx}`);
+    if (ta && fuScanResults[idx]) fuScanResults[idx].message = ta.value;
+    scheduleSaveFollowupResults();
+  };
+
+  async function loadFollowupResults() {
+    let payload = null;
+    try {
+      await waitForWrapper();
+      const { doc, getDoc } = window.clemailFirestore;
+      const snap = await withTimeout(
+        getDoc(doc(window.clemailDb, FU_SAVE_COLL, FU_SAVE_DOC)),
+        12000,
+        'Load follow-up opportunities'
+      );
+      const exists = typeof snap.exists === 'function' ? snap.exists() : snap.exists;
+      if (exists) payload = snap.data();
+    } catch (e) {
+      console.warn('Firestore follow-up load failed:', e.message);
+    }
+    if (!payload?.results?.length) {
+      try {
+        const raw = localStorage.getItem(FU_SAVE_LS_KEY);
+        if (raw) payload = JSON.parse(raw);
+      } catch (e) {
+        console.warn('localStorage follow-up load failed:', e);
+      }
+    }
+    if (!payload?.results?.length) return;
+    fuScanResults = payload.results.map(fuRehydrateFromScan);
+    fuSaveMeta = {
+      scanned: payload.scanned || fuScanResults.length,
+      savedAt: payload.savedAt || null,
+    };
+    showFollowupResults(fuScanResults, fuSaveMeta.scanned, fuScanResults.length, { restored: true });
+    updateFuCacheNote();
+  }
+
+  window.addEventListener('beforeunload', () => {
+    if (!fuScanResults.length) return;
+    fuSyncMessagesFromDom();
+    fuWriteLocal(fuBuildSavePayload(fuScanResults, {
+      scanned: fuSaveMeta.scanned,
+      savedAt: new Date().toISOString(),
+    }));
+  });
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -4900,7 +5166,7 @@ Given our conversation before, I was hoping to ask your thoughts on the question
       return;
     }
 
-    fuLog(`Analyzing ${targetAccounts.length} compan${targetAccounts.length === 1 ? 'y' : 'ies'} · lookback ${lookbackDays}d · reconnect after ${staleDays}d · threshold ${fitThreshold}/10`);
+    fuLog(`Analyzing ${targetAccounts.length} compan${targetAccounts.length === 1 ? 'y' : 'ies'} · lookback ${lookbackDays}d · reconnect after ${staleDays}d · threshold ${fitThreshold}/10 · model ${getSelectedAiModel()}`);
     if (testN) fuLog(`Test mode: top ${targetAccounts.length} companies with communications`);
     document.getElementById('fuJobCount').textContent = `0 / ${targetAccounts.length} analyzed`;
 
@@ -4930,12 +5196,13 @@ Given our conversation before, I was hoping to ask your thoughts on the question
       const staleReconnect = !hexOnly && last1to1 && (
         daysAgo(last1to1) >= staleDays || !lastInLookback
       );
+      const knownBrand = detectKnownBrand(otherAll.length ? otherAll : hexAll, allLi);
       const pct = Math.round((i / targetAccounts.length) * 90);
       fuSetStatus(`Analyzing ${account.name}… (${i + 1}/${targetAccounts.length})`, pct);
       if (hexOnly) {
         fuLog(`[${account.name}] HEX-only connection (${hexAll.length} DRI Monthly meeting email${hexAll.length === 1 ? '' : 's'}) — using HEX intro`);
       } else if (staleReconnect) {
-        fuLog(`[${account.name}] Last 1:1 was ${fmtDaysAgo(last1to1)} — using HealthLuminate → Pando reconnect${hexAll.length ? ` · ignored ${hexAll.length} HEX meeting email${hexAll.length === 1 ? '' : 's'}` : ''}`);
+        fuLog(`[${account.name}] Last 1:1 was ${fmtDaysAgo(last1to1)} — using ${knownBrand} → Pando reconnect${hexAll.length ? ` · ignored ${hexAll.length} HEX meeting email${hexAll.length === 1 ? '' : 's'}` : ''}`);
       } else {
         fuLog(`[${account.name}] ${otherEmails.length} email(s), ${liMsgs.length} LinkedIn conv(s)${hexEmails.length ? ` · ignored ${hexEmails.length} HEX meeting email${hexEmails.length === 1 ? '' : 's'}` : ''}`);
       }
@@ -4974,11 +5241,21 @@ Given our conversation before, I was hoping to ask your thoughts on the question
       const analysis = hexOnly
         ? fuHexOnlyAnalysis(account, hexAll)
         : benefitsPath
-          ? fuBenefitsAnalysis(account, otherAll, allLi)
+          ? fuBenefitsAnalysis(account, otherAll, allLi, knownBrand)
           : staleReconnect
-            ? fuStaleReconnectAnalysis(account, otherAll, allLi, last1to1)
+            ? fuStaleReconnectAnalysis(account, otherAll, allLi, last1to1, knownBrand)
             : await fuAnalyzeCompany(account, emailsForAi, liMsgs, notes,
-                                     screeningPrompt, contentPrompt, minDaysSince, skipScheduled);
+                                     screeningPrompt, contentPrompt, minDaysSince, skipScheduled, knownBrand);
+
+      if (usedTemplate && analysis) {
+        const rating = await fuRateNeed(account, emailsForAi, liForCard, {
+          hexOnly, staleReconnect, benefitsPath, last1to1,
+        });
+        if (rating?.needScore) {
+          analysis.needScore  = rating.needScore;
+          analysis.needReason = rating.needReason;
+        }
+      }
 
       analyzed++;
       document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
@@ -5020,6 +5297,8 @@ Given our conversation before, I was hoping to ask your thoughts on the question
           contactLocation:   bestLi?.leadLocation  || '', // best-effort, used for timezone guessing when inserting times
           source:            hexOnly ? 'HEX intro' : (benefitsPath ? 'Benefits reconnect' : (staleReconnect ? 'Rebrand reconnect' : (analysis.channel || 'linkedin'))),
           llamaScore:        analysis.fitScore      || 5,
+          needScore:         clampNeedScore(analysis.needScore),
+          needReason:        analysis.needReason    || '',
           urgency:           analysis.urgency       || 'medium',
           reason:            analysis.reason        || '',
           aiSummary:         analysis.summary       || '',
@@ -5039,8 +5318,10 @@ Given our conversation before, I was hoping to ask your thoughts on the question
           hexOnly,
           staleReconnect,
           isBenefits:        benefitsPath,
+          knownBrand:        analysis.knownBrand || knownBrand,
         });
-        fuLog(`  ✓ Follow-up recommended for ${analysis.contactName} (score ${analysis.fitScore}/10, ${analysis.urgency})`, 'success');
+        fuLog(`  ✓ Follow-up recommended for ${analysis.contactName} (need ${analysis.needScore || '?'}/5, score ${analysis.fitScore}/10, ${analysis.urgency})`, 'success');
+        fuWriteLocal(fuBuildSavePayload(results, { scanned: analyzed, partial: true }));
       } else {
         fuLog(`  — No follow-up needed (score ${analysis.fitScore || '?'}/10)${analysis.reason ? ' — ' + analysis.reason : ''}`);
       }
@@ -5053,18 +5334,16 @@ Given our conversation before, I was hoping to ask your thoughts on the question
     }
 
     document.getElementById('fuStopBtn').style.display = 'none';
+    results.sort((a, b) =>
+      (b.needScore || 0) - (a.needScore || 0) ||
+      (b.llamaScore || 0) - (a.llamaScore || 0)
+    );
     fuScanResults = results;
     const stopped = fuShouldStop;
     fuShouldStop  = false;
     fuSetStatus(`${stopped ? 'Stopped — partial results: ' : 'Complete — '}${results.length} follow-up opportunit${results.length === 1 ? 'y' : 'ies'}`, 100);
 
-    // Last-scan note next to the scan button
-    const noteEl = document.getElementById('fuCacheNote');
-    if (noteEl) {
-      const ts = new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-      noteEl.textContent = `Last scan: ${ts} · ${analyzed} compan${analyzed === 1 ? 'y' : 'ies'} analyzed · ${results.length} opportunit${results.length === 1 ? 'y' : 'ies'}${stopped ? ' (stopped early)' : ''}`;
-    }
-
+    await saveFollowupResults({ scanned: analyzed, partial: stopped });
     showFollowupResults(results, analyzed, results.length);
   };
 
@@ -5147,7 +5426,7 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           provider:    'openrouter',
-          model:       'moonshotai/kimi-k3',
+          model:       getSelectedAiModel(),
           prompt,
           temperature: 0.1,
           max_tokens:  200,
@@ -5219,34 +5498,37 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
     };
   }
 
-  function fuStaleReconnectAnalysis(account, emails, liMsgs, lastDate) {
+  function fuStaleReconnectAnalysis(account, emails, liMsgs, lastDate, knownBrand) {
     const contact = fuContactFromHexEmails(account, emails);
     const li = (liMsgs || [])[0];
     const name = contact.name || li?.leadName || 'Unknown';
     const ago = fmtDaysAgo(lastDate);
     const hasLi = (liMsgs || []).length > 0;
+    const brand = knownBrand || detectKnownBrand(emails, liMsgs);
     return {
       shouldFollowUp: true,
       contactName:    name,
       contactTitle:   li?.leadPosition || '',
       contactEmail:   contact.email || '',
       channel:        contact.email ? 'email' : (hasLi ? 'linkedin' : 'email'),
-      reason:         `Last 1:1 contact was ${ago} — they knew us as HealthLuminate / CareLuminate. Using Pando reconnect.`,
-      summary:        `Last 1:1 contact with ${account.name} was ${ago}. They would have known the firm as HealthLuminate or CareLuminate, now Pando Executive Networking. No recent conversation — reconnect with the rebrand and what we do for busy executives.`,
+      reason:         `Last 1:1 contact was ${ago} — they knew us as ${brand}. Using Pando reconnect.`,
+      summary:        `Last 1:1 contact with ${account.name} was ${ago}. They would have known the firm as ${brand}, now Pando Executive Networking. No recent conversation — reconnect with the rebrand and what we do for busy executives.`,
       urgency:        'low',
       fitScore:       6,
-      message:        STALE_RECONNECT_MESSAGE,
+      message:        staleReconnectMessage(brand),
       staleReconnect: true,
+      knownBrand:     brand,
     };
   }
 
   // Company is primarily an employee-benefits business — pitch the benefits-leader
   // interview series instead of the generic rebrand reconnect.
-  function fuBenefitsAnalysis(account, emails, liMsgs) {
+  function fuBenefitsAnalysis(account, emails, liMsgs, knownBrand) {
     const contact = fuContactFromHexEmails(account, emails);
     const li = (liMsgs || [])[0];
     const name = contact.name || li?.leadName || 'Unknown';
     const hasLi = (liMsgs || []).length > 0;
+    const brand = knownBrand || detectKnownBrand(emails, liMsgs);
     return {
       shouldFollowUp: true,
       contactName:    name,
@@ -5257,15 +5539,17 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
       summary:        `${account.name} is primarily an employee-benefits organization. Reconnecting about our confidential benefits-leader interview series instead of the standard rebrand messaging.`,
       urgency:        'low',
       fitScore:       6,
-      message:        BENEFITS_FOLLOWUP_MESSAGE,
+      message:        benefitsFollowupMessage(brand),
       isBenefits:     true,
+      knownBrand:     brand,
     };
   }
 
   async function fuAnalyzeCompany(account, emails, liMsgs, notes,
-                                   screeningPrompt, contentPrompt, minDaysSince, skipScheduled) {
+                                   screeningPrompt, contentPrompt, minDaysSince, skipScheduled, knownBrand) {
     const today = new Date().toLocaleDateString('en-US',
       { month: 'long', day: 'numeric', year: 'numeric' });
+    const brand = knownBrand || detectKnownBrand(emails, liMsgs);
 
     const emailLines = emails.slice(0, 15).map(e => {
       const daysAgo = e.date ? Math.floor((Date.now() - new Date(e.date)) / 86400000) : '?';
@@ -5305,13 +5589,17 @@ RULES:
 ${skipScheduled ? '- Do NOT recommend follow-up if a meeting or call is already scheduled, or the contact said they would book a time — they are already in motion.' : ''}
 - DO recommend follow-up if a contact replied with interest and the conversation has since gone quiet, there is an unanswered question, or it has been more than ${minDaysSince} days since meaningful two-way contact and the signals are positive.
 ${screeningPrompt ? '- ADDITIONAL CRITERIA: ' + screeningPrompt : ''}
+- Our firm was previously ${brand} and is now Pando Executive Networking. If the follow-up mentions a former name, use ONLY "${brand}" — never mention both CareLuminate and HealthLuminate.
 
 MESSAGE STYLE: ${contentPrompt || 'Write a brief 2-3 sentence warm follow-up referencing specifics. Human and conversational.'}
+
+NEED SCORE:
+${NEED_SCORE_RUBRIC}
 
 TASK: Identify the single best follow-up opportunity at ${account.name}. Choose the most engaged contact and the best channel (email or linkedin).
 
 Respond ONLY with valid JSON (no markdown, no code fences):
-{"shouldFollowUp":true_or_false,"contactName":"best contact name or Unknown","contactTitle":"title if visible","channel":"email or linkedin","reason":"one concise sentence explaining the follow-up decision","summary":"2-3 sentence narrative of the full communication history and current relationship status (use names and dates)","urgency":"high, medium, or low","fitScore":integer_1_to_10,"message":"the follow-up message or empty string if no follow-up"}`;
+{"shouldFollowUp":true_or_false,"contactName":"best contact name or Unknown","contactTitle":"title if visible","channel":"email or linkedin","reason":"one concise sentence explaining the follow-up decision","summary":"2-3 sentence narrative of the full communication history and current relationship status (use names and dates)","urgency":"high, medium, or low","fitScore":integer_1_to_10,"needScore":integer_1_to_5,"needReason":"one short phrase matching the 1-5 rubric","message":"the follow-up message or empty string if no follow-up"}`;
 
     const MAX_RETRIES = 4;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -5321,7 +5609,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             provider:    'openrouter',
-            model:       'moonshotai/kimi-k3',
+            model:       getSelectedAiModel(),
             prompt,
             temperature: 0.3,
             max_tokens:  700,
@@ -5346,7 +5634,10 @@ Respond ONLY with valid JSON (no markdown, no code fences):
         const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
         const match   = cleaned.match(/\{[\s\S]*\}/);
         if (!match) return null;
-        return JSON.parse(match[0]);
+        const parsed = JSON.parse(match[0]);
+        parsed.needScore = clampNeedScore(parsed.needScore);
+        parsed.knownBrand = brand;
+        return parsed;
       } catch (e) {
         if (attempt === MAX_RETRIES) {
           console.warn('fuAnalyzeCompany failed for', account.name, e.message);
@@ -5358,6 +5649,70 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       }
     }
     return null;
+  }
+
+  // Compact rating call for template follow-ups (HEX / rebrand / benefits) that skip
+  // the full drafting prompt. Uses the same 1–5 need rubric as fuAnalyzeCompany.
+  async function fuRateNeed(account, emails, liMsgs, extra = {}) {
+    const emailLines = (emails || []).slice(0, 10).map(e => {
+      const d = e.date ? Math.floor((Date.now() - new Date(e.date)) / 86400000) : '?';
+      const dir = (e.folder === 'SENT' || e.folder === 'SentItems') ? 'SENT' : 'RECEIVED';
+      return `  [${d}d | ${dir}] "${e.subject}" — "${(e.snippet || '').slice(0, 100)}"`;
+    }).join('\n');
+    const liLines = (liMsgs || []).slice(0, 5).map(li => {
+      const d = li.date ? Math.floor((Date.now() - new Date(li.date)) / 86400000) : '?';
+      return `  [${d}d] ${li.leadName || '?'}: "${(li.lastMessage || '').slice(0, 120)}"`;
+    }).join('\n');
+    const context = extra.hexOnly
+      ? 'This is a HEX-only connection (shared DRI Monthly meeting group; no 1:1 history).'
+      : extra.staleReconnect
+        ? `Last 1:1 contact was ${extra.last1to1 ? fmtDaysAgo(extra.last1to1) : 'a long time ago'}. Rebrand reconnect.`
+        : extra.benefitsPath
+          ? 'Employee-benefits company — benefits-leader interview reconnect.'
+          : '';
+
+    const prompt =
+`You are rating how needed a follow-up is for ${account.name}.
+
+${NEED_SCORE_RUBRIC}
+
+${context}
+
+EMAILS:
+${emailLines || '  (none)'}
+
+LINKEDIN:
+${liLines || '  (none)'}
+
+Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needReason":"one short phrase matching the rubric"}`;
+
+    try {
+      const res = await fetchWithTimeout(`${RAILWAY_URL}/api/ai-profile-eval`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider:    'openrouter',
+          model:       getSelectedAiModel(),
+          prompt,
+          temperature: 0.1,
+          max_tokens:  120,
+        }),
+      }, 20000);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data    = await res.json();
+      const raw     = (data.message || data.response || '').trim();
+      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      const match   = cleaned.match(/\{[\s\S]*\}/);
+      if (!match) return null;
+      const parsed = JSON.parse(match[0]);
+      return {
+        needScore:  clampNeedScore(parsed.needScore),
+        needReason: parsed.needReason || '',
+      };
+    } catch (e) {
+      console.warn('fuRateNeed failed for', account.name, e.message);
+      return null;
+    }
   }
 
   // Build a structured transcript string for the result card.
@@ -5433,14 +5788,15 @@ Respond ONLY with valid JSON (no markdown, no code fences):
 
   // ── Render results ──────────────────────────────────────────────────────────
 
-  function showFollowupResults(followUps, scanned, approved) {
+  function showFollowupResults(followUps, scanned, approved, { restored = false } = {}) {
     fuSetBtnState(false);
     document.getElementById('fuProgressPanel').style.display = 'none';
     document.getElementById('fuResultsPanel').style.display  = 'block';
     document.getElementById('fuCriteriaPanel').style.display = 'block';
 
     document.getElementById('fuResultsSummary').innerHTML =
-      `Analyzed <strong>${scanned}</strong> compan${scanned === 1 ? 'y' : 'ies'} · `
+      `${restored ? '<span style="color:#6b7280;">Restored from last session · </span>' : ''}`
+      + `Analyzed <strong>${scanned}</strong> compan${scanned === 1 ? 'y' : 'ies'} · `
       + `<strong>${followUps.length}</strong> follow-up opportunit${followUps.length === 1 ? 'y' : 'ies'} found`;
 
     const list = document.getElementById('fuCardList');
@@ -5513,6 +5869,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
             </div>
           </div>
           <div class="fu-card-badges">
+            ${needBadgeHtml(fu.needScore, fu.needReason)}
             <span class="fu-badge fu-badge-score">Score ${score}/10</span>
             ${urgency ? `<span class="fu-badge" style="background:${urgencyColor};color:#fff;">${urgency}</span>` : ''}
             <span class="fu-badge fu-badge-source">${escHtml(fu.source || 'conversation')}</span>
@@ -5547,7 +5904,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
           </div>
           <div class="fu-card-right">
             <div class="fu-card-label"><i class="fas fa-pen-nib"></i> Generated Follow-up (editable)</div>
-            <textarea class="fu-msg-textarea" id="fu-msg-${idx}">${escHtml(fu.message || '')}</textarea>
+            <textarea class="fu-msg-textarea" id="fu-msg-${idx}" oninput="window.onFuMessageEdit(${idx})">${escHtml(fu.message || '')}</textarea>
             <div class="fu-send-row">
               <button class="fu-send-btn email" onclick="window.openEmailCompose(${idx})">
                 <i class="fas fa-envelope"></i> Send Email
@@ -5707,6 +6064,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
           <div style="font-size:0.85em;line-height:1.6;color:#0c4a6e;">${escHtml(summaryText)}</div>
         </div>` : ''}
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+        ${needBadgeHtml(fu.needScore, fu.needReason)}
         <span style="font-size:0.78em;padding:3px 8px;border-radius:5px;background:#e0e7ff;color:#3730a3;font-weight:600;">
           Score ${fu.llamaScore || '?'}/10
         </span>
@@ -5715,6 +6073,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
           via ${escHtml(fu.source || 'contact')}
         </span>
       </div>
+      ${fu.needReason ? `<div style="font-size:0.8em;color:#6b7280;margin:-4px 0 10px;">${escHtml(fu.needReason)}</div>` : ''}
       ${(() => {
         const bdrs = fuResolveBdrs(fu);
         const lead = bdrs[0];
@@ -6322,9 +6681,9 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       subject:   fu.hexOnly
         ? 'Great to be connected'
         : (fu.isBenefits
-          ? 'Quick question for you — HealthLuminate'
+          ? `Quick question for you — ${fu.knownBrand || 'HealthLuminate'}`
           : (fu.staleReconnect
-            ? 'Pando Executive Networking (formerly HealthLuminate)'
+            ? `Pando Executive Networking (formerly ${fu.knownBrand || 'HealthLuminate'})`
             : (skipThread
               ? 'Great to be connected'
               : (fu.contactCompany ? `Re: ${fu.contactCompany}` : 'Following up')))),
@@ -6339,6 +6698,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
   };
 
   window.closeEmailCompose = function () {
+    fuSyncComposeBodyToCard();
     document.getElementById('emailComposeOverlay').style.display = 'none';
     fuComposeState = {};
   };
@@ -6539,6 +6899,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
   };
 
   window.submitEmailCompose = async function () {
+    fuSyncComposeBodyToCard();
     const accountId = document.getElementById('emailComposeFrom').value;
     const to        = document.getElementById('emailComposeTo').value.trim();
     const cc        = document.getElementById('emailComposeCc').value.trim();
@@ -6910,11 +7271,13 @@ Respond ONLY with valid JSON (no markdown, no code fences):
   };
 
   window.closeLiCompose = function () {
+    fuSyncComposeBodyToCard();
     document.getElementById('liComposeOverlay').style.display = 'none';
     fuComposeState = {};
   };
 
   window.submitLiCompose = async function () {
+    fuSyncComposeBodyToCard();
     const { idx, conversationId, linkedInAccountId, sendMode, quickCampaign, customerId } = fuComposeState;
     const fu      = fuScanResults[idx];
     const message = document.getElementById('liComposeBody').value.trim();
