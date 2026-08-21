@@ -3224,34 +3224,47 @@
                 const db = window.clemailDb;
                 if (!db) throw new Error('Firestore not available');
 
-                // Look up this BDR's email so we can query by account_email too
+                // Look up this BDR's email variants. connect_queue docs are written by many
+                // different flows across generate_messages.html/etc. using inconsistent
+                // snake_case fields (account_email is sometimes the LinkedIn seat email,
+                // sometimes the auth email; bdr_auth_email/bdr_primary_email cover the gap) —
+                // so we collect every known email for this BDR and check all of them.
                 const bdrRecord = allBdrLeaders.find(b => b.name === bdrName);
-                const bdrEmail  = bdrRecord?.email || bdrRecord?.linkedinEmail || bdrRecord?.accountEmail || null;
+                const emailCandidates = [
+                    bdrRecord?.primaryEmail,
+                    bdrRecord?.linkedInEmail,
+                    ...(bdrRecord?.emailAccountIds || [])
+                ].filter(Boolean).map(e => e.toLowerCase());
+                const uniqueEmails = [...new Set(emailCandidates)].slice(0, 10); // Firestore 'in' cap
 
-                console.log(`[BDR Tracer] Loading for: "${bdrName}"${bdrEmail ? ` (${bdrEmail})` : ' (no email found)'}`);
+                console.log(`[BDR Tracer] Loading for: "${bdrName}"${uniqueEmails.length ? ` (emails: ${uniqueEmails.join(', ')})` : ' (no email found on bdr_leaders record)'}`);
 
                 tracerLoadingText.textContent = `Querying messages for ${bdrName}…`;
 
-                // Query 1: by bdrName field (most common)
+                // Query 1: by bdr_name field — the actual field connect_queue docs use
+                // (NOT the camelCase "bdrName", which doesn't exist on this collection at all
+                // and previously made this query silently return zero results for every BDR).
                 const byNameSnap = await db.collection('connect_queue')
-                    .where('bdrName', '==', bdrName)
+                    .where('bdr_name', '==', bdrName)
                     .limit(500)
                     .get();
 
-                // Query 2: by account_email field (older docs / different creation path)
-                let byEmailSnap = null;
-                if (bdrEmail) {
-                    tracerLoadingText.textContent = `Checking account_email…`;
-                    byEmailSnap = await db.collection('connect_queue')
-                        .where('account_email', '==', bdrEmail)
-                        .limit(500)
-                        .get();
+                // Query 2 & 3: by the actual email fields connect_queue docs use.
+                // Firestore 'in' matches ANY of up to 10 values in one query.
+                let byAccountEmailSnap = null;
+                let byAuthEmailSnap = null;
+                if (uniqueEmails.length > 0) {
+                    tracerLoadingText.textContent = `Checking account_email / bdr_auth_email…`;
+                    [byAccountEmailSnap, byAuthEmailSnap] = await Promise.all([
+                        db.collection('connect_queue').where('account_email', 'in', uniqueEmails).limit(500).get(),
+                        db.collection('connect_queue').where('bdr_auth_email', 'in', uniqueEmails).limit(500).get()
+                    ]);
                 }
 
-                // Merge both result sets, deduplicating by doc ID
+                // Merge all result sets, deduplicating by doc ID
                 const seen = new Set();
                 const allDocs = [];
-                [byNameSnap, byEmailSnap].forEach(snap => {
+                [byNameSnap, byAccountEmailSnap, byAuthEmailSnap].forEach(snap => {
                     if (!snap) return;
                     snap.forEach(doc => {
                         if (!seen.has(doc.id)) {
@@ -3261,7 +3274,9 @@
                     });
                 });
 
-                console.log(`[BDR Tracer] Found ${allDocs.length} total docs (${byNameSnap.size} by name${byEmailSnap ? ', ' + byEmailSnap.size + ' by email' : ''})`);
+                console.log(`[BDR Tracer] Found ${allDocs.length} total docs (${byNameSnap.size} by bdr_name` +
+                    `${byAccountEmailSnap ? ', ' + byAccountEmailSnap.size + ' by account_email' : ''}` +
+                    `${byAuthEmailSnap ? ', ' + byAuthEmailSnap.size + ' by bdr_auth_email' : ''})`);
 
                 const groups = {};
                 TRACER_QUEUES.forEach(q => { groups[q.key] = []; });
@@ -3356,10 +3371,19 @@
                                </button>`
                             : '';
 
+                        // Surfaces the exact strings the auto-push job's email-match gate compares
+                        // against bdr_leaders.primaryEmail / linkedInEmail — a BDR with two company
+                        // records (one retired) often has queue items whose email fields don't match
+                        // either variant of the active record, which silently blocks every push.
+                        const emailFieldsPresent = [
+                            item.account_email ? `account_email: <code>${escHtml(item.account_email)}</code>` : null,
+                            item.bdr_auth_email && item.bdr_auth_email !== item.account_email ? `bdr_auth_email: <code>${escHtml(item.bdr_auth_email)}</code>` : null
+                        ].filter(Boolean).join(' · ');
                         html += `<div class="tracer-row">
                             <div>
                                 <div class="tracer-contact">${escHtml(contactName)}</div>
                                 <div class="tracer-company">${escHtml(company)}</div>
+                                ${emailFieldsPresent ? `<div class="tracer-company" style="margin-top:2px;font-size:0.7rem;"><i class="fas fa-envelope" style="font-size:0.65rem;"></i> ${emailFieldsPresent}</div>` : '<div class="tracer-company" style="margin-top:2px;color:#ef4444;font-size:0.7rem;"><i class="fas fa-exclamation-circle" style="font-size:0.65rem;"></i> No account_email/bdr_auth_email on this record — auto-push cannot match it to any BDR</div>'}
                                 ${campaign ? `<div class="tracer-company" style="margin-top:2px;"><i class="fas fa-bullhorn" style="font-size:0.7rem;"></i> ${escHtml(campaign)}</div>` : '<div class="tracer-company" style="margin-top:2px;color:#ef4444;font-size:0.75rem;"><i class="fas fa-exclamation-circle" style="font-size:0.7rem;"></i> No campaign recorded</div>'}
                             </div>
                             <div class="tracer-msg">${msgText ? escHtml(msgText.substring(0, 160)) + (msgText.length > 160 ? '…' : '') : '<em style="color:var(--gray)">No message text</em>'}</div>
