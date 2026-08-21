@@ -59,6 +59,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Auto-Reply Inbox', href: 'linkedin_auto_replies.html', icon: 'fa-robot' },
                 { label: 'Sent Messages', href: 'sent_messages.html', icon: 'fa-check-double' },
                 { label: 'Outcomes', href: 'index.html', icon: 'fa-chart-line' },
+                { label: 'Post-Call Tracking', href: 'post_call_tracking.html', icon: 'fa-handshake-simple' },
                 { label: 'Stop Outreach', href: 'outreach_stop_button.html', icon: 'fa-power-off' }
             ]
         },
