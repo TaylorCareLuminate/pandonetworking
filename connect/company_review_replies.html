@@ -1890,7 +1890,7 @@
                     <i class="fas fa-file-excel"></i>
                     Export All Contacts &amp; Conversations
                 </button>
-                <button id="followUpCountScanBtn" onclick="scanForNumberOfFollowUps()" style="background: linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%); box-shadow: 0 4px 12px rgba(124,58,237,0.35); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 10px; font-weight: 600; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem;" title="Reads each conversation's full transcript and asks the AI to count how many separate meeting invitations (follow-ups) the BDR has sent, then saves that number to the card. Skips anything marked Scheduled or Wrong Contact.">
+                <button id="followUpCountScanBtn" onclick="scanForNumberOfFollowUps()" style="background: linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%); box-shadow: 0 4px 12px rgba(124,58,237,0.35); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 10px; font-weight: 600; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem;" title="Counts how many separate meeting invitations (follow-ups) the BDR has sent, then saves that number to the card. Skips anything marked Scheduled or Wrong Contact. Offers a fast logic-based Quick Scan (no AI) or a more thorough AI Scan.">
                     <i class="fas fa-list-ol"></i>
                     Scan for Number of Follow-Ups
                 </button>
@@ -8752,17 +8752,156 @@
         // cap each run again if you ever need to spot-check results by hand.
         const FOLLOWUP_COUNT_SCAN_TEST_LIMIT = null;
 
-        window.scanForNumberOfFollowUps = async function() {
-            const button = document.getElementById('followUpCountScanBtn');
-            const originalBtnHtml = button ? button.innerHTML : '';
+        async function fetchJsonWithTimeout(url, options, timeoutMs) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const res = await fetch(url, { ...options, signal: controller.signal });
+                return await res.json();
+            } catch (e) {
+                if (e.name === 'AbortError') throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+                throw e;
+            } finally {
+                clearTimeout(timer);
+            }
+        }
 
-            const eligible = allConversations.filter(conv => {
+        function getEligibleFollowUpCountConversations() {
+            return allConversations.filter(conv => {
                 if ((conv.responseCategory || '') === 'Scheduled') return false;
                 if ((conv.followUpCategory || 'No Follow Up') === 'Qualified Wrong Contact') return false;
                 const msgs = conv.messages || conv.rawData?.messages || [];
                 if (!msgs.length) return false;
                 return msgs.some(m => m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound');
             });
+        }
+
+        // "Scan for Number of Follow-Ups" now offers two modes — show a small chooser
+        // instead of jumping straight into the (paid, slower) AI scan.
+        window.scanForNumberOfFollowUps = function() {
+            const existing = document.getElementById('fuCountScanModeModal');
+            if (existing) existing.remove();
+
+            const modal = document.createElement('div');
+            modal.id = 'fuCountScanModeModal';
+            modal.style.cssText = 'position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 10000; display: flex; align-items: center; justify-content: center; padding: 1.5rem;';
+            modal.innerHTML = `
+                <div style="background: white; border-radius: 14px; max-width: 480px; width: 100%; box-shadow: 0 20px 50px rgba(0,0,0,0.3);">
+                    <div style="padding: 1.1rem 1.25rem; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center;">
+                        <h3 style="margin: 0; font-size: 1.05rem; color: #111827;"><i class="fas fa-list-ol" style="color: #7c3aed;"></i> Scan for Number of Follow-Ups</h3>
+                        <button onclick="document.getElementById('fuCountScanModeModal').remove()" style="background: none; border: none; font-size: 1.3rem; color: #6b7280; cursor: pointer; line-height: 1;">&times;</button>
+                    </div>
+                    <div style="padding: 1.1rem 1.25rem; display: flex; flex-direction: column; gap: 0.75rem;">
+                        <button onclick="document.getElementById('fuCountScanModeModal').remove(); runQuickFollowUpCountScan();" style="text-align: left; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 10px; padding: 0.85rem 1rem; cursor: pointer;">
+                            <div style="font-weight: 700; color: #065f46;"><i class="fas fa-bolt"></i> Quick Scan (Logic-Based, No AI)</div>
+                            <div style="font-size: 0.82rem; color: #047857; margin-top: 0.25rem;">Instantly counts BDR messages sent after the prospect's last reply that are at least 3 days apart. Only ever raises the saved count — never lowers it. Free and instant.</div>
+                        </button>
+                        <button onclick="document.getElementById('fuCountScanModeModal').remove(); runAiFollowUpCountScan();" style="text-align: left; background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 10px; padding: 0.85rem 1rem; cursor: pointer;">
+                            <div style="font-weight: 700; color: #5b21b6;"><i class="fas fa-brain"></i> AI Scan</div>
+                            <div style="font-size: 0.82rem; color: #6d28d9; margin-top: 0.25rem;">Reads each full transcript and asks the AI to judge how many separate meeting invitations were actually sent. Slower and uses AI credits, but understands context the Quick Scan can miss.</div>
+                        </button>
+                    </div>
+                </div>`;
+            modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+            document.body.appendChild(modal);
+        };
+
+        // Sorts a conversation's messages by time, finds the LAST message the prospect sent
+        // to us, then counts how many BDR messages after that point are at least 3 days apart
+        // from the previous counted one — i.e. distinct follow-up attempts, not just message
+        // fragments sent minutes/hours apart as part of the same attempt. Pure dates/counts,
+        // no AI involved.
+        function computeQuickFollowUpCount(conv) {
+            const rawMsgs = conv.messages || conv.rawData?.messages || [];
+            const withDates = rawMsgs.map(m => ({
+                isBdr: m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound',
+                date: safeToDate(m.createdAt || m.timestamp || m.date)
+            })).filter(x => x.date && !isNaN(x.date));
+            withDates.sort((a, b) => a.date - b.date);
+
+            let lastProspectIdx = -1;
+            withDates.forEach((x, idx) => { if (!x.isBdr) lastProspectIdx = idx; });
+            if (lastProspectIdx === -1) return { count: 0, dates: [] }; // prospect has never replied — nothing to quick-count
+
+            const afterMsgs = withDates.slice(lastProspectIdx + 1).filter(x => x.isBdr);
+            if (afterMsgs.length === 0) return { count: 0, dates: [] };
+
+            const countedDates = [afterMsgs[0].date];
+            for (let i = 1; i < afterMsgs.length; i++) {
+                const daysSinceLastCounted = (afterMsgs[i].date - countedDates[countedDates.length - 1]) / (24 * 60 * 60 * 1000);
+                if (daysSinceLastCounted >= 3) countedDates.push(afterMsgs[i].date);
+            }
+            return { count: countedDates.length, dates: countedDates };
+        }
+
+        window.runQuickFollowUpCountScan = async function() {
+            const button = document.getElementById('followUpCountScanBtn');
+            const originalBtnHtml = button ? button.innerHTML : '';
+
+            const eligible = getEligibleFollowUpCountConversations();
+            if (eligible.length === 0) {
+                alert('No eligible conversations to scan (everything is Scheduled, marked Wrong Contact, or has no BDR messages).');
+                return;
+            }
+
+            const resolveLeadName = (conv) => {
+                const fn = (conv.leadFirstName || '').trim();
+                const ln = (conv.leadLastName || '').trim();
+                return conv.lead_name || conv.leadName || (fn && ln ? `${fn} ${ln}` : fn || ln) || '';
+            };
+
+            if (button) { button.disabled = true; button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Quick scanning…'; }
+
+            const results = [];
+            for (let i = 0; i < eligible.length; i++) {
+                const conv = eligible[i];
+                const oldCount = conv.followUpInvitesSent || 0;
+                const label = { name: resolveLeadName(conv) || 'Unknown', company: conv.companyName || '', bdr: conv.bdrEmail || '', oldCount };
+                try {
+                    const { count: quickCount, dates } = computeQuickFollowUpCount(conv);
+                    if (quickCount <= oldCount) {
+                        results.push({ ...label, newCount: oldCount, ok: true, changed: false });
+                        continue;
+                    }
+                    const { collection, docId } = resolveConversationDocRef(conv);
+                    const saveResult = await fetchJsonWithTimeout(`${RAILWAY_URL}/heyreach/inbox/set-followup-invites-sent`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ collection, docId, invitesSent: quickCount })
+                    }, 30000);
+                    if (!saveResult.success) throw new Error(saveResult.error || 'Failed to save count');
+
+                    conv.followUpInvitesSent = quickCount;
+                    conv.followUpSequence = null;
+                    const cardInput = document.getElementById(`invitesSentInput-${conv.id}`);
+                    if (cardInput) cardInput.value = quickCount;
+
+                    const dateLabels = dates.map(d => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })).join(', ');
+                    results.push({
+                        ...label,
+                        newCount: quickCount,
+                        ok: true,
+                        changed: true,
+                        reasoning: `Found ${quickCount} BDR message${quickCount === 1 ? '' : 's'} after the prospect's last reply, spaced ≥3 days apart (${dateLabels}).`
+                    });
+                } catch (error) {
+                    console.error(`❌ Quick follow-up count failed for ${conv.id}:`, error);
+                    results.push({ ...label, ok: false, error: error.message });
+                }
+            }
+
+            if (button) { button.disabled = false; button.innerHTML = originalBtnHtml; }
+            updateFollowUpDraftCount();
+            updateCategoryGrid();
+            applyAllFilters();
+            showFollowUpCountScanResults(results, eligible.length, 'quick');
+        };
+
+        window.runAiFollowUpCountScan = async function() {
+            const button = document.getElementById('followUpCountScanBtn');
+            const originalBtnHtml = button ? button.innerHTML : '';
+
+            const eligible = getEligibleFollowUpCountConversations();
 
             if (eligible.length === 0) {
                 alert('No eligible conversations to scan (everything is Scheduled, marked Wrong Contact, or has no BDR messages).');
@@ -8778,20 +8917,6 @@
             }
 
             if (button) { button.disabled = true; }
-
-            const fetchJsonWithTimeout = async (url, options, timeoutMs) => {
-                const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), timeoutMs);
-                try {
-                    const res = await fetch(url, { ...options, signal: controller.signal });
-                    return await res.json();
-                } catch (e) {
-                    if (e.name === 'AbortError') throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
-                    throw e;
-                } finally {
-                    clearTimeout(timer);
-                }
-            };
 
             const fmtTs = (raw) => {
                 try {
@@ -8910,19 +9035,21 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer �
             updateFollowUpDraftCount();
             updateCategoryGrid();
             applyAllFilters();
-            showFollowUpCountScanResults(results, eligible.length);
+            showFollowUpCountScanResults(results, eligible.length, 'ai');
         };
 
-        // Pop-up listing exactly which conversations were scanned and what the AI
-        // decided, so each one can be opened and verified by hand while the scan
-        // is still in test mode.
-        function showFollowUpCountScanResults(results, eligibleTotal) {
+        // Pop-up listing exactly which conversations were scanned and what was decided,
+        // so each one can be opened and verified by hand. `mode` is 'quick' or 'ai'.
+        function showFollowUpCountScanResults(results, eligibleTotal, mode) {
             const existing = document.getElementById('fuCountScanResultsModal');
             if (existing) existing.remove();
 
             const okResults = results.filter(r => r.ok);
             const failed = results.filter(r => !r.ok);
             const changed = okResults.filter(r => r.newCount !== r.oldCount);
+            const accent = mode === 'quick' ? '#0d9488' : '#7c3aed';
+            const modeLabel = mode === 'quick' ? 'Quick Scan (Logic-Based)' : 'AI Scan';
+            const modeIcon = mode === 'quick' ? 'fa-bolt' : 'fa-list-ol';
 
             const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -8942,11 +9069,11 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer �
                         ${changedBadge}
                     </div>
                     ${r.bdr ? `<div style="font-size: 0.78rem; color: #6b7280;">BDR: ${esc(r.bdr)}</div>` : ''}
-                    ${r.reasoning ? `<div style="font-size: 0.83rem; color: #4b5563; margin-top: 0.25rem;">🧠 ${esc(r.reasoning)}</div>` : ''}
+                    ${r.reasoning ? `<div style="font-size: 0.83rem; color: #4b5563; margin-top: 0.25rem;">${mode === 'quick' ? '📆' : '🧠'} ${esc(r.reasoning)}</div>` : ''}
                 </div>`;
             }).join('');
 
-            const testModeNote = FOLLOWUP_COUNT_SCAN_TEST_LIMIT
+            const testModeNote = (mode === 'ai' && FOLLOWUP_COUNT_SCAN_TEST_LIMIT)
                 ? `<div style="background: #fffbeb; border: 1px solid #fde68a; color: #92400e; font-size: 0.85rem; padding: 0.6rem 1rem; border-radius: 8px; margin-bottom: 0.75rem;">🧪 <strong>Test mode:</strong> scanned the first ${results.length} of ${eligibleTotal} eligible conversation(s). Look these up below to verify the counts, then we'll turn the limit off.</div>`
                 : '';
 
@@ -8956,7 +9083,7 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer �
             modal.innerHTML = `
                 <div style="background: white; border-radius: 14px; max-width: 640px; width: 100%; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(0,0,0,0.3);">
                     <div style="padding: 1.1rem 1.25rem; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center;">
-                        <h3 style="margin: 0; font-size: 1.05rem; color: #111827;"><i class="fas fa-list-ol" style="color: #7c3aed;"></i> Follow-Up Count Scan Results</h3>
+                        <h3 style="margin: 0; font-size: 1.05rem; color: #111827;"><i class="fas ${modeIcon}" style="color: ${accent};"></i> ${modeLabel} Results</h3>
                         <button onclick="document.getElementById('fuCountScanResultsModal').remove()" style="background: none; border: none; font-size: 1.3rem; color: #6b7280; cursor: pointer; line-height: 1;">&times;</button>
                     </div>
                     <div style="padding: 1rem 1.25rem; overflow-y: auto;">
@@ -8967,7 +9094,7 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer �
                         <div style="border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden;">${rowsHtml}</div>
                     </div>
                     <div style="padding: 0.9rem 1.25rem; border-top: 1px solid #e5e7eb; text-align: right;">
-                        <button onclick="document.getElementById('fuCountScanResultsModal').remove()" style="background: #7c3aed; color: white; border: none; padding: 0.55rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer;">Close</button>
+                        <button onclick="document.getElementById('fuCountScanResultsModal').remove()" style="background: ${accent}; color: white; border: none; padding: 0.55rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer;">Close</button>
                     </div>
                 </div>`;
             modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
