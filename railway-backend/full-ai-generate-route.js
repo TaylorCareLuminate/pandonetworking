@@ -1123,6 +1123,10 @@ Return JSON: {"message": "...", "prospectReference": "...", "bdrReference": "...
                 `All commonalities found: ${commonalities.join('; ')}`
             ].filter(Boolean).join('\n'),
             postsCount: recentPosts.length,
+            // Full post list — used by the client to archive every piece of data this
+            // message was built from (see message-data-archive.js / generate_messages.html),
+            // not just the count. Not shown anywhere in the AMC UI itself.
+            recentPosts,
             log
         });
 

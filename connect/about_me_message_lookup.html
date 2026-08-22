@@ -8,6 +8,8 @@
 
     <script src="../js/auth.js"></script>
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <!-- Message Generation Data Archive: full research snapshot per generated message, 90-day retention -->
+    <script src="message-data-archive.js"></script>
 
     <style>
         :root {
@@ -676,6 +678,41 @@
             .kv-grid   { grid-template-columns: 1fr; }
             .kv-label  { margin-bottom: 0.1rem; }
         }
+
+        /* ── Full archived research data ─────────────────────────────────────── */
+        .archive-wrap {
+            border: 2px solid #059669;
+            border-radius: 12px;
+            padding: 1rem 1.15rem;
+            margin-top: 0.5rem;
+            background: linear-gradient(135deg, #ecfdf5 0%, #f0fdfa 100%);
+        }
+        .archive-banner {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            font-size: 0.8rem;
+            font-weight: 700;
+            color: #065f46;
+            background: white;
+            border: 1px solid #6ee7b7;
+            border-radius: 8px;
+            padding: 0.55rem 0.8rem;
+            margin-bottom: 0.9rem;
+        }
+        .archive-banner .exp { margin-left: auto; font-weight: 500; color: #047857; }
+        .archive-missing {
+            border: 1.5px dashed #94a3b8;
+            border-radius: 10px;
+            padding: 0.7rem 0.9rem;
+            font-size: 0.8rem;
+            color: #475569;
+            background: #f8fafc;
+            margin-top: 0.5rem;
+        }
+        .archive-section { margin-top: 0.85rem; }
+        .archive-section:first-child { margin-top: 0; }
     </style>
 </head>
 <body>
@@ -767,6 +804,14 @@
     const AI_MODEL = 'anthropic/claude-opus-4.7';
     const PROFILE_CACHE_COLLECTION = 'linkedin_profile_cache';
     const CACHE_FRESH_DAYS = 90;
+
+    // Full research archive (message_generation_archive, via message-data-archive.js) —
+    // the point-in-time snapshot of every bit of data (profile, posts, news, About Me
+    // findings, sender BDR About Me) used to build one specific message. Auto-deleted
+    // 90 days after generation (see functions/index.js: cleanupExpiredMessageGenerationData).
+    // This is NOT profile enrichment — linkedin_profile_cache above is the permanent
+    // enrichment cache and is never touched by that cleanup job.
+    const HAS_ARCHIVE = !!window.MessageDataArchive;
 
     /** Shared context for deep lookup + Q&A */
     let deepCtx = null;
@@ -1417,6 +1462,85 @@ ${queueFindings}
         }
     }
 
+    // ─── Full archived research data (message_generation_archive) ─────────────
+
+    function fmtDate(iso) {
+        if (!iso) return '';
+        try { return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }); }
+        catch { return ''; }
+    }
+
+    /** Renders EVERYTHING saved for this message at generation time: full profile,
+     *  every post, every news item, About Me findings, and the sender BDR's About Me
+     *  profile — reusing the same panel renderers the live Deep Source Lookup uses,
+     *  so an archived record and a freshly-fetched one look identical. */
+    function renderArchivePanel(archive, docId) {
+        if (!archive) return '';
+        const daysLeft = window.MessageDataArchive?.daysUntilExpiry(archive);
+        const newsItems = [];
+        if (archive.news?.newsData) newsItems.push(archive.news.newsData);
+        if (archive.post?.text || archive.post?.url) {
+            newsItems.push({
+                headline: archive.post.type && archive.post.type !== 'regular' ? `Reshared/${archive.post.type} post` : 'LinkedIn post used for this message',
+                url: archive.post.url,
+                date: archive.post.date,
+                content: archive.post.resharedText || archive.post.text
+            });
+        }
+
+        const bdrProfileHtml = archive.bdrProfile
+            ? renderBdrAboutMePanel(archive.bdrProfile, archive.bdrEmail, archive.bdrName)
+            : '';
+
+        return `
+        <div class="archive-wrap">
+            <div class="archive-banner">
+                <i class="fas fa-box-archive"></i>
+                Full archived research data — saved ${fmtDate(archive.archivedAt)}
+                <span class="exp">${daysLeft != null ? `retained for ${Math.max(daysLeft, 0)} more day${daysLeft === 1 ? '' : 's'} (auto-deleted ${fmtDate(archive.expiresAt)})` : ''}</span>
+            </div>
+
+            ${archive.aboutMeFindings ? `<div class="archive-section">${renderFindings(archive.aboutMeFindings)}</div>` : ''}
+            ${newsItems.length ? `<div class="archive-section">${renderNewsPanel(newsItems)}</div>` : ''}
+            ${Array.isArray(archive.posts) && archive.posts.length ? `
+                <div class="archive-section posts-panel">
+                    <div class="panel-title"><i class="fab fa-linkedin"></i> Every LinkedIn post fetched for this message (${archive.posts.length})</div>
+                    ${renderPostsHtml(archive.posts, `archive-${docId}`)}
+                </div>` : ''}
+            ${archive.profile ? `<div class="archive-section">${renderProfile(archive.profile, 'Archived Prospect Profile (exact snapshot used to generate this message)')}</div>` : ''}
+            ${archive.profileRaw ? `
+                <div class="archive-section">
+                    <button class="raw-toggle" onclick="var el=document.getElementById('archive-raw-profile-${docId}');el.style.display=el.style.display==='none'?'block':'none';this.textContent=el.style.display==='none'?'▶ Show raw scraped profile (unprocessed)':'▼ Hide raw scraped profile';">▶ Show raw scraped profile (unprocessed)</button>
+                    <pre id="archive-raw-profile-${docId}" class="raw-json" style="display:none;">${esc(JSON.stringify(archive.profileRaw, null, 2))}</pre>
+                </div>` : ''}
+            ${bdrProfileHtml ? `<div class="archive-section">${bdrProfileHtml}</div>` : ''}
+
+            <div class="archive-section">
+                <button class="raw-toggle" onclick="var el=document.getElementById('archive-raw-full-${docId}');el.style.display=el.style.display==='none'?'block':'none';this.textContent=el.style.display==='none'?'▶ Show complete raw archive (every field saved, incl. news headline strings, final review context, source keys)':'▼ Hide complete raw archive';">▶ Show complete raw archive (every field saved, incl. news headline strings, final review context, source keys)</button>
+                <pre id="archive-raw-full-${docId}" class="raw-json" style="display:none;">${esc(JSON.stringify(archive, null, 2))}</pre>
+            </div>
+        </div>`;
+    }
+
+    /** Fetches the full archive for one connect_queue doc id and fills in its panel.
+     *  Falls back to an explanatory note (not an error) when nothing is archived —
+     *  either the message predates this feature, or it's older than 90 days and was
+     *  auto-deleted by cleanupExpiredMessageGenerationData. */
+    window.loadArchiveForRecord = async function loadArchiveForRecord(docId) {
+        const panel = document.getElementById(`archive-panel-${docId}`);
+        if (!panel || !HAS_ARCHIVE) return;
+        try {
+            const archive = await window.MessageDataArchive.load(docId);
+            if (!archive) {
+                panel.innerHTML = `<div class="archive-missing"><i class="fas fa-info-circle"></i> No archived research data found for this message — either it predates this archiving feature, or it's older than 90 days and was automatically deleted. Use <strong>Deep Source Lookup</strong> above to re-fetch live sources instead.</div>`;
+                return;
+            }
+            panel.innerHTML = renderArchivePanel(archive, docId);
+        } catch (e) {
+            panel.innerHTML = `<div class="archive-missing"><i class="fas fa-exclamation-triangle"></i> Could not load archived data: ${esc(e.message)}</div>`;
+        }
+    };
+
     // ─── Full record renderer ──────────────────────────────────────────────────
 
     function renderRecord(docId, data, isMatch) {
@@ -1463,6 +1587,10 @@ ${queueFindings}
             </div>
 
             <div class="rc-body">
+
+                <div id="archive-panel-${docId}">
+                    ${HAS_ARCHIVE ? '<div class="archive-missing"><i class="fas fa-circle-notch fa-spin"></i> Checking for full archived research data (message_generation_archive)…</div>' : ''}
+                </div>
 
                 ${renderFindings(data.about_me_findings || null)}
 
@@ -1635,6 +1763,7 @@ ${queueFindings}
                     <div class="deep-progress-item" id="prog-bdr"><i class="fas fa-circle" style="opacity:0.35;"></i> Sender About Me (BDR)</div>
                     <div class="deep-progress-item" id="prog-ai"><i class="fas fa-circle" style="opacity:0.35;"></i> Opus claim attribution</div>
                 </div>
+                <div id="deepArchiveSection"></div>
                 <div id="deepOtherMsgs"></div>
                 <div id="deepProfile"></div>
                 <div id="deepPosts"></div>
@@ -1816,6 +1945,30 @@ If the detail appears nowhere, say UNSOURCED clearly. Be specific and quote exac
                     `).join('')}
                 </div>` : '';
             document.getElementById('deepOtherMsgs').innerHTML = otherHtml;
+
+            // 1b) Full archived research data for every queue record found above —
+            // shown before the live re-fetch below since it's instant (Firestore reads)
+            // and is exactly what each message was actually generated from.
+            if (HAS_ARCHIVE && queueDocs.length) {
+                setProgress('prog-queue', 'pending', 'Checking full archived research data…');
+                const archiveResults = await Promise.all(queueDocs.map(async d => ({
+                    doc: d,
+                    archive: await window.MessageDataArchive.load(d.id)
+                })));
+                const withArchive = archiveResults.filter(r => r.archive);
+                if (withArchive.length) {
+                    document.getElementById('deepArchiveSection').innerHTML = withArchive.map(({ doc, archive }) => `
+                        <div style="margin-bottom:1rem;">
+                            <div style="font-size:0.78rem;font-weight:700;color:#334155;margin-bottom:0.35rem;">
+                                <i class="fas fa-envelope"></i> Archived research for ${esc(doc.source || doc.generated_via || 'message')}
+                                ${doc.uploaded_date ? ` · generated ${esc(new Date(doc.uploaded_date).toLocaleDateString())}` : ''}
+                            </div>
+                            ${renderArchivePanel(archive, doc.id)}
+                        </div>
+                    `).join('');
+                }
+                setProgress('prog-queue', 'done', `Found ${queueDocs.length} queue record(s) (any source) — ${withArchive.length} with full archived research data`);
+            }
 
             // 2) Profile
             setProgress('prog-profile', 'pending', 'Loading enriched profile…');
@@ -2079,6 +2232,10 @@ If the detail appears nowhere, say UNSOURCED clearly. Be specific and quote exac
                 <span style="color:var(--gray);font-weight:400;"> — use <strong>Deep Source Lookup</strong> to also pull live profile/posts/news and ask follow-up questions.</span>
             </div>
             ${filtered.map((r,i) => renderRecord(r.id, r, pastedMsg ? (i===0 && hasGoodMatch) : false)).join('')}`;
+
+        // Fetch each record's full archived research data (fast Firestore reads —
+        // safe to fire in parallel, unlike the live posts re-fetch which stays manual).
+        if (HAS_ARCHIVE) filtered.forEach(r => loadArchiveForRecord(r.id));
 
         // If user already typed a question, go straight into deep lookup
         if (getFormState().question) {

@@ -23,6 +23,10 @@
  * - cleanupAbandonedReservations (runs every hour)
  * - manualReleaseExpired (HTTP endpoint for manual trigger)
  * - manualRebalance (HTTP endpoint for manual trigger)
+ * - cleanupExpiredMessageGenerationData (runs daily at 4 AM Mountain Time —
+ *   deletes message_generation_archive docs past their 90-day retention;
+ *   never touches linkedin_profile_cache/prospect_contacts enrichment data)
+ * - manualCleanupExpiredMessageGenerationData (HTTP endpoint for manual trigger)
  */
 
 const functions = require('firebase-functions');
@@ -1258,6 +1262,105 @@ exports.manualCalculateClientDashboard = functions
         console.log('🔧 Manual trigger: calculateClientDashboard');
         try {
             const result = await calculateClientDashboardHelper();
+            res.status(200).json(result);
+        } catch (error) {
+            console.error('❌ Manual trigger failed:', error);
+            res.status(500).json({ success: false, error: error.message });
+        }
+    });
+
+/**
+ * Cleanup Expired Message Generation Data — deletes documents from
+ * message_generation_archive (the full research snapshot saved per generated
+ * message by connect/message-data-archive.js) once they're past their 90-day
+ * retention window (expiresAtMs <= now).
+ *
+ * IMPORTANT: This ONLY touches message_generation_archive. It must never
+ * touch linkedin_profile_cache or prospect_contacts — those are the
+ * permanent profile enrichment cache and are intentionally excluded from
+ * any retention/deletion policy.
+ */
+async function cleanupExpiredMessageGenerationDataHelper() {
+    console.log('🧹 Starting: Cleanup Expired Message Generation Data');
+    const startTime = Date.now();
+    const nowMs = Date.now();
+    let deletedCount = 0;
+
+    try {
+        // Loop in pages so a huge backlog doesn't blow past the 540s timeout or
+        // the 500-writes-per-batch Firestore limit in one shot.
+        while (true) {
+            const expiredSnapshot = await db.collection('message_generation_archive')
+                .where('expiresAtMs', '<=', nowMs)
+                .limit(CONFIG.BATCH_SIZE)
+                .get();
+
+            if (expiredSnapshot.empty) break;
+
+            const batch = db.batch();
+            expiredSnapshot.docs.forEach((doc) => batch.delete(doc.ref));
+            await batch.commit();
+
+            deletedCount += expiredSnapshot.size;
+            console.log(`   🗑️  Deleted ${expiredSnapshot.size} expired archive doc(s) (running total: ${deletedCount})`);
+
+            // Fewer than a full page means we've caught up.
+            if (expiredSnapshot.size < CONFIG.BATCH_SIZE) break;
+        }
+
+        const duration = Date.now() - startTime;
+        console.log(`✅ Cleanup complete - deleted ${deletedCount} expired message_generation_archive doc(s) in ${duration}ms`);
+
+        return { success: true, deletedCount, duration };
+    } catch (error) {
+        console.error('❌ Error cleaning up expired message generation data:', error);
+        throw error;
+    }
+}
+
+/**
+ * Runs nightly at 4 AM Mountain Time — safely after nightlyClientDashboardCalc (3 AM)
+ * so both jobs never overlap.
+ */
+exports.cleanupExpiredMessageGenerationData = functions
+    .runWith({
+        timeoutSeconds: 540,
+        memory: '512MB'
+    })
+    .pubsub.schedule('0 4 * * *') // 4:00 AM daily
+    .timeZone(CONFIG.TIMEZONE)
+    .onRun(async (context) => {
+        console.log('⏰ Scheduled run: cleanupExpiredMessageGenerationData (4 AM MT)');
+        try {
+            const result = await cleanupExpiredMessageGenerationDataHelper();
+            console.log('📊 Result:', result);
+            return result;
+        } catch (error) {
+            console.error('❌ Function failed:', error);
+            throw error;
+        }
+    });
+
+/**
+ * Manual trigger for expired message generation data cleanup (for testing/on-demand runs).
+ *
+ * Usage:
+ *   curl -X POST https://us-central1-clemail.cloudfunctions.net/manualCleanupExpiredMessageGenerationData
+ */
+exports.manualCleanupExpiredMessageGenerationData = functions
+    .runWith({
+        timeoutSeconds: 540,
+        memory: '512MB'
+    })
+    .https.onRequest(async (req, res) => {
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Access-Control-Allow-Methods', 'POST');
+        if (req.method === 'OPTIONS') { res.status(204).send(''); return; }
+        if (req.method !== 'POST') { res.status(405).send('Method Not Allowed'); return; }
+
+        console.log('🔧 Manual trigger: cleanupExpiredMessageGenerationData');
+        try {
+            const result = await cleanupExpiredMessageGenerationDataHelper();
             res.status(200).json(result);
         } catch (error) {
             console.error('❌ Manual trigger failed:', error);

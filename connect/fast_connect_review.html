@@ -3469,6 +3469,8 @@
     <script src="../js/auth.js"></script>
     <!-- CLEmail Secure API Wrapper -->
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <!-- Message Generation Data Archive: full research snapshot per generated message, 90-day retention -->
+    <script src="message-data-archive.js"></script>
     <!-- Shared AI model catalog (managed on ai_models_admin.html) -->
     <script src="../js/ai-model-catalog.js"></script>
     <!-- Shared Final AI Review rules store (Firestore-backed, localStorage cache) -->
@@ -14607,6 +14609,17 @@ Rules:
         }
 
         const fields = rule.includeFields || [];
+        // "Full Research Archive" is the recommended, consolidated option (see
+        // final_ai_review.html) — checking it alone implies every legacy granular
+        // field too, so the trimmed connect_queue-based fallbacks below still run
+        // and populate ctx even for messages whose 90-day archive has expired.
+        // The archive override + {{full_research_data}} block near the end of this
+        // function then replaces those trimmed values with the full originals
+        // whenever message._fullArchive is actually available.
+        const wantsFullArchive = fields.includes('full_archive');
+        const effectiveFields = wantsFullArchive
+            ? [...new Set([...fields, 'news_data', 'profile', 'about_me', 'ai_context', 'bdr_profile', 'original_message'])]
+            : fields;
 
         // Always include post content + metadata if present — core message context
         if (message.post_text) ctx.post_text = message.post_text;
@@ -14644,11 +14657,11 @@ Rules:
             if (resharedAuthor) ctx.reshared_post_author = resharedAuthor;
         }
 
-        if (fields.includes('post_text')) {
+        if (effectiveFields.includes('post_text')) {
             // Extended: no extra fields needed — all are now always-included above
         }
 
-        if (fields.includes('news_data')) {
+        if (effectiveFields.includes('news_data')) {
             const nd = message.news_data || message.newsData;
             if (nd) ctx.news_data = nd;
             if (message.ai_company_news)  ctx.ai_company_news = message.ai_company_news;
@@ -14656,7 +14669,7 @@ Rules:
             if (message.ai_fit_reason)    ctx.ai_fit_reason   = message.ai_fit_reason;
         }
 
-        if (fields.includes('profile')) {
+        if (effectiveFields.includes('profile')) {
             const cached = _profileDataCache.get(message.id);
             if (cached) {
                 if (cached.headline)   ctx.profile_headline    = cached.headline;
@@ -14696,22 +14709,22 @@ Rules:
             }
         }
 
-        if (fields.includes('about_me') && message.about_me_findings) {
+        if (effectiveFields.includes('about_me') && message.about_me_findings) {
             ctx.about_me_findings = message.about_me_findings;
         }
 
-        if (fields.includes('ai_context')) {
+        if (effectiveFields.includes('ai_context')) {
             if (message.ai_fit_reason)   ctx.ai_fit_reason   = message.ai_fit_reason;
             if (message.ai_company_news) ctx.ai_company_news = message.ai_company_news;
             if (message.ai_contact_news) ctx.ai_contact_news = message.ai_contact_news;
         }
 
-        if (fields.includes('original_message') && message.original_ai_message) {
+        if (effectiveFields.includes('original_message') && message.original_ai_message) {
             ctx.original_ai_message = message.original_ai_message;
         }
 
         // BDR background — pulled from about_me contact_profiles (pre-loaded by runFinalAiReviews)
-        if (fields.includes('bdr_profile') && _bdrProfileData && Object.keys(_bdrProfileData).length) {
+        if (effectiveFields.includes('bdr_profile') && _bdrProfileData && Object.keys(_bdrProfileData).length) {
             const sc  = _bdrProfileData.bdrSalesConfig       || {};
             const ai  = _bdrProfileData.aboutMeAiInstructions || {};
             const lines = [];
@@ -14765,12 +14778,117 @@ Rules:
             if (lines.length) ctx.bdr_profile = lines.join('\n');
         }
 
+        // "Full Research Archive" field (recommended, consolidated option) — overrides
+        // the trimmed fields collected above with the untrimmed originals from
+        // message_generation_archive when available (no ~1500-char caps, full post/news
+        // lists instead of whatever survived onto the connect_queue doc), AND builds
+        // {{full_research_data}}: one clearly-labeled text block combining everything,
+        // so a rule can just use that single variable instead of hunting through a
+        // dozen separate {{profile_about}}/{{news_data}}/etc. placeholders.
+        // Gated on wantsFullArchive so rules that didn't ask for this don't get extra
+        // (costlier) context they never requested.
+        const archive = wantsFullArchive ? message._fullArchive : null;
+        if (archive) {
+            if (archive.profile?.headline) ctx.profile_headline = archive.profile.headline;
+            if (archive.profile?.about)    ctx.profile_about    = String(archive.profile.about);
+            if (archive.profile?.experienceParagraph) {
+                ctx.profile_experience = String(archive.profile.experienceParagraph).split('\n').map(s => s.trim()).filter(Boolean);
+            }
+            if (archive.profile?.educationParagraph) {
+                ctx.profile_education = String(archive.profile.educationParagraph).split('\n').map(s => s.trim()).filter(Boolean);
+            }
+            if (Array.isArray(archive.posts) && archive.posts.length) ctx.recent_posts = archive.posts;
+
+            if (archive.post?.text || archive.post?.url) {
+                ctx.post_text = archive.post.resharedText || archive.post.text || ctx.post_text;
+                if (archive.post.url)  ctx.post_url  = archive.post.url;
+                if (archive.post.date) ctx.post_date = archive.post.date;
+                ctx.post_type = archive.post.type || ctx.post_type;
+                if (archive.post.resharedText) {
+                    ctx.reshared_post_text = archive.post.resharedText;
+                    const resharedAuthor = [archive.post.resharedAuthorFirstName, archive.post.resharedAuthorLastName].filter(Boolean).join(' ');
+                    if (resharedAuthor) ctx.reshared_post_author = resharedAuthor;
+                }
+            }
+
+            if (archive.news?.newsData) {
+                const nd = archive.news.newsData;
+                if (nd.headline) ctx.news_headline     = nd.headline;
+                if (nd.url)      ctx.news_article_url  = nd.url;
+                if (nd.date)     ctx.news_article_date = nd.date;
+                if (nd.content)  ctx.news_article_text = String(nd.content);
+                ctx.news_data = nd;
+            }
+            if (archive.news?.aiCompanyNews) ctx.ai_company_news = archive.news.aiCompanyNews;
+            if (archive.news?.aiContactNews) ctx.ai_contact_news = archive.news.aiContactNews;
+
+            if (archive.aboutMeFindings) ctx.about_me_findings = archive.aboutMeFindings;
+
+            if (archive.bdrProfile && Object.keys(archive.bdrProfile).length) {
+                const sc = archive.bdrProfile.bdrSalesConfig || {};
+                const ai = archive.bdrProfile.aboutMeAiInstructions || {};
+                const lines = [];
+                if (ctx.bdr_name)  lines.push(`BDR name: ${ctx.bdr_name}`);
+                if (archive.bdrEmail) lines.push(`BDR email: ${archive.bdrEmail}`);
+                if (sc.companyValueProposition)     lines.push(`Company value proposition: ${sc.companyValueProposition}`);
+                if (sc.companySalesApproach)        lines.push(`Sales approach: ${sc.companySalesApproach}`);
+                if (sc.targetProspectContacts)      lines.push(`Target prospect roles: ${sc.targetProspectContacts}`);
+                if (sc.targetProspectOrganizations) lines.push(`Target organizations: ${sc.targetProspectOrganizations}`);
+                if (sc.newsStoryTypes)              lines.push(`News story types used: ${sc.newsStoryTypes}`);
+                if (sc.otherOutreachNotes)          lines.push(`Outreach notes: ${sc.otherOutreachNotes}`);
+                if (ai.tone)                lines.push(`Message tone: ${ai.tone}`);
+                if (ai.commonalityPriority) lines.push(`Commonality priority: ${ai.commonalityPriority}`);
+                if (ai.length)              lines.push(`Message length guidance: ${ai.length}`);
+                if (ai.avoid)               lines.push(`Things to avoid: ${ai.avoid}`);
+                if (ai.openClose)           lines.push(`Opening/closing style: ${ai.openClose}`);
+                if (ai.additional)          lines.push(`Additional instructions: ${ai.additional}`);
+                const stmts = archive.bdrProfile.statements || {};
+                const stmtLines = [];
+                for (const [topic, arr] of Object.entries(stmts)) {
+                    const topicStmts = (Array.isArray(arr) ? arr : []).map(s => typeof s === 'string' ? s : (s?.text || '')).filter(Boolean);
+                    if (topicStmts.length) stmtLines.push(`  [${topic}] ${topicStmts.join(' | ')}`);
+                }
+                if (stmtLines.length) lines.push(`BDR "I" statements:\n${stmtLines.join('\n')}`);
+                const weStmts = (archive.bdrProfile.weStatements || []).map(s => typeof s === 'string' ? s : (s?.text || '')).filter(Boolean);
+                if (weStmts.length) lines.push(`Company "We" statements: ${weStmts.join(' | ')}`);
+                if (lines.length) ctx.bdr_profile = lines.join('\n');
+            }
+        }
+
+        if (wantsFullArchive && window.MessageDataArchive) {
+            // Prefer the real archive bundle (untrimmed, exact shape formatForReview expects).
+            // If it's missing or aged out, fall back to whatever the trimmed field-collection
+            // above already gathered into ctx, so {{full_research_data}} still degrades
+            // gracefully instead of coming back empty for older messages.
+            const bundle = archive || {
+                profile: message.linkedin_profile || (ctx.profile_headline || ctx.profile_about ? {
+                    headline: ctx.profile_headline, about: ctx.profile_about,
+                    experienceParagraph: Array.isArray(ctx.profile_experience) ? ctx.profile_experience.join('\n') : '',
+                    educationParagraph:  Array.isArray(ctx.profile_education)  ? ctx.profile_education.join('\n')  : ''
+                } : null),
+                posts: ctx.recent_posts,
+                post: (ctx.post_text || ctx.post_url) ? {
+                    text: ctx.post_text, url: ctx.post_url, date: ctx.post_date, type: ctx.post_type,
+                    resharedText: ctx.reshared_post_text
+                } : null,
+                news: ctx.news_data || (ctx.news_headline || ctx.news_article_text ? {
+                    newsData: { headline: ctx.news_headline, url: ctx.news_article_url, date: ctx.news_article_date, content: ctx.news_article_text }
+                } : null),
+                aboutMeFindings: ctx.about_me_findings,
+                bdrProfile: _bdrProfileData,
+                bdrEmail: ctx.bdr_email,
+                bdrName: ctx.bdr_name
+            };
+            ctx.full_research_data = window.MessageDataArchive.formatForReview(bundle);
+        }
+
         return ctx;
     }
 
     // Resolve prompt template variables for a context object
     function resolveFinalReviewPrompt(template, ctx) {
         const vars = {
+            '{{full_research_data}}': ctx.full_research_data  || '(not available — check the "Full Research Archive" context field on this rule)',
             '{{message}}':          ctx.message_to_contact   || '',
             '{{message_type}}':     ctx.message_type         || '',
             '{{source}}':           ctx.source               || '',
@@ -14787,7 +14905,7 @@ Rules:
             '{{post_age}}':         ctx.post_age               || '(unknown)',
             '{{reshared_post_text}}': ctx.reshared_post_text   || '(none)',
             '{{reshared_post_author}}': ctx.reshared_post_author || '(unknown)',
-            '{{news_data}}':         ctx.news_data ? JSON.stringify(ctx.news_data).slice(0, 1200) : '(not available)',
+            '{{news_data}}':         ctx.news_data ? JSON.stringify(ctx.news_data).slice(0, 4000) : '(not available)',
             '{{news_headline}}':     ctx.news_headline        || '(not available)',
             '{{news_article_url}}':  ctx.news_article_url     || '(not available)',
             '{{news_article_date}}': ctx.news_article_date    || '(not available)',
@@ -14800,7 +14918,7 @@ Rules:
             '{{profile_experience}}': Array.isArray(ctx.profile_experience) ? ctx.profile_experience.join(' | ') : (ctx.profile_experience || '(not available)'),
             '{{profile_education}}':  Array.isArray(ctx.profile_education)  ? ctx.profile_education.join(' | ')  : (ctx.profile_education  || '(not available)'),
             '{{recent_posts}}':        Array.isArray(ctx.recent_posts) ? ctx.recent_posts.map(p => typeof p === 'string' ? p : (p?.text || '')).filter(Boolean).join(' | ') : '(not available)',
-            '{{about_me_findings}}': ctx.about_me_findings ? JSON.stringify(ctx.about_me_findings).slice(0, 800) : '(not available)',
+            '{{about_me_findings}}': ctx.about_me_findings ? JSON.stringify(ctx.about_me_findings).slice(0, 4000) : '(not available)',
             '{{bdr_profile}}':      ctx.bdr_profile          || '(not available)',
             '{{bdr_name}}':         ctx.bdr_name             || '',
             '{{bdr_email}}':        ctx.bdr_email            || '',
@@ -14855,6 +14973,30 @@ Rules:
     // times over and slows down loading the page. Full AI Generate instead writes them to a
     // side collection (connect_queue_ai_context), and we only pull them here — for the small
     // set of messages actually being AI-reviewed right now — right before they're needed.
+    // Loads the FULL, untrimmed research archive (message_generation_archive, via
+    // message-data-archive.js) for each message being reviewed and stashes it as
+    // m._fullArchive. buildFinalReviewContext() below prefers this over the trimmed
+    // connect_queue_ai_context / cached fields whenever it's present, so Final AI
+    // Review sees exactly what the message was generated from — full profile about
+    // text, every post, full news article body, full About Me findings, full BDR
+    // profile — with none of the ~1500-char caps applied to the legacy fallback
+    // fields. Silently does nothing for messages older than the 90-day retention
+    // window (or generated before this archive existed) — they just fall back to
+    // whatever trimmed data is already on the doc, same as before.
+    async function fetchArchiveExtrasFor(messages) {
+        if (!window.MessageDataArchive) return;
+        const targets = messages.filter(m => m._fullArchive === undefined);
+        if (targets.length === 0) return;
+        await Promise.all(targets.map(async m => {
+            try {
+                m._fullArchive = await window.MessageDataArchive.load(m.id) || null;
+            } catch (e) {
+                console.warn(`[FinalAIReview] Couldn't load full archive for ${m.id}:`, e.message);
+                m._fullArchive = null;
+            }
+        }));
+    }
+
     async function fetchAiContextExtrasFor(messages) {
         const targets = messages.filter(m => m.linkedin_profile === undefined && m.recent_posts === undefined);
         if (targets.length === 0) return;
@@ -14898,14 +15040,21 @@ Rules:
             delete window[`far_warn_${m}`];
         });
 
-        // Pre-load BDR profile if any rule uses the bdr_profile field
-        const needsBdrProfile = rules.some(r => (r.includeFields || []).includes('bdr_profile'));
+        // Pre-load BDR profile if any rule uses the bdr_profile field (or the
+        // consolidated full_archive field, whose fallback bundle also needs it)
+        const needsBdrProfile = rules.some(r => (r.includeFields || []).includes('bdr_profile') || (r.includeFields || []).includes('full_archive'));
         if (needsBdrProfile) await loadBdrProfile();
 
         // Pre-load the linkedin_profile / recent_posts side-doc for just these messages, if
         // any enabled rule actually reads the 'profile' field group.
         const needsProfileFields = rules.some(r => (r.includeFields || []).includes('profile'));
         if (needsProfileFields) await fetchAiContextExtrasFor(messagesToReview);
+
+        // Pre-load the full research archive only for rules that actually asked for it
+        // via the "Full Research Archive" field (see final_ai_review.html) — keeps
+        // reviews that don't need it just as fast/cheap as before.
+        const needsFullArchive = rules.some(r => (r.includeFields || []).includes('full_archive'));
+        if (needsFullArchive) await fetchArchiveExtrasFor(messagesToReview);
 
         const token = await auth.currentUser.getIdToken();
         const resultsMap = new Map(); // messageId -> { flagged, concerns[] }

@@ -17,6 +17,8 @@
     <script src="../js/clemail-firestore-wrapper.js"></script>
     <!-- Shared Final AI Review rules store (Firestore-backed, localStorage cache) -->
     <script src="final-ai-review-rules-store.js"></script>
+    <!-- Message Generation Data Archive: full research snapshot per generated message, 90-day retention -->
+    <script src="message-data-archive.js"></script>
     <!-- Shared AI model catalog (managed on ai_models_admin.html) -->
     <script src="../js/ai-model-catalog.js"></script>
 
@@ -985,20 +987,61 @@
             return out;
         }
 
-        async function saveFullAiContextExtras(msgId, { profileData, recentPosts }) {
+        // ALSO writes the full, untrimmed research bundle (raw profile, every post, every
+        // news item, About Me findings, sender BDR About Me profile/instructions) to the
+        // message_generation_archive collection via window.MessageDataArchive — this is what
+        // about_me_message_lookup.html reads to show "every bit of data used to make the
+        // message" and what Final AI Review can pull for full (non-truncated) context. That
+        // archive auto-expires after 90 days (see functions/index.js:
+        // cleanupExpiredMessageGenerationData). Profile ENRICHMENT (linkedin_profile_cache /
+        // prospect_contacts) is a completely separate, permanent store untouched by this.
+        async function saveFullAiContextExtras(msgId, {
+            profileData, recentPosts, profileRaw = null, sourceData = null,
+            bdrEmail = '', bdrName = '', prospectLinkedInUrl = '', source = '', sourceKey = '',
+            bdrProfileDoc = null, finalReviewContext = null
+        }) {
             const linkedin_profile = (profileData?.headline || profileData?.about)
                 ? { headline: profileData.headline || '', about: profileData.about || '' }
                 : null;
             const recent_posts = Array.isArray(recentPosts) && recentPosts.length ? recentPosts : null;
-            if (!linkedin_profile && !recent_posts) return;
-            try {
-                await window.clemailDb.collection('connect_queue_ai_context').doc(msgId).set({
-                    id: msgId,
-                    ...(linkedin_profile ? { linkedin_profile } : {}),
-                    ...(recent_posts ? { recent_posts } : {})
+            if (linkedin_profile || recent_posts) {
+                try {
+                    await window.clemailDb.collection('connect_queue_ai_context').doc(msgId).set({
+                        id: msgId,
+                        ...(linkedin_profile ? { linkedin_profile } : {}),
+                        ...(recent_posts ? { recent_posts } : {})
+                    });
+                } catch (e) {
+                    console.warn(`   ⚠️ Failed to save AI context extras for ${msgId}:`, e.message);
+                }
+            }
+
+            if (window.MessageDataArchive) {
+                const sd = sourceData || {};
+                const news = (sd.news_data || sd.ai_company_news || sd.ai_contact_news) ? {
+                    newsData:      sd.news_data      || null,
+                    aiCompanyNews: sd.ai_company_news || null,
+                    aiContactNews: sd.ai_contact_news || null
+                } : null;
+                await window.MessageDataArchive.save(msgId, {
+                    bdrEmail, bdrName, prospectLinkedInUrl, source, sourceKey,
+                    profile:    profileData || null,
+                    profileRaw: profileRaw  || null,
+                    posts:      Array.isArray(recentPosts) ? recentPosts : [],
+                    post: (sd.post_text || sd.post_url) ? {
+                        text: sd.post_text || null,
+                        url: sd.post_url || null,
+                        date: sd.post_date || null,
+                        type: sd.post_type || null,
+                        resharedText: sd.reshared_post_text || null,
+                        resharedAuthorFirstName: sd.resharedAuthorFirstName || null,
+                        resharedAuthorLastName: sd.resharedAuthorLastName || null
+                    } : null,
+                    news,
+                    aboutMeFindings: sd.about_me_findings || null,
+                    bdrProfile: bdrProfileDoc || null,
+                    finalReviewContext: finalReviewContext || null
                 });
-            } catch (e) {
-                console.warn(`   ⚠️ Failed to save AI context extras for ${msgId}:`, e.message);
             }
         }
 
@@ -1045,7 +1088,7 @@
                 if (nd.headline) ctx.news_headline     = nd.headline;
                 if (nd.url)      ctx.news_article_url  = nd.url;
                 if (nd.date)     ctx.news_article_date = nd.date;
-                if (nd.content)  ctx.news_article_text = String(nd.content).slice(0, 1500);
+                if (nd.content)  ctx.news_article_text = String(nd.content); // full article text — this is generation time, we already have it all in memory
             }
             if (sourceData.ai_company_news) ctx.ai_company_news = sourceData.ai_company_news;
             if (sourceData.ai_contact_news) ctx.ai_contact_news = sourceData.ai_contact_news;
@@ -1053,7 +1096,7 @@
 
             if (pd) {
                 if (pd.headline) ctx.profile_headline = pd.headline;
-                if (pd.about)    ctx.profile_about    = String(pd.about).slice(0, 1500);
+                if (pd.about)    ctx.profile_about    = String(pd.about); // full About text — already in memory at generation time
                 // processProfileData() (above) returns experience/education as pre-formatted
                 // newline-joined strings (experienceParagraph/educationParagraph) — NOT arrays
                 // named "experiences"/"education". Split back into an array of readable lines
@@ -1103,11 +1146,39 @@
                 if (lines.length) ctx.bdr_profile = lines.join('\n');
             }
 
+            // One clearly-labeled bundle combining everything above (profile, posts, post,
+            // news, About Me findings, BDR background) for the {{full_research_data}}
+            // variable — see the "Full Research Archive" field on final_ai_review.html.
+            // Built straight from the in-memory generation-time data (pd/sourceData/
+            // recentPosts/bdrProfileDoc), so it's already the full untrimmed version —
+            // no need to round-trip through message_generation_archive here.
+            if (window.MessageDataArchive) {
+                ctx.full_research_data = window.MessageDataArchive.formatForReview({
+                    profile: pd || null,
+                    posts: Array.isArray(recentPosts) ? recentPosts : [],
+                    post: (sourceData.post_text || sourceData.post_url) ? {
+                        text: sourceData.post_text, url: sourceData.post_url, date: sourceData.post_date,
+                        type: sourceData.post_type, resharedText: sourceData.reshared_post_text,
+                        resharedAuthorFirstName: sourceData.resharedAuthorFirstName,
+                        resharedAuthorLastName: sourceData.resharedAuthorLastName
+                    } : null,
+                    news: (sourceData.news_data || sourceData.ai_company_news || sourceData.ai_contact_news) ? {
+                        newsData: sourceData.news_data || null,
+                        aiCompanyNews: sourceData.ai_company_news || null,
+                        aiContactNews: sourceData.ai_contact_news || null
+                    } : null,
+                    aboutMeFindings: sourceData.about_me_findings || null,
+                    bdrProfile: bdrProfileDoc || null,
+                    bdrEmail, bdrName: bdrContext?.bdrName || ''
+                });
+            }
+
             return ctx;
         }
 
         function resolveFinalReviewPrompt(template, ctx) {
             const vars = {
+                '{{full_research_data}}':  ctx.full_research_data  || '(not available)',
                 '{{message}}':            ctx.message_to_contact   || '',
                 '{{message_type}}':       ctx.message_type         || '',
                 '{{source}}':             ctx.source               || '',
@@ -1124,7 +1195,7 @@
                 '{{post_age}}':           ctx.post_age               || '(unknown)',
                 '{{reshared_post_text}}': ctx.reshared_post_text   || '(none)',
                 '{{reshared_post_author}}': ctx.reshared_post_author || '(unknown)',
-                '{{news_data}}':          ctx.news_data ? JSON.stringify(ctx.news_data).slice(0, 1200) : '(not available)',
+                '{{news_data}}':          ctx.news_data ? JSON.stringify(ctx.news_data).slice(0, 4000) : '(not available)',
                 '{{news_headline}}':      ctx.news_headline        || '(not available)',
                 '{{news_article_url}}':   ctx.news_article_url     || '(not available)',
                 '{{news_article_date}}':  ctx.news_article_date    || '(not available)',
@@ -1137,7 +1208,7 @@
                 '{{profile_experience}}': Array.isArray(ctx.profile_experience) ? ctx.profile_experience.join(' | ') : (ctx.profile_experience || '(not available)'),
                 '{{profile_education}}':  Array.isArray(ctx.profile_education)  ? ctx.profile_education.join(' | ')  : (ctx.profile_education  || '(not available)'),
                 '{{recent_posts}}':        Array.isArray(ctx.recent_posts) ? ctx.recent_posts.map(p => typeof p === 'string' ? p : (p?.text || '')).filter(Boolean).join(' | ') : '(not available)',
-                '{{about_me_findings}}':  ctx.about_me_findings ? JSON.stringify(ctx.about_me_findings).slice(0, 800) : '(not available)',
+                '{{about_me_findings}}':  ctx.about_me_findings ? JSON.stringify(ctx.about_me_findings).slice(0, 4000) : '(not available)',
                 '{{bdr_profile}}':        ctx.bdr_profile          || '(not available)',
                 '{{bdr_name}}':           ctx.bdr_name             || '',
                 '{{bdr_email}}':          ctx.bdr_email            || '',
@@ -4248,7 +4319,13 @@
                                                     });
                                                     await saveFullAiContextExtras(msgIdPM, {
                                                         profileData: singleData.profileData,
-                                                        recentPosts: singleData.recentPosts
+                                                        recentPosts: singleData.recentPosts,
+                                                        profileRaw: existingProfileData || null,
+                                                        bdrEmail, bdrName: bdrContext.bdrName || '',
+                                                        prospectLinkedInUrl: prospect.linkedInUrl,
+                                                        source: 'Profile Message',
+                                                        sourceKey: getFullAiMessageSourceKey('Profile Message'),
+                                                        bdrProfileDoc: finalReviewBdrProfile
                                                     });
                                                     plan.generated++;
                                                     orgReport.messagesGenerated++;
@@ -4380,7 +4457,14 @@
                                             hypothesisGroupName:  groupName,
                                             ...sourceData
                                         });
-                                        await saveFullAiContextExtras(msgId, { profileData: pd, recentPosts: singleData.recentPosts });
+                                        await saveFullAiContextExtras(msgId, {
+                                            profileData: pd, recentPosts: singleData.recentPosts,
+                                            profileRaw: existingProfileData || null, sourceData,
+                                            bdrEmail, bdrName: bdrContext.bdrName || '',
+                                            prospectLinkedInUrl: prospect.linkedInUrl,
+                                            source: src, sourceKey,
+                                            bdrProfileDoc: finalReviewBdrProfile
+                                        });
                                         savedCount++;
                                         if (src === 'Post Reply') {
                                             const pt = sourceData.post_type || 'regular';
