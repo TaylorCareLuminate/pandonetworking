@@ -4773,18 +4773,48 @@
                 const realApify = await fpFetchRealApifyCosts({ bdrEmails: bdrPlan.map(b => b.bdrEmail), sinceIso: report.startedAt });
                 const aiEstimate = fpEstimateAiCost(report.aiCallCounts);
 
-                // Fallback for the contact-search bucket only: the Employee Contact Scanner job
-                // itself always computes a formula-based cost (contacts found × Harvest's published
-                // per-1000-contacts rate) independent of whether Apify's actor-run API reported
-                // usageTotalUsd — see linkedin_contact_search_job_processor.js. Use it whenever the
-                // ledger came back with $0 measured for contact search, so the total shown here is
-                // never a flat, misleading $0 for the single biggest cost driver in this pipeline.
+                // Contact-search bucket has THREE possible sources, in order of precision:
+                //   1. realApify.contactSearch — apify_run_ledger joined by bdrEmail + this run's
+                //      time window (fpFetchRealApifyCosts, above). Most complete when it works, but
+                //      silently returns $0 if the ledger doc's bdrEmail doesn't exactly match one of
+                //      this run's BDR emails (e.g. workspace-routed accounts record bdrEmail: null),
+                //      or if Apify hadn't finished tallying usageTotalUsd yet when the ledger doc was
+                //      written (docsWithNullCost > 0 covers that case — see the warning below).
+                //   2. report.totals.apifyUsd — apify_run_ledger joined by this run's own scan-job
+                //      IDs instead (see fpLedgerCostForJob, called per-org right after each scan job
+                //      completes). Narrower join key than #1 (exact jobId, not bdrEmail+window), so it
+                //      can catch real measured cost that #1 missed due to attribution mismatches.
+                //   3. scanJobHarvestUsd + scanJobBebityUsd — a formula-based estimate the Employee
+                //      Contact Scanner job always computes for itself (contacts found × Harvest's
+                //      published per-1000-contacts rate), independent of whether Apify ever reported
+                //      usageTotalUsd for it at all. Last resort — an estimate, not a measurement.
+                // Whichever tier is used, the source is recorded (contactSearchSource) so the
+                // dashboard can show exactly which one produced the number instead of just "measured"
+                // vs "estimated" — that distinction is what makes a $0 diagnosable instead of a dead end.
+                const jobLedgerContactSearchUsd = report.totals.apifyUsd || 0;
                 const contactSearchFallbackUsd = report.totals.scanJobHarvestUsd + report.totals.scanJobBebityUsd;
-                const contactSearchUsedFallback = realApify.contactSearch <= 0 && contactSearchFallbackUsd > 0;
-                const contactSearchDisplayUsd = contactSearchUsedFallback ? contactSearchFallbackUsd : realApify.contactSearch;
+                let contactSearchDisplayUsd, contactSearchSource;
+                if (realApify.contactSearch > 0) {
+                    contactSearchDisplayUsd = realApify.contactSearch;
+                    contactSearchSource = 'ledger_bdr_window';
+                } else if (jobLedgerContactSearchUsd > 0) {
+                    contactSearchDisplayUsd = jobLedgerContactSearchUsd;
+                    contactSearchSource = 'ledger_job_id';
+                } else if (contactSearchFallbackUsd > 0) {
+                    contactSearchDisplayUsd = contactSearchFallbackUsd;
+                    contactSearchSource = 'formula_estimate';
+                } else {
+                    contactSearchDisplayUsd = 0;
+                    contactSearchSource = 'zero';
+                }
+                const contactSearchUsedFallback = contactSearchSource === 'formula_estimate'; // kept for older dashboard code that reads this flag
                 const grandTotalUsd = contactSearchDisplayUsd + realApify.profileScrape + realApify.postScrape + realApify.other + aiEstimate.totalUsd;
 
-                report.totals.realCostBreakdown = { apify: realApify, contactSearchFallbackUsd, contactSearchUsedFallback, aiEstimate, grandTotalUsd };
+                report.totals.realCostBreakdown = {
+                    apify: realApify, contactSearchFallbackUsd, contactSearchUsedFallback,
+                    jobLedgerContactSearchUsd, contactSearchDisplayUsd, contactSearchSource,
+                    aiEstimate, grandTotalUsd
+                };
                 await saveReport();
 
                 if (realApify.errors.length > 0) {

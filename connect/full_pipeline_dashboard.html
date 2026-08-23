@@ -658,27 +658,81 @@
         // above has been run, a data-driven "modeled" adjustment for the contact-search bucket.
         // Called both when a run is first selected and whenever the audit is (re)run, so the
         // modeled panel reflects whichever audit window is currently loaded.
+        // Older saved runs never persisted contactSearchDisplayUsd as its own field (a report-save
+        // bug in full_pipeline.html — the in-memory value WAS correctly folded into grandTotalUsd,
+        // it just never got its own key in the saved object) — so reading it directly rendered as
+        // $0.00 via fmtUsd(undefined) even on runs that measured a real, nonzero contact-search
+        // cost. Recover the exact original figure algebraically (grandTotal minus every other
+        // bucket we know) instead of guessing, and fall back cleanly for genuinely-old runs that
+        // are also missing grandTotalUsd/aiEstimate.
+        function fpdContactSearchCost(rb) {
+            if (!rb) return { usd: 0, recovered: false };
+            if (rb.contactSearchDisplayUsd != null) return { usd: rb.contactSearchDisplayUsd, recovered: false };
+            const otherBuckets = (rb.apify?.profileScrape || 0) + (rb.apify?.postScrape || 0) + (rb.apify?.other || 0) + (rb.aiEstimate?.totalUsd || 0);
+            return { usd: Math.max(0, (rb.grandTotalUsd || 0) - otherBuckets), recovered: true };
+        }
+
         function fpdRenderCostBreakdown() {
             if (!fpdSelectedRun) return;
             const t = fpdSelectedRun.totals || {};
             const rb = t.realCostBreakdown;
             let html;
             if (rb) {
+                const cs = fpdContactSearchCost(rb);
                 html = `
                     <div class="detail-panel">
                         <h4>Cost breakdown</h4>
                         <table class="mini-table">
-                            <tr><td>Apify — contact search</td><td>${fmtUsd(rb.contactSearchDisplayUsd)} ${rb.contactSearchUsedFallback ? '<span class="badge badge-amber">estimated</span>' : '<span class="badge badge-green">measured</span>'}</td></tr>
+                            <tr><td>Apify — contact search</td><td>${fmtUsd(cs.usd)} ${rb.contactSearchUsedFallback ? '<span class="badge badge-amber">estimated</span>' : '<span class="badge badge-green">measured</span>'}</td></tr>
                             <tr><td>Apify — profile scrapes</td><td>${fmtUsd(rb.apify?.profileScrape)} <span class="badge badge-green">measured</span></td></tr>
                             <tr><td>Apify — LinkedIn post search/scrape</td><td>${fmtUsd(rb.apify?.postScrape)} <span class="badge badge-green">measured</span></td></tr>
                             <tr><td>AI / LLM (estimated, not metered)</td><td>${fmtUsd(rb.aiEstimate?.totalUsd)}</td></tr>
                             <tr><td><strong>Grand total</strong></td><td><strong>${fmtUsd(rb.grandTotalUsd)}</strong>${t.messages > 0 ? ` — ${fmtUsd(rb.grandTotalUsd / t.messages)}/message` : ''}</td></tr>
                         </table>
+                        ${cs.recovered ? `<div class="empty-hint" style="margin-top:6px;">ℹ️ This run was saved before a bug fix — the contact-search line above was reconstructed from the grand total (it was always correctly included in the total, just never saved under its own field).</div>` : ''}
+                        ${fpdApifyLedgerDiagnosticsHtml(rb)}
                     </div>`;
             } else {
                 html = '<div class="empty-hint">No cost breakdown saved for this run — this happens when a run never reached its "finally" step (e.g. the browser tab was closed while it was still running). Use "Recompute Costs from Ledger" above to reconstruct it from the real Apify billing records instead.</div>';
             }
-            document.getElementById('fpdCostBreakdown').innerHTML = html + fpdLedgerCostHtml() + fpaModeledCostHtml(t);
+            document.getElementById('fpdCostBreakdown').innerHTML = html + fpdLedgerCostHtml() + fpdApifyUsdCrossCheckHtml(t) + fpaModeledCostHtml(t);
+        }
+
+        // Surfaces the diagnostic counters fpFetchRealApifyCosts already saves under
+        // realCostBreakdown.apify (docsFound / docsWithCost / docsWithNullCost / errors) — these
+        // explain *why* a bucket is $0 instead of leaving it a dead end: no ledger docs matched
+        // this run's BDR(s)+window at all (attribution problem) vs. docs matched but Apify hadn't
+        // reported a $ figure for them yet (timing problem) are very different bugs to chase.
+        function fpdApifyLedgerDiagnosticsHtml(rb) {
+            const a = rb.apify;
+            if (!a || a.docsFound == null) return '';
+            const parts = [`${a.docsFound} ledger entr${a.docsFound === 1 ? 'y' : 'ies'} matched this run's BDR(s) in-window`, `${a.docsWithCost} with a measured cost`, `${a.docsWithNullCost} still null (Apify hadn't reported a $ figure yet)`];
+            let warn = '';
+            if (a.docsFound === 0) {
+                warn = '<div style="color:var(--danger); margin-top:4px;">⚠️ Zero matches at all — this almost always means the Apify calls this run made were tagged with a bdrEmail (or none at all, e.g. a workspace-routed account) that doesn\'t match this run\'s BDR email(s) exactly, not that no cost was incurred. Cross-check with the Apify Cost Audit above, which pulls straight from Apify\'s own account and ignores this attribution entirely.</div>';
+            } else if (a.docsWithCost === 0 && a.docsWithNullCost > 0) {
+                warn = '<div style="color:var(--warning); margin-top:4px;">⚠️ Runs were found and attributed correctly, but Apify never reported a $ figure for any of them (usageTotalUsd was null) — the calls happened and almost certainly cost money, Apify\'s API just didn\'t expose it here in time.</div>';
+            }
+            return `<div class="empty-hint" style="margin-top:8px;">🔍 Ledger match diagnostics: ${parts.join(', ')}.${a.errors?.length ? ` Errors: ${escHtml(a.errors.join('; '))}.` : ''}${warn}</div>`;
+        }
+
+        // Cross-check the contact-search figure above against report.totals.apifyUsd — a
+        // SEPARATE real-cost total computed live during the run by joining apify_run_ledger on
+        // this run's own scan-job IDs (fpLedgerCostForJob), rather than bdrEmail + time window.
+        // A narrower, more exact join key, so when it disagrees with the bucket above it's a
+        // strong signal of exactly which query is missing ledger entries.
+        function fpdApifyUsdCrossCheckHtml(t) {
+            const jobIdUsd = t.apifyUsd || 0;
+            const formulaUsd = (t.scanJobHarvestUsd || 0) + (t.scanJobBebityUsd || 0);
+            if (jobIdUsd <= 0 && formulaUsd <= 0) return '';
+            return `<div class="detail-panel">
+                <h4>Contact-search cost — independent cross-checks</h4>
+                <table class="mini-table">
+                    <tr><td>Per-job ledger match (apify_run_ledger joined by this run's own scan-job IDs)</td><td>${fmtUsd(jobIdUsd)}</td></tr>
+                    <tr><td>Formula estimate (Employee Contact Scanner's own cost model)</td><td>${fmtUsd(formulaUsd)}</td></tr>
+                </table>
+                <div class="empty-hint" style="margin-top:6px;">These are computed independently of the bdrEmail+time-window ledger query used in the breakdown above — if they're meaningfully different from the contact-search line up there, that query is the one to fix.</div>
+            </div>`;
         }
 
         // Shows the ledger-recomputed cost for the selected run (see fpdRecomputeCostsFromLedger),
