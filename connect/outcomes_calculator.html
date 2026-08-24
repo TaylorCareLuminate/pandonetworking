@@ -2294,7 +2294,9 @@
     // Analysis payload (same source as analysis_results.html) and uses them
     // to auto-fill the scenario table + suggest At-Risk pricing.
     // ══════════════════════════════════════════════════════════════════════
-    const ANALYSIS_JSON_PATH = 'connect_analysis/latest.json';
+    const ANALYSIS_DIR = 'connect_analysis';
+    const ANALYSIS_JSON_PATH = `${ANALYSIS_DIR}/latest.json`;
+    const ANALYSIS_MANIFEST_PATH = `${ANALYSIS_DIR}/manifest.json`;
     const GEN_POST_FRACTION = 0.20; // Post Reply is capped at no more than 20% of outreach
     // Floor for generated reply/schedule rates: no group may fall more than 70% below the
     // overall average rate for that outcome, i.e. its rate can't drop below 30% of average.
@@ -2326,12 +2328,60 @@
         return n > 0 ? { n, connect: c / n, reply: r / n, meeting: m / n } : { n: 0, connect: 0, reply: 0, meeting: 0 };
     }
 
+    // Analysis reply_rate / meeting_rate are % of all contacted. The 2026-08-22
+    // export under-counted replies (321 vs 412 meetings), which makes
+    // reply-of-accepted look like ~3% and schedule-of-replied look like ~100%.
+    function isAnalysisFunnelUsable(funnel) {
+        if (!funnel || !funnel.n) return false;
+        if (!(funnel.connect_rate > 0) || !(funnel.reply_rate > 0) || !(funnel.meeting_rate > 0)) return false;
+        if ((funnel.scheduled || 0) > (funnel.replied || 0)) return false;
+        if ((funnel.cond_meeting_rate || 0) > 100) return false;
+        return true;
+    }
+
+    async function fetchAnalysisJson(path) {
+        const resp = await fetch(path, { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        return resp.json();
+    }
+
+    async function loadAnalysisPayload() {
+        const consider = async (path, label) => {
+            const payload = await fetchAnalysisJson(path);
+            if (isAnalysisFunnelUsable(payload.overall?.funnel)) return payload;
+            console.warn(`[Generate From Analysis] Skipping ${label}: funnel is incoherent (meetings > replies).`);
+            return null;
+        };
+
+        try {
+            const latest = await consider(ANALYSIS_JSON_PATH, 'latest.json');
+            if (latest) return latest;
+        } catch (e) {
+            console.warn('[Generate From Analysis] latest.json failed:', e.message);
+        }
+
+        try {
+            const manifest = await fetchAnalysisJson(ANALYSIS_MANIFEST_PATH);
+            for (const run of (manifest.runs || [])) {
+                if (!run.file) continue;
+                try {
+                    const payload = await consider(`${ANALYSIS_DIR}/${run.file}`, run.file);
+                    if (payload) return payload;
+                } catch (e) {
+                    console.warn(`[Generate From Analysis] ${run.file} failed:`, e.message);
+                }
+            }
+        } catch (e) {
+            console.warn('[Generate From Analysis] manifest.json failed:', e.message);
+        }
+
+        throw new Error('No usable analysis run found');
+    }
+
     async function loadAnalysisData() {
         const metaEl = document.getElementById('analysisGenMeta');
         try {
-            const resp = await fetch(ANALYSIS_JSON_PATH, { cache: 'no-store' });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const payload = await resp.json();
+            const payload = await loadAnalysisPayload();
             const funnel = payload.overall?.funnel || {};
             const orgRows = payload.overall?.research?.audience_org_type || [];
             const msgRows = payload.overall?.research?.message_type || [];

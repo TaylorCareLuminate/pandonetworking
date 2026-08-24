@@ -1000,11 +1000,25 @@ async function loadRunCandidates() {
     return [...byDate.values()].sort((a, b) => b.run_date.localeCompare(a.run_date));
 }
 
+// Latest must keep sent → accepted → replied → scheduled. The 2026-08-22
+// export inverted that (321 replies vs 412 meetings) and is skipped for "Latest".
+function isAnalysisFunnelUsable(funnel) {
+    if (!funnel) return false;
+    if ((funnel.scheduled || 0) > (funnel.replied || 0)) return false;
+    if ((funnel.cond_meeting_rate || 0) > 100) return false;
+    return true;
+}
+
 async function loadPayloadForRun(entry) {
     // Prefer live Firebase data; fall back to a local static file for the same date.
     try {
         const fb = await fetchPayloadFromFirebase(entry ? entry.run_date : null);
-        if (fb) return { payload: fb, source: 'firebase' };
+        if (fb && (entry || isAnalysisFunnelUsable(fb.overall && fb.overall.funnel))) {
+            return { payload: fb, source: 'firebase' };
+        }
+        if (fb && !entry) {
+            console.warn('Firebase latest has an incoherent funnel (meetings > replies); falling back to a local run.');
+        }
     } catch (e) {
         console.warn('Firebase RTDB fetch failed, falling back to local file:', e.message);
     }
@@ -1013,9 +1027,24 @@ async function loadPayloadForRun(entry) {
     if (!entry) {
         try {
             const resp = await fetch('connect_analysis/latest.json', { cache: 'no-store' });
-            if (resp.ok) return { payload: await resp.json(), source: 'local' };
+            if (resp.ok) {
+                const payload = await resp.json();
+                if (isAnalysisFunnelUsable(payload.overall && payload.overall.funnel)) {
+                    return { payload, source: 'local' };
+                }
+                console.warn('connect_analysis/latest.json has an incoherent funnel; trying previous dated runs.');
+            }
         } catch (e) {
             console.warn('connect_analysis/latest.json not available:', e.message);
+        }
+        for (const candidate of RUN_CANDIDATES) {
+            if (!candidate.file) continue;
+            try {
+                const payload = await fetchPayloadFromLocal(candidate);
+                if (isAnalysisFunnelUsable(payload.overall && payload.overall.funnel)) {
+                    return { payload, source: 'local' };
+                }
+            } catch (e) { /* try next dated run */ }
         }
     }
     if (entry && entry.file) {

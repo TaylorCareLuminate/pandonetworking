@@ -1295,6 +1295,44 @@
             }
         }
 
+        function normalizeProfileUrl(url) {
+            if (!url) return '';
+            return String(url).toLowerCase().trim()
+                .replace(/^https?:\/\//i, '')
+                .replace(/^www\./i, '')
+                .replace(/\/+$/, '')
+                .replace(/\?.*$/, '');
+        }
+
+        function linkedInSlug(url) {
+            if (!url) return '';
+            const m = String(url).match(/linkedin\.com\/in\/([^\/\?#]+)/i);
+            return m ? m[1].toLowerCase().trim() : '';
+        }
+
+        // Stable identity for a HeyReach lead so duplicate webhook/backfill docs
+        // for the same person collapse to one billable action.
+        function leadIdentity(activity) {
+            const url = activity.leadProfileUrl || activity.profileUrl || '';
+            const slug = linkedInSlug(url);
+            if (slug) return `in:${slug}`;
+            const norm = normalizeProfileUrl(url);
+            if (norm) return `url:${norm}`;
+            const id = activity.leadLinkedInId || activity.leadId;
+            if (id) return `id:${String(id)}`;
+            const name = `${activity.leadFirstName || ''} ${activity.leadLastName || ''}`.trim().toLowerCase();
+            if (name && name !== 'unknown') return `name:${name}`;
+            return `doc:${activity.id || ''}`;
+        }
+
+        function eventMinuteKey(date) {
+            if (!date) return '';
+            const d = new Date(date);
+            if (isNaN(d.getTime())) return '';
+            d.setSeconds(0, 0);
+            return d.toISOString().slice(0, 16);
+        }
+
         // Convert Firestore Timestamp, Date, or ISO string to a JS Date (or null)
         function safeToDate(val) {
             if (!val) return null;
@@ -1545,7 +1583,7 @@
                 'INMAIL_SENT',
                 'CONNECTION_REQUEST_ACCEPTED'
             ]);
-            let heyreachProcessedCount = 0;
+            const pending = [];
             
             heyreachActivities.forEach(activity => {
                 if (!BILLED_EVENTS.has(activity.eventType)) return;
@@ -1570,20 +1608,57 @@
                 // Use safeToDate so Firestore Timestamps are handled correctly
                 const actDate = safeToDate(activity.timestamp || activity.receivedAt);
 
-                activities.push({
+                pending.push({
                     type: activityType,
                     bdr: normalizeBdrEmail(bdrEmail),
                     company: activity.leadCompany || 'Unknown',
                     contact: `${activity.leadFirstName || ''} ${activity.leadLastName || ''}`.trim() || 'Unknown',
                     profileUrl: activity.leadProfileUrl || '',
+                    leadKey: leadIdentity(activity),
+                    backfilled: !!(activity.backfilled || activity.backfillSource || activity.rawData?.backfilled),
                     date: actDate,
                     source: 'heyreach_' + activity.eventType,
                     cost: costSettings[activityType] ?? DEFAULT_COSTS[activityType] ?? 0
                 });
-                heyreachProcessedCount++;
             });
-            
-            console.log(`📊 HeyReach billed activities processed: ${heyreachProcessedCount}`);
+
+            // heyreach_activity often has several docs for one LinkedIn action:
+            // live webhook + campaign backfill (one CONNECTION_REQUEST_SENT per
+            // campaign the lead sits in). HeyReach's own "sent" count is unique
+            // people, so billing must collapse those copies.
+            // Prefer live webhooks over backfill, then keep:
+            //   connection request / accepted → 1 per BDR + lead
+            //   live MESSAGE_SENT → 1 per BDR + lead + minute (real follow-ups)
+            //   backfilled MESSAGE_SENT → 1 per BDR + lead
+            pending.sort((a, b) => {
+                if (a.backfilled !== b.backfilled) return a.backfilled ? 1 : -1;
+                return (a.date?.getTime() || 0) - (b.date?.getTime() || 0);
+            });
+
+            const seenLeadType = new Set();
+            const seenMessageMinute = new Set();
+            const rawTypeCounts = {};
+            const uniqueTypeCounts = {};
+            pending.forEach(item => {
+                rawTypeCounts[item.type] = (rawTypeCounts[item.type] || 0) + 1;
+                const leadTypeKey = `${item.bdr}|${item.type}|${item.leadKey}`;
+                if (item.type === 'heyreach_message_sent' && !item.backfilled) {
+                    const minuteKey = `${leadTypeKey}|${eventMinuteKey(item.date)}`;
+                    if (seenMessageMinute.has(minuteKey)) return;
+                    seenMessageMinute.add(minuteKey);
+                    seenLeadType.add(leadTypeKey);
+                } else {
+                    if (seenLeadType.has(leadTypeKey)) return;
+                    seenLeadType.add(leadTypeKey);
+                }
+                uniqueTypeCounts[item.type] = (uniqueTypeCounts[item.type] || 0) + 1;
+                activities.push(item);
+            });
+
+            const dropped = pending.length - activities.length;
+            console.log(`📊 HeyReach billed activities: ${pending.length} raw → ${activities.length} unique` +
+                (dropped > 0 ? ` (dropped ${dropped} duplicate webhook/backfill docs)` : ''),
+                { raw: rawTypeCounts, unique: uniqueTypeCounts });
 
             // Keys already billed as HeyReach follow-ups, so a matching
             // review_replies activity_tracking row is not charged twice.

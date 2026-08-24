@@ -36,6 +36,22 @@ const DATE_RE = /^Connect_Analysis_(\d{4}-\d{2}-\d{2})\.json$/;
 const DEIDENTIFIED_DATE_RE = /^Connect_Analysis_(\d{4}-\d{2}-\d{2})_deidentified\.json$/;
 const RUNS_DATE_RE = /^(\d{4}-\d{2}-\d{2})\.json$/;
 
+// A usable funnel must keep the sent → accepted → replied → scheduled order.
+// The 2026-08-22 export inverted that (321 replies vs 412 meetings), which
+// collapses "reply of accepted" to ~3% and inflates "schedule of replied" past 100%.
+function funnelIsUsable(filePath) {
+    try {
+        const payload = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        const f = payload && payload.overall && payload.overall.funnel;
+        if (!f) return false;
+        if ((f.scheduled || 0) > (f.replied || 0)) return false;
+        if ((f.cond_meeting_rate || 0) > 100) return false;
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function buildManifest(dir, { manifestFile, latestFile, comment }, byDate) {
     const runs = [...byDate.values()].sort((a, b) => b.run_date.localeCompare(a.run_date));
 
@@ -47,10 +63,20 @@ function buildManifest(dir, { manifestFile, latestFile, comment }, byDate) {
     const manifest = { _comment: comment, runs };
     fs.writeFileSync(path.join(dir, manifestFile), JSON.stringify(manifest, null, 2) + '\n');
 
-    const newest = runs[0];
-    fs.copyFileSync(path.join(dir, newest.file), path.join(dir, latestFile));
+    const usable = runs.filter(r => funnelIsUsable(path.join(dir, r.file)));
+    if (usable.length && usable[0].run_date !== runs[0].run_date) {
+        console.warn(`[regenerate_manifest] Newest run ${runs[0].run_date} has an incoherent funnel (meetings > replies); pointing ${latestFile} at ${usable[0].run_date} instead.`);
+    }
+    const latestRun = usable[0] || runs[0];
+    fs.copyFileSync(path.join(dir, latestRun.file), path.join(dir, latestFile));
 
-    console.log(`[regenerate_manifest] ${manifestFile} + ${latestFile} refreshed — ${runs.length} run${runs.length === 1 ? '' : 's'}, newest: ${newest.run_date}`);
+    console.log(`\n  ${manifestFile}  (${runs.length} run${runs.length === 1 ? '' : 's'})`);
+    runs.forEach(r => {
+        const ok = usable.some(u => u.run_date === r.run_date);
+        const mark = r.run_date === latestRun.run_date ? '  ← latest' : (ok ? '' : '  (skipped — incoherent funnel)');
+        console.log(`    ${r.run_date}   ${r.file}${mark}`);
+    });
+    console.log(`  → copied ${latestRun.file} → ${latestFile}`);
     return runs;
 }
 
