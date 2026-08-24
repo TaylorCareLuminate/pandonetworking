@@ -706,7 +706,7 @@
         import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
         
         // Use CLEmail wrapper for secure data access
-        const { collection, doc, getDoc, getDocs, setDoc, addDoc, query, where, orderBy, limit } = window.clemailFirestore;
+        const { collection, doc, getDoc, getDocs, setDoc, addDoc, query, where } = window.clemailFirestore;
 
         // Wait for auth.js to initialize
         console.log('⏳ Waiting for auth.js to initialize...');
@@ -859,6 +859,8 @@
             profile_view: 'Profile View',
             successful_connection: 'Successful Connection',
             meeting_scheduled: 'Meeting Scheduled',
+            connection_request_sent: 'Connection Request Sent',
+            heyreach_message_sent: 'Follow-Up Message (HeyReach)',
             other_message: 'Other Message'
         };
 
@@ -1226,6 +1228,24 @@
                     }
                 });
 
+                // Some BDRs only store the HeyReach account ID on bdr_leaders (or nested
+                // in heyreachCampaigns). Missing those IDs silently drops their webhooks.
+                bdrLeaders.forEach(bdr => {
+                    const email = (bdr.primaryEmail || '').toLowerCase();
+                    if (!email) return;
+                    const extraIds = [];
+                    if (bdr.heyreachAccountId) extraIds.push(String(bdr.heyreachAccountId));
+                    (bdr.heyreachCampaigns || []).forEach(c => {
+                        const id = c?.accountId || c?.heyreachAccountId;
+                        if (id) extraIds.push(String(id));
+                    });
+                    extraIds.forEach(id => {
+                        if (!linkedInAccountIdMapping.has(id)) {
+                            linkedInAccountIdMapping.set(id, email);
+                        }
+                    });
+                });
+
                 console.log(`✅ Loaded ${linkedInAccountIdMapping.size} LinkedIn account ID → BDR email mappings`);
             } catch (error) {
                 console.error('❌ Error loading LinkedIn account ID mappings:', error);
@@ -1237,6 +1257,42 @@
             if (!email) return email;
             const lower = email.toLowerCase();
             return linkedInEmailToCanonical.get(lower) || lower;
+        }
+
+        // Billable HeyReach webhook types. Queried individually so likes/views/replies
+        // cannot crowd out CONNECTION_REQUEST_SENT and MESSAGE_SENT.
+        const BILLED_HEYREACH_EVENTS = [
+            'CONNECTION_REQUEST_SENT',
+            'MESSAGE_SENT',
+            'INMAIL_SENT',
+            'CONNECTION_REQUEST_ACCEPTED'
+        ];
+
+        function accountIdQueryValues(accountIdStr) {
+            const values = [String(accountIdStr)];
+            const asNum = Number(accountIdStr);
+            if (Number.isFinite(asNum) && String(asNum) === String(accountIdStr).trim()) {
+                values.push(asNum);
+            }
+            return values;
+        }
+
+        // No limit() — the CLEmail wrapper paginates automatically when limit() is
+        // omitted. Passing limit(10000) forced a single truncated page of mixed
+        // event types and under-counted connection requests / follow-ups.
+        async function fetchHeyreachDocs(constraints, label) {
+            try {
+                const snap = await getDocs(
+                    query(collection(emailDB, 'heyreach_activity'), ...constraints)
+                );
+                const items = [];
+                snap.forEach(d => items.push({ id: d.id, ...d.data() }));
+                if (items.length) console.log(`  ${label}: ${items.length} records`);
+                return items;
+            } catch (e) {
+                console.warn(`heyreach_activity query failed (${label}):`, e.message || e);
+                return [];
+            }
         }
 
         // Convert Firestore Timestamp, Date, or ISO string to a JS Date (or null)
@@ -1307,7 +1363,7 @@
                 // ── Determine which BDR emails (and their account IDs) are in scope ──
                 let scopeEmails = [];
                 if (bdrFilter) {
-                    scopeEmails = [bdrFilter];
+                    scopeEmails = [bdrFilter.toLowerCase()];
                 } else if (companyFilter) {
                     bdrLeaders.forEach(b => {
                         const email = b.primaryEmail?.toLowerCase();
@@ -1315,103 +1371,115 @@
                     });
                 }
                 const scopeAccountIds = [...new Set(
-                    scopeEmails.flatMap(e => bdrEmailToAccountIds.get(e) || [])
+                    scopeEmails.flatMap(e => bdrEmailToAccountIds.get(e) || bdrEmailToAccountIds.get(e.toLowerCase()) || [])
                 )];
                 console.log(`🔍 Scope: ${scopeEmails.length} BDR(s), ${scopeAccountIds.length} LinkedIn account ID(s)`);
 
-                // ── Load heyreach_activity per account ID ──
-                // Query WITHOUT date conditions to avoid composite-index requirements.
-                // Date filtering is applied in-memory via inRange().
-                // Both string and number ID types are tried because Firestore collections
-                // can store linkedInAccountId as either — we deduplicate by document ID.
-                let heyreachActivities = [];
-                if (scopeAccountIds.length > 0) {
-                    // Each account ID tried as both string AND number in parallel
-                    const queryPromises = scopeAccountIds.flatMap((accountIdStr) => {
-                        const idAsNum = Number(accountIdStr);
-                        const idAsStr = accountIdStr; // already a string from the map
-                        return [idAsStr, idAsNum].map(async (idValue) => {
-                            try {
-                                const snap = await getDocs(
-                                    query(collection(emailDB, 'heyreach_activity'),
-                                        where('linkedInAccountId', '==', idValue),
-                                        limit(10000))
-                                );
-                                const items = [];
-                                snap.forEach(d => items.push({ id: d.id, ...d.data() }));
-                                console.log(`  accountId ${idValue} (${typeof idValue}): ${items.length} records`);
-                                return items;
-                            } catch(e) {
-                                console.warn(`heyreach_activity query for accountId ${idValue} failed:`, e);
-                                return [];
-                            }
-                        });
-                    });
-                    const results = await Promise.all(queryPromises);
-                    // Deduplicate by doc ID, then apply date filter in memory
-                    const seenDocIds = new Set();
-                    results.flat().forEach(item => {
+                // ── Load heyreach_activity ──
+                // Query billed event types only, with no limit(), so getDocs paginates
+                // the full set. The previous all-types + limit(10000) query returned an
+                // arbitrary slice of likes/views/replies and dropped connection requests
+                // and nearly all MESSAGE_SENT follow-ups.
+                // Date filtering stays in-memory via inRange() to avoid extra indexes.
+                const heyreachActivities = [];
+                const seenDocIds = new Set();
+                const ingestHeyreach = (items) => {
+                    items.forEach(item => {
                         if (seenDocIds.has(item.id)) return;
                         seenDocIds.add(item.id);
                         const itemDate = safeToDate(item.timestamp || item.receivedAt);
                         if (!inRange(itemDate)) return;
                         heyreachActivities.push(item);
                     });
-                }
+                };
 
-                // Fallback when no account IDs were found: global query with date filter + in-memory BDR filter
-                if (heyreachActivities.length === 0 && scopeAccountIds.length === 0) {
-                    console.warn('⚠️ No LinkedIn account IDs found — falling back to global query');
-                    try {
-                        const conds = [];
-                        if (startDate) conds.push(where('timestamp', '>=', startDate));
-                        if (endDate)   conds.push(where('timestamp', '<=', endDate));
-                        const snap = await getDocs(
-                            conds.length > 0
-                                ? query(collection(emailDB, 'heyreach_activity'), ...conds, limit(25000))
-                                : query(collection(emailDB, 'heyreach_activity'), limit(25000))
+                const queryPromises = [];
+
+                // Primary path: every event for this account, paginated. Filter to billed
+                // types in memory so we do not depend on a (linkedInAccountId, eventType)
+                // composite index. This is the same query that already returned accepted
+                // connections correctly — without the old 10k cap that dropped the rest.
+                scopeAccountIds.forEach((accountIdStr) => {
+                    accountIdQueryValues(accountIdStr).forEach((idValue) => {
+                        queryPromises.push(
+                            fetchHeyreachDocs(
+                                [where('linkedInAccountId', '==', idValue)],
+                                `accountId ${idValue}`
+                            ).then(items => items.filter(item => BILLED_HEYREACH_EVENTS.includes(item.eventType)))
                         );
-                        const emailSet = new Set(scopeEmails);
-                        snap.forEach(d => {
-                            const a = d.data();
-                            let e = a.bdrEmail || a.linkedInAccountEmail || a.accountEmail || null;
-                            if (!e && a.linkedInAccountId) e = linkedInAccountIdMapping.get(String(a.linkedInAccountId)) || null;
-                            if (emailSet.size > 0 && !emailSet.has(normalizeBdrEmail(e))) return;
-                            heyreachActivities.push({ id: d.id, ...a });
-                        });
-                    } catch(e) { console.warn('heyreach_activity global fallback failed:', e); }
-                }
-                console.log(`✅ Loaded ${heyreachActivities.length} HeyReach activities for scope (after date filter)`);
+                    });
+                });
 
-                // ── Load activity_tracking (follow-up messages + meetings) ──
-                // Query by bdr_email using both canonical and LinkedIn email variants.
+                // Email-field path: some older webhooks have accountEmail/bdrEmail but
+                // no linkedInAccountId (or an ID that isn't in linkedin_accounts).
+                const queryEmails = new Set(scopeEmails);
+                scopeEmails.forEach(email => {
+                    const linkedInVariants = canonicalToLinkedInEmails.get(email);
+                    if (linkedInVariants) linkedInVariants.forEach(li => queryEmails.add(li));
+                });
+                ['accountEmail', 'bdrEmail'].forEach((field) => {
+                    queryEmails.forEach((email) => {
+                        BILLED_HEYREACH_EVENTS.forEach((eventType) => {
+                            queryPromises.push(
+                                fetchHeyreachDocs(
+                                    [
+                                        where(field, '==', email),
+                                        where('eventType', '==', eventType)
+                                    ],
+                                    `${field}=${email} ${eventType}`
+                                )
+                            );
+                        });
+                    });
+                });
+
+                if (queryPromises.length === 0) {
+                    console.warn('⚠️ No LinkedIn account IDs or BDR emails in scope — skipping heyreach_activity');
+                } else {
+                    const results = await Promise.all(queryPromises);
+                    results.forEach(ingestHeyreach);
+                }
+
+                const heyreachTypeCounts = {};
+                heyreachActivities.forEach(a => {
+                    const k = a.eventType || '(none)';
+                    heyreachTypeCounts[k] = (heyreachTypeCounts[k] || 0) + 1;
+                });
+                console.log(`✅ Loaded ${heyreachActivities.length} HeyReach activities for scope (after date filter)`, heyreachTypeCounts);
+
+                // ── Load activity_tracking (manual follow-ups + meetings) ──
+                // No limit() so pagination returns the full BDR history. The previous
+                // limit(2000) truncated follow_up_message rows on active accounts.
                 const activityTrackingData = [];
                 try {
-                    // Include LinkedIn email variants in case bdr_email stored as LinkedIn alias
                     const atQueryEmails = new Set(scopeEmails);
                     scopeEmails.forEach(email => {
                         const linkedInVariants = canonicalToLinkedInEmails.get(email);
                         if (linkedInVariants) linkedInVariants.forEach(li => atQueryEmails.add(li));
                     });
-                    const atPromises = [...atQueryEmails].map(email =>
-                        getDocs(query(collection(emailDB, 'activity_tracking'),
-                            where('bdr_email', '==', email), limit(2000)))
-                        .catch(() => null)
-                    );
-                    // If no scope emails, try a small global fetch
-                    if (atPromises.length === 0) {
-                        atPromises.push(getDocs(query(collection(emailDB, 'activity_tracking'), limit(2000))).catch(() => null));
-                    }
+                    const atFields = ['bdr_email', 'bdr_auth_email'];
+                    const atPromises = [];
+                    atQueryEmails.forEach(email => {
+                        atFields.forEach(field => {
+                            atPromises.push(
+                                getDocs(query(collection(emailDB, 'activity_tracking'),
+                                    where(field, '==', email)))
+                                .catch(() => null)
+                            );
+                        });
+                    });
                     const atResults = await Promise.all(atPromises);
+                    const seenAtIds = new Set();
                     let atRawCount = 0;
                     atResults.forEach(snap => {
                         if (!snap) return;
                         snap.forEach(d => {
+                            if (seenAtIds.has(d.id)) return;
+                            seenAtIds.add(d.id);
                             atRawCount++;
                             const data = d.data();
-                            const rawDateVal = data.created_at || data.timestamp || data.scheduled_at;
+                            const rawDateVal = data.created_at || data.timestamp || data.replied_at || data.scheduled_at;
                             const dt = safeToDate(rawDateVal);
-                            // Log first few for debugging
                             if (atRawCount <= 3) {
                                 console.log(`  activity_tracking[${atRawCount}] type=${data.activity_type} raw_date=`, rawDateVal, '→', dt);
                             }
@@ -1507,6 +1575,7 @@
                     bdr: normalizeBdrEmail(bdrEmail),
                     company: activity.leadCompany || 'Unknown',
                     contact: `${activity.leadFirstName || ''} ${activity.leadLastName || ''}`.trim() || 'Unknown',
+                    profileUrl: activity.leadProfileUrl || '',
                     date: actDate,
                     source: 'heyreach_' + activity.eventType,
                     cost: costSettings[activityType] ?? DEFAULT_COSTS[activityType] ?? 0
@@ -1516,12 +1585,27 @@
             
             console.log(`📊 HeyReach billed activities processed: ${heyreachProcessedCount}`);
 
+            // Keys already billed as HeyReach follow-ups, so a matching
+            // review_replies activity_tracking row is not charged twice.
+            const heyreachFollowupKeys = new Set();
+            const followupDedupeKey = (bdr, url, name, date) => {
+                const day = date ? date.toISOString().slice(0, 10) : '';
+                const ident = (url || '').toLowerCase().replace(/\/$/, '')
+                    || (name || '').toLowerCase().trim();
+                return `${(bdr || '').toLowerCase()}|${ident}|${day}`;
+            };
+            activities.forEach(a => {
+                if (a.type !== 'heyreach_message_sent') return;
+                heyreachFollowupKeys.add(followupDedupeKey(a.bdr, a.profileUrl, a.contact, a.date));
+            });
+
             // Process activity_tracking + inbox meeting records
             // Log activity types found for diagnostics
             const atTypeCounts = {};
             activityTrackingData.forEach(t => { const k = t.activity_type || '(none)'; atTypeCounts[k] = (atTypeCounts[k]||0)+1; });
             if (activityTrackingData.length > 0) console.log('📋 activity_tracking types found:', atTypeCounts);
 
+            let skippedDuplicateFollowups = 0;
             activityTrackingData.forEach(tracking => {
                 // meeting_scheduled → meetings billing row
                 // follow_up_message → followup_msgs billing row ($1.60)
@@ -1532,9 +1616,22 @@
                 const activityDate = safeToDate(
                     tracking.created_at || tracking.timestamp || tracking.replied_at || tracking.scheduled_at
                 );
+                const bdr = normalizeBdrEmail(tracking.bdr_email || tracking.bdr_auth_email || '');
+                if (type === 'follow_up_message') {
+                    const key = followupDedupeKey(
+                        bdr,
+                        tracking.contact_linkedin_url || tracking.leadProfileUrl,
+                        tracking.contact_name,
+                        activityDate
+                    );
+                    if (heyreachFollowupKeys.has(key)) {
+                        skippedDuplicateFollowups++;
+                        return;
+                    }
+                }
                 activities.push({
                     type,
-                    bdr: normalizeBdrEmail(tracking.bdr_email || tracking.bdr_auth_email || ''),
+                    bdr,
                     company: tracking.contact_company || 'Unknown',
                     contact: tracking.contact_name || 'Unknown',
                     date: activityDate,
@@ -1542,6 +1639,9 @@
                     cost: costSettings[type] ?? DEFAULT_COSTS[type] ?? 0
                 });
             });
+            if (skippedDuplicateFollowups > 0) {
+                console.log(`📋 Skipped ${skippedDuplicateFollowups} activity_tracking follow-ups already counted via HeyReach MESSAGE_SENT`);
+            }
 
             return activities;
         }

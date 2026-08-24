@@ -166,14 +166,23 @@
   }
 
   // ── Scene construction ─────────────────────────────────────────────────
+  function viewBox() {
+    // Draw into the canvas's actual CSS box (fixed, 100% of the viewport).
+    // Never use window.innerWidth for layout — on phones a wider layout
+    // viewport left-aligns the scene and the growing tree sits off-screen.
+    const vv = window.visualViewport;
+    const cw = canvas.clientWidth || (vv && vv.width) || window.innerWidth;
+    const ch = canvas.clientHeight || (vv && vv.height) || window.innerHeight;
+    return { w: Math.max(1, cw), h: Math.max(1, ch) };
+  }
+
   function resize() {
+    const box = viewBox();
+    w = box.w;
+    h = box.h;
     dpr = Math.min(window.devicePixelRatio || 1, 2);
-    w = window.innerWidth;
-    h = window.innerHeight;
     canvas.width = Math.floor(w * dpr);
     canvas.height = Math.floor(h * dpr);
-    canvas.style.width = w + 'px';
-    canvas.style.height = h + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     buildScene();
   }
@@ -181,14 +190,15 @@
   function buildScene() {
     const rand = mulberry32(7);
     horizonY = h * 0.74;
-    const mobile = w < 700;
+    const mobile = w < 900;
 
     trees = [];
-    // Mobile: just the two trees flanking the center sapling ("middle three")
-    const slots = mobile ? [0.15, 0.85] : [0.06, 0.22, 0.78, 0.94];
+    // Phone / tablet: no large side trees — they read as "the two left
+    // trees" when the viewport is narrow. The growing sapling is the subject.
+    const slots = mobile ? [] : [0.06, 0.22, 0.78, 0.94];
     slots.forEach(fx => {
       const dir = fx < 0.5 ? 1 : -1; // leans/reaches toward center
-      const height = mobile ? h * (0.42 + rand() * 0.08) : h * (0.48 + rand() * 0.10);
+      const height = h * (0.48 + rand() * 0.10);
       trees.push(buildTree(rand, w * fx, height, dir, mobile));
     });
 
@@ -943,6 +953,9 @@
 
   window.addEventListener('resize', resize);
   window.addEventListener('load', () => resize());
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', resize);
+  }
 
   resize();
   requestAnimationFrame(frame);
