@@ -87,10 +87,11 @@
     '  </div>' +
     '</div>' +
     '<p class="dyk-body">' +
-    '  <strong>Pando</strong> &mdash; Latin for <em>&ldquo;I spread&rdquo;</em> &mdash; is a grove of' +
+    '  <strong>Pando</strong>, Latin for <em>&ldquo;I spread&rdquo;</em>, is a grove of' +
     '  roughly 47,000 aspen trees in central Utah that are all <strong>one single living' +
     '  organism</strong>, sharing one vast root system. It&rsquo;s the largest and heaviest' +
-    '  living thing on Earth &mdash; and it&rsquo;s right in our backyard.' +
+    '  living thing on Earth, and similar to Pando Executive Networking, one of Mother' +
+    '  Nature&rsquo;s premier examples of amazing &lsquo;networking&rsquo;.' +
     '</p>' +
     '<a class="dyk-link" href="https://en.wikipedia.org/wiki/Pando_(tree)" target="_blank" rel="noopener">' +
     '  Read more about Pando &rarr;</a>';
