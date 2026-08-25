@@ -334,9 +334,11 @@
   }
 
   function buildSapling(rand, mobile) {
-    // By the bottom of the page: BY FAR the largest tree in the grove
+    // By the bottom of the page: BY FAR the largest tree in the grove.
+    // On mobile there are no neighbor trees to size against — use the
+    // viewport so the trunk actually grows instead of becoming a bush.
     const tallest = trees.reduce((m, t) => Math.max(m, t.height), 0);
-    const Hf = Math.min(h * 0.70, tallest * 1.32);
+    const Hf = tallest > 0 ? Math.min(h * 0.70, tallest * 1.32) : h * 0.62;
     const maxTrunkW = mobile ? 17 : 24;
 
     // Trunk twist parameters (stable across frames)
