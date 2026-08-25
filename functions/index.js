@@ -1025,6 +1025,57 @@ const CLIENT_DASHBOARD_HEYREACH_EVENT_TO_TYPE = {
     CONNECTION_REQUEST_ACCEPTED: 'successful_connection'
 };
 
+function clientDashSafeToDate(val) {
+    if (!val) return null;
+    if (typeof val.toDate === 'function') return val.toDate();
+    if (val instanceof Date) return val;
+    if (typeof val === 'object' && typeof val._seconds === 'number') return new Date(val._seconds * 1000);
+    if (typeof val === 'object' && typeof val.seconds === 'number') return new Date(val.seconds * 1000);
+    if (typeof val === 'string' || typeof val === 'number') {
+        const d = new Date(val);
+        return isNaN(d.getTime()) ? null : d;
+    }
+    return null;
+}
+
+function clientDashLinkedInSlug(url) {
+    if (!url) return '';
+    const m = String(url).match(/linkedin\.com\/in\/([^\/\?#]+)/i);
+    return m ? m[1].toLowerCase().trim() : '';
+}
+
+function clientDashNormalizeUrl(url) {
+    if (!url) return '';
+    return String(url).toLowerCase().trim()
+        .replace(/^https?:\/\//i, '')
+        .replace(/^www\./i, '')
+        .replace(/\/+$/, '')
+        .replace(/\?.*$/, '');
+}
+
+// Same identity used by cost_revenue_tracking.html — collapses webhook +
+// per-campaign backfill copies of one LinkedIn action into a single lead.
+function clientDashLeadIdentity(activity) {
+    const url = activity.leadProfileUrl || activity.profileUrl || activity.contact_linkedin_url || '';
+    const slug = clientDashLinkedInSlug(url);
+    if (slug) return `in:${slug}`;
+    const norm = clientDashNormalizeUrl(url);
+    if (norm) return `url:${norm}`;
+    const id = activity.leadLinkedInId || activity.leadId;
+    if (id) return `id:${String(id)}`;
+    const name = `${activity.leadFirstName || ''} ${activity.leadLastName || activity.contact_name || ''}`.trim().toLowerCase();
+    if (name && name !== 'unknown') return `name:${name}`;
+    return `doc:${activity.id || ''}`;
+}
+
+function clientDashEventMinuteKey(date) {
+    if (!date) return '';
+    const d = new Date(date);
+    if (isNaN(d.getTime())) return '';
+    d.setSeconds(0, 0);
+    return d.toISOString().slice(0, 16);
+}
+
 /**
  * Core nightly/manual calculation: revenue earned this month, per client company.
  * Mirrors the billing formula in connect/cost_revenue_tracking.html but runs
@@ -1089,6 +1140,23 @@ async function calculateClientDashboardHelper() {
             accountIdToEmail[String(x.heyreachAccountId)] = normalizeEmail(x.bdrEmail);
         }
     });
+    // Some BDRs only store the HeyReach account ID on bdr_leaders (or nested
+    // in heyreachCampaigns). Missing those IDs silently drops their webhooks.
+    bdrSnap.forEach(d => {
+        const x = d.data();
+        if (x.status === 'inactive') return;
+        const email = normalizeEmail(x.primaryEmail);
+        if (!email) return;
+        const extraIds = [];
+        if (x.heyreachAccountId) extraIds.push(String(x.heyreachAccountId));
+        (x.heyreachCampaigns || []).forEach(c => {
+            const id = c && (c.accountId || c.heyreachAccountId);
+            if (id) extraIds.push(String(id));
+        });
+        extraIds.forEach(id => {
+            if (!accountIdToEmail[id]) accountIdToEmail[id] = email;
+        });
+    });
 
     function resolveCustomerForEmail(email) {
         if (!email) return null;
@@ -1119,8 +1187,15 @@ async function calculateClientDashboardHelper() {
         }
     }
 
-    const HEYREACH_SELECT_FIELDS = ['eventType', 'bdrEmail', 'linkedInAccountEmail', 'accountEmail', 'bdr_email', 'linkedInAccountId'];
-    const ACTIVITY_TRACKING_SELECT_FIELDS = ['activity_type', 'bdr_email', 'bdr_auth_email'];
+    const HEYREACH_SELECT_FIELDS = [
+        'eventType', 'bdrEmail', 'linkedInAccountEmail', 'accountEmail', 'bdr_email',
+        'linkedInAccountId', 'leadProfileUrl', 'leadLinkedInId', 'leadFirstName',
+        'leadLastName', 'backfilled', 'backfillSource', 'timestamp'
+    ];
+    const ACTIVITY_TRACKING_SELECT_FIELDS = [
+        'activity_type', 'bdr_email', 'bdr_auth_email',
+        'contact_linkedin_url', 'leadProfileUrl', 'contact_name', 'created_at'
+    ];
 
     // heyreach_activity records are written with BOTH `timestamp` and `receivedAt`
     // populated (see HEYREACH_WEBHOOKS_GUIDE.md), so querying on either field alone
@@ -1136,7 +1211,7 @@ async function calculateClientDashboardHelper() {
     [...heyreachByTimestamp, ...heyreachByReceivedAt].forEach(({ id, data }) => {
         if (seenHeyreachIds.has(id)) return;
         seenHeyreachIds.add(id);
-        heyreachActivities.push(data);
+        heyreachActivities.push({ id, ...data });
     });
 
     // activity_tracking (meetings + follow-ups) is written with `created_at`.
@@ -1157,6 +1232,10 @@ async function calculateClientDashboardHelper() {
         if (customerId) bucket.breakdown[type] = (bucket.breakdown[type] || 0) + 1;
     }
 
+    // Collapse duplicate webhook / per-campaign backfill docs the same way
+    // cost_revenue_tracking.html does. Without this, a lead in 4 campaigns is
+    // billed 4 times for one LinkedIn connection request.
+    const pending = [];
     heyreachActivities.forEach(activity => {
         const type = CLIENT_DASHBOARD_HEYREACH_EVENT_TO_TYPE[activity.eventType];
         if (!type) return;
@@ -1168,20 +1247,82 @@ async function calculateClientDashboardHelper() {
         }
         if (!bdrEmail) return;
 
-        const customerId = resolveCustomerForEmail(bdrEmail);
-        const cost = costSettings[type] ?? CLIENT_DASHBOARD_DEFAULT_COSTS[type] ?? 0;
-        addActivity(customerId, type, cost);
+        pending.push({
+            type,
+            bdr: normalizeEmail(bdrEmail),
+            customerId: resolveCustomerForEmail(bdrEmail),
+            leadKey: clientDashLeadIdentity(activity),
+            backfilled: !!(activity.backfilled || activity.backfillSource),
+            date: clientDashSafeToDate(activity.timestamp),
+            profileUrl: activity.leadProfileUrl || '',
+            contact: `${activity.leadFirstName || ''} ${activity.leadLastName || ''}`.trim()
+        });
     });
 
+    pending.sort((a, b) => {
+        if (a.backfilled !== b.backfilled) return a.backfilled ? 1 : -1;
+        return (a.date ? a.date.getTime() : 0) - (b.date ? b.date.getTime() : 0);
+    });
+
+    const uniqueHeyreach = [];
+    const seenLeadType = new Set();
+    const seenMessageMinute = new Set();
+    pending.forEach(item => {
+        const leadTypeKey = `${item.bdr}|${item.type}|${item.leadKey}`;
+        if (item.type === 'heyreach_message_sent' && !item.backfilled) {
+            const minuteKey = `${leadTypeKey}|${clientDashEventMinuteKey(item.date)}`;
+            if (seenMessageMinute.has(minuteKey)) return;
+            seenMessageMinute.add(minuteKey);
+            seenLeadType.add(leadTypeKey);
+        } else {
+            if (seenLeadType.has(leadTypeKey)) return;
+            seenLeadType.add(leadTypeKey);
+        }
+        uniqueHeyreach.push(item);
+    });
+    console.log(`📊 HeyReach billed: ${pending.length} raw → ${uniqueHeyreach.length} unique (dropped ${pending.length - uniqueHeyreach.length} duplicate webhook/backfill docs)`);
+
+    uniqueHeyreach.forEach(item => {
+        const cost = costSettings[item.type] ?? CLIENT_DASHBOARD_DEFAULT_COSTS[item.type] ?? 0;
+        addActivity(item.customerId, item.type, cost);
+    });
+
+    const heyreachFollowupKeys = new Set();
+    uniqueHeyreach.forEach(item => {
+        if (item.type !== 'heyreach_message_sent') return;
+        const day = item.date ? item.date.toISOString().slice(0, 10) : '';
+        const ident = clientDashLeadIdentity({
+            leadProfileUrl: item.profileUrl,
+            contact_name: item.contact
+        });
+        heyreachFollowupKeys.add(`${item.bdr}|${ident}|${day}`);
+    });
+
+    let skippedDuplicateFollowups = 0;
     activityTrackingData.forEach(tracking => {
         const type = tracking.activity_type;
         if (type !== 'meeting_scheduled' && type !== 'follow_up_message') return;
 
-        const bdrEmail = tracking.bdr_email || tracking.bdr_auth_email || '';
+        const bdrEmail = normalizeEmail(tracking.bdr_email || tracking.bdr_auth_email || '');
+        if (type === 'follow_up_message') {
+            const day = (() => {
+                const d = clientDashSafeToDate(tracking.created_at);
+                return d ? d.toISOString().slice(0, 10) : '';
+            })();
+            const ident = clientDashLeadIdentity(tracking);
+            if (heyreachFollowupKeys.has(`${bdrEmail}|${ident}|${day}`)) {
+                skippedDuplicateFollowups++;
+                return;
+            }
+        }
+
         const customerId = resolveCustomerForEmail(bdrEmail);
         const cost = costSettings[type] ?? CLIENT_DASHBOARD_DEFAULT_COSTS[type] ?? 0;
         addActivity(customerId, type, cost);
     });
+    if (skippedDuplicateFollowups > 0) {
+        console.log(`📋 Skipped ${skippedDuplicateFollowups} activity_tracking follow-ups already counted via HeyReach MESSAGE_SENT`);
+    }
 
     // ── 5. Build + write the cache doc (one entry per known client company) ──
     const companies = {};
@@ -1211,7 +1352,9 @@ async function calculateClientDashboardHelper() {
         success: true,
         month: monthKey,
         companies: Object.keys(companies).length,
-        totalActivities: heyreachActivities.length + activityTrackingData.length,
+        totalActivities: uniqueHeyreach.length + activityTrackingData.length - skippedDuplicateFollowups,
+        rawHeyreachActivities: pending.length,
+        uniqueHeyreachActivities: uniqueHeyreach.length,
         duration
     };
 }
