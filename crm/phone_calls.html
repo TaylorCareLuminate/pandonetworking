@@ -1576,6 +1576,33 @@
         let selectedCustomer = null;
         let selectedCampaign = null;
         let selectedTimeRange = 3; // Default to 3 days
+
+        // -----------------------------------------------------------------
+        // SHORT-LIVED QUERY CACHE
+        // -----------------------------------------------------------------
+        // Several dashboard refresh functions (updatePerformanceDashboard,
+        // updateQueueStatsDashboard) get re-invoked back-to-back — once when
+        // a campaign is selected AND again after every single call
+        // completion. Multiple agents each doing this simultaneously was
+        // hammering the Railway backend with redundant, near-identical
+        // queries (200+ requests/min to the same endpoint) and driving it
+        // into overload. Caching each query's result for a few seconds
+        // means rapid repeated refreshes reuse the same data instead of
+        // re-fetching, while staying fresh enough that agents never notice.
+        const _queryCache = new Map(); // key -> { expires, promise }
+        function cachedQuery(key, ttlMs, fetchFn) {
+            const now = Date.now();
+            const entry = _queryCache.get(key);
+            if (entry && entry.expires > now) {
+                return entry.promise;
+            }
+            const promise = Promise.resolve().then(fetchFn).catch(err => {
+                _queryCache.delete(key); // never cache a failure
+                throw err;
+            });
+            _queryCache.set(key, { expires: now + ttlMs, promise });
+            return promise;
+        }
         
         // Payment rates for different call outcomes
         const PAYMENT_RATES = {
@@ -3164,7 +3191,7 @@
         // Load and display queue statistics dashboard (for the top dashboard with all stats)
         async function updateQueueStatsDashboard() {
             try {
-                const { getFirestore, collection, getDocs, emailApp } = await initializeFirestore();
+                const { getFirestore, collection, query, where, getDocs, emailApp } = await initializeFirestore();
                 const dbFS = getFirestore(emailApp);
                 
                 const userEmail = window.auth?.currentUser?.email || 'unknown';
@@ -3174,14 +3201,27 @@
                 
                 console.log('📊 Loading queue statistics dashboard...');
                 
-                // Get all phone activities
-                const activitiesSnapshot = await getDocs(collection(dbFS, 'phone_activities'));
+                // Previously this fetched the ENTIRE phone_activities collection
+                // (every campaign's full history, unbounded) just to compute a
+                // handful of counts. Scoping to the two subsets actually needed -
+                // pending/scheduled activities, and this user's completed ones -
+                // cuts the payload from "the whole collection" down to just the
+                // live queue, which is what was overwhelming Railway. Both are
+                // cached briefly since this runs after every single call completion.
+                const [pendingSnapshot, completedByUserSnapshot] = await Promise.all([
+                    cachedQuery('phoneActivities:pendingOrScheduled', 15000, () =>
+                        getDocs(query(collection(dbFS, 'phone_activities'), where('status', 'in', ['pending', 'scheduled'])))
+                    ),
+                    cachedQuery(`phoneActivities:completedBy:${userEmail}`, 15000, () =>
+                        getDocs(query(collection(dbFS, 'phone_activities'), where('completedBy', '==', userEmail)))
+                    )
+                ]);
                 
                 let callsDueToday = 0;
                 let completedToday = 0;
                 let upcomingCalls = 0;
                 
-                activitiesSnapshot.forEach(doc => {
+                pendingSnapshot.forEach(doc => {
                     const data = doc.data();
                     
                     // Get scheduled date
@@ -3199,21 +3239,24 @@
                     }
                     
                     // Count calls due today/overdue (pending or scheduled status, due today or earlier)
-                    if ((data.status === 'pending' || data.status === 'scheduled') && scheduledDate && scheduledDate <= now) {
+                    if (scheduledDate && scheduledDate <= now) {
                         callsDueToday++;
                     }
                     
+                    // Count upcoming calls (next 7 days, not including today)
+                    if (scheduledDate && scheduledDate > now && scheduledDate <= sevenDaysFromNow) {
+                        upcomingCalls++;
+                    }
+                });
+                
+                completedByUserSnapshot.forEach(doc => {
+                    const data = doc.data();
                     // Count completed calls today
-                    if (data.completedAt && data.completedBy === userEmail) {
+                    if (data.completedAt) {
                         const completedDate = data.completedAt?.toDate?.() || new Date(data.completedAt);
                         if (completedDate >= today && completedDate <= now) {
                             completedToday++;
                         }
-                    }
-                    
-                    // Count upcoming calls (next 7 days, not including today)
-                    if ((data.status === 'pending' || data.status === 'scheduled') && scheduledDate && scheduledDate > now && scheduledDate <= sevenDaysFromNow) {
-                        upcomingCalls++;
                     }
                 });
                 
@@ -3221,14 +3264,12 @@
                 // Count pending/scheduled calls as the user's "reserved" workload
                 let totalReservedCalls = 0;
                 
-                activitiesSnapshot.forEach(docSnap => {
+                pendingSnapshot.forEach(docSnap => {
                     const data = docSnap.data();
                     // Count pending/scheduled calls that are assigned to or available to this user
-                    if (data.status === 'pending' || data.status === 'scheduled') {
-                        const assignedTo = data.assignedTo || data.completedBy || data.reservedBy || '';
-                        if (assignedTo === userEmail || !assignedTo) {
-                            totalReservedCalls++;
-                        }
+                    const assignedTo = data.assignedTo || data.completedBy || data.reservedBy || '';
+                    if (assignedTo === userEmail || !assignedTo) {
+                        totalReservedCalls++;
                     }
                 });
                 
@@ -3271,12 +3312,26 @@
                 const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
                 const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
                 
-                // Query calls for different time periods
-                const [hourlyData, weeklyData, monthlyData] = await Promise.all([
-                    getCallsInRange(userEmail, hourAgo, now),
-                    getCallsInRange(userEmail, weekAgo, now),
-                    getCallsInRange(userEmail, monthAgo, now)
-                ]);
+                // Fetch once (cached briefly) and bucket into hourly/weekly/monthly
+                // client-side instead of firing 3 separate Firestore queries every
+                // time this dashboard refreshes — this was the single biggest
+                // contributor to campaign_call_tracking query volume on Railway.
+                const monthlyRecords = await cachedQuery(
+                    `callTrackingRecords:${userEmail}`,
+                    20000, // 20s — refreshes fire after every call, no need to re-fetch that often
+                    () => getCallRecordsInRange(userEmail, monthAgo, now)
+                );
+                const bucketRecords = (since) => monthlyRecords.reduce((acc, data) => {
+                    if (data.timestamp >= since) {
+                        acc.earnings += data.totalPayment || 0;
+                        acc.calls += 1;
+                    }
+                    return acc;
+                }, { earnings: 0, calls: 0 });
+
+                const hourlyData = bucketRecords(hourAgo.toISOString());
+                const weeklyData = bucketRecords(weekAgo.toISOString());
+                const monthlyData = bucketRecords(monthAgo.toISOString());
                 
                 // Update dashboard
                 document.getElementById('hourlyEarnings').textContent = `$${hourlyData.earnings.toFixed(2)}`;
@@ -3304,8 +3359,10 @@
             }
         }
         
-        // Get calls in date range for a user
-        async function getCallsInRange(userEmail, startDate, endDate) {
+        // Get raw call-tracking records for a user within a date range (used by
+        // updatePerformanceDashboard, which buckets one wide fetch into
+        // hourly/weekly/monthly instead of firing 3 separate queries).
+        async function getCallRecordsInRange(userEmail, startDate, endDate) {
             try {
                 const { getFirestore, collection, query, where, getDocs, emailApp } = await initializeFirestore();
                 const dbFS = getFirestore(emailApp);
@@ -3318,21 +3375,31 @@
                 );
                 
                 const snapshot = await getDocs(q);
-                let earnings = 0;
-                let calls = 0;
-                
-                snapshot.forEach(doc => {
-                    const data = doc.data();
-                    earnings += data.totalPayment || 0;
-                    calls += 1;
-                });
-                
-                return { earnings, calls };
+                return snapshot.docs.map(doc => doc.data());
                 
             } catch (error) {
-                console.error('❌ Failed to get calls in range:', error);
-                return { earnings: 0, calls: 0 };
+                console.error('❌ Failed to get call records in range:', error);
+                return [];
             }
+        }
+
+        // Kept for compatibility with any other callers - now backed by the
+        // same cached wide fetch instead of its own dedicated query.
+        async function getCallsInRange(userEmail, startDate, endDate) {
+            const records = await cachedQuery(
+                `callTrackingRecords:${userEmail}`,
+                20000,
+                () => getCallRecordsInRange(userEmail, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), new Date())
+            );
+            const startIso = startDate.toISOString();
+            const endIso = endDate.toISOString();
+            return records.reduce((acc, data) => {
+                if (data.timestamp >= startIso && data.timestamp <= endIso) {
+                    acc.earnings += data.totalPayment || 0;
+                    acc.calls += 1;
+                }
+                return acc;
+            }, { earnings: 0, calls: 0 });
         }
         
         // Load phone calls from Firestore 'phone_activities'
@@ -3430,14 +3497,22 @@
                     })));
                 }
                 
+                // Fallbacks 2 & 3 below both need the full phone_activities collection.
+                // Previously each fetched it independently, so a campaignId
+                // mismatch (which triggers both fallbacks) meant TWO full
+                // unfiltered collection scans back-to-back. Fetch it at most once
+                // here, cached briefly, and reuse it for whichever fallback needs it.
+                const getAllPhoneActivities = () => cachedQuery('phoneActivities:all', 15000, async () => {
+                    const allCallsSnap = await getDocs(query(collection(dbFS, 'phone_activities')));
+                    return allCallsSnap.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() }));
+                });
+                
                 // 2. If no exact matches, try partial matches (campaignId starts with selectedCampaign)
                 if (foundCalls.length === 0) {
                     console.log(`🔍 No exact matches, trying partial matches for campaign starting with: ${selectedCampaign}`);
                     
                     // Get all phone activities and filter in memory for partial matches
-                    const allCallsQuery = query(collection(dbFS, 'phone_activities'));
-                    const allCallsSnap = await getDocs(allCallsQuery);
-                    const allCalls = allCallsSnap.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() }));
+                    const allCalls = await getAllPhoneActivities();
                     
                     console.log(`📋 Total phone activities in database: ${allCalls.length}`);
                     
@@ -3459,9 +3534,7 @@
                     if (selectedCampaignObj && selectedCampaignObj.name) {
                         console.log(`🔍 Trying to match by campaignName: ${selectedCampaignObj.name}`);
                         
-                        const allCallsQuery = query(collection(dbFS, 'phone_activities'));
-                        const allCallsSnap = await getDocs(allCallsQuery);
-                        const allCalls = allCallsSnap.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() }));
+                        const allCalls = await getAllPhoneActivities();
                         
                         console.log(`📋 Sample of all calls in database:`, allCalls.slice(0, 5).map(c => ({
                             id: c.id,
