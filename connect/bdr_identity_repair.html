@@ -461,9 +461,22 @@ window.analyze = async function() {
         }
         log(`Found ${queueDocs.length} queue docs for this person (by name + emails)`);
 
-        // Classify each queue doc by which identity its email fields match
+        // Classify each queue doc by which identity its email fields match.
+        // A shared LinkedIn email (same seat under both companies) makes account_email
+        // ambiguous, so prefer the auth/primary email fields, which are identity-specific,
+        // and recognize docs this tool already repaired.
         const docEmails = (d) => [d.account_email, d.accountEmail, d.bdr_auth_email, d.bdr_email, d.bdr_primary_email]
             .filter(Boolean).map(e => e.toLowerCase());
+        const authVerdict = (d) => {
+            if (d.identity_repaired_to === newDoc.id) return true;
+            const authEmails = [d.bdr_auth_email, d.bdr_primary_email, d.bdr_email]
+                .filter(Boolean).map(e => e.toLowerCase());
+            const distinctlyNew = authEmails.some(e => newEmails.has(e) && !oldEmails.has(e));
+            const distinctlyOld = authEmails.some(e => oldEmails.has(e) && !newEmails.has(e));
+            if (distinctlyOld) return false;
+            if (distinctlyNew) return true;
+            return null; // shared/missing emails — fall back to full-set matching
+        };
         const oldUnpushed = [], oldPushedInWindow = [], oldPushedBefore = [], newIdentity = [], unknown = [];
 
         queueDocs.forEach(d => {
@@ -471,9 +484,11 @@ window.analyze = async function() {
             const emails = docEmails(d);
             const matchesOld = emails.some(e => oldEmails.has(e));
             const matchesNew = emails.some(e => newEmails.has(e));
-            if (matchesNew && !matchesOld) { newIdentity.push(d); return; }
             if (!matchesOld && !matchesNew) { unknown.push(d); return; }
-            // Matches OLD (possibly both — treat shared emails as old so they get re-tagged explicitly)
+            const verdict = authVerdict(d);
+            const isNew = verdict === null ? (matchesNew && !matchesOld) : verdict;
+            if (isNew) { newIdentity.push(d); return; }
+            // Belongs to OLD identity (shared-email docs land here too, so they get re-tagged explicitly)
             if (!d.pushed_to_heyreach) { oldUnpushed.push(d); return; }
             const pushDate = safeDate(d.heyreach_push_date) || safeDate(d.auto_push_timestamp) || safeDate(d.lastRepushAttempt);
             if (cutoff && pushDate && pushDate >= cutoff) oldPushedInWindow.push(d);
@@ -496,6 +511,7 @@ window.analyze = async function() {
 };
 
 function renderAnalysis() {
+    disarmActionButtons();
     const { oldDoc, newDoc, newKeys, oldPushedInWindow, oldUnpushed } = analysis;
 
     const identityHtml = (bdrDoc, isNew) => {
@@ -527,8 +543,11 @@ function renderAnalysis() {
     document.getElementById('oldIdentityBox').innerHTML = identityHtml(oldDoc, false);
     document.getElementById('newIdentityBox').innerHTML = identityHtml(newDoc, true);
 
+    const unpushedApproved = analysis.oldUnpushed.filter(d => (d.reviewStatus || '').toLowerCase() === 'approved').length;
+    const unpushedNote = analysis.oldUnpushed.length > 0
+        ? ` (${unpushedApproved} approved, ${analysis.oldUnpushed.length - unpushedApproved} awaiting review)` : '';
     document.getElementById('queueSummary').innerHTML = `
-        <div class="queue-pill yellow">${analysis.oldUnpushed.length} unpushed on OLD identity → re-tag (B)</div>
+        <div class="queue-pill yellow">${analysis.oldUnpushed.length} unpushed on OLD identity → re-tag (B)${unpushedNote}</div>
         <div class="queue-pill red">${analysis.oldPushedInWindow.length} pushed on OLD since ${analysis.cutoff ? analysis.cutoff.toLocaleDateString() : '—'} → reset + re-send (C)</div>
         <div class="queue-pill">${analysis.oldPushedBefore.length} pushed on OLD before cutoff (untouched)</div>
         <div class="queue-pill green">${analysis.newIdentity.length} already on NEW identity</div>
@@ -567,6 +586,39 @@ function renderAnalysis() {
 
 // ── Actions ──────────────────────────────────────────────────────────────────
 
+// Inline two-click confirmation. Native confirm() dialogs can be silently
+// suppressed by the browser, making buttons appear to do nothing — this
+// pattern always gives visible feedback and logs every click.
+function armOrFire(btn, summary) {
+    if (btn.dataset.armed === '1') {
+        delete btn.dataset.armed;
+        btn.innerHTML = btn.dataset.origHtml || btn.innerHTML;
+        return true;
+    }
+    btn.dataset.armed = '1';
+    btn.dataset.origHtml = btn.innerHTML;
+    btn.innerHTML = '<i class="fas fa-triangle-exclamation"></i> Click again to confirm';
+    log(`CONFIRM NEEDED — ${summary} Click the same button again within 10 seconds to proceed.`, 'warn');
+    setTimeout(() => {
+        if (btn.dataset.armed === '1') {
+            delete btn.dataset.armed;
+            btn.innerHTML = btn.dataset.origHtml;
+            log('Confirmation timed out — no changes were made.');
+        }
+    }, 10000);
+    return false;
+}
+
+function disarmActionButtons() {
+    ['btnDeactivate', 'btnRetag', 'btnReset', 'btnPush'].forEach(id => {
+        const b = document.getElementById(id);
+        if (b?.dataset.armed === '1') {
+            delete b.dataset.armed;
+            b.innerHTML = b.dataset.origHtml;
+        }
+    });
+}
+
 // Fields written when re-pointing a queue doc at the NEW identity. The backend's
 // email-match is case-sensitive and compares account_email against primaryEmail
 // and the association's linkedInEmail, so we write those exact strings.
@@ -604,8 +656,8 @@ async function batchUpdate(docsWithFields, label) {
 
 window.deactivateOld = async function() {
     const { oldDoc } = analysis;
-    if (!confirm(`Set "${oldDoc.name}" (${oldDoc.primaryEmail}) to INACTIVE?\n\nThe hourly push job will stop processing this record. Reversible in Admin › BDR Leaders.`)) return;
     const btn = document.getElementById('btnDeactivate');
+    if (!armOrFire(btn, `This will set "${oldDoc.name}" (${oldDoc.primaryEmail}) to INACTIVE so the push job stops processing it. Reversible in Admin › BDR Leaders.`)) return;
     btn.disabled = true;
     try {
         await updateDoc(doc(emailDB, 'bdr_leaders', oldDoc.id), {
@@ -626,8 +678,8 @@ window.deactivateOld = async function() {
 window.retagUnpushed = async function() {
     const items = analysis.oldUnpushed;
     const { newKeys } = analysis;
-    if (!confirm(`Re-tag ${items.length} UNPUSHED queue item(s) to the NEW identity?\n\naccount_email → ${newKeys.linkedIn || newKeys.primary}\nbdr_auth_email → ${newKeys.primary}\n\nOriginal values are saved on each doc.`)) return;
     const btn = document.getElementById('btnRetag');
+    if (!armOrFire(btn, `This will re-tag ${items.length} UNPUSHED queue item(s) to the NEW identity (account_email → ${newKeys.linkedIn || newKeys.primary}, bdr_auth_email → ${newKeys.primary}). Original values are saved on each doc.`)) return;
     btn.disabled = true;
     try {
         await batchUpdate(items.map(d => ({ id: d.id, fields: retagFields(d) })), 'Re-tag');
@@ -642,9 +694,8 @@ window.retagUnpushed = async function() {
 window.resetWrongPushes = async function() {
     const items = analysis.oldPushedInWindow;
     const { newKeys, cutoff } = analysis;
-    if (!confirm(`Reset ${items.length} item(s) pushed under the OLD identity since ${cutoff?.toLocaleDateString()}?\n\nThey will be marked NOT pushed, re-tagged to the NEW identity ` +
-        `(account_email → ${newKeys.linkedIn || newKeys.primary}), and sent again on the next push run.\n\nOnly do this if these messages never reached the correct HeyReach account.`)) return;
     const btn = document.getElementById('btnReset');
+    if (!armOrFire(btn, `This will reset ${items.length} item(s) pushed under the OLD identity since ${cutoff?.toLocaleDateString()}: they are marked NOT pushed, re-tagged to the NEW identity (account_email → ${newKeys.linkedIn || newKeys.primary}), and will send again on the next push run.`)) return;
     btn.disabled = true;
     try {
         await batchUpdate(items.map(d => ({
@@ -665,9 +716,13 @@ window.resetWrongPushes = async function() {
 };
 
 window.triggerPush = async function() {
-    const { newDoc } = analysis;
-    if (!confirm(`Trigger the Railway auto-push job now?\n\nIt processes ALL active BDRs (not just ${newDoc.name}), same as the hourly run.`)) return;
+    const { newDoc, oldDoc } = analysis;
     const btn = document.getElementById('btnPush');
+    let warnings = '';
+    if (oldDoc.status === 'active') warnings += ` ⚠️ Action A not run: the OLD record is still ACTIVE and will keep claiming these messages.`;
+    if (analysis.oldUnpushed.length > 0) warnings += ` ⚠️ Action B not run: ${analysis.oldUnpushed.length} unpushed item(s) are still tagged to the OLD identity.`;
+    if (analysis.oldPushedInWindow.length > 0) warnings += ` ⚠️ Action C not run: ${analysis.oldPushedInWindow.length} wrongly-pushed item(s) are still marked as pushed and will NOT be re-sent.`;
+    if (!armOrFire(btn, `This will trigger the Railway auto-push job now (it processes ALL active BDRs, same as the hourly run).${warnings}`)) return;
     btn.disabled = true;
     btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Pushing…';
     try {
@@ -680,10 +735,13 @@ window.triggerPush = async function() {
         const r = data.results || data;
         log(`Push run complete: ${r?.pushed?.connect ?? '?'} connect + ${r?.pushed?.message ?? '?'} message pushed, ` +
             `${r?.failed ?? '?'} failed, ${r?.skipped ?? '?'} skipped, ${r?.noCampaignMatch ?? '?'} no campaign match`, 'good');
-        const detail = (r?.details || []).find(x => x.bdr === newDoc.name);
-        if (detail) {
-            log(`→ ${newDoc.name}: status=${detail.status}${detail.reason ? `, reason=${detail.reason}` : ''}${detail.messages !== undefined ? `, messages=${detail.messages}` : ''}${detail.pushed !== undefined ? `, pushed=${detail.pushed}` : ''}`,
-                detail.status === 'processed' ? 'good' : 'warn');
+        // Both records usually share a display name, so log every matching entry
+        const matches = (r?.details || []).filter(x => x.bdr === newDoc.name);
+        if (matches.length > 0) {
+            matches.forEach(detail => {
+                log(`→ ${newDoc.name}: status=${detail.status}${detail.reason ? `, reason=${detail.reason}` : ''}${detail.messages !== undefined ? `, messages=${detail.messages}` : ''}${detail.pushed !== undefined ? `, pushed=${detail.pushed}` : ''}`,
+                    detail.status === 'processed' ? 'good' : 'warn');
+            });
         } else {
             log(`→ ${newDoc.name}: not in the run's per-BDR details — the record may have been skipped at the campaign/active gate`, 'warn');
         }
