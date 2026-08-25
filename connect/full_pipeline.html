@@ -105,6 +105,31 @@
         }
         .stat-tile .num { font-size: 20px; font-weight: 800; color: var(--gray-900); }
         .stat-tile .lbl { font-size: 11px; color: var(--gray-500); text-transform: uppercase; letter-spacing: 0.04em; }
+        .stat-tile.net-usable { background: #ecfdf5; border-color: #a7f3d0; }
+        .stat-tile.net-usable .num { color: #047857; }
+
+        /* Live "where did matched contacts go" funnel + message-source mix, updated as the run progresses */
+        .fp-insight-box {
+            background: var(--gray-50); border: 1px solid var(--gray-200); border-radius: 10px;
+            padding: 12px 14px; margin-bottom: 12px;
+        }
+        .fp-insight-title { font-size: 12.5px; font-weight: 700; color: var(--gray-700); margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+        .fp-funnel-bar {
+            display: flex; height: 22px; border-radius: 6px; overflow: hidden; background: var(--gray-200);
+            margin-bottom: 8px;
+        }
+        .fp-funnel-seg { transition: width 0.4s ease; min-width: 0; }
+        .fp-funnel-seg:hover { filter: brightness(1.1); }
+        .fp-funnel-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+        .fp-funnel-legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--gray-700); }
+        .fp-funnel-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+        .fp-funnel-empty { font-size: 12px; color: var(--gray-400); font-style: italic; }
+        .fp-funnel-note { font-size: 11.5px; color: #b45309; margin-top: 8px; }
+        .fp-srcmix-row { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+        .fp-srcmix-label { font-size: 11.5px; color: var(--gray-600); width: 108px; flex-shrink: 0; text-align: right; }
+        .fp-srcmix-track { flex: 1; height: 14px; background: var(--gray-200); border-radius: 4px; overflow: hidden; }
+        .fp-srcmix-fill { height: 100%; border-radius: 4px; transition: width 0.4s ease; }
+        .fp-srcmix-count { font-size: 11.5px; color: var(--gray-500); width: 30px; flex-shrink: 0; }
         #fpProgressLog {
             background: #0f172a; color: #cbd5e1; border-radius: 10px; padding: 14px;
             font-family: 'SF Mono', Consolas, monospace; font-size: 12px; line-height: 1.55;
@@ -548,10 +573,26 @@
                 <div class="stat-tile"><div class="num" id="fpStatDropped">0</div><div class="lbl">Dropped by Rules</div></div>
                 <div class="stat-tile"><div class="num" id="fpStatMessages">0</div><div class="lbl">Messages Saved</div></div>
                 <div class="stat-tile"><div class="num" id="fpStatExcluded">0</div><div class="lbl">Opus Excluded</div></div>
+                <div class="stat-tile net-usable" title="Messages Saved minus Opus Excluded — the count that's actually usable/sendable out of Fast Connect Review."><div class="num" id="fpStatNetUsable">0</div><div class="lbl">Net Usable Messages</div></div>
                 <div class="stat-tile"><div class="num" id="fpStatDnc" style="color:#dc2626;">0</div><div class="lbl">DNC Orgs Skipped</div></div>
                 <div class="stat-tile"><div class="num" id="fpStatConnected">0</div><div class="lbl">Already Connected</div></div>
                 <div class="stat-tile" title="Running total Apify contact-search spend for this whole run so far — NOT a per-message rate. Compare it against Step 6's computed per-message limit, not the raw dollar amount you typed there."><div class="num" id="fpStatApifyCost">$0.00</div><div class="lbl">Apify Cost (run total)</div></div>
             </div>
+
+            <!-- Live funnel: where matched-by-rules contacts actually end up, updated after every org -->
+            <div class="fp-insight-box">
+                <div class="fp-insight-title"><i class="fas fa-filter" style="color:var(--primary);"></i> Where Matched Contacts Go (live)</div>
+                <div id="fpFunnelBar" class="fp-funnel-bar"></div>
+                <div id="fpFunnelLegend" class="fp-funnel-legend"><span class="fp-funnel-empty">Run the pipeline to see this fill in live, org by org.</span></div>
+                <div id="fpFunnelNote"></div>
+            </div>
+
+            <!-- Live message-source mix: which routing tier (Post Reply / About Me / Internet Search / Profile Message) is actually producing messages -->
+            <div class="fp-insight-box">
+                <div class="fp-insight-title"><i class="fas fa-comments" style="color:var(--primary);"></i> Message Source Mix (live)</div>
+                <div id="fpSrcMixBody"><span class="fp-funnel-empty">No messages saved yet this run.</span></div>
+            </div>
+
             <div style="display:flex; align-items:center; gap: 12px; margin-bottom: 8px;">
                 <div class="progress-track" style="flex:1;"><div class="progress-fill" id="fpProgressBar"></div></div>
                 <span id="fpProgressLabel" style="font-size: 12.5px; color: var(--gray-600); min-width: 220px;">Waiting…</span>
@@ -2465,9 +2506,126 @@
             document.getElementById('fpStatDropped').textContent  = fpStats.dropped;
             document.getElementById('fpStatMessages').textContent = fpStats.messages;
             document.getElementById('fpStatExcluded').textContent = fpStats.excluded;
+            document.getElementById('fpStatNetUsable').textContent = Math.max(0, fpStats.messages - fpStats.excluded);
             document.getElementById('fpStatApifyCost').textContent = '$' + fpStats.apifyCost.toFixed(2);
             document.getElementById('fpStatDnc').textContent       = fpStats.dncSkipped;
             document.getElementById('fpStatConnected').textContent = fpStats.alreadyConnected;
+            fpRenderFunnel();
+            fpRenderMessageSourceMix();
+        }
+
+        // ── Live "where matched contacts go" funnel ─────────────────────────────
+        // Answers, at a glance and updated after every org, the #1 question this dashboard
+        // used to bury in scrollback: "I matched N contacts, why did I only get M messages?"
+        // Segments: Dropped by Rules (title/role didn't fit) + the fpRunHypTally breakdown of
+        // matched contacts (already queued from earlier work / below connection floor / not in
+        // contact pool / already connected / previously excluded / processed this round).
+        const FP_FUNNEL_COLORS = {
+            dropped_by_rules:    '#94a3b8',
+            already_messaged:    '#2563eb',
+            low_connections:     '#dc2626',
+            not_in_contact_pool: '#991b1b',
+            already_connected:   '#7c3aed',
+            excluded:            '#b45309',
+            eligible:            '#059669',
+            pending:             '#e2e8f0'
+        };
+        const FP_FUNNEL_LABELS = {
+            dropped_by_rules:    'Dropped by Rules',
+            already_messaged:    'Already queued (dedup)',
+            low_connections:     'Below connection floor',
+            not_in_contact_pool: 'Not in contact pool',
+            already_connected:   'Already connected',
+            excluded:            'Previously excluded',
+            eligible:            'Processed this round',
+            pending:             'Not yet evaluated'
+        };
+        function fpRenderFunnel() {
+            const barEl = document.getElementById('fpFunnelBar');
+            const legendEl = document.getElementById('fpFunnelLegend');
+            const noteEl = document.getElementById('fpFunnelNote');
+            if (!barEl || !legendEl) return;
+
+            const tally = fpRunHypTally || {};
+            const tallySum = Object.values(tally).reduce((s, v) => s + (v || 0), 0);
+            // Matched contacts whose fate hasn't been diagnosed yet this instant (diagnostics
+            // land slightly after fpStats.matched, per org) — shown as a neutral "pending" sliver
+            // instead of letting the bar's total width visibly shrink/jump as the run progresses.
+            const pending = Math.max(0, fpStats.matched - tallySum);
+
+            const segments = [
+                ['dropped_by_rules',    fpStats.dropped],
+                ['already_messaged',    tally.already_messaged || 0],
+                ['low_connections',     tally.low_connections || 0],
+                ['not_in_contact_pool', tally.not_in_contact_pool || 0],
+                ['already_connected',   tally.already_connected || 0],
+                ['excluded',            tally.excluded || 0],
+                ['eligible',            tally.eligible || 0],
+                ['pending',             pending]
+            ].filter(([, count]) => count > 0);
+
+            const total = segments.reduce((s, [, c]) => s + c, 0);
+            if (total === 0) {
+                barEl.innerHTML = '';
+                legendEl.innerHTML = '<span class="fp-funnel-empty">Run the pipeline to see this fill in live, org by org.</span>';
+                if (noteEl) noteEl.innerHTML = '';
+                return;
+            }
+
+            barEl.innerHTML = segments.map(([key, count]) => {
+                const pct = (count / total * 100).toFixed(2);
+                return `<div class="fp-funnel-seg" style="width:${pct}%; background:${FP_FUNNEL_COLORS[key]};" title="${FP_FUNNEL_LABELS[key]}: ${count}"></div>`;
+            }).join('');
+
+            legendEl.innerHTML = segments.map(([key, count]) => {
+                const pct = (count / total * 100).toFixed(0);
+                return `<span class="fp-funnel-legend-item"><span class="fp-funnel-dot" style="background:${FP_FUNNEL_COLORS[key]};"></span>${FP_FUNNEL_LABELS[key]}: <strong>${count}</strong> (${pct}%)</span>`;
+            }).join('');
+
+            if (noteEl) {
+                const alreadyMsg = tally.already_messaged || 0;
+                if (alreadyMsg > 10 && alreadyMsg > fpStats.messages * 2) {
+                    noteEl.innerHTML = `<div class="fp-funnel-note"><i class="fas fa-circle-info"></i> Most matched contacts already have a message queued from earlier work on this hypothesis group — that's expected dedup, not a bug. Check Fast Connect Review for the backlog, or point this run at a less-worked group for fresh volume.</div>`;
+                } else {
+                    noteEl.innerHTML = '';
+                }
+            }
+        }
+
+        // ── Live message-source mix ─────────────────────────────────────────────
+        // Shows which routing tier (Post Reply / About Me / Internet Search / Profile Message)
+        // is actually producing saved messages, updated after every message. A run with zero
+        // Post Reply bars despite "Worthy post found" lines in the log is the visual tell that
+        // Post Reply is silently failing (e.g. a campaign-settings lookup error) this run.
+        const FP_SRC_COLORS = {
+            'Post Reply':       '#2563eb',
+            'About Me':         '#059669',
+            'Internet Search':  '#d97706',
+            'Profile Message':  '#7c3aed'
+        };
+        function fpRenderMessageSourceMix() {
+            const body = document.getElementById('fpSrcMixBody');
+            if (!body) return;
+            const tally = fpRunMessageSourceTally || {};
+            const entries = Object.entries(tally).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+            if (entries.length === 0) {
+                body.innerHTML = '<span class="fp-funnel-empty">No messages saved yet this run.</span>';
+                return;
+            }
+            const max = Math.max(...entries.map(([, v]) => v));
+            let html = entries.map(([src, count]) => {
+                const pct = Math.max(4, (count / max * 100)).toFixed(0);
+                const color = FP_SRC_COLORS[src] || '#64748b';
+                return `<div class="fp-srcmix-row">
+                    <div class="fp-srcmix-label">${escHtml(src)}</div>
+                    <div class="fp-srcmix-track"><div class="fp-srcmix-fill" style="width:${pct}%; background:${color};"></div></div>
+                    <div class="fp-srcmix-count">${count}</div>
+                </div>`;
+            }).join('');
+            if (!(tally['Post Reply'] > 0)) {
+                html += `<div class="fp-funnel-note"><i class="fas fa-circle-info"></i> No Post Reply messages yet — LinkedIn post scraping hasn't produced a usable post for anyone this run.</div>`;
+            }
+            body.innerHTML = html;
         }
 
         function getMultiValues(id) {
@@ -2836,6 +2994,7 @@
                 for (const [reason, count] of Object.entries(diag.tally)) {
                     fpRunHypTally[reason] = (fpRunHypTally[reason] || 0) + count;
                 }
+                fpRenderFunnel(); // refresh the live funnel immediately — don't wait for the next message/stat event
             }
             const nonEligible = Object.entries(diag.tally).filter(([reason]) => reason !== 'eligible');
             if (nonEligible.length === 0) return;
@@ -3697,12 +3856,12 @@
             fpRunning = true;
             window.fpStopRequested = false;
             Object.keys(fpStats).forEach(k => fpStats[k] = 0);
-            fpRenderStats();
             fpRunHypTally = { already_messaged: 0, excluded: 0, already_connected: 0, low_connections: 0, not_in_contact_pool: 0, eligible: 0 };
             fpRunPostTypeTally = { regular: 0, quote: 0, repost: 0 };
             fpRunMessageSourceTally = {};
             fpStoryUsageByUrl = new Map();
             window.fpRunNoMsgTally = {};
+            fpRenderStats(); // after the tallies above so the live funnel/source-mix reset to their empty state too
             document.getElementById('fpProgressSection').style.display = 'block';
             document.getElementById('fpProgressLog').innerHTML = '';
             document.getElementById('fpReportLink').innerHTML = '';
