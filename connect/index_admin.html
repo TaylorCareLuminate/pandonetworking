@@ -7195,7 +7195,293 @@
             // Kick off AI reply drafting for any alert without a fresh draft
             // (fire-and-forget so the banner renders immediately).
             _liEnsureAiDrafts().catch(err => console.warn('[LiAlerts][AI] Draft pass failed:', err.message));
+            // Lazy DNC check — runs in background while the banner is on screen
+            liCheckDNCInBackground().catch(e => console.warn('DNC check failed:', e));
         }
+
+        // ══════════════════════════════════════════════════════════════
+        //  DNC (DO NOT CONTACT) CHECK — LinkedIn Message Follow Up banner
+        //  Same fuzzy pre-filter + AI (Llama) confirmation flow as the
+        //  "Re-scan DNC List" feature in fast_connect_review.html. Runs
+        //  automatically each time the alert list refreshes (initial load,
+        //  5-min auto-poll, manual scan); each alert is only ever fuzzy/AI-
+        //  checked once per page session (tracked in _liDncCheckedIds) so a
+        //  routine poll doesn't keep re-running Llama on alerts it already
+        //  cleared or already flagged.
+        // ══════════════════════════════════════════════════════════════
+        const _liDncCheckedIds = new Set();
+
+        function _liDncNormalize(name) {
+            if (!name) return '';
+            return name.toLowerCase()
+                .replace(/\bcorporation\b/g, 'corp')
+                .replace(/\bincorporated\b/g, 'inc')
+                .replace(/\blimited liability company\b/g, 'llc')
+                .replace(/\bl\.l\.c\./g, 'llc')
+                .replace(/\binc\.\b/g, 'inc')
+                .replace(/\bcorp\.\b/g, 'corp')
+                .replace(/\bltd\.\b/g, 'ltd')
+                .replace(/\blimited\b/g, 'ltd')
+                .replace(/\band\b/g, '&')
+                .replace(/^\s*the\s+/i, '')
+                .replace(/[^\w\s&]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        function _liIsDNCMatch(companyName, dncList) {
+            if (!companyName || !dncList || dncList.length === 0) return null;
+            const normalized = _liDncNormalize(companyName);
+            if (!normalized) return null;
+            const stop = new Set(['the','and','for','llc','inc','corp','ltd','co','group','health','care','healthcare','systems','services','solutions']);
+            for (const entry of dncList) {
+                const allNames = [entry.original_name, ...(entry.variations || [])].filter(Boolean);
+                for (const name of allNames) {
+                    const n = _liDncNormalize(name);
+                    if (!n) continue;
+                    if (normalized === n) return entry;
+                    if (normalized.length >= 5 && n.length >= 5) {
+                        if (normalized.includes(n) || n.includes(normalized)) return entry;
+                    }
+                    const w1 = normalized.split(' ').filter(w => w.length > 2 && !stop.has(w));
+                    const w2 = n.split(' ').filter(w => w.length > 2 && !stop.has(w));
+                    if (w1.length > 0 && w2.length > 0) {
+                        const shorter = w1.length <= w2.length ? w1 : w2;
+                        const longer  = w1.length <= w2.length ? w2 : w1;
+                        const overlap = shorter.filter(w => longer.includes(w)).length;
+                        if (overlap >= Math.ceil(shorter.length * 0.7)) return entry;
+                    }
+                }
+            }
+            return null;
+        }
+
+        /** Filter a full DNC list to only entries relevant for a given BDR/customer.
+         *  Global entries always apply; bdr/customer-scoped entries apply only to a
+         *  matching BDR email or customer ID. Legacy entries without a scope are global. */
+        function _liFilterDNCForContext(allDncList, bdrEmail, customerId) {
+            if (!allDncList || allDncList.length === 0) return [];
+            const emailLower = (bdrEmail || '').toLowerCase();
+            return allDncList.filter(entry => {
+                const scope = entry.scope || 'global';
+                if (scope === 'global')   return true;
+                if (scope === 'bdr')      return emailLower && (entry.scopeValue || '').toLowerCase() === emailLower;
+                if (scope === 'customer') return customerId && entry.scopeValue === customerId;
+                return true;
+            });
+        }
+
+        /** Lazy DNC check runs after the alert banner renders — does not block it.
+         *  Step 1: fuzzy pre-filter (fast, local) over alerts not yet checked this
+         *  session. Step 2: AI confirmation via Llama (Railway API) — runs in
+         *  background. If Llama fails the fuzzy candidates are shown with a notice. */
+        async function liCheckDNCInBackground() {
+            try {
+                const unseen = (_liAlerts || []).filter(a => !_liDncCheckedIds.has(a.id));
+                if (!unseen.length) return;
+
+                const { collection, getDocs } = window.clemailFirestore;
+                const emailDB = window.clemailDb;
+                const snap = await getDocs(collection(emailDB, 'dnc_organizations'));
+                const allDncList = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+                // Mark evaluated regardless of outcome — a later poll shouldn't
+                // re-run Llama against alerts already cleared (or already flagged
+                // and sitting in an open/dismissed popup).
+                unseen.forEach(a => _liDncCheckedIds.add(a.id));
+                if (!allDncList.length) return;
+
+                const candidates = [];
+                for (const a of unseen) {
+                    const company = a.leadCompany || '';
+                    if (!company) continue;
+                    const relevantDNC = _liFilterDNCForContext(allDncList, a.bdrEmail, a.customerId);
+                    if (!relevantDNC.length) continue;
+                    const entry = _liIsDNCMatch(company, relevantDNC);
+                    if (entry) {
+                        const leadName = a.leadName || [a.leadFirstName, a.leadLastName].filter(Boolean).join(' ') || 'Unknown contact';
+                        candidates.push({ msgId: a.id, company, dncOrg: entry.original_name, contactName: leadName });
+                    }
+                }
+                if (!candidates.length) return;
+
+                console.log(`🔍 DNC fuzzy pre-filter: ${candidates.length} candidate(s) — sending to Llama for confirmation…`, candidates);
+
+                let confirmedMatches = candidates, aiUsed = false, aiFailedFallback = false;
+                try {
+                    const token = await getRailwayToken();
+                    const resp = await fetch(`${RAILWAY_BASE}/api/dnc/check-matches`, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ candidates }),
+                        signal: AbortSignal.timeout(90_000)
+                    });
+                    if (!resp.ok) throw new Error(`API ${resp.status}`);
+                    const data = await resp.json();
+                    if (!data.success) throw new Error(data.error || 'Unknown error from DNC check API');
+                    if (data.fallback) { aiFailedFallback = true; } else { aiUsed = data.used_ai; }
+                    confirmedMatches = Array.isArray(data.confirmed) ? data.confirmed : candidates;
+                    console.warn(`🚫 DNC check: ${confirmedMatches.length} confirmed match(es) (AI used: ${aiUsed})`, confirmedMatches);
+                } catch (aiErr) {
+                    console.error('❌ DNC AI check failed — falling back to fuzzy matches:', aiErr.message);
+                    aiFailedFallback = true;
+                    confirmedMatches = candidates;
+                }
+
+                if (!confirmedMatches.length) return;
+                liShowDNCWarning(confirmedMatches, { aiUsed, aiFailedFallback });
+            } catch (e) {
+                console.warn('DNC background check failed:', e.message);
+            }
+        }
+
+        function liDncRowHtml(m, idx) {
+            return `
+                <div class="li-dnc-match-row" id="liDncRow_${idx}">
+                    <button class="li-dnc-del-btn" id="liDncDelBtn_${idx}"
+                        onclick="liDncDismissMatch('${m.msgId}', ${idx})"
+                        title="Dismiss this reply alert">
+                        <i class="fas fa-check"></i>
+                    </button>
+                    <div style="min-width:0;flex:1;">
+                        <span style="font-weight:600;font-size:0.85rem;">${_liEscHtml(m.contactName)}</span>
+                        <span style="color:#6b7280;font-size:0.8rem;"> @ ${_liEscHtml(m.company)}</span><br>
+                        <span style="font-size:0.75rem;color:#9f1239;">Matches DNC: <em>${_liEscHtml(m.dncOrg)}</em></span>
+                    </div>
+                </div>`;
+        }
+
+        /** Show a DNC warning popup listing LinkedIn reply alerts whose company
+         *  matches the Do Not Contact list, with a per-match "Dismiss" action
+         *  (same effect as the card's own Dismiss button — window.liDismissOne). */
+        function liShowDNCWarning(matches, opts = {}) {
+            document.getElementById('liDncWarningPopup')?.remove();
+
+            const popup = document.createElement('div');
+            popup.id = 'liDncWarningPopup';
+            popup.style.cssText = `
+                position: fixed; bottom: 24px; right: 24px; z-index: 99999;
+                background: #fff; border: 2px solid #dc2626; border-radius: 12px;
+                box-shadow: 0 8px 32px rgba(220,38,38,0.25); max-width: 440px;
+                font-family: inherit; animation: liDncSlideIn 0.3s ease;
+            `;
+
+            if (!document.getElementById('liDncAnimStyle')) {
+                const style = document.createElement('style');
+                style.id = 'liDncAnimStyle';
+                style.textContent = `
+                    @keyframes liDncSlideIn { from { transform: translateX(110%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+                    .li-dnc-match-row { display:flex; align-items:flex-start; gap:8px; padding:7px 0; border-bottom:1px solid #fee2e2; }
+                    .li-dnc-match-row:last-child { border-bottom: none; }
+                    .li-dnc-del-btn { flex-shrink:0; background:#fee2e2; color:#991b1b; border:1px solid #fca5a5; border-radius:5px;
+                                   padding:3px 8px; font-size:0.75rem; cursor:pointer; white-space:nowrap; margin-top:1px; }
+                    .li-dnc-del-btn:hover { background:#fecaca; }
+                    .li-dnc-del-btn:disabled { opacity:0.5; cursor:default; }
+                `;
+                document.head.appendChild(style);
+            }
+
+            popup._dncMatches = matches.map(m => ({ ...m }));
+
+            const aiBadge = opts.aiUsed
+                ? `<span style="font-size:0.7rem;background:#dcfce7;color:#166534;border:1px solid #86efac;border-radius:4px;padding:1px 6px;margin-left:6px;">AI confirmed</span>`
+                : opts.aiFailedFallback
+                    ? `<span style="font-size:0.7rem;background:#fef9c3;color:#854d0e;border:1px solid #fde047;border-radius:4px;padding:1px 6px;margin-left:6px;" title="Llama was unavailable — results are fuzzy-match only">Fuzzy match</span>`
+                    : '';
+
+            popup.innerHTML = `
+                <div style="background:#fef2f2;padding:12px 16px;border-radius:10px 10px 0 0;border-bottom:1px solid #fecaca;display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                    <span style="font-weight:700;color:#991b1b;font-size:0.95rem;">
+                        <i class="fas fa-ban"></i> DNC Warning${aiBadge}
+                    </span>
+                    <button onclick="document.getElementById('liDncWarningPopup').remove()"
+                        style="background:none;border:none;cursor:pointer;color:#991b1b;font-size:1.1rem;padding:0;line-height:1;" title="Dismiss">&times;</button>
+                </div>
+                <div style="padding:12px 16px;">
+                    <p style="margin:0 0 10px;font-size:0.84rem;color:#374151;">
+                        The following reply alerts are from contacts whose organization is on the <strong>Do Not Contact</strong> list.
+                        ${opts.aiFailedFallback ? '<br><span style="color:#92400e;font-size:0.78rem;"><i class="fas fa-exclamation-triangle"></i> AI review unavailable — showing fuzzy matches. Verify before dismissing.</span>' : ''}
+                    </p>
+                    <div id="liDncMatchRows" style="max-height:400px;overflow-y:auto;">${popup._dncMatches.map((m, idx) => liDncRowHtml(m, idx)).join('')}</div>
+                    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+                        <button id="liDncDismissAllBtn" onclick="liDncDismissAll()"
+                            style="background:#dc2626;color:#fff;border:1px solid #dc2626;border-radius:6px;padding:7px 14px;font-size:0.83rem;cursor:pointer;font-weight:600;">
+                            <i class="fas fa-check-double"></i> Dismiss All (${popup._dncMatches.length})
+                        </button>
+                        <button onclick="document.getElementById('liDncWarningPopup').remove()"
+                            style="background:#f3f4f6;color:#374151;border:1px solid #d1d5db;border-radius:6px;padding:7px 14px;font-size:0.83rem;cursor:pointer;">
+                            Dismiss Popup
+                        </button>
+                    </div>
+                </div>`;
+
+            document.body.appendChild(popup);
+        }
+
+        function liDncUpdateDismissAllBtn(popup) {
+            const btn = document.getElementById('liDncDismissAllBtn');
+            if (btn) btn.innerHTML = `<i class="fas fa-check-double"></i> Dismiss All (${(popup._dncMatches || []).length})`;
+        }
+
+        /** Dismiss a single DNC-matched reply alert (same effect as the card's own
+         *  Dismiss button). */
+        window.liDncDismissMatch = async function(alertId, rowIdx) {
+            const popup = document.getElementById('liDncWarningPopup');
+            if (!popup) return;
+
+            const btn = document.getElementById(`liDncDelBtn_${rowIdx}`);
+            const row = document.getElementById(`liDncRow_${rowIdx}`);
+            if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>'; }
+
+            await window.liDismissOne(alertId);
+
+            const stillPresent = (_liAlerts || []).some(a => a.id === alertId);
+            if (stillPresent) {
+                if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-check"></i>'; }
+                return;
+            }
+
+            if (row) {
+                row.style.transition = 'opacity 0.25s, max-height 0.25s';
+                row.style.opacity = '0';
+                row.style.maxHeight = '0';
+                row.style.overflow = 'hidden';
+                setTimeout(() => row.remove(), 260);
+            }
+            popup._dncMatches = (popup._dncMatches || []).filter(m => m.msgId !== alertId);
+            liDncUpdateDismissAllBtn(popup);
+            setTimeout(() => {
+                if ((popup._dncMatches || []).length === 0) popup.remove();
+            }, 280);
+        };
+
+        /** Dismiss every DNC-matched reply alert currently listed in the popup. */
+        window.liDncDismissAll = async function() {
+            const popup = document.getElementById('liDncWarningPopup');
+            if (!popup) return;
+            const matches = [...(popup._dncMatches || [])];
+            if (!matches.length) return;
+
+            const allBtn = document.getElementById('liDncDismissAllBtn');
+            if (allBtn) { allBtn.disabled = true; allBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Dismissing…'; }
+            popup.querySelectorAll('.li-dnc-del-btn').forEach(b => b.disabled = true);
+
+            for (const m of matches) {
+                await window.liDismissOne(m.msgId);
+            }
+
+            const stillPresentIds = new Set((_liAlerts || []).map(a => a.id));
+            const failed = matches.filter(m => stillPresentIds.has(m.msgId));
+            popup._dncMatches = (popup._dncMatches || []).filter(m => stillPresentIds.has(m.msgId));
+
+            if (popup._dncMatches.length === 0) {
+                popup.remove();
+            } else {
+                document.getElementById('liDncMatchRows').innerHTML = popup._dncMatches.map((m, idx) => liDncRowHtml(m, idx)).join('');
+                liDncUpdateDismissAllBtn(popup);
+                if (allBtn) { allBtn.disabled = false; allBtn.innerHTML = `<i class="fas fa-check-double"></i> Retry Dismiss All (${failed.length})`; }
+            }
+        };
 
         // The 5-min auto-poll (and manual scans) re-render every card from
         // scratch, which destroys and recreates the compose/notes <textarea>

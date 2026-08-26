@@ -5714,6 +5714,331 @@
         }
 
         // Load all conversations
+        // ══════════════════════════════════════════════════════════════
+        //  DNC (DO NOT CONTACT) CHECK — company_review_replies.html
+        //  Same fuzzy pre-filter + AI (Llama) confirmation flow as the
+        //  "Re-scan DNC List" feature in fast_connect_review.html, run
+        //  automatically once conversations finish loading so a BDR can see
+        //  if they're replying to someone whose organization has landed on
+        //  the DNC list.
+        // ══════════════════════════════════════════════════════════════
+
+        /** Normalize company name for fuzzy comparison */
+        function dncNormalize(name) {
+            if (!name) return '';
+            return name.toLowerCase()
+                .replace(/\bcorporation\b/g, 'corp')
+                .replace(/\bincorporated\b/g, 'inc')
+                .replace(/\blimited liability company\b/g, 'llc')
+                .replace(/\bl\.l\.c\./g, 'llc')
+                .replace(/\binc\.\b/g, 'inc')
+                .replace(/\bcorp\.\b/g, 'corp')
+                .replace(/\bltd\.\b/g, 'ltd')
+                .replace(/\blimited\b/g, 'ltd')
+                .replace(/\band\b/g, '&')
+                .replace(/^\s*the\s+/i, '')
+                .replace(/[^\w\s&]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        /** Returns matching DNC entry or null */
+        function isDNCMatch(companyName, dncList) {
+            if (!companyName || !dncList || dncList.length === 0) return null;
+            const normalized = dncNormalize(companyName);
+            if (!normalized) return null;
+            const stop = new Set(['the','and','for','llc','inc','corp','ltd','co','group','health','care','healthcare','systems','services','solutions']);
+            for (const entry of dncList) {
+                const allNames = [entry.original_name, ...(entry.variations || [])].filter(Boolean);
+                for (const name of allNames) {
+                    const n = dncNormalize(name);
+                    if (!n) continue;
+                    if (normalized === n) return entry;
+                    if (normalized.length >= 5 && n.length >= 5) {
+                        if (normalized.includes(n) || n.includes(normalized)) return entry;
+                    }
+                    const w1 = normalized.split(' ').filter(w => w.length > 2 && !stop.has(w));
+                    const w2 = n.split(' ').filter(w => w.length > 2 && !stop.has(w));
+                    if (w1.length > 0 && w2.length > 0) {
+                        const shorter = w1.length <= w2.length ? w1 : w2;
+                        const longer  = w1.length <= w2.length ? w2 : w1;
+                        const overlap = shorter.filter(w => longer.includes(w)).length;
+                        if (overlap >= Math.ceil(shorter.length * 0.7)) return entry;
+                    }
+                }
+            }
+            return null;
+        }
+
+        /** Filter a full DNC list to only entries relevant for a given BDR/customer.
+         *  Global entries always apply; bdr/customer-scoped entries apply only to a
+         *  matching BDR email or customer ID. Legacy entries without a scope are global. */
+        function filterDNCForContext(allDncList, bdrEmail, customerId) {
+            if (!allDncList || allDncList.length === 0) return [];
+            const emailLower = (bdrEmail || '').toLowerCase();
+            return allDncList.filter(entry => {
+                const scope = entry.scope || 'global';
+                if (scope === 'global')   return true;
+                if (scope === 'bdr')      return emailLower && (entry.scopeValue || '').toLowerCase() === emailLower;
+                if (scope === 'customer') return customerId && entry.scopeValue === customerId;
+                return true;
+            });
+        }
+
+        /** Lazy DNC check runs after conversations load — does not block rendering.
+         *  Step 1: fuzzy pre-filter (fast, local), skipping conversations already
+         *  hidden/ignored. Step 2: AI confirmation via Llama (Railway API) — runs
+         *  in background. If Llama fails the fuzzy candidates are shown with a notice. */
+        async function checkDNCInBackground() {
+            try {
+                const { collection, getDocs } = window.clemailFirestore;
+                const snap = await getDocs(collection(emailDB, 'dnc_organizations'));
+                const allDncList = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                if (!allDncList.length) return;
+
+                const candidates = [];
+                for (const conv of allConversations) {
+                    if (conv.isCurrentlyIgnored || conv.ignored) continue;
+                    const company = conv.companyName || conv.leadCompany || conv.company || '';
+                    if (!company) continue;
+                    const relevantDNC = filterDNCForContext(allDncList, conv.bdrEmail, getConvCustomerId(conv));
+                    if (!relevantDNC.length) continue;
+                    const entry = isDNCMatch(company, relevantDNC);
+                    if (entry) {
+                        const leadName = conv.lead_name || conv.leadName ||
+                            `${conv.leadFirstName || ''} ${conv.leadLastName || ''}`.trim();
+                        candidates.push({
+                            msgId:       conv.id,
+                            company,
+                            dncOrg:      entry.original_name,
+                            contactName: leadName || 'Unknown contact'
+                        });
+                    }
+                }
+                if (candidates.length === 0) return;
+
+                console.log(`🔍 DNC fuzzy pre-filter: ${candidates.length} candidate(s) — sending to Llama for confirmation…`, candidates);
+
+                let confirmedMatches = candidates, aiUsed = false, aiFailedFallback = false;
+                try {
+                    const token = await auth.currentUser.getIdToken();
+                    const resp = await fetch(`${RAILWAY_URL}/api/dnc/check-matches`, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ candidates }),
+                        signal: AbortSignal.timeout(90_000)
+                    });
+                    if (!resp.ok) {
+                        const errText = await resp.text();
+                        throw new Error(`API ${resp.status}: ${errText.substring(0, 200)}`);
+                    }
+                    const data = await resp.json();
+                    if (!data.success) throw new Error(data.error || 'Unknown error from DNC check API');
+                    if (data.fallback) { aiFailedFallback = true; } else { aiUsed = data.used_ai; }
+                    confirmedMatches = Array.isArray(data.confirmed) ? data.confirmed : candidates;
+                    console.warn(`🚫 DNC check: ${confirmedMatches.length} confirmed match(es) (AI used: ${aiUsed})`, confirmedMatches);
+                } catch (aiErr) {
+                    console.error('❌ DNC AI check failed — falling back to fuzzy matches:', aiErr.message);
+                    aiFailedFallback = true;
+                    confirmedMatches = candidates;
+                }
+
+                if (confirmedMatches.length === 0) return;
+                showDNCWarning(confirmedMatches, { aiUsed, aiFailedFallback });
+            } catch (e) {
+                console.warn('DNC background check failed:', e.message);
+            }
+        }
+
+        /** Show DNC warning popup listing conversations whose company matches the
+         *  Do Not Contact list, with a per-match "Hide" action (same effect as the
+         *  existing eye-slash / ignoreConversation card action — sets a BDR-specific
+         *  override so the conversation stops showing up here). */
+        function showDNCWarning(matches, opts = {}) {
+            document.getElementById('dncWarningPopup')?.remove();
+
+            const popup = document.createElement('div');
+            popup.id = 'dncWarningPopup';
+            popup.style.cssText = `
+                position: fixed; bottom: 24px; right: 24px; z-index: 99999;
+                background: #fff; border: 2px solid #dc2626; border-radius: 12px;
+                box-shadow: 0 8px 32px rgba(220,38,38,0.25); max-width: 440px;
+                font-family: inherit; animation: dncSlideIn 0.3s ease;
+            `;
+
+            if (!document.getElementById('dncAnimStyle')) {
+                const style = document.createElement('style');
+                style.id = 'dncAnimStyle';
+                style.textContent = `
+                    @keyframes dncSlideIn { from { transform: translateX(110%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+                    .dnc-match-row { display:flex; align-items:flex-start; gap:8px; padding:7px 0; border-bottom:1px solid #fee2e2; }
+                    .dnc-match-row:last-child { border-bottom: none; }
+                    .dnc-del-btn { flex-shrink:0; background:#fee2e2; color:#991b1b; border:1px solid #fca5a5; border-radius:5px;
+                                   padding:3px 8px; font-size:0.75rem; cursor:pointer; white-space:nowrap; margin-top:1px; }
+                    .dnc-del-btn:hover { background:#fecaca; }
+                    .dnc-del-btn:disabled { opacity:0.5; cursor:default; }
+                `;
+                document.head.appendChild(style);
+            }
+
+            popup._dncMatches = matches.map(m => ({ ...m }));
+
+            const aiBadge = opts.aiUsed
+                ? `<span style="font-size:0.7rem;background:#dcfce7;color:#166534;border:1px solid #86efac;border-radius:4px;padding:1px 6px;margin-left:6px;">AI confirmed</span>`
+                : opts.aiFailedFallback
+                    ? `<span style="font-size:0.7rem;background:#fef9c3;color:#854d0e;border:1px solid #fde047;border-radius:4px;padding:1px 6px;margin-left:6px;" title="Llama was unavailable — results are fuzzy-match only">Fuzzy match</span>`
+                    : '';
+
+            const buildRows = () => popup._dncMatches.map((m, idx) => `
+                <div class="dnc-match-row" id="dncRow_${idx}">
+                    <button class="dnc-del-btn" id="dncDelBtn_${idx}"
+                        onclick="dncHideConversation('${m.msgId}', ${idx})"
+                        title="Hide this conversation">
+                        <i class="fas fa-eye-slash"></i>
+                    </button>
+                    <div style="min-width:0;flex:1;">
+                        <span style="font-weight:600;font-size:0.85rem;">${escapeHtml(m.contactName)}</span>
+                        <span style="color:#6b7280;font-size:0.8rem;"> @ ${escapeHtml(m.company)}</span><br>
+                        <span style="font-size:0.75rem;color:#9f1239;">Matches DNC: <em>${escapeHtml(m.dncOrg)}</em></span>
+                    </div>
+                </div>`).join('');
+
+            popup.innerHTML = `
+                <div style="background:#fef2f2;padding:12px 16px;border-radius:10px 10px 0 0;border-bottom:1px solid #fecaca;display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                    <span style="font-weight:700;color:#991b1b;font-size:0.95rem;">
+                        <i class="fas fa-ban"></i> DNC Warning${aiBadge}
+                    </span>
+                    <button onclick="document.getElementById('dncWarningPopup').remove()"
+                        style="background:none;border:none;cursor:pointer;color:#991b1b;font-size:1.1rem;padding:0;line-height:1;" title="Dismiss">&times;</button>
+                </div>
+                <div style="padding:12px 16px;">
+                    <p style="margin:0 0 10px;font-size:0.84rem;color:#374151;">
+                        The following conversations belong to organizations on the <strong>Do Not Contact</strong> list.
+                        ${opts.aiFailedFallback ? '<br><span style="color:#92400e;font-size:0.78rem;"><i class="fas fa-exclamation-triangle"></i> AI review unavailable — showing fuzzy matches. Verify before hiding.</span>' : ''}
+                    </p>
+                    <div id="dncMatchRows" style="max-height:400px;overflow-y:auto;">${buildRows()}</div>
+                    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+                        <button id="dncHideAllBtn" onclick="dncHideAllMatches()"
+                            style="background:#dc2626;color:#fff;border:1px solid #dc2626;border-radius:6px;padding:7px 14px;font-size:0.83rem;cursor:pointer;font-weight:600;">
+                            <i class="fas fa-eye-slash"></i> Hide All (${popup._dncMatches.length})
+                        </button>
+                        <button onclick="document.getElementById('dncWarningPopup').remove()"
+                            style="background:#f3f4f6;color:#374151;border:1px solid #d1d5db;border-radius:6px;padding:7px 14px;font-size:0.83rem;cursor:pointer;">
+                            Dismiss
+                        </button>
+                    </div>
+                </div>`;
+
+            document.body.appendChild(popup);
+        }
+
+        function dncUpdateHideAllBtn(popup) {
+            const btn = document.getElementById('dncHideAllBtn');
+            if (btn) btn.innerHTML = `<i class="fas fa-eye-slash"></i> Hide All (${(popup._dncMatches || []).length})`;
+        }
+
+        /** Sets a BDR-specific "ignored" override for one conversation — same
+         *  Firestore write ignoreConversation() uses, without its confirm() dialog
+         *  (the DNC popup's own button click is the confirmation). */
+        async function dncIgnoreConversationInternal(conversationId) {
+            const conversation = allConversations.find(c => c.id === conversationId);
+            if (!conversation) return { success: false, error: 'Conversation not found' };
+            if (conversation.ignored || conversation.isCurrentlyIgnored) return { success: true };
+            try {
+                const { doc, setDoc } = window.clemailFirestore;
+                const overrideDocId = `${conversationId}_${accountEmail.replace(/[@.]/g, '_')}`;
+                const overrideRef = doc(emailDB, 'conversation_category_overrides', overrideDocId);
+                await setDoc(overrideRef, {
+                    conversationId: conversationId,
+                    bdrEmail: accountEmail,
+                    ignored: true,
+                    ignoredAt: new Date().toISOString(),
+                    lastMessageCountWhenIgnored: conversation.messages?.length || 0,
+                    responseCategory: conversation.responseCategory,
+                    followUpCategory: conversation.followUpCategory,
+                    manualCategoryOverride: conversation.manualCategoryOverride || false,
+                    updatedAt: new Date(),
+                    updatedBy: currentUserEmail
+                }, { merge: true });
+                conversation.ignored = true;
+                conversation.isCurrentlyIgnored = true;
+                return { success: true };
+            } catch (error) {
+                console.error('Failed to hide conversation:', error);
+                return { success: false, error: error.message };
+            }
+        }
+
+        /** Hide a single DNC-matched conversation from the popup. */
+        window.dncHideConversation = async function(conversationId, rowIdx) {
+            const popup = document.getElementById('dncWarningPopup');
+            if (!popup) return;
+
+            const btn = document.getElementById(`dncDelBtn_${rowIdx}`);
+            const row = document.getElementById(`dncRow_${rowIdx}`);
+            if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>'; }
+
+            const result = await dncIgnoreConversationInternal(conversationId);
+            if (!result.success) {
+                console.error(`Failed to hide conversation ${conversationId}:`, result.error);
+                if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-eye-slash"></i>'; }
+                return;
+            }
+
+            if (row) {
+                row.style.transition = 'opacity 0.25s, max-height 0.25s';
+                row.style.opacity = '0';
+                row.style.maxHeight = '0';
+                row.style.overflow = 'hidden';
+                setTimeout(() => row.remove(), 260);
+            }
+
+            popup._dncMatches = (popup._dncMatches || []).filter(m => m.msgId !== conversationId);
+            dncUpdateHideAllBtn(popup);
+            updateCategoryGrid();
+            applyAllFilters();
+
+            setTimeout(() => {
+                if ((popup._dncMatches || []).length === 0) popup.remove();
+            }, 280);
+        };
+
+        /** Hide every DNC-matched conversation currently listed in the popup. */
+        window.dncHideAllMatches = async function() {
+            const popup = document.getElementById('dncWarningPopup');
+            if (!popup) return;
+            const matches = [...(popup._dncMatches || [])];
+            if (matches.length === 0) return;
+
+            const allBtn = document.getElementById('dncHideAllBtn');
+            if (allBtn) { allBtn.disabled = true; allBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Hiding…'; }
+            popup.querySelectorAll('.dnc-del-btn').forEach(b => b.disabled = true);
+
+            const results = await Promise.allSettled(matches.map(m => dncIgnoreConversationInternal(m.msgId)));
+
+            const failed = [];
+            results.forEach((r, i) => {
+                if (r.status === 'fulfilled' && r.value.success) {
+                    popup._dncMatches = (popup._dncMatches || []).filter(m => m.msgId !== matches[i].msgId);
+                    document.getElementById(`dncRow_${i}`)?.remove();
+                } else {
+                    failed.push(matches[i]);
+                    console.error(`Failed to hide conversation ${matches[i].msgId}:`, r.reason || (r.value && r.value.error));
+                }
+            });
+
+            updateCategoryGrid();
+            applyAllFilters();
+
+            if (failed.length === 0) {
+                popup.remove();
+            } else {
+                dncUpdateHideAllBtn(popup);
+                if (allBtn) { allBtn.disabled = false; allBtn.innerHTML = `<i class="fas fa-eye-slash"></i> Retry Hide All (${failed.length})`; }
+                popup.querySelectorAll('.dnc-del-btn').forEach(b => b.disabled = false);
+            }
+        };
+
         async function loadConversations() {
             const container = document.getElementById('repliesContainer');
             
@@ -5884,6 +6209,9 @@
                 
                 // Show conversations with time filter applied
                 applyAllFilters();
+
+                // Lazy DNC check — runs in background while conversations are on screen
+                checkDNCInBackground().catch(e => console.warn('DNC check failed:', e));
                 
             } catch (error) {
                 console.error('❌ Error loading conversations:', error);
