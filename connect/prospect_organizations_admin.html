@@ -1092,6 +1092,36 @@
         </div>
     </div>
 
+    <!-- Hypothesis Group Duplicate Organizations Modal -->
+    <div id="hypoDupeModal" class="modal">
+        <div class="modal-content" style="max-width:920px;">
+            <div class="modal-header">
+                <i class="fas fa-clone"></i> Duplicate Organizations in <span id="hypoDupeGroupName"></span>
+            </div>
+            <div class="modal-body">
+                <div style="display:flex; gap:1rem; align-items:center; flex-wrap:wrap; margin-bottom:0.9rem;">
+                    <label style="display:flex; align-items:center; gap:6px; font-size:0.86rem; color:var(--secondary);">
+                        <input type="checkbox" id="hypoDupeLooseMatch" checked onchange="hypoFindDuplicates()">
+                        Ignore Inc / LLC / punctuation when comparing names
+                    </label>
+                    <span style="font-size:0.82rem; color:var(--gray);">Matches also connect records that share a domain or LinkedIn URL.</span>
+                </div>
+                <div style="padding:8px 12px; background:#fffbeb; border:1px solid #fde68a; border-radius:6px; font-size:0.82rem; color:#92400e; margin-bottom:0.9rem;">
+                    The record you keep inherits missing details, scan labels, group links and any contacts from the duplicates it absorbs. The duplicates are then removed from this group (and deleted if they only ever existed in this group's pool).
+                </div>
+                <div id="hypoDupeBody"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="hypoMergeDuplicates()" id="btnHypoMergeDupes" style="background: var(--danger); color: white;">
+                    <i class="fas fa-compress-arrows-alt"></i> Merge &amp; Remove Duplicates (<span id="hypoDupeRemoveCount">0</span>)
+                </button>
+                <button class="btn" onclick="closeHypoDupeModal()" style="background: var(--gray); color: white;">
+                    <i class="fas fa-times"></i> Close
+                </button>
+            </div>
+        </div>
+    </div>
+
     <!-- Load Snapshot to BDR Modal -->
     <div class="modal" id="loadSnapshotModal">
         <div class="modal-content" style="max-width: 520px;">
@@ -3545,15 +3575,21 @@
 
                 <!-- ── Scan names for this group ───────────────────── -->
                 <div style="margin-bottom:1.25rem;">
-                    <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.5rem;">
+                    <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.5rem;">
                         <h3 style="font-size:0.98rem; font-weight:700; color:var(--secondary); margin:0;">
                             <i class="fas fa-tags"></i> Scan Names Used in This Group
                         </h3>
                         <span style="font-size:0.8rem; color:var(--gray);">Each named scan (e.g. "Executives Only", "Managers") run from Full Pipeline is tracked here so you can see what's already been done.</span>
+                        <button class="btn" onclick="hypoFindDuplicates()" id="btnHypoFindDupes"
+                                title="Look for the same organization added to this group more than once"
+                                style="margin-left:auto; white-space:nowrap; padding:6px 12px; font-size:0.82rem; background:var(--warning); color:white;">
+                            <i class="fas fa-clone"></i> Find Duplicate Organizations
+                        </button>
                     </div>
                     <div id="hypoScanNamesBody" style="display:flex; gap:0.6rem; flex-wrap:wrap;">
                         <span style="color:var(--gray); font-size:0.85rem;">No named scans recorded for this group yet — run one from Full Pipeline.</span>
                     </div>
+                    <div id="hypoDupeStatus" style="margin-top:0.5rem; font-size:0.84rem; color:var(--gray);"></div>
                 </div>
 
                 <!-- ── Group organizations table ────────────────────── -->
@@ -14542,6 +14578,7 @@
                 hypoUpdateStats();
                 hypoRenderOrgsTable();
                 hypoRenderScanNamesSummary();
+                hypoUpdateDupeHint();
             } catch (error) {
                 console.error('Error loading group organizations:', error);
                 tbody.innerHTML = `<tr><td colspan="11" style="padding:1.5rem; text-align:center; color:var(--danger);">Error: ${escAdminHtml(error.message)}</td></tr>`;
@@ -14582,6 +14619,404 @@
                 </span>`;
             }).join('');
         }
+
+        // ── Duplicate organizations ───────────────────────────────────────
+        // Re-running the same add (AI finder, CSV, paste) against a group can
+        // create a second org doc for a company that's already in it. These
+        // helpers find those sets, let you pick which record to keep, and fold
+        // the others into it.
+        let _hypoDupeSets = [];  // [{ orgs:[...], keeperId, include }]
+
+        const HYPO_LEGAL_SUFFIX_RE = /\s(inc|incorporated|llc|l l c|llp|lp|ltd|limited|corp|corporation|co|company|plc|pllc|pc|gmbh|ag|sa|nv|bv|srl|pty)$/;
+        const HYPO_DUPE_RENDER_CAP = 100;
+
+        function hypoNormName(name, loose) {
+            let s = (name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            if (!s || !loose) return s;
+            s = s.replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+            s = s.replace(/^the\s+/, '');
+            let prev;
+            do { prev = s; s = s.replace(HYPO_LEGAL_SUFFIX_RE, '').trim(); } while (s !== prev && s);
+            return s;
+        }
+
+        function hypoNormDomain(domain) {
+            if (!domain) return '';
+            return String(domain).toLowerCase().trim()
+                .replace(/^https?:\/\//, '').replace(/^www\./, '')
+                .split(/[\/?#]/)[0].trim();
+        }
+
+        function hypoNormLinkedIn(url) {
+            if (!url) return '';
+            const m = String(url).toLowerCase().match(/linkedin\.com\/(?:company|school)\/([^\/?#]+)/);
+            return m ? m[1] : '';
+        }
+
+        // Keys any two records must share to be considered the same company
+        function hypoDupeKeys(org, loose) {
+            const keys = [];
+            const name = hypoNormName(org.company_name, loose);
+            if (name) keys.push('n:' + name);
+            const domain = hypoNormDomain(org.company_domain);
+            if (domain) keys.push('d:' + domain);
+            const li = hypoNormLinkedIn(org.company_linkedin_url);
+            if (li) keys.push('l:' + li);
+            return keys;
+        }
+
+        function hypoBuildGroupKeyIndex(orgs = hypoOrgsData, loose = true) {
+            const map = new Map();
+            (orgs || []).forEach(o => {
+                hypoDupeKeys(o, loose).forEach(k => { if (!map.has(k)) map.set(k, o); });
+            });
+            return map;
+        }
+
+        function hypoMatchesExisting(org, keyIndex, loose = true) {
+            if (!keyIndex) return false;
+            return hypoDupeKeys(org, loose).some(k => keyIndex.has(k));
+        }
+
+        function hypoIndexAdd(keyIndex, org, loose = true) {
+            if (!keyIndex || !org) return;
+            hypoDupeKeys(org, loose).forEach(k => { if (!keyIndex.has(k)) keyIndex.set(k, org); });
+        }
+
+        // Records worth keeping: scanned history first, then richer data, then
+        // real owners over group-pool copies, then the oldest record.
+        function hypoDupeScore(org) {
+            let score = 0;
+            if (org.scanned) score += 1000;
+            score += (Number(org.scan_count) || 0) * 100;
+            score += (Array.isArray(org.scan_labels) ? org.scan_labels.length : 0) * 50;
+            if (!(org.bdrEmail || '').startsWith(HYPO_SENTINEL_PREFIX)) score += 30;
+            if (org.company_linkedin_url) score += 20;
+            if (org.company_domain) score += 5;
+            if (org.extra_data && Object.keys(org.extra_data).length) score += 5;
+            return score;
+        }
+
+        function hypoDupeBetterKeeper(a, b) {
+            const diff = hypoDupeScore(b) - hypoDupeScore(a);
+            if (diff !== 0) return diff > 0 ? b : a;
+            const ta = new Date(a.created_at || 0).getTime() || Infinity;
+            const tb = new Date(b.created_at || 0).getTime() || Infinity;
+            return tb < ta ? b : a;
+        }
+
+        // Union-find over the group's orgs so records linked through any shared
+        // key (name, domain, LinkedIn URL) end up in the same set.
+        function hypoBuildDupeSets(loose) {
+            const parent = hypoOrgsData.map((_, i) => i);
+            const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+            const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[rb] = ra; };
+
+            const keyOwner = new Map();
+            hypoOrgsData.forEach((org, i) => {
+                hypoDupeKeys(org, loose).forEach(key => {
+                    if (keyOwner.has(key)) union(keyOwner.get(key), i);
+                    else keyOwner.set(key, i);
+                });
+            });
+
+            const buckets = new Map();
+            hypoOrgsData.forEach((org, i) => {
+                const root = find(i);
+                if (!buckets.has(root)) buckets.set(root, []);
+                buckets.get(root).push(org);
+            });
+
+            return [...buckets.values()]
+                .filter(orgs => orgs.length > 1)
+                .map(orgs => {
+                    const sorted = [...orgs].sort((a, b) => hypoDupeScore(b) - hypoDupeScore(a) ||
+                        ((new Date(a.created_at || 0).getTime() || Infinity) - (new Date(b.created_at || 0).getTime() || Infinity)));
+                    return { orgs: sorted, keeperId: sorted.reduce(hypoDupeBetterKeeper).id, include: true };
+                })
+                .sort((a, b) => b.orgs.length - a.orgs.length ||
+                    (a.orgs[0].company_name || '').localeCompare(b.orgs[0].company_name || ''))
+                // Only the sets we actually show are pre-checked, so nothing is
+                // merged without being reviewed on a group with thousands of orgs.
+                .map((set, i) => ({ ...set, include: i < HYPO_DUPE_RENDER_CAP }));
+        }
+
+        // Passive hint under the scan names so duplicates get noticed without
+        // having to open the modal.
+        function hypoUpdateDupeHint() {
+            const el = document.getElementById('hypoDupeStatus');
+            if (!el) return;
+            const sets = hypoBuildDupeSets(true);
+            if (sets.length === 0) {
+                el.innerHTML = '<span style="color:var(--success);"><i class="fas fa-check-circle"></i> No duplicate organizations detected in this group.</span>';
+                return;
+            }
+            const extra = sets.reduce((n, s) => n + s.orgs.length - 1, 0);
+            el.innerHTML = `<span style="color:#b45309;"><i class="fas fa-exclamation-triangle"></i>
+                ${sets.length} compan${sets.length === 1 ? 'y appears' : 'ies appear'} more than once
+                (${extra} extra record${extra === 1 ? '' : 's'}) — use <strong>Find Duplicate Organizations</strong> to review and merge.</span>`;
+        }
+
+        window.hypoFindDuplicates = function() {
+            if (!hypoCurrentGroupId) { alert('Select a hypothesis group first.'); return; }
+            const looseEl = document.getElementById('hypoDupeLooseMatch');
+            _hypoDupeSets = hypoBuildDupeSets(looseEl ? looseEl.checked : true);
+            document.getElementById('hypoDupeGroupName').textContent = `"${hypoCurrentGroupName || ''}"`;
+            hypoRenderDupeModal();
+            document.getElementById('hypoDupeModal').classList.add('active');
+        };
+
+        window.closeHypoDupeModal = function() {
+            document.getElementById('hypoDupeModal').classList.remove('active');
+        };
+
+        function hypoRenderDupeModal() {
+            const body = document.getElementById('hypoDupeBody');
+            if (_hypoDupeSets.length === 0) {
+                body.innerHTML = `<div style="padding:1.5rem; text-align:center; color:var(--gray);">
+                    <i class="fas fa-check-circle" style="color:var(--success); font-size:1.6rem;"></i>
+                    <div style="margin-top:0.5rem;">No duplicate organizations found in this group.</div>
+                </div>`;
+                hypoUpdateDupeCount();
+                return;
+            }
+
+            const shown = _hypoDupeSets.slice(0, HYPO_DUPE_RENDER_CAP);
+            const overflowNotice = _hypoDupeSets.length > shown.length
+                ? `<div style="padding:8px 12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; font-size:0.83rem; color:#1d4ed8; margin-bottom:0.9rem;">
+                       Showing the first ${shown.length} of ${_hypoDupeSets.length} duplicate sets. Merge these, then run <strong>Find Duplicate Organizations</strong> again for the rest.
+                   </div>`
+                : '';
+
+            body.innerHTML = overflowNotice + shown.map((set, idx) => {
+                const rows = set.orgs.map(org => {
+                    const isKeeper = org.id === set.keeperId;
+                    const lastScanned = org.last_scanned_at ? new Date(org.last_scanned_at).toLocaleDateString() : '—';
+                    const created = org.created_at ? new Date(org.created_at).toLocaleDateString() : '—';
+                    const labels = Array.isArray(org.scan_labels) && org.scan_labels.length
+                        ? org.scan_labels.join(', ')
+                        : (org.last_scan_label || '—');
+                    const otherGroups = (Array.isArray(org.hypothesis_group_ids) ? org.hypothesis_group_ids : []).filter(id => id !== hypoCurrentGroupId).length;
+                    return `<tr style="border-bottom:1px solid var(--border); background:${isKeeper ? '#f0fdf4' : 'transparent'};">
+                        <td style="padding:6px 8px; text-align:center;">
+                            <input type="radio" name="hypoDupeKeeper_${idx}" ${isKeeper ? 'checked' : ''}
+                                   onchange="hypoSetDupeKeeper(${idx}, '${escAdminHtml(org.id)}')">
+                        </td>
+                        <td style="padding:6px 8px;">
+                            <strong>${escAdminHtml(org.company_name || '(no name)')}</strong>
+                            ${isKeeper ? '<span style="color:var(--success); font-size:0.74rem; font-weight:700;"> KEEP</span>' : ''}
+                            <div style="color:var(--gray); font-size:0.74rem;">
+                                ${escAdminHtml([org.company_city, org.company_state].filter(Boolean).join(', ') || '—')}
+                                · ${escAdminHtml(hypoOwnerLabel(org.bdrEmail))}
+                                ${otherGroups ? ` · also in ${otherGroups} other group${otherGroups === 1 ? '' : 's'}` : ''}
+                            </div>
+                        </td>
+                        <td style="padding:6px 8px; font-size:0.78rem;">${org.company_linkedin_url ? '<i class="fab fa-linkedin" style="color:#0F2D4D;"></i>' : '<span style="color:var(--gray);">—</span>'}</td>
+                        <td style="padding:6px 8px; text-align:center; font-size:0.8rem;">${org.scanned ? (org.scan_count || 1) : '—'}<div style="color:var(--gray); font-size:0.72rem;">${escAdminHtml(lastScanned)}</div></td>
+                        <td style="padding:6px 8px; font-size:0.78rem;">${escAdminHtml(labels)}</td>
+                        <td style="padding:6px 8px; font-size:0.78rem; color:var(--gray);">${escAdminHtml(created)}</td>
+                    </tr>`;
+                }).join('');
+
+                return `<div style="border:1.5px solid var(--border); border-radius:8px; padding:0.75rem 0.9rem; margin-bottom:0.9rem;">
+                    <label style="display:flex; align-items:center; gap:8px; font-weight:700; color:var(--secondary); font-size:0.9rem; margin-bottom:0.5rem; cursor:pointer;">
+                        <input type="checkbox" ${set.include ? 'checked' : ''} onchange="hypoToggleDupeSet(${idx}, this.checked)">
+                        ${escAdminHtml(set.orgs[0].company_name || '(no name)')}
+                        <span style="font-weight:500; color:var(--gray); font-size:0.82rem;">— ${set.orgs.length} records, ${set.orgs.length - 1} would be removed</span>
+                    </label>
+                    <div style="overflow-x:auto;">
+                        <table style="width:100%; border-collapse:collapse; font-size:0.84rem;">
+                            <thead>
+                                <tr style="background:var(--light-gray); text-align:left;">
+                                    <th style="padding:5px 8px; text-align:center; font-size:0.74rem;">Keep</th>
+                                    <th style="padding:5px 8px; font-size:0.74rem;">Organization</th>
+                                    <th style="padding:5px 8px; font-size:0.74rem;">LI</th>
+                                    <th style="padding:5px 8px; text-align:center; font-size:0.74rem;">Scans</th>
+                                    <th style="padding:5px 8px; font-size:0.74rem;">Scan Names</th>
+                                    <th style="padding:5px 8px; font-size:0.74rem;">Added</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                        </table>
+                    </div>
+                </div>`;
+            }).join('');
+
+            hypoUpdateDupeCount();
+        }
+
+        function hypoUpdateDupeCount() {
+            const n = _hypoDupeSets.filter(s => s.include).reduce((sum, s) => sum + s.orgs.length - 1, 0);
+            document.getElementById('hypoDupeRemoveCount').textContent = n;
+            document.getElementById('btnHypoMergeDupes').disabled = n === 0;
+        }
+
+        window.hypoToggleDupeSet = function(idx, checked) {
+            if (_hypoDupeSets[idx]) _hypoDupeSets[idx].include = checked;
+            hypoUpdateDupeCount();
+        };
+
+        window.hypoSetDupeKeeper = function(idx, orgId) {
+            if (!_hypoDupeSets[idx]) return;
+            _hypoDupeSets[idx].keeperId = orgId;
+            hypoRenderDupeModal();
+        };
+
+        // Everything the keeper should inherit from the records being removed:
+        // any field it's missing, plus the combined scan history.
+        function hypoBuildMergeUpdate(keeper, dupes) {
+            const update = {};
+            const fillFields = ['company_domain', 'company_industry', 'company_staff_count', 'company_revenue',
+                'company_street_address', 'company_city', 'company_state', 'company_zip', 'company_description',
+                'company_linkedin_url', 'hypothesis_org_source'];
+
+            fillFields.forEach(field => {
+                if (keeper[field]) return;
+                const donor = dupes.find(d => d[field]);
+                if (donor) update[field] = donor[field];
+            });
+
+            const extra = { ...(keeper.extra_data && typeof keeper.extra_data === 'object' ? keeper.extra_data : {}) };
+            let extraChanged = false;
+            dupes.forEach(d => {
+                if (!d.extra_data || typeof d.extra_data !== 'object') return;
+                Object.entries(d.extra_data).forEach(([k, v]) => {
+                    if (extra[k] === undefined && v !== undefined && v !== null && v !== '') { extra[k] = v; extraChanged = true; }
+                });
+            });
+            if (extraChanged) update.extra_data = extra;
+
+            const labels = Array.isArray(keeper.scan_labels) ? [...keeper.scan_labels] : [];
+            const labelDates = { ...(keeper.scan_label_dates || {}) };
+            let labelsChanged = false;
+            dupes.forEach(d => {
+                const dLabels = Array.isArray(d.scan_labels) && d.scan_labels.length
+                    ? d.scan_labels
+                    : (d.last_scan_label ? [d.last_scan_label] : []);
+                dLabels.forEach(label => {
+                    if (!labels.includes(label)) { labels.push(label); labelsChanged = true; }
+                    const date = (d.scan_label_dates && d.scan_label_dates[label]) || (d.last_scan_label === label ? d.last_scanned_at : null);
+                    if (date && (!labelDates[label] || new Date(date) > new Date(labelDates[label]))) { labelDates[label] = date; labelsChanged = true; }
+                });
+            });
+            if (labelsChanged) {
+                update.scan_labels = labels;
+                if (Object.keys(labelDates).length) update.scan_label_dates = labelDates;
+            }
+
+            const scannedDupes = dupes.filter(d => d.scanned);
+            if (scannedDupes.length) {
+                update.scanned = true;
+                update.scan_count = (Number(keeper.scan_count) || 0) + scannedDupes.reduce((n, d) => n + (Number(d.scan_count) || 1), 0);
+                const latest = [keeper, ...scannedDupes]
+                    .filter(o => o.last_scanned_at)
+                    .sort((a, b) => new Date(b.last_scanned_at) - new Date(a.last_scanned_at))[0];
+                if (latest) {
+                    update.last_scanned_at = latest.last_scanned_at;
+                    if (!keeper.last_scan_label && latest.last_scan_label) update.last_scan_label = latest.last_scan_label;
+                }
+            }
+
+            if (keeper.hypothesis_priority === null || keeper.hypothesis_priority === undefined || keeper.hypothesis_priority === '') {
+                const priorities = dupes
+                    .map(d => d.hypothesis_priority)
+                    .filter(p => p !== null && p !== undefined && p !== '' && !isNaN(Number(p)))
+                    .map(Number);
+                if (priorities.length) update.hypothesis_priority = Math.min(...priorities);
+            }
+
+            if (Object.keys(update).length) {
+                update.merged_duplicate_ids = [...(Array.isArray(keeper.merged_duplicate_ids) ? keeper.merged_duplicate_ids : []), ...dupes.map(d => d.id)];
+                update.last_deduped_at = new Date().toISOString();
+                update.last_updated_at = new Date().toISOString();
+            }
+            return update;
+        }
+
+        // A duplicate that only ever existed in this group's pool is deleted by
+        // hypoUnlinkOrgDoc, so its contacts have to be re-pointed at the keeper
+        // before it goes.
+        function hypoDupeWillBeDeleted(org) {
+            return (org.bdrEmail || '').startsWith(HYPO_SENTINEL_PREFIX) &&
+                   (Array.isArray(org.hypothesis_group_ids) ? org.hypothesis_group_ids : []).filter(id => id !== hypoCurrentGroupId).length === 0;
+        }
+
+        async function hypoRepointOrgContacts(fromOrgId, keeperId) {
+            const snap = await getDocs(query(collection(db, 'prospect_contacts'), where('prospect_org_id', '==', fromOrgId)));
+            let moved = 0;
+            for (const d of snap.docs) {
+                try {
+                    await updateDoc(doc(db, 'prospect_contacts', d.id), {
+                        prospect_org_id: keeperId,
+                        merged_from_org_id: fromOrgId,
+                        last_updated_at: new Date().toISOString()
+                    });
+                    moved++;
+                } catch (err) {
+                    console.warn(`[Hypo Dedupe] Could not re-point contact ${d.id}:`, err.message);
+                }
+            }
+            return moved;
+        }
+
+        window.hypoMergeDuplicates = async function() {
+            const sets = _hypoDupeSets.filter(s => s.include && s.orgs.length > 1);
+            if (sets.length === 0) { alert('No duplicate sets are checked.'); return; }
+            const removeCount = sets.reduce((n, s) => n + s.orgs.length - 1, 0);
+            if (!confirm(`Merge ${sets.length} duplicate set(s) and remove ${removeCount} organization record(s) from "${hypoCurrentGroupName}"?\n\nThe kept record inherits missing details, scan names and contacts. Records that exist only in this group's pool are deleted; records owned by a BDR/workspace just lose their link to this group.`)) return;
+
+            const btn = document.getElementById('btnHypoMergeDupes');
+            const originalHtml = btn.innerHTML;
+            let mergedSets = 0, removed = 0, contactsMoved = 0;
+            const errors = [];
+
+            try {
+                btn.disabled = true;
+                for (let i = 0; i < sets.length; i++) {
+                    const set = sets[i];
+                    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Merging ${i + 1}/${sets.length}…`;
+                    const keeper = set.orgs.find(o => o.id === set.keeperId) || set.orgs[0];
+                    const dupes = set.orgs.filter(o => o.id !== keeper.id);
+                    try {
+                        const update = hypoBuildMergeUpdate(keeper, dupes);
+                        if (Object.keys(update).length) {
+                            await updateDoc(doc(db, 'prospect_organizations', keeper.id), update);
+                            const liveKeeper = hypoOrgsData.find(o => o.id === keeper.id);
+                            if (liveKeeper) Object.assign(liveKeeper, update);
+                        }
+                        for (const dupe of dupes) {
+                            if (hypoDupeWillBeDeleted(dupe)) {
+                                contactsMoved += await hypoRepointOrgContacts(dupe.id, keeper.id);
+                            }
+                            await hypoUnlinkOrgDoc(dupe);
+                            hypoOrgsData = hypoOrgsData.filter(o => o.id !== dupe.id);
+                            hypoSelectedOrgIds.delete(dupe.id);
+                            removed++;
+                        }
+                        mergedSets++;
+                    } catch (err) {
+                        console.error(`Error merging duplicates for ${keeper.company_name}:`, err);
+                        errors.push(`${keeper.company_name}: ${err.message}`);
+                    }
+                }
+
+                hypoUpdateStats();
+                hypoRenderOrgsTable();
+                hypoRenderScanNamesSummary();
+                hypoUpdateSelectionCounts();
+                _hypoDupeSets = hypoBuildDupeSets(document.getElementById('hypoDupeLooseMatch').checked);
+                hypoRenderDupeModal();
+                hypoUpdateDupeHint();
+
+                let msg = `✅ Merged ${mergedSets} duplicate set(s) — ${removed} record(s) removed from the group.`;
+                if (contactsMoved) msg += `\n📋 ${contactsMoved} contact(s) re-pointed to the kept organizations.`;
+                if (errors.length) msg += `\n\n⚠️ ${errors.length} error(s):\n${errors.slice(0, 5).join('\n')}`;
+                alert(msg);
+            } finally {
+                btn.innerHTML = originalHtml;
+                hypoUpdateDupeCount();
+            }
+        };
 
         function hypoUpdateStats() {
             const total = hypoOrgsData.length;
@@ -14975,10 +15410,6 @@
             return docRef.id;
         }
 
-        function hypoGroupOrgNameSet() {
-            return new Set(hypoOrgsData.map(o => (o.company_name || '').toLowerCase().trim()));
-        }
-
         // ── Add tab switching ─────────────────────────────────────────────
         window.hypoSwitchAddTab = function(tab) {
             const tabs = { bdr: 'hypoTabBdr', csv: 'hypoTabCsv', paste: 'hypoTabPaste', tagged: 'hypoTabTagged', ai: 'hypoTabAi' };
@@ -15033,11 +15464,14 @@
                 }
 
                 const groupOrgIds = new Set(hypoOrgsData.map(o => o.id));
+                const keyIndex = hypoBuildGroupKeyIndex();
                 _hypoSourceRows = rows
                     .sort((a, b) => (a.company_name || '').localeCompare(b.company_name || ''))
                     .map(o => ({
                         org: o,
-                        inGroup: groupOrgIds.has(o.id) || (Array.isArray(o.hypothesis_group_ids) && o.hypothesis_group_ids.includes(hypoCurrentGroupId)),
+                        inGroup: groupOrgIds.has(o.id)
+                            || (Array.isArray(o.hypothesis_group_ids) && o.hypothesis_group_ids.includes(hypoCurrentGroupId))
+                            || hypoMatchesExisting(o, keyIndex),
                         selected: false
                     }));
 
@@ -15096,12 +15530,20 @@
             const btn = document.getElementById('btnHypoTagSource');
             try {
                 btn.disabled = true;
-                let tagged = 0;
+                const keyIndex = hypoBuildGroupKeyIndex();
+                let tagged = 0, skipped = 0;
                 for (const r of selected) {
+                    if (hypoMatchesExisting(r.org, keyIndex)) {
+                        r.inGroup = true; r.selected = false; skipped++;
+                        continue;
+                    }
                     const ok = await hypoTagOrgDoc(r.org.id, r.org, 'bdr_workspace_import');
-                    if (ok !== false) { r.inGroup = true; r.selected = false; tagged++; }
+                    if (ok !== false) {
+                        r.inGroup = true; r.selected = false; tagged++;
+                        hypoIndexAdd(keyIndex, r.org);
+                    }
                 }
-                alert(`✅ Tagged ${tagged} organization(s) into "${hypoCurrentGroupName}".`);
+                alert(`✅ Tagged ${tagged} organization(s) into "${hypoCurrentGroupName}".${skipped ? `\n\n${skipped} skipped — already in this group under a matching name, domain, or LinkedIn URL.` : ''}`);
                 hypoRenderSourceTable();
                 await hypoLoadOrgsTable();
             } catch (error) {
@@ -15372,15 +15814,15 @@
             try {
                 btn.disabled = true;
                 btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Adding…';
-                const existing = hypoGroupOrgNameSet();
+                const keyIndex = hypoBuildGroupKeyIndex();
                 let added = 0, duplicates = 0;
                 for (const org of _hypoCsvRows) {
-                    if (existing.has(org.company_name.toLowerCase().trim())) { duplicates++; continue; }
+                    if (hypoMatchesExisting(org, keyIndex)) { duplicates++; continue; }
                     await hypoCreateGroupOrgDoc(org, 'csv_upload');
-                    existing.add(org.company_name.toLowerCase().trim());
+                    hypoIndexAdd(keyIndex, org);
                     added++;
                 }
-                alert(`✅ Added ${added} organizations to "${hypoCurrentGroupName}"!\n\n${duplicates} duplicates were skipped.`);
+                alert(`✅ Added ${added} organizations to "${hypoCurrentGroupName}"!\n\n${duplicates} duplicates were skipped (matching name, domain, or LinkedIn URL already in this group).`);
                 _hypoCsvRows = [];
                 _hypoCsvHeaders = [];
                 _hypoCsvDataRows = [];
@@ -15440,15 +15882,15 @@
             try {
                 btn.disabled = true;
                 btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Adding…';
-                const existing = hypoGroupOrgNameSet();
+                const keyIndex = hypoBuildGroupKeyIndex();
                 let added = 0, duplicates = 0;
                 for (const org of _hypoPasteRows) {
-                    if (existing.has(org.company_name.toLowerCase().trim())) { duplicates++; continue; }
+                    if (hypoMatchesExisting(org, keyIndex)) { duplicates++; continue; }
                     await hypoCreateGroupOrgDoc(org, 'pasted_names');
-                    existing.add(org.company_name.toLowerCase().trim());
+                    hypoIndexAdd(keyIndex, org);
                     added++;
                 }
-                alert(`✅ Added ${added} organizations to "${hypoCurrentGroupName}"!\n\n${duplicates} duplicates were skipped.`);
+                alert(`✅ Added ${added} organizations to "${hypoCurrentGroupName}"!\n\n${duplicates} duplicates were skipped (matching name already in this group).`);
                 _hypoPasteRows = [];
                 document.getElementById('hypoPasteTextarea').value = '';
                 document.getElementById('hypoPastePreviewBar').innerHTML = 'Start typing or pasting names above.';
@@ -15509,10 +15951,14 @@
                     if (!entry.orgLinkedInUrl && c.orgLinkedInUrl) entry.orgLinkedInUrl = c.orgLinkedInUrl;
                 }
 
-                const groupNames = hypoGroupOrgNameSet();
+                const keyIndex = hypoBuildGroupKeyIndex();
                 _hypoTaggedRows = [...orgMap.values()]
                     .sort((a, b) => b.contactCount - a.contactCount)
-                    .map(o => ({ ...o, inGroup: groupNames.has(o.name.toLowerCase().trim()), selected: false }));
+                    .map(o => ({
+                        ...o,
+                        inGroup: hypoMatchesExisting({ company_name: o.name, company_linkedin_url: o.orgLinkedInUrl }, keyIndex),
+                        selected: false
+                    }));
 
                 document.getElementById('hypoTaggedSummary').textContent =
                     `${taggedContacts.length} tagged contacts → ${_hypoTaggedRows.length} unique organizations (${_hypoTaggedRows.filter(r => !r.inGroup).length} not yet in this group)`;
@@ -15555,27 +16001,35 @@
             try {
                 btn.disabled = true;
                 const orgsRef = collection(db, 'prospect_organizations');
-                let tagged = 0, created = 0;
+                const keyIndex = hypoBuildGroupKeyIndex();
+                let tagged = 0, created = 0, skipped = 0;
                 for (const r of selected) {
+                    const candidate = { company_name: r.name, company_linkedin_url: r.orgLinkedInUrl || null };
+                    if (hypoMatchesExisting(candidate, keyIndex)) {
+                        r.inGroup = true; r.selected = false; skipped++;
+                        continue;
+                    }
                     // Look for an existing org record with this name anywhere
                     const existingSnap = await getDocs(query(orgsRef, where('company_name', '==', r.name)));
                     const existing = existingSnap.docs.map(d => ({ id: d.id, ...d.data() }));
                     const alreadyTagged = existing.find(o => Array.isArray(o.hypothesis_group_ids) && o.hypothesis_group_ids.includes(hypoCurrentGroupId));
-                    if (alreadyTagged) { r.inGroup = true; r.selected = false; continue; }
+                    if (alreadyTagged) { r.inGroup = true; r.selected = false; skipped++; continue; }
 
                     if (existing.length > 0) {
                         // Prefer a record that already has a LinkedIn URL
                         const best = existing.find(o => o.company_linkedin_url) || existing[0];
                         await hypoTagOrgDoc(best.id, best, 'tagged_contacts_sync');
+                        hypoIndexAdd(keyIndex, { ...best, company_linkedin_url: best.company_linkedin_url || r.orgLinkedInUrl });
                         tagged++;
                     } else {
                         await hypoCreateGroupOrgDoc({ company_name: r.name, company_linkedin_url: r.orgLinkedInUrl || null }, 'tagged_contacts_sync');
+                        hypoIndexAdd(keyIndex, candidate);
                         created++;
                     }
                     r.inGroup = true;
                     r.selected = false;
                 }
-                alert(`✅ Done!\n\n${tagged} existing organization record(s) tagged\n${created} new organization record(s) created`);
+                alert(`✅ Done!\n\n${tagged} existing organization record(s) tagged\n${created} new organization record(s) created${skipped ? `\n${skipped} skipped as already in this group` : ''}`);
                 hypoRenderTaggedTable();
                 await hypoLoadOrgsTable();
             } catch (error) {
@@ -15765,16 +16219,19 @@
         // Tag all orgs owned by this group's pool sentinel with the group fields.
         async function hypoTagSentinelOrgs() {
             const snap = await getDocs(query(collection(db, 'prospect_organizations'), where('bdrEmail', '==', hypoSentinel())));
+            const keyIndex = hypoBuildGroupKeyIndex();
             let tagged = 0;
             for (const d of snap.docs) {
                 const data = d.data();
                 if (Array.isArray(data.hypothesis_group_ids) && data.hypothesis_group_ids.includes(hypoCurrentGroupId)) continue;
+                if (hypoMatchesExisting({ id: d.id, ...data }, keyIndex)) continue;
                 await updateDoc(doc(db, 'prospect_organizations', d.id), {
                     hypothesis_group_ids: [...(Array.isArray(data.hypothesis_group_ids) ? data.hypothesis_group_ids : []), hypoCurrentGroupId],
                     hypothesis_group_names: { ...(data.hypothesis_group_names || {}), [hypoCurrentGroupId]: hypoCurrentGroupName },
                     hypothesis_org_source: data.hypothesis_org_source || 'ai_finder',
                     last_updated_at: new Date().toISOString()
                 });
+                hypoIndexAdd(keyIndex, { id: d.id, ...data });
                 tagged++;
             }
             return tagged;

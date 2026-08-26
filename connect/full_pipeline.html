@@ -296,6 +296,7 @@
                 <div class="stat-tile"><div class="num" id="fpOrgCountScanned">–</div><div class="lbl">Previously Scanned</div></div>
                 <div class="stat-tile"><div class="num" id="fpOrgCountThisName">–</div><div class="lbl">Already Scanned as This Name</div></div>
             </div>
+            <div id="fpDupeStatus" style="font-size: 12.5px; font-weight: 600; margin: 8px 0 4px;"></div>
             <div style="max-height: 300px; overflow-y: auto; border: 1px solid var(--gray-200); border-radius: 8px;">
                 <table class="data-table" id="fpOrgTable">
                     <thead><tr><th>#</th><th>Priority</th><th>Organization</th><th>LinkedIn URL</th><th title="Distinct scan names ever run against this org — the tie-breaker for queue order">Total Scans</th><th>Scan Names</th></tr></thead>
@@ -1726,6 +1727,8 @@
             document.getElementById('fpGroupStats').innerHTML = '';
             document.getElementById('fpBdrList').innerHTML = '<span style="color: var(--gray-500); font-size: 13px;">Select a client and hypothesis group above.</span>';
             document.getElementById('fpVariationBlock').style.display = 'none';
+            const dupeEl = document.getElementById('fpDupeStatus');
+            if (dupeEl) dupeEl.textContent = '';
         }
 
         // Populates the Message Variation dropdown from the selected group's messageVariations[]
@@ -1851,6 +1854,7 @@
 
                 fpRenderGroupOrgsTable();
                 fpUpdateScanNameStatus();
+                fpUpdateDupeStatus();
             } catch (e) {
                 console.error('Failed to load group orgs:', e);
                 tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color: var(--danger); padding: 20px;">Error: ${escHtml(e.message)}</td></tr>`;
@@ -1893,6 +1897,106 @@
                 if (aDone !== bDone) return aDone - bDone;
                 return fpOrgTotalScanCount(a) - fpOrgTotalScanCount(b);
             });
+        }
+
+        // Same company-matching keys the Hypothesis Group Organizations de-dupe uses:
+        // normalized name, domain, and LinkedIn company slug. Duplicate records in a
+        // group would otherwise each get their own paid Apify scan.
+        const FP_LEGAL_SUFFIX_RE = /\s(inc|incorporated|llc|l l c|llp|lp|ltd|limited|corp|corporation|co|company|plc|pllc|pc|gmbh|ag|sa|nv|bv|srl|pty)$/;
+
+        function fpNormOrgName(name) {
+            let s = (name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            if (!s) return s;
+            s = s.replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+            s = s.replace(/^the\s+/, '');
+            let prev;
+            do { prev = s; s = s.replace(FP_LEGAL_SUFFIX_RE, '').trim(); } while (s !== prev && s);
+            return s;
+        }
+        function fpNormOrgDomain(domain) {
+            if (!domain) return '';
+            return String(domain).toLowerCase().trim()
+                .replace(/^https?:\/\//, '').replace(/^www\./, '')
+                .split(/[\/?#]/)[0].trim();
+        }
+        function fpNormOrgLinkedIn(url) {
+            if (!url) return '';
+            const m = String(url).toLowerCase().match(/linkedin\.com\/(?:company|school)\/([^\/?#]+)/);
+            return m ? m[1] : '';
+        }
+        function fpOrgDupeKeys(org) {
+            const keys = [];
+            const name = fpNormOrgName(org.company_name);
+            if (name) keys.push('n:' + name);
+            const domain = fpNormOrgDomain(org.company_domain);
+            if (domain) keys.push('d:' + domain);
+            const li = fpNormOrgLinkedIn(org.company_linkedin_url);
+            if (li) keys.push('l:' + li);
+            return keys;
+        }
+
+        function fpBuildDupeClusters(orgs) {
+            const list = orgs || [];
+            const parent = list.map((_, i) => i);
+            const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+            const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[rb] = ra; };
+            const keyOwner = new Map();
+            list.forEach((org, i) => {
+                fpOrgDupeKeys(org).forEach(key => {
+                    if (keyOwner.has(key)) union(keyOwner.get(key), i);
+                    else keyOwner.set(key, i);
+                });
+            });
+            const buckets = new Map();
+            list.forEach((org, i) => {
+                const root = find(i);
+                if (!buckets.has(root)) buckets.set(root, []);
+                buckets.get(root).push(org);
+            });
+            return [...buckets.values()].filter(members => members.length > 1);
+        }
+
+        function fpDupeSkipInfo(queue, scanName, skipAlreadyScanned) {
+            const clusters = fpBuildDupeClusters(fpGroupOrgs);
+            const idToCluster = new Map();
+            clusters.forEach((members, i) => members.forEach(o => idToCluster.set(o.id, i)));
+            const clusterHasScanName = new Set();
+            if (skipAlreadyScanned && scanName) {
+                clusters.forEach((members, i) => {
+                    if (members.some(o => fpOrgScanLabels(o).includes(scanName))) clusterHasScanName.add(i);
+                });
+            }
+            const seenCluster = new Set();
+            const skipReason = new Map(); // orgId -> reason
+            const kept = [];
+            for (const org of queue) {
+                const ci = idToCluster.get(org.id);
+                if (ci === undefined) { kept.push(org); continue; }
+                const keeperName = clusters[ci][0]?.company_name || org.company_name;
+                if (clusterHasScanName.has(ci)) {
+                    skipReason.set(org.id, `duplicate of "${keeperName}" already scanned as this name`);
+                    continue;
+                }
+                if (seenCluster.has(ci)) {
+                    skipReason.set(org.id, `duplicate of "${keeperName}" already in this run`);
+                    continue;
+                }
+                seenCluster.add(ci);
+                kept.push(org);
+            }
+            return { orgs: kept, skipReason, extraCount: skipReason.size, clusterCount: clusters.length };
+        }
+
+        function fpUpdateDupeStatus() {
+            const el = document.getElementById('fpDupeStatus');
+            if (!el) return;
+            const clusters = fpBuildDupeClusters(fpGroupOrgs);
+            if (!fpGroupOrgs.length || clusters.length === 0) {
+                el.innerHTML = '';
+                return;
+            }
+            const extra = clusters.reduce((n, c) => n + c.length - 1, 0);
+            el.innerHTML = `<span style="color: var(--warning);"><i class="fas fa-clone"></i> ${clusters.length} compan${clusters.length === 1 ? 'y appears' : 'ies appear'} more than once in this group (${extra} extra record${extra === 1 ? '' : 's'}). Full Pipeline will scan each company once — merge them in Prospect Organizations Admin to remove the extras.</span>`;
         }
 
         // Record that this scan name has been fully applied to an organization — ONLY call
@@ -2082,9 +2186,11 @@
             const skip = document.getElementById('fpSkipAlreadyScanned')?.checked ?? true;
             const retryNotFound = document.getElementById('fpRetryNotFoundUrls')?.checked ?? false;
             const ordered = currentName ? fpBuildRunQueue(currentName, skip) : fpGroupOrgs;
+            const dupeInfo = fpDupeSkipInfo(ordered, currentName, skip);
             tbody.innerHTML = ordered.map((o, i) => {
                 const labels = fpOrgScanLabels(o);
                 const hasCurrent = currentName && labels.includes(currentName);
+                const dupeSkip = dupeInfo.skipReason.get(o.id);
                 const scanCell = labels.length
                     ? labels.map(l => l === currentName
                         ? `<span class="badge badge-amber" title="Already scanned as this name" style="margin: 1px 3px 1px 0;"><i class="fas fa-check"></i> ${escHtml(l)}</span>`
@@ -2101,17 +2207,21 @@
                 } else {
                     urlCell = '<span class="badge badge-amber">will research</span>';
                 }
+                const dupeBadge = dupeSkip
+                    ? ` <span class="badge badge-amber" title="${escHtml(dupeSkip)}">duplicate — skip scan</span>`
+                    : '';
                 return `
-                    <tr${hasCurrent ? ' style="opacity: 0.6;"' : ''}>
+                    <tr${hasCurrent || dupeSkip ? ' style="opacity: 0.6;"' : ''}>
                         <td>${i + 1}</td>
                         <td>${o.hypothesis_priority ?? '—'}</td>
-                        <td><strong>${escHtml(o.company_name || '(unnamed)')}</strong>${o.company_state ? ` <span style="color: var(--gray-400); font-size: 11px;">${escHtml(o.company_state)}</span>` : ''}</td>
+                        <td><strong>${escHtml(o.company_name || '(unnamed)')}</strong>${o.company_state ? ` <span style="color: var(--gray-400); font-size: 11px;">${escHtml(o.company_state)}</span>` : ''}${dupeBadge}</td>
                         <td>${urlCell}</td>
                         <td style="text-align:center; color: var(--gray-500);">${fpOrgTotalScanCount(o)}</td>
                         <td style="font-size: 12px;">${scanCell}</td>
                     </tr>
                 `;
             }).join('');
+            fpUpdateDupeStatus();
         }
 
         // Live count/status of how many group organizations already carry the
@@ -3826,7 +3936,9 @@
             // favors the least-covered organizations. See fpBuildRunQueue for the full
             // priority order.
             const alreadyScannedCount = fpGroupOrgs.filter(o => fpOrgScanLabels(o).includes(scanName)).length;
-            const fpRunOrgs = fpBuildRunQueue(scanName, skipAlreadyScanned);
+            const queuedOrgs = fpBuildRunQueue(scanName, skipAlreadyScanned);
+            const dupeCollapse = fpDupeSkipInfo(queuedOrgs, scanName, skipAlreadyScanned);
+            const fpRunOrgs = dupeCollapse.orgs;
 
             // Organizations that were already researched for a LinkedIn URL and came up
             // empty — by default these are skipped instead of being re-searched (and
@@ -3848,13 +3960,16 @@
             const scanNameNote = alreadyScannedCount > 0
                 ? `\n• ${alreadyScannedCount} organization(s) already scanned as "${scanName}" — ${skipAlreadyScanned ? 'will be skipped' : 'moved to the back of the queue'}`
                 : '';
+            const dupeNote = dupeCollapse.extraCount > 0
+                ? `\n• ${dupeCollapse.extraCount} duplicate organization record(s) will be skipped so the same company is not scanned twice (merge them in Prospect Organizations Admin to remove them permanently)`
+                : '';
             const orgTypeNoteForConfirm = orgTypeConfig.enabled
                 ? `\n• Each organization will first be classified by AI (${orgTypeConfig.classifierModel}) into one of ${orgTypeConfig.types.length} type(s) (${orgTypeConfig.types.map(t => t.name).join(', ')}), each using its own scan rules`
                 : '';
             const notFoundUrlNote = notFoundUrlCount > 0
                 ? `\n• ${notFoundUrlCount} organization(s) previously had no LinkedIn URL found — ${retryNotFoundUrls ? 'will be RE-SEARCHED because "Re-search..." is checked' : 'will be SKIPPED (not re-searched) — check "Re-search organizations whose LinkedIn URL wasn\'t found" in Step 3 to retry them'}`
                 : '';
-            if (!confirm(`Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}${orgTypeNoteForConfirm}${notFoundUrlNote}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules — matches are tagged with this hypothesis group and stay in prospect_contacts (whether or not they end up with a message), while rule-dropped contacts are moved to prospect_contacts_deleted — news is searched once per organization, and messages are generated + Opus reviewed one at a time.`)) return;
+            if (!confirm(`Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}${dupeNote}${orgTypeNoteForConfirm}${notFoundUrlNote}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules — matches are tagged with this hypothesis group and stay in prospect_contacts (whether or not they end up with a message), while rule-dropped contacts are moved to prospect_contacts_deleted — news is searched once per organization, and messages are generated + Opus reviewed one at a time.`)) return;
 
             const buildModel   = document.getElementById('fpBuildModel').value;
             const opusModel    = document.getElementById('fpOpusModel').value;
@@ -4043,7 +4158,8 @@
                     opusExcludeMode, crossBdrEnabled, finalReviewEnabled, profileMsgFallback: profileMsgFallbackOn,
                     scanCriteria, secondScan: secondScanConfig, orgTypeMode: orgTypeConfig,
                     costGuard: { costPerMessage, apifyPerMessageLimit, minSpendBeforeEnforcing: costMinSpend },
-                    scanName, skipAlreadyScanned, alreadyScannedSkippedAtStart: skipAlreadyScanned ? alreadyScannedCount : 0
+                    scanName, skipAlreadyScanned, alreadyScannedSkippedAtStart: skipAlreadyScanned ? alreadyScannedCount : 0,
+                    duplicateRecordsSkippedAtStart: dupeCollapse.extraCount
                 },
                 costGuardResult: null, // filled in if the run is shut down for cost
                 // AI review/Opus token costs are not exposed by the endpoints — record call
@@ -4051,7 +4167,7 @@
                 aiCostTracking: 'call_counts_only',
                 aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0, storyMatch: 0 },
                 orgs: [],
-                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, hypothesisTally: null, noMessageTally: null, postTypeTally: null, messageSourceTally: null,
+                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, duplicateSkippedOrgs: 0, hypothesisTally: null, noMessageTally: null, postTypeTally: null, messageSourceTally: null,
                     // Filled in once at the end of the run — see fpFetchRealApifyCosts(). apifyUsd
                     // above only ever reflected the contact-search (scan) job; realCostBreakdown is
                     // the actual apify_run_ledger total across EVERY Apify call this run triggered
@@ -4076,6 +4192,9 @@
                     ? `⏭️ Skipping ${alreadyScannedCount} organization(s) already scanned as "${scanName}".`
                     : `↩️ ${alreadyScannedCount} organization(s) already scanned as "${scanName}" moved to the back of the queue.`, 'dim');
             }
+            if (dupeCollapse.extraCount > 0) {
+                addLog(`⏭️ Skipping ${dupeCollapse.extraCount} duplicate organization record(s) so the same company is not scanned twice this run. Merge them in Prospect Organizations Admin to remove the extras permanently.`, 'warning');
+            }
             if (notFoundUrlCount > 0) {
                 addLog(retryNotFoundUrls
                     ? `🔁 Re-searching ${notFoundUrlCount} organization(s) whose LinkedIn URL wasn't found in a previous run (checkbox is on).`
@@ -4086,6 +4205,12 @@
             let token = await auth.currentUser.getIdToken();
             let lastTokenRefreshAt = Date.now();
             let orgPointer = 0;
+            const fpRunCompanyKeys = new Set();
+            if (skipAlreadyScanned) {
+                fpGroupOrgs.forEach(o => {
+                    if (fpOrgScanLabels(o).includes(scanName)) fpOrgDupeKeys(o).forEach(k => fpRunCompanyKeys.add(k));
+                });
+            }
             // Circuit breaker for the auth-failure cascade described above full-ai-init's
             // retry loop: if several organizations IN A ROW fail specifically because
             // full-ai-init couldn't get a valid token, the session is very likely dead
@@ -4230,6 +4355,20 @@
                                 continue;
                             }
 
+                            const skipIfDuplicateCompany = (when) => {
+                                const keys = fpOrgDupeKeys(org);
+                                if (!keys.some(k => fpRunCompanyKeys.has(k))) return false;
+                                orgReport.error = 'duplicate_org';
+                                report.totals.duplicateSkippedOrgs = (report.totals.duplicateSkippedOrgs || 0) + 1;
+                                addLog(`   ⏭️ SKIPPED — this organization matches another company already ${when} (same name, domain, or LinkedIn URL). No scan, no extra cost.`, 'warning');
+                                report.orgs.push(orgReport);
+                                return true;
+                            };
+                            if (skipIfDuplicateCompany('queued or scanned this run')) {
+                                await saveReport();
+                                continue;
+                            }
+
                             // ── 0.5. Organization Type Classification (if enabled) — one AI call
                             // per organization, right here, right before its scan — not a big
                             // batch up front. Whatever type this org matches (or doesn't) decides
@@ -4300,6 +4439,12 @@
                                     addLog(`   ⚠️ URL research failed: ${e.message} — the scan will try its own company lookup (will retry researching next run, not flagged as not-found).`, 'warning');
                                 }
                             }
+
+                            if (skipIfDuplicateCompany('scanned this run')) {
+                                await saveReport();
+                                continue;
+                            }
+                            fpOrgDupeKeys(org).forEach(k => fpRunCompanyKeys.add(k));
 
                             // ── 2. Apify Employee Contact Scan (same job pipeline as the admin page) ──
                             const { jobId, job } = await fpRunScanJob({

@@ -119,6 +119,8 @@ async function processOrgSearchJob(jobId, db, criteria, bdrEmail, submittedBy) {
 
     let totalFound = 0, totalSaved = 0, totalSkipped = 0;
 
+    const existingIndex = await loadExistingOrgIndex(db, bdrEmail);
+
     for (let i = 0; i < locationsToProcess.length; i++) {
         const location = locationsToProcess[i];
 
@@ -144,7 +146,7 @@ async function processOrgSearchJob(jobId, db, criteria, bdrEmail, submittedBy) {
             const items = resp.data.items || [];
             totalFound += items.length;
 
-            const { saved, skipped } = await saveOrgItems(db, items, bdrEmail, submittedBy);
+            const { saved, skipped } = await saveOrgItems(db, items, bdrEmail, submittedBy, existingIndex);
             totalSaved   += saved;
             totalSkipped += skipped;
 
@@ -178,22 +180,70 @@ async function processOrgSearchJob(jobId, db, criteria, bdrEmail, submittedBy) {
 
 // ── Save items to prospect_organizations ──────────────────────────────────────
 
-async function saveOrgItems(db, items, bdrEmail, submittedBy) {
+function normOrgName(name) {
+    return String(name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function orgLinkedInSlug(url) {
+    if (!url) return '';
+    const m = String(url).toLowerCase().match(/linkedin\.com\/(?:company|school)\/([^\/?#]+)/);
+    return m ? m[1] : '';
+}
+
+function orgDomainKey(domain) {
+    if (!domain) return '';
+    return String(domain).toLowerCase().trim()
+        .replace(/^https?:\/\//, '').replace(/^www\./, '')
+        .split(/[\/?#]/)[0].trim();
+}
+
+async function loadExistingOrgIndex(db, bdrEmail) {
+    const index = { names: new Set(), slugs: new Set(), domains: new Set() };
+    try {
+        const snap = await db.collection('prospect_organizations').where('bdrEmail', '==', bdrEmail).get();
+        snap.docs.forEach(d => {
+            const data = d.data() || {};
+            const name = normOrgName(data.company_name);
+            if (name) index.names.add(name);
+            const slug = orgLinkedInSlug(data.company_linkedin_url);
+            if (slug) index.slugs.add(slug);
+            const domain = orgDomainKey(data.company_domain);
+            if (domain) index.domains.add(domain);
+        });
+        console.log(`[OrgSearch] Loaded ${snap.size} existing org(s) for ${bdrEmail} — ${index.names.size} names, ${index.slugs.size} LinkedIn slugs`);
+    } catch (err) {
+        console.warn('[OrgSearch] Failed to load existing orgs for duplicate check:', err.message);
+    }
+    return index;
+}
+
+function rememberSavedOrg(index, name, linkedinUrl, domain) {
+    const n = normOrgName(name);
+    if (n) index.names.add(n);
+    const slug = orgLinkedInSlug(linkedinUrl);
+    if (slug) index.slugs.add(slug);
+    const d = orgDomainKey(domain);
+    if (d) index.domains.add(d);
+}
+
+async function saveOrgItems(db, items, bdrEmail, submittedBy, existingIndex) {
     const orgsRef = db.collection('prospect_organizations');
+    const index = existingIndex || { names: new Set(), slugs: new Set(), domains: new Set() };
     let saved = 0, skipped = 0;
 
     for (const item of items) {
         const name = (item.name || '').trim();
         if (!name) continue;
 
-        // Duplicate check
-        const existing = await orgsRef
-            .where('bdrEmail', '==', bdrEmail)
-            .where('company_name', '==', name)
-            .limit(1)
-            .get();
-
-        if (!existing.empty) { skipped++; continue; }
+        const nameKey = normOrgName(name);
+        const slug = orgLinkedInSlug(item.linkedinUrl);
+        const domain = orgDomainKey(item.website);
+        if ((nameKey && index.names.has(nameKey))
+            || (slug && index.slugs.has(slug))
+            || (domain && index.domains.has(domain))) {
+            skipped++;
+            continue;
+        }
 
         const hq       = (item.locations || []).find(l => l.headquarter) || item.locations?.[0] || {};
         const industry = item.industries?.[0]?.title || item.industries?.[0]?.name || '';
@@ -221,6 +271,7 @@ async function saveOrgItems(db, items, bdrEmail, submittedBy) {
             created_by:             submittedBy || 'unknown',
             source:                 'apify_linkedin_company_search',
         });
+        rememberSavedOrg(index, name, item.linkedinUrl, item.website);
         saved++;
     }
 
