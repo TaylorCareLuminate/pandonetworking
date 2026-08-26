@@ -223,6 +223,31 @@
                 </div>
                 <button class="btn" id="fpSaveInstructionsBtn" onclick="fpSaveInstructions()"><i class="fas fa-save"></i> Save Instructions to Hypothesis Group</button>
                 <span id="fpSaveInstructionsStatus" style="font-size: 12px; color: var(--success); margin-left: 8px;"></span>
+
+                <!-- Message Variation — appends a variation's "AI Prompt / Writing Instructions" (defined
+                     on Connect Hypothesis Documentation's Message Variations tab) onto the base Message
+                     Review Instructions above for each message this run generates, and stamps which
+                     variation was used onto the connect_queue doc so outcomes.html can report on it. -->
+                <div id="fpVariationBlock" style="display:none; margin-top: 14px; padding-top: 14px; border-top: 1px solid #e5e7eb;">
+                    <label for="fpVariationSelect"><i class="fas fa-vial" style="color:#C9973D;"></i> Message Variation</label>
+                    <select id="fpVariationSelect" style="max-width: 460px;" onchange="fpUpdateVariationModeUi()">
+                        <option value="">— No variation —</option>
+                    </select>
+                    <div class="form-help" id="fpVariationHelp">This hypothesis group has no message variations defined yet — add some on Connect Hypothesis Documentation's "Message Variations" tab to A/B test different angles.</div>
+
+                    <!-- Shown only when "AI decides by criteria" is selected — the AI model used to
+                         read each contact's profile against every variation's AI Selection Criteria. -->
+                    <div id="fpVariationAiModelBlock" style="display:none; margin-top: 10px;">
+                        <label for="fpVariationAiModel" style="font-size: 13px;"><i class="fas fa-brain"></i> Variation Selection Model</label>
+                        <select id="fpVariationAiModel" style="max-width: 460px;">
+                            <option value="anthropic/claude-sonnet-5" selected>Claude Sonnet 5 (current default)</option>
+                            <option value="anthropic/claude-opus-4-7">Claude Opus 4.7</option>
+                            <option value="anthropic/claude-haiku-3-5">Claude Haiku 3.5</option>
+                            <option value="meta-llama/llama-4-maverick">Llama 4 Maverick</option>
+                        </select>
+                        <div class="form-help">Given each contact's title/company/location and every variation's AI Selection Criteria, this model picks one variation per contact. Falls back to Random Selection Share % if the AI call fails or doesn't confidently match any variation.</div>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -1705,7 +1730,41 @@
             document.getElementById('fpScanNameHistory').innerHTML = '';
             document.getElementById('fpGroupStats').innerHTML = '';
             document.getElementById('fpBdrList').innerHTML = '<span style="color: var(--gray-500); font-size: 13px;">Select a client and hypothesis group above.</span>';
+            document.getElementById('fpVariationBlock').style.display = 'none';
         }
+
+        // Populates the Message Variation dropdown from the selected group's messageVariations[]
+        // (defined on Connect Hypothesis Documentation). Shown even with 0 variations so the
+        // help text explains where to add them.
+        function fpPopulateVariationSelect(group) {
+            const block = document.getElementById('fpVariationBlock');
+            const sel   = document.getElementById('fpVariationSelect');
+            const help  = document.getElementById('fpVariationHelp');
+            if (!block || !sel) return;
+            const variations = group?.messageVariations || [];
+            block.style.display = 'block';
+            const prevVal = sel.value;
+            sel.innerHTML = '<option value="">— No variation —</option>' +
+                (variations.length > 1 ? '<option value="__rotate__">🔀 Rotate evenly across all variations</option>' : '') +
+                (variations.length > 1 ? '<option value="__weighted__">🎲 Random selection by share %</option>' : '') +
+                (variations.length > 1 ? '<option value="__ai__">🤖 AI decides by criteria</option>' : '') +
+                variations.map(v => `<option value="${v.id}">${escHtml(v.label || v.id)}</option>`).join('');
+            if (variations.some(v => v.id === prevVal) || ['__rotate__', '__weighted__', '__ai__'].includes(prevVal)) sel.value = prevVal;
+            if (help) {
+                help.textContent = variations.length
+                    ? `${variations.length} variation${variations.length !== 1 ? 's' : ''} defined on this group. When selected, a variation's "AI Prompt / Writing Instructions" is appended to the Message Review Instructions above for that message, and stamped onto it for reporting on outcomes.html.`
+                    : 'This hypothesis group has no message variations defined yet — add some on Connect Hypothesis Documentation\'s "Message Variations" tab to A/B test different angles.';
+            }
+            fpUpdateVariationModeUi();
+        }
+
+        // Shows/hides the "Variation Selection Model" dropdown depending on whether
+        // "AI decides by criteria" is the currently selected Message Variation mode.
+        window.fpUpdateVariationModeUi = function() {
+            const mode = document.getElementById('fpVariationSelect')?.value || '';
+            const modelBlock = document.getElementById('fpVariationAiModelBlock');
+            if (modelBlock) modelBlock.style.display = mode === '__ai__' ? 'block' : 'none';
+        };
 
         document.getElementById('fpCustomerSelect').addEventListener('change', function() {
             const company = this.value;
@@ -2100,6 +2159,7 @@
             document.getElementById('fpReviewInstructions').value   = group.messageReviewInstructions || '';
             document.getElementById('fpInstructionsBlock').style.display = 'block';
             document.getElementById('fpGroupStats').innerHTML = `<i class="fas fa-flask" style="color: var(--primary);"></i> <strong>${escHtml(group.name || groupId)}</strong> <span style="color: var(--gray-500);">— ${fpGroupBdrEmails(group).length} linked BDR(s)</span>`;
+            fpPopulateVariationSelect(group);
             fpRenderBdrList(group);
             // Per-group Scan Name → Step 4 rules presets, keyed by exact scan name.
             fpCurrentGroupScanPresets = group.scanNamePresets || {};
@@ -3824,6 +3884,102 @@
             const targetInstr   = document.getElementById('fpTargetInstructions').value;
             const reviewInstr   = document.getElementById('fpReviewInstructions').value;
 
+            // ── Message Variation ── picks (and stamps) a hypothesis-group message variation
+            // for each message this run generates:
+            //   '__rotate__'  cycles evenly through every variation (round-robin, one per message)
+            //   '__weighted__' random pick weighted by each variation's Random Selection Share %
+            //                  (falls back to a uniform random pick if no shares are set)
+            //   '__ai__'      sends the contact's profile + every variation's AI Selection Criteria
+            //                  to an AI model, which decides; falls back to '__weighted__' if the
+            //                  call fails or the AI doesn't confidently pick one
+            //   <variation id> pins every message to that one; '' means no variation
+            // fpNextVariation() (async — the AI mode makes a network call) is called once per
+            // message right before it's saved, and awaited by every call site.
+            const fpVariationMode = document.getElementById('fpVariationSelect')?.value || '';
+            const fpVariations = group.messageVariations || [];
+            const fpVariationAiModel = document.getElementById('fpVariationAiModel')?.value || 'anthropic/claude-sonnet-5';
+            let fpVariationCounter = 0;
+
+            function fpWeightedRandomVariation() {
+                const weights = fpVariations.map(v => Math.max(0, parseFloat(v.sharePercent) || 0));
+                const total = weights.reduce((s, w) => s + w, 0);
+                if (total <= 0) return fpVariations[Math.floor(Math.random() * fpVariations.length)];
+                let r = Math.random() * total;
+                for (let i = 0; i < fpVariations.length; i++) {
+                    r -= weights[i];
+                    if (r <= 0) return fpVariations[i];
+                }
+                return fpVariations[fpVariations.length - 1];
+            }
+
+            // Builds the minimal contact-profile object sent to the AI selector. Checks
+            // processed profile fields first (pd — has .currentTitle/.currentCompany/.location/
+            // .headline/.about when built via processProfileData), then falls back to whatever
+            // the generation server already returned for this contact.
+            function fpContactInfoForVariation(prospectArg, pdArg, singleDataArg) {
+                pdArg = pdArg || {};
+                return {
+                    name:     pdArg.name || `${prospectArg.firstName || ''} ${prospectArg.lastName || ''}`.trim() || singleDataArg?.prospectName || '',
+                    title:    pdArg.currentTitle   || singleDataArg?.prospectTitle   || prospectArg.title   || '',
+                    company:  pdArg.currentCompany || singleDataArg?.prospectCompany || prospectArg.company || '',
+                    location: pdArg.location || prospectArg.location || '',
+                    headline: pdArg.headline || '',
+                    about:    pdArg.about || ''
+                };
+            }
+
+            async function fpSelectVariationWithAI(contactInfo) {
+                try {
+                    const resp = await fetch(`${RAILWAY_API}/api/connect/select-message-variation`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                        body: JSON.stringify({
+                            contact: contactInfo,
+                            variations: fpVariations.map(v => ({ id: v.id, label: v.label, criteria: v.aiCriteria || '' })),
+                            model: fpVariationAiModel
+                        })
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (resp.ok && data.success && data.variationId) {
+                        const chosen = fpVariations.find(v => v.id === data.variationId);
+                        if (chosen) {
+                            addLog(`   🤖 AI selected variation "${chosen.label}"${data.reason ? ` — ${data.reason}` : ''}`, 'dim');
+                            return chosen;
+                        }
+                    }
+                } catch (e) {
+                    console.warn('[Message Variation] AI selection failed:', e.message);
+                }
+                addLog('   ⚠️ AI variation selection returned nothing usable — falling back to random selection by share %', 'dim');
+                return fpWeightedRandomVariation();
+            }
+
+            async function fpNextVariation(prospectArg, pdArg, singleDataArg) {
+                if (!fpVariationMode || !fpVariations.length) return null;
+                if (fpVariationMode === '__rotate__') {
+                    const v = fpVariations[fpVariationCounter % fpVariations.length];
+                    fpVariationCounter++;
+                    return v;
+                }
+                if (fpVariationMode === '__weighted__') return fpWeightedRandomVariation();
+                if (fpVariationMode === '__ai__') return await fpSelectVariationWithAI(fpContactInfoForVariation(prospectArg, pdArg, singleDataArg));
+                return fpVariations.find(v => v.id === fpVariationMode) || null;
+            }
+            // Appends the chosen variation's "AI Prompt / Writing Instructions" onto the base
+            // Message Review Instructions, per the exact wording used everywhere else this
+            // pattern appears (Connect Hypothesis Documentation / Fast Connect Review).
+            function fpReviewInstrFor(variation) {
+                if (!variation || !variation.prompt) return reviewInstr;
+                return `${reviewInstr}\n\n${variation.prompt}`;
+            }
+            if (fpVariationMode) {
+                const modeLabel = fpVariationMode === '__rotate__' ? `rotating evenly across ${fpVariations.length} variation(s)`
+                    : fpVariationMode === '__weighted__' ? `random selection by share % across ${fpVariations.length} variation(s)`
+                    : fpVariationMode === '__ai__' ? `AI (${fpVariationAiModel}) deciding per contact from ${fpVariations.length} variation(s)' criteria`
+                    : `"${fpVariations.find(v => v.id === fpVariationMode)?.label || fpVariationMode}" applied to every message`;
+                addLog(`🧪 Message Variation: ${modeLabel} for this run`, 'info');
+            }
+
             const scanCriteria = fpBuildScanCriteria('');
             const secondScanConfig = document.getElementById('fpSecondScanEnabled').checked
                 ? { threshold: parseInt(document.getElementById('fpSecondScanThreshold').value) || 5, criteria: fpBuildScanCriteria('2') }
@@ -4548,6 +4704,7 @@
                                                     const bdrNameValPM       = bdrContext.bdrName || '';
                                                     const pdPM    = fallbackProfileData;
                                                     const msgIdPM = `full_ai_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                                                    const variationPM = await fpNextVariation(prospect, pProfile, singleData);
                                                     await queueDb.collection('connect_queue').doc(msgIdPM).set({
                                                         id:                   msgIdPM,
                                                         prospect_li_url:      prospect.linkedInUrl,
@@ -4578,7 +4735,10 @@
                                                         pipelineRunId:        runId,
                                                         buildModel:           buildModel,
                                                         hypothesisGroupId:    groupId,
-                                                        hypothesisGroupName:  groupName
+                                                        hypothesisGroupName:  groupName,
+                                                        // Message Variation — recorded so outcomes.html can report performance per variation
+                                                        hypothesisVariationId:    variationPM ? variationPM.id    : null,
+                                                        hypothesisVariationLabel: variationPM ? variationPM.label : null
                                                     });
                                                     await saveFullAiContextExtras(msgIdPM, {
                                                         profileData: singleData.profileData,
@@ -4604,7 +4764,7 @@
                                                         const rPM = await runFullAiOpusReviewSingle({
                                                             token, bdrEmail, hypothesisGroupId: groupId, docId: msgIdPM,
                                                             targetContactInstructions: targetInstr,
-                                                            messageReviewInstructions: reviewInstr,
+                                                            messageReviewInstructions: fpReviewInstrFor(variationPM),
                                                             bdrOpusInstructions: bdrOpusInstr,
                                                             excludeMode: opusExcludeMode,
                                                             opusModel,
@@ -4682,6 +4842,10 @@
                                     const sourceKey = getFullAiMessageSourceKey(src);
                                     let savedCount = 0;
                                     let savedPostType = null; // last Post Reply message's post_type (regular/quote/repost) — for the tally + log line below
+                                    // Picked once per prospect (not per candidate message) so About Me's two
+                                    // alternatives share the same variation — they're two phrasings of the
+                                    // same idea for one contact, not two separate rotation slots.
+                                    const variation = await fpNextVariation(prospect, pd, singleData);
                                     for (const msg of msgsToSave) {
                                         const msgText = typeof msg === 'string' ? msg : (msg.message || msg.text || '');
                                         if (!msgText) continue;
@@ -4719,6 +4883,9 @@
                                             buildModel:           buildModel,
                                             hypothesisGroupId:    groupId,
                                             hypothesisGroupName:  groupName,
+                                            // Message Variation — recorded so outcomes.html can report performance per variation
+                                            hypothesisVariationId:    variation ? variation.id    : null,
+                                            hypothesisVariationLabel: variation ? variation.label : null,
                                             ...sourceData
                                         });
                                         await saveFullAiContextExtras(msgId, {
@@ -4748,7 +4915,7 @@
                                             const r = await runFullAiOpusReviewSingle({
                                                 token, bdrEmail, hypothesisGroupId: groupId, docId: msgId,
                                                 targetContactInstructions: targetInstr,
-                                                messageReviewInstructions: reviewInstr,
+                                                messageReviewInstructions: fpReviewInstrFor(variation),
                                                 bdrOpusInstructions: bdrOpusInstr,
                                                 excludeMode: opusExcludeMode,
                                                 opusModel,
