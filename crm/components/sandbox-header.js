@@ -1,5 +1,5 @@
 /**
- * HealthLuminate CRM Sandbox Header Component
+ * Pando CRM Sandbox Header Component
  * Shared header for account-detail.html and contact-detail.html
  * 
  * Usage:
@@ -13,14 +13,14 @@ function renderSandboxHeader(options = {}) {
     type = 'account',           // 'account' or 'contact'
     backUrl = 'crm-sandbox.html',
     backText = 'Back to Accounts',
-    icon = type === 'contact' ? 'fa-user-circle' : 'fa-heartbeat',
-    title = 'HealthLuminate CRM'
+    icon = type === 'contact' ? 'fa-user-circle' : 'fa-tree',
+    title = 'Pando CRM'
   } = options;
 
-  // Unified color scheme for all pages - Dark Green/Teal
+  // Pando palette shared with the public site
   const currentColors = {
-    primary: '#1e4a54',     // Dark teal
-    gradient: 'linear-gradient(135deg, #1e4a54 0%, #1f7a6d 100%)'  // Dark teal to green gradient
+    primary: '#12314C',
+    gradient: 'linear-gradient(135deg, #12314C 0%, #4E6E4A 100%)'
   };
 
   const headerHTML = `
