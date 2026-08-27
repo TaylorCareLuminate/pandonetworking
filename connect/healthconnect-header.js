@@ -101,6 +101,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Overall Trends', href: 'overall_trends.html', icon: 'fa-chart-line' },
                 { label: 'Message History', href: 'message_history.html', icon: 'fa-history' },
                 { label: 'Message Outcomes', href: 'outcomes.html', icon: 'fa-bullseye' },
+                { label: 'A/B Outcome Comparison', href: 'ab_outcomes_comparison.html', icon: 'fa-balance-scale-left' },
                 { label: 'Connect Success Analysis', href: 'analysis_results.html', icon: 'fa-lightbulb' },
                 { label: 'Analysis Dataset (Probit)', href: 'analysis_data.html', icon: 'fa-database' },
                 { label: 'Research Hypotheses', href: 'connect_hypothesis_documentation.html', icon: 'fa-flask' },
