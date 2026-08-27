@@ -5140,8 +5140,15 @@
         // Utility: HTML-escape a string for safe innerHTML insertion
         const escHtml = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
+        // Wrapper exposes `.exists` as a boolean getter; native Firestore uses `.exists()`.
+        // `snap.exists || snap.exists?.()` throws when exists is the boolean `false`
+        // (`false?.()` is a TypeError). Check the type instead.
+        function snapExists(snap) {
+            return !!snap && (snap.exists === true || (typeof snap.exists === 'function' && snap.exists()));
+        }
+
         // VERSION CHECK: Log script version to confirm it's loaded
-        console.log('🔧 generate_messages.html loaded - Version: 2026-03-18-v1 (Removed Test/Regen/Recovery tabs; added Post Reply tab + batch filter on all generation tabs)');
+        console.log('🔧 generate_messages.html loaded - Version: 2026-08-27-v1 (Full AI init: retry timeout/CORS drop; fix exists() on missing global instructions)');
 
         let bdrs = [];
         let bdrCustomerMap = new Map(); // customerId -> company name
@@ -15725,7 +15732,7 @@
             let globalCreationInstr = '';
             try {
                 const globalInstrSnap = await getDoc(doc(db, 'connect_settings', 'global_ai_instructions'));
-                if (globalInstrSnap.exists || globalInstrSnap.exists?.()) {
+                if (snapExists(globalInstrSnap)) {
                     globalCreationInstr = (globalInstrSnap.data()?.messageCreationInstructions || '').trim();
                 }
             } catch (e) {
@@ -16041,10 +16048,7 @@
                     if (finalReviewRules.some(r => (r.includeFields || []).includes('bdr_profile'))) {
                         try {
                             const bdrProfSnap = await getDoc(doc(db, 'contact_profiles', bdrEmail));
-                            // clemail-firestore-wrapper exposes `.exists` as a getter, not a method like the
-                            // real Firestore SDK — check both so this works regardless of which one is live.
-                            const bdrProfExists = bdrProfSnap && (bdrProfSnap.exists || bdrProfSnap.exists?.());
-                            finalReviewBdrProfile = bdrProfExists ? (bdrProfSnap.data() || {}) : {};
+                            finalReviewBdrProfile = snapExists(bdrProfSnap) ? (bdrProfSnap.data() || {}) : {};
                         } catch (e) { addLog(`   ⚠️ Could not load BDR profile for Final AI Review: ${e.message}`, 'warning'); }
                     }
                 }
@@ -16080,19 +16084,28 @@
                     }
                 }
 
-                const initRes = await fetch('https://railwayclemail-production.up.railway.app/api/connect/full-ai-init', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-                    body: JSON.stringify({
-                        bdrEmail, count,
-                        connectionFilterEnabled: isConnectionFilterEnabled(),
-                        minConnectionCount: getConnectionFilterMin(),
-                        ...(scanJobId    ? { scanJobId, importBatchStartTime, importBatchEndTime } : {}),
-                        ...(moveBatchId  ? { moveBatchId }  : {}),
-                        ...(groupBatchId ? { groupBatchId } : {}),
-                        ...(fullAiHypUrlSet && fullAiHypUrlSet.size ? { hypothesisGroupUrls: [...fullAiHypUrlSet], hypothesisGroupName: fullAiHypGroupName, hypothesisGroupId: fullAiHypGroupId } : {})
-                    })
-                });
+                let initRes;
+                try {
+                    initRes = await fetchWithRetry('https://railwayclemail-production.up.railway.app/api/connect/full-ai-init', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                        body: JSON.stringify({
+                            bdrEmail, count,
+                            connectionFilterEnabled: isConnectionFilterEnabled(),
+                            minConnectionCount: getConnectionFilterMin(),
+                            ...(scanJobId    ? { scanJobId, importBatchStartTime, importBatchEndTime } : {}),
+                            ...(moveBatchId  ? { moveBatchId }  : {}),
+                            ...(groupBatchId ? { groupBatchId } : {}),
+                            ...(fullAiHypUrlSet && fullAiHypUrlSet.size ? { hypothesisGroupUrls: [...fullAiHypUrlSet], hypothesisGroupName: fullAiHypGroupName, hypothesisGroupId: fullAiHypGroupId } : {})
+                        })
+                    }, { addLog, label: 'Full AI init', retries: 1, delayMs: 5000 });
+                } catch (fetchErr) {
+                    const msg = String(fetchErr && fetchErr.message || fetchErr);
+                    if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+                        throw new Error('Full AI init timed out or was blocked. The console often labels this as a CORS error when Railway takes too long and drops the response (no Access-Control-Allow-Origin on the timeout page). Wait a few seconds and try again.');
+                    }
+                    throw fetchErr;
+                }
                 if (!initRes.ok) {
                     const errText = await initRes.text();
                     throw new Error(`Failed to load prospects: ${initRes.status} — ${errText.substring(0, 200)}`);
