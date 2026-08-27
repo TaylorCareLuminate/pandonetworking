@@ -5148,7 +5148,7 @@
         }
 
         // VERSION CHECK: Log script version to confirm it's loaded
-        console.log('🔧 generate_messages.html loaded - Version: 2026-08-27-v1 (Full AI init: retry timeout/CORS drop; fix exists() on missing global instructions)');
+        console.log('🔧 generate_messages.html loaded - Version: 2026-08-27-v2 (Full AI: filter exclusions/hyp group BEFORE selecting count)');
 
         let bdrs = [];
         let bdrCustomerMap = new Map(); // customerId -> company name
@@ -6449,11 +6449,11 @@
         const _hypothesisGroupUrlCache = new Map();
 
         function _normalizeHypUrl(url) {
-            if (!url) return '';
-            return url.toLowerCase()
-                .replace(/^https?:\/\//i, '')
-                .replace(/^www\./i, '')
-                .replace(/\/+$/g, '');
+            // Same canonical form as normalizeLinkedInUrl (`linkedin.com/in/<slug>`).
+            // The old strip-protocol-only version left query params / locale subdomains
+            // in place, so a contact the server counted as in-group was later dropped
+            // by the client as "outside hypothesis group" — after the count cap.
+            return normalizeLinkedInUrl(url);
         }
 
         // Raw hypothesis_groups docs fetched from Firestore (shared across every tab's dropdown
@@ -16125,11 +16125,9 @@
                     addLog(`⚠️ ${bdrEmail} has no About Me profile statements — the About Me step will be SKIPPED for every prospect and only Internet Search will run. Fill out their About Me profile (about_me.html) to enable About Me messages.`, 'warning');
                 }
 
-                // Client-side safety net for Target Contact / Exclude Rules + soft-excludes.
-                // Older Railway builds compared exclusion URLs without stripping https://www.,
-                // so exclusions written by hypothesis_target_rules.html (protocol-stripped) could
-                // miss. Also drop excludedFromCampaign contacts and enforce hypothesis-group
-                // membership here in case the server build hasn't picked those filters up yet.
+                // Safety-net exclusion + hypothesis-group check. Filters run on the FULL
+                // returned pool, THEN we take `count`. Previously the server sliced to
+                // `count` first and this pass shrank the batch (e.g. 400 → 66 → 1).
                 try {
                     const { collection: colEx, getDocs: gdEx, getAllDocs: gadEx } = window.clemailFirestore;
                     const fetchEx = gadEx || gdEx;
@@ -16147,27 +16145,33 @@
                         }
                     }
                     const beforeClientFilter = prospectList.length;
+                    let droppedExcluded = 0, droppedSoft = 0, droppedOutsideHyp = 0, droppedNoUrl = 0;
                     prospectList = prospectList.filter(p => {
-                        if (p.excludedFromCampaign) return false;
+                        if (p.excludedFromCampaign) { droppedSoft++; return false; }
                         const rawUrl = p.linkedInUrl || p.li_url || p.linkedin_url || p.profile_url || '';
                         const url = normalizeLinkedInUrl(rawUrl);
-                        if (!url) return false;
-                        if (clientExcludedUrls.has(url)) return false;
-                        // Hyp sets are keyed by _normalizeHypUrl; accept either form.
-                        // Also keep contacts Full Pipeline stamped with this groupId even if
-                        // their URL is missing from the group's list. An empty Set is not a filter.
+                        if (!url) { droppedNoUrl++; return false; }
+                        if (clientExcludedUrls.has(url)) { droppedExcluded++; return false; }
                         if (fullAiHypUrlSet && fullAiHypUrlSet.size > 0) {
                             const hypForm = _normalizeHypUrl(rawUrl);
                             const stamped = fullAiHypGroupId && (p.hypothesisGroupId === fullAiHypGroupId);
-                            if (!stamped && !fullAiHypUrlSet.has(url) && !fullAiHypUrlSet.has(hypForm)) return false;
+                            if (!stamped && !fullAiHypUrlSet.has(url) && !fullAiHypUrlSet.has(hypForm)) {
+                                droppedOutsideHyp++;
+                                return false;
+                            }
                         }
                         return true;
                     });
                     const dropped = beforeClientFilter - prospectList.length;
                     if (dropped > 0) {
-                        addLog(`🚫 Client exclusion filter removed ${dropped} prospect(s) (excluded / soft-excluded / outside hypothesis group)`, 'warning');
+                        const bits = [];
+                        if (droppedExcluded) bits.push(`${droppedExcluded} exclusion list`);
+                        if (droppedSoft) bits.push(`${droppedSoft} soft-excluded`);
+                        if (droppedOutsideHyp) bits.push(`${droppedOutsideHyp} outside hypothesis group`);
+                        if (droppedNoUrl) bits.push(`${droppedNoUrl} no URL`);
+                        addLog(`🚫 Exclusion filter removed ${dropped} of ${beforeClientFilter} pool prospect(s) (${bits.join(', ')}) — count is applied after this`, 'warning');
                     } else {
-                        addLog(`🚫 Client exclusion filter: ${clientExcludedUrls.size.toLocaleString()} exclusion URL(s) checked — none of the loaded prospects matched`, 'info');
+                        addLog(`🚫 Exclusion filter: ${clientExcludedUrls.size.toLocaleString()} exclusion URL(s) checked against a pool of ${beforeClientFilter} — none matched`, 'info');
                     }
                 } catch (e) {
                     addLog(`   ⚠️ Client exclusion filter skipped: ${e.message}`, 'warning');
@@ -16210,6 +16214,17 @@
                         return connB - connA; // most connections first
                     });
                     addLog(`📶 Sorted ${prospectList.length} prospects by connection count (most first)`, 'info');
+                }
+
+                // Count is applied LAST — after exclusions, hypothesis-group membership, and sort.
+                const afterFilterCount = prospectList.length;
+                if (prospectList.length > count) {
+                    prospectList = prospectList.slice(0, count);
+                    addLog(`📋 ${afterFilterCount} remaining after filters — selecting ${count}`, 'info');
+                } else if (prospectList.length < count) {
+                    addLog(`⚠️ ${prospectList.length} remaining after filters (requested ${count})`, 'warning');
+                } else {
+                    addLog(`📋 Selecting ${prospectList.length} prospect(s) after filters`, 'info');
                 }
 
                 // skippedConnCount is already visible in the skipSummary log line above;
