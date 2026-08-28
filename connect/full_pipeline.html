@@ -256,7 +256,7 @@
         <!-- ══════════ STEP 3: Organizations preview ══════════ -->
         <div class="section">
             <div class="section-title"><span class="step-num">3</span> Organizations to Scan (preview)</div>
-            <p class="section-help">Read-only preview, in the exact order this run will process them: organizations never scanned under the Scan Name below come first, then — as a tie-breaker, so even a brand-new Scan Name doesn't just restart from the top of the priority list — organizations scanned the fewest total times across ALL scan names. Add / remove / re-prioritize organizations in <a href="prospect_organizations_admin.html" target="_blank">Prospect Organizations Admin</a> (that priority still breaks any remaining ties). Organizations without a LinkedIn URL are researched automatically during the run.</p>
+            <p class="section-help">Read-only preview, in the exact order this run will process them: organizations never scanned under the Scan Name below come first, then — as a tie-breaker, so even a brand-new Scan Name doesn't just restart from the top of the priority list — organizations scanned the fewest total times across ALL scan names (organizations pulled in from a BDR/workspace that were already scanned <em>before</em> joining this hypothesis group are treated as partially-covered here too, so they're queued behind truly never-scanned organizations). Add / remove / re-prioritize organizations in <a href="prospect_organizations_admin.html" target="_blank">Prospect Organizations Admin</a> (that priority still breaks any remaining ties — the AI Priority Scorer there can also set it for you). Organizations without a LinkedIn URL are researched automatically during the run.</p>
 
             <div class="form-group" style="margin-bottom: 14px;">
                 <label for="fpScanName"><i class="fas fa-tag"></i> Scan Name <span style="color: var(--danger); font-weight: 400;">(required)</span></label>
@@ -2108,6 +2108,27 @@
             return fpOrgScanLabels(org).length;
         }
 
+        // Whether this organization has ever been scanned for contacts through ANY
+        // workflow — including the general (non-hypothesis) Apify scan used elsewhere
+        // in Prospect Organizations Admin, not just a hypothesis Full Pipeline run.
+        // An organization pulled into a hypothesis group from a BDR/workspace that
+        // already carries this general scan history has zero scan_labels once tagged
+        // in, so it would otherwise look identical to a truly brand-new org here.
+        function fpHasPriorGeneralScanHistory(org) {
+            return !!org.scanned || (Number(org.scan_count) || 0) > 0;
+        }
+
+        // Combined "how covered is this org" weight for queue ordering: real
+        // hypothesis scan count wins when present; otherwise, organizations that
+        // already carry general scan history (imported already-scanned from a
+        // BDR/workspace) rank just behind truly never-scanned organizations instead
+        // of tying with them.
+        function fpOrgEffectiveScanWeight(org) {
+            const hypoCount = fpOrgTotalScanCount(org);
+            if (hypoCount > 0) return hypoCount;
+            return fpHasPriorGeneralScanHistory(org) ? 0.5 : 0;
+        }
+
         // Builds this run's working queue in priority order:
         //   1) organizations never scanned under THIS exact scan name come first
         //      (or, in skip mode, organizations already scanned under it are dropped
@@ -2116,20 +2137,24 @@
         //      not skipping), organizations scanned the fewest total times across ALL
         //      scan names go first — so a brand-new scan name still favors the
         //      least-covered organizations rather than starting from the top of the
-        //      manually-set priority list every time;
+        //      manually-set priority list every time. Organizations that were already
+        //      scanned elsewhere (general scan_count/scanned flag) before ever being
+        //      tagged into this hypothesis group count as partially-covered here too,
+        //      so they're queued behind truly fresh organizations instead of tying
+        //      with them at zero;
         //   3) any remaining ties keep the existing hypothesis-priority order (stable
         //      sort over the already priority-sorted fpGroupOrgs).
         function fpBuildRunQueue(scanName, skipAlreadyScanned) {
             if (skipAlreadyScanned) {
                 return fpGroupOrgs
                     .filter(o => !fpOrgScanLabels(o).includes(scanName))
-                    .sort((a, b) => fpOrgTotalScanCount(a) - fpOrgTotalScanCount(b));
+                    .sort((a, b) => fpOrgEffectiveScanWeight(a) - fpOrgEffectiveScanWeight(b));
             }
             return [...fpGroupOrgs].sort((a, b) => {
                 const aDone = fpOrgScanLabels(a).includes(scanName) ? 1 : 0;
                 const bDone = fpOrgScanLabels(b).includes(scanName) ? 1 : 0;
                 if (aDone !== bDone) return aDone - bDone;
-                return fpOrgTotalScanCount(a) - fpOrgTotalScanCount(b);
+                return fpOrgEffectiveScanWeight(a) - fpOrgEffectiveScanWeight(b);
             });
         }
 
@@ -2429,7 +2454,11 @@
                     ? labels.map(l => l === currentName
                         ? `<span class="badge badge-amber" title="Already scanned as this name" style="margin: 1px 3px 1px 0;"><i class="fas fa-check"></i> ${escHtml(l)}</span>`
                         : `<span class="badge badge-gray" style="margin: 1px 3px 1px 0;">${escHtml(l)}</span>`).join('')
-                    : (o.last_scanned_at ? `<span style="color: var(--gray-400);">${new Date(o.last_scanned_at).toLocaleDateString()}</span>` : '—');
+                    : (fpHasPriorGeneralScanHistory(o)
+                        ? `<span class="badge badge-gray" title="Scanned ${o.scan_count || 1}x outside Full Pipeline before joining this group — queued behind never-scanned organizations">
+                               <i class="fas fa-history"></i> prior scan (${o.scan_count || 1}x)${o.last_scanned_at ? ', ' + new Date(o.last_scanned_at).toLocaleDateString() : ''}
+                           </span>`
+                        : '—');
                 let urlCell;
                 if (o.company_linkedin_url) {
                     urlCell = `<a href="${escHtml(o.company_linkedin_url)}" target="_blank" style="color: var(--primary); font-size: 12px;">${escHtml(o.company_linkedin_url.replace(/^https?:\/\/(www\.)?/, '').slice(0, 45))}</a>`;

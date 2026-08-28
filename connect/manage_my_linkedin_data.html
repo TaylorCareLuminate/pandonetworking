@@ -1199,7 +1199,53 @@
                     </div>
                 </div>
             </div>
-            
+
+            <!-- Assign Uploaded Contacts to Group / Hypothesis Group (Admin Only) -->
+            <div class="section" id="prospectGroupAssignSection" style="display: none;">
+                <div class="section-title">
+                    <i class="fas fa-object-group"></i>
+                    Assign Uploaded Contacts to a Group &amp; Hypothesis Group
+                    <span style="margin-left: 0.5rem; padding: 2px 10px; background: #dbeafe; color: #1e40af; border-radius: 10px; font-size: 0.7rem; font-weight: 700; vertical-align: middle;">
+                        <i class="fas fa-shield-alt"></i> ADMIN ONLY
+                    </span>
+                </div>
+
+                <div class="alert" style="background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af;">
+                    <i class="fas fa-info-circle"></i>
+                    <div>
+                        <strong><span id="groupAssignContactCount">0</span> contact(s)</strong> from this upload can be assigned to a
+                        <strong>Group</strong> (a named batch, used for exporting/filtering) and/or a <strong>Hypothesis Group</strong>
+                        (used for research/outreach hypothesis testing). Pick an existing one or create a new one on the fly.
+                    </div>
+                </div>
+
+                <div style="display: flex; gap: 1.5rem; flex-wrap: wrap;">
+                    <div class="form-group" style="flex: 1; min-width: 280px;">
+                        <label class="form-label"><i class="fas fa-layer-group"></i> Group</label>
+                        <select id="assignGroupSelect" class="form-select" onchange="onAssignGroupSelectChange()">
+                            <option value="">— No Group —</option>
+                            <option value="__new__">+ Create New Group…</option>
+                        </select>
+                        <input type="text" id="assignNewGroupName" class="form-select" placeholder="New group name…" style="display: none; margin-top: 0.5rem; cursor: text;">
+                    </div>
+                    <div class="form-group" style="flex: 1; min-width: 280px;">
+                        <label class="form-label"><i class="fas fa-flask"></i> Hypothesis Group</label>
+                        <select id="assignHypothesisSelect" class="form-select" onchange="onAssignHypothesisSelectChange()">
+                            <option value="">— No Hypothesis Group —</option>
+                            <option value="__new__">+ Create New Hypothesis Group…</option>
+                        </select>
+                        <input type="text" id="assignNewHypothesisName" class="form-select" placeholder="New hypothesis group name…" style="display: none; margin-top: 0.5rem; cursor: text;">
+                    </div>
+                </div>
+
+                <div style="margin-top: 1.25rem; display: flex; align-items: center; gap: 1rem;">
+                    <button class="btn btn-primary" onclick="saveGroupAssignments()" id="saveGroupAssignBtn">
+                        <i class="fas fa-save"></i> Assign Uploaded Contacts
+                    </button>
+                    <span id="groupAssignStatus" style="color: var(--gray); font-size: 0.9rem;"></span>
+                </div>
+            </div>
+
             <!-- Prospect Contacts Management -->
             <div class="section">
                 <div class="section-title">
@@ -1267,7 +1313,7 @@
         import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
         
         // Use CLEmail wrapper for secure data access via Railway backend
-        const { collection, addDoc, getDocs, query, where, deleteDoc, doc, getDoc, writeBatch } = window.clemailFirestore;
+        const { collection, addDoc, getDocs, query, where, deleteDoc, doc, getDoc, writeBatch, setDoc, updateDoc, Timestamp } = window.clemailFirestore;
 
         // Wait for auth.js to initialize first
         console.log('⏳ Waiting for auth.js to initialize...');
@@ -1303,6 +1349,11 @@
         let selectedProspects = new Set();
         let allConversations = [];
         let allProspectsData = [];
+
+        // Group / Hypothesis Group assignment (Admin Only)
+        let lastUploadBatchContacts = []; // Contacts from the most recent successful prospect upload
+        let allImportGroupsForAssign = []; // { id, name, userEmail, dateKeys }
+        let allHypothesisGroupsForAssign = []; // { id, name, bdrEmails }
         
         // LinkedIn email associations (auth email -> LinkedIn email)
         let linkedInEmailAssociations = new Map();
@@ -3396,6 +3447,9 @@
             // Track URLs seen in this batch to detect duplicates within the upload
             const urlsSeenInBatch = new Set();
             
+            // Reset the list of contacts from this batch (used for Group / Hypothesis Group assignment)
+            lastUploadBatchContacts = [];
+            
             // Required fields
             const requiredFields = ['First Name', 'Last Name', 'Company', 'Company Domain', 'Location', 'Category', 'LinkedIn URL'];
             
@@ -3524,6 +3578,16 @@
                         addLog('warning', `⚠️ Row ${rowNumber}: ${prospect['First Name']} ${prospect['Last Name']} is already uploaded by: ${otherBdrs.map(b => b.bdrEmail).join(', ')}`);
                     }
                 }
+                
+                // Track this contact for potential Group / Hypothesis Group assignment (Admin Only feature)
+                lastUploadBatchContacts.push({
+                    linkedInUrl: prospect['LinkedIn URL'].trim(),
+                    normalizedUrl,
+                    firstName: prospect['First Name'].trim(),
+                    lastName: prospect['Last Name'].trim(),
+                    title: prospect['Title'] ? prospect['Title'].trim() : '',
+                    company: prospect['Company'].trim()
+                });
                 
                 // Create prospect document
                 const prospectData = {
@@ -3777,6 +3841,13 @@
             // Refresh prospect list
             await loadProspectData();
             
+            // Show the Group / Hypothesis Group assignment panel (Admin Only)
+            if (isAdmin && lastUploadBatchContacts.length > 0) {
+                await showGroupAssignmentPanel();
+            } else {
+                document.getElementById('prospectGroupAssignSection').style.display = 'none';
+            }
+            
             // Reset and clear data
             setTimeout(() => {
                 progressBar.style.display = 'none';
@@ -4006,6 +4077,319 @@
                 alert.remove();
             }, 5000);
         }
+
+        // ===== GROUP / HYPOTHESIS GROUP ASSIGNMENT (Admin Only) =====
+        // Lets an admin assign the contacts from the most recent upload to a named
+        // "Group" (import_batch_groups — matched by upload-date batches, same model
+        // used on prospect_contacts.html) and/or a "Hypothesis Group"
+        // (hypothesis_groups — matched by LinkedIn URL, same model used across
+        // connect_hypothesis_documentation.html / prospect_contacts.html).
+
+        const HYPOTHESIS_CHUNK_LIMIT = 700 * 1024; // 700 KB per chunk (Firestore 1MB doc-size safety margin)
+
+        // Show/refresh the assignment panel after a successful prospect upload
+        async function showGroupAssignmentPanel() {
+            document.getElementById('groupAssignContactCount').textContent = lastUploadBatchContacts.length;
+            document.getElementById('groupAssignStatus').textContent = '';
+            await loadGroupAssignmentDropdowns();
+            document.getElementById('prospectGroupAssignSection').style.display = 'block';
+        }
+
+        // Load existing Groups + Hypothesis Groups into the two dropdowns
+        async function loadGroupAssignmentDropdowns() {
+            const targetEmail = (selectedBdrEmail || userEmail || '').toLowerCase();
+
+            // ── Groups (import_batch_groups, scoped to the target BDR) ──
+            try {
+                const snap = await getDocs(query(
+                    collection(db, 'import_batch_groups'),
+                    where('userEmail', '==', targetEmail)
+                ));
+                allImportGroupsForAssign = [];
+                snap.forEach(d => allImportGroupsForAssign.push({ id: d.id, ...d.data() }));
+                allImportGroupsForAssign.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+            } catch (err) {
+                console.warn('loadGroupAssignmentDropdowns (groups):', err.message);
+                allImportGroupsForAssign = [];
+            }
+
+            const groupSel = document.getElementById('assignGroupSelect');
+            const prevGroupVal = groupSel.value;
+            groupSel.innerHTML = '<option value="">— No Group —</option><option value="__new__">+ Create New Group…</option>';
+            allImportGroupsForAssign.forEach(g => {
+                const opt = document.createElement('option');
+                opt.value = g.id;
+                opt.textContent = `${g.name} (${(g.dateKeys || []).length} batch${(g.dateKeys || []).length === 1 ? '' : 'es'})`;
+                groupSel.appendChild(opt);
+            });
+            if (prevGroupVal && [...groupSel.options].some(o => o.value === prevGroupVal)) groupSel.value = prevGroupVal;
+
+            // ── Hypothesis Groups (all groups — admin may assign contacts to any company's hypothesis group) ──
+            try {
+                const snap = await getDocs(collection(db, 'hypothesis_groups'));
+                allHypothesisGroupsForAssign = [];
+                snap.forEach(d => {
+                    const data = d.data();
+                    if (!data.name) return;
+                    allHypothesisGroupsForAssign.push({ id: d.id, name: data.name, bdrEmails: data.bdrEmails || (data.bdrEmail ? [data.bdrEmail] : []) });
+                });
+                allHypothesisGroupsForAssign.sort((a, b) => a.name.localeCompare(b.name));
+            } catch (err) {
+                console.warn('loadGroupAssignmentDropdowns (hypothesis groups):', err.message);
+                allHypothesisGroupsForAssign = [];
+            }
+
+            const hypSel = document.getElementById('assignHypothesisSelect');
+            const prevHypVal = hypSel.value;
+            hypSel.innerHTML = '<option value="">— No Hypothesis Group —</option><option value="__new__">+ Create New Hypothesis Group…</option>';
+            allHypothesisGroupsForAssign.forEach(g => {
+                const opt = document.createElement('option');
+                opt.value = g.id;
+                opt.textContent = g.name;
+                hypSel.appendChild(opt);
+            });
+            if (prevHypVal && [...hypSel.options].some(o => o.value === prevHypVal)) hypSel.value = prevHypVal;
+        }
+
+        window.onAssignGroupSelectChange = function() {
+            const isNew = document.getElementById('assignGroupSelect').value === '__new__';
+            const input = document.getElementById('assignNewGroupName');
+            input.style.display = isNew ? 'block' : 'none';
+            if (isNew) input.focus();
+        };
+
+        window.onAssignHypothesisSelectChange = function() {
+            const isNew = document.getElementById('assignHypothesisSelect').value === '__new__';
+            const input = document.getElementById('assignNewHypothesisName');
+            input.style.display = isNew ? 'block' : 'none';
+            if (isNew) input.focus();
+        };
+
+        // Read a hypothesis group's contacts, transparently resolving chunked storage
+        // (groups with thousands of contacts are split into the 'hypothesis_group_chunks'
+        // collection to stay under Firestore's 1MB document limit).
+        async function readHypothesisGroupContacts(groupId, data) {
+            if (!data._chunked) {
+                return { urls: data.contactLinkedInUrls || [], tagged: data.taggedContacts || [] };
+            }
+            const count = data._chunkCount || 0;
+            const urls = [], tagged = [];
+            for (let i = 0; i < count; i++) {
+                try {
+                    const snap = await getDoc(doc(db, 'hypothesis_group_chunks', `${groupId}_${i}`));
+                    if (snap.exists) {
+                        const d = snap.data();
+                        urls.push(...(d.contactLinkedInUrls || []));
+                        tagged.push(...(d.taggedContacts || []));
+                    }
+                } catch (e) {
+                    console.warn(`readHypothesisGroupContacts: failed to read chunk ${i} for group ${groupId}:`, e.message);
+                }
+            }
+            return { urls, tagged };
+        }
+
+        // Write a hypothesis group's contacts, automatically chunking into
+        // 'hypothesis_group_chunks' when the payload exceeds ~700KB.
+        async function writeHypothesisGroupContacts(groupRef, urls, tagged) {
+            const gid = groupRef.id;
+            const trySize = JSON.stringify({ contactLinkedInUrls: urls, taggedContacts: tagged }).length;
+
+            if (trySize <= HYPOTHESIS_CHUNK_LIMIT) {
+                await updateDoc(groupRef, {
+                    contactLinkedInUrls: urls,
+                    taggedContacts: tagged,
+                    contactNames: tagged.map(c => c.name),
+                    _chunked: false,
+                    _chunkCount: 0,
+                    _totalContactCount: null,
+                    updatedAt: Timestamp.now()
+                });
+                return;
+            }
+
+            const chunks = [];
+            let cu = [], ct = [];
+            for (let i = 0; i < urls.length; i++) {
+                cu.push(urls[i]);
+                if (tagged[i]) ct.push(tagged[i]);
+                if (JSON.stringify({ contactLinkedInUrls: cu, taggedContacts: ct }).length >= HYPOTHESIS_CHUNK_LIMIT) {
+                    cu.pop();
+                    if (tagged[i]) ct.pop();
+                    chunks.push({ contactLinkedInUrls: [...cu], taggedContacts: [...ct] });
+                    cu = [urls[i]];
+                    ct = tagged[i] ? [tagged[i]] : [];
+                }
+            }
+            if (cu.length) chunks.push({ contactLinkedInUrls: cu, taggedContacts: ct });
+
+            for (let i = 0; i < chunks.length; i++) {
+                await setDoc(doc(db, 'hypothesis_group_chunks', `${gid}_${i}`), chunks[i]);
+            }
+
+            await updateDoc(groupRef, {
+                contactLinkedInUrls: [],
+                taggedContacts: [],
+                contactNames: tagged.map(c => c.name),
+                _chunked: true,
+                _chunkCount: chunks.length,
+                _totalContactCount: urls.length,
+                updatedAt: Timestamp.now()
+            });
+        }
+
+        // Main handler for the "Assign Uploaded Contacts" button
+        window.saveGroupAssignments = async function() {
+            const groupSelVal = document.getElementById('assignGroupSelect').value;
+            const newGroupName = document.getElementById('assignNewGroupName').value.trim();
+            const hypSelVal = document.getElementById('assignHypothesisSelect').value;
+            const newHypName = document.getElementById('assignNewHypothesisName').value.trim();
+
+            const wantsGroup = groupSelVal === '__new__' ? !!newGroupName : !!groupSelVal;
+            const wantsHypothesis = hypSelVal === '__new__' ? !!newHypName : !!hypSelVal;
+
+            if (!wantsGroup && !wantsHypothesis) {
+                showProspectAlert('Please select or create a Group and/or a Hypothesis Group to assign these contacts to.', 'warning');
+                return;
+            }
+            if (groupSelVal === '__new__' && !newGroupName) {
+                showProspectAlert('Please enter a name for the new Group.', 'warning');
+                return;
+            }
+            if (hypSelVal === '__new__' && !newHypName) {
+                showProspectAlert('Please enter a name for the new Hypothesis Group.', 'warning');
+                return;
+            }
+            if (!lastUploadBatchContacts.length) {
+                showProspectAlert('No uploaded contacts available to assign. Please upload a CSV first.', 'warning');
+                return;
+            }
+
+            const targetEmail = (selectedBdrEmail || userEmail || '').toLowerCase();
+            const btn = document.getElementById('saveGroupAssignBtn');
+            const statusEl = document.getElementById('groupAssignStatus');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Assigning…';
+
+            try {
+                const summaryParts = [];
+
+                // ── Group (import_batch_groups) — tags today's upload-date batch under a name ──
+                if (wantsGroup) {
+                    const todayKey = new Date().toISOString().split('T')[0];
+                    statusEl.textContent = 'Saving Group…';
+
+                    if (groupSelVal === '__new__') {
+                        await addDoc(collection(db, 'import_batch_groups'), {
+                            userEmail: targetEmail,
+                            name: newGroupName,
+                            dateKeys: [todayKey],
+                            createdAt: new Date(),
+                            createdBy: userEmail
+                        });
+                        addLog('success', `✅ Created new Group "${newGroupName}" and assigned today's upload batch`);
+                        summaryParts.push(`Group "${newGroupName}" (new)`);
+                    } else {
+                        const groupRef = doc(db, 'import_batch_groups', groupSelVal);
+                        const existing = allImportGroupsForAssign.find(g => g.id === groupSelVal);
+                        const dateKeys = new Set(existing?.dateKeys || []);
+                        dateKeys.add(todayKey);
+                        await updateDoc(groupRef, { dateKeys: [...dateKeys] });
+                        addLog('success', `✅ Assigned today's upload batch to Group "${existing?.name || groupSelVal}"`);
+                        summaryParts.push(`Group "${existing?.name || groupSelVal}"`);
+                    }
+                }
+
+                // ── Hypothesis Group (hypothesis_groups) — tags each contact's LinkedIn URL directly ──
+                if (wantsHypothesis) {
+                    statusEl.textContent = 'Saving Hypothesis Group…';
+
+                    const newTagged = lastUploadBatchContacts.map(c => ({
+                        name: `${c.firstName} ${c.lastName}`.trim(),
+                        linkedInUrl: c.linkedInUrl,
+                        title: c.title || '',
+                        org: c.company || '',
+                        orgLinkedInUrl: ''
+                    }));
+
+                    if (hypSelVal === '__new__') {
+                        const metaPayload = {
+                            name: newHypName,
+                            description: '',
+                            color: '#0F2D4D',
+                            bdrEmails: [targetEmail],
+                            bdrEmail: targetEmail,
+                            contactSource: '',
+                            workspaceId: null,
+                            workspaceName: null,
+                            importBatchGroupId: null,
+                            sourcePrompts: [],
+                            messageVariations: [],
+                            sourceBatchIds: [],
+                            targetContactInstructions: '',
+                            messageReviewInstructions: '',
+                            createdAt: Timestamp.now(),
+                            createdBy: userEmail,
+                            updatedAt: Timestamp.now()
+                        };
+                        const groupRef = await addDoc(collection(db, 'hypothesis_groups'), metaPayload);
+                        await writeHypothesisGroupContacts(groupRef, newTagged.map(c => c.linkedInUrl), newTagged);
+                        addLog('success', `✅ Created new Hypothesis Group "${newHypName}" with ${newTagged.length} contact(s)`);
+                        summaryParts.push(`Hypothesis Group "${newHypName}" (new)`);
+                    } else {
+                        const groupRef = doc(db, 'hypothesis_groups', hypSelVal);
+                        const snap = await getDoc(groupRef);
+                        if (!snap.exists) throw new Error('Selected Hypothesis Group no longer exists');
+                        const data = snap.data();
+
+                        const { urls: existingUrls, tagged: existingTagged } = await readHypothesisGroupContacts(hypSelVal, data);
+
+                        // Merge by normalized LinkedIn URL — new upload data wins on conflicts
+                        const merged = new Map();
+                        existingTagged.forEach((c, i) => {
+                            const key = normalizeLinkedInUrl(c.linkedInUrl || existingUrls[i] || '');
+                            if (key) merged.set(key, { ...c, linkedInUrl: c.linkedInUrl || existingUrls[i] });
+                        });
+                        newTagged.forEach(c => {
+                            const key = normalizeLinkedInUrl(c.linkedInUrl);
+                            if (key) merged.set(key, c);
+                        });
+
+                        const mergedTagged = [...merged.values()];
+                        const mergedUrls = mergedTagged.map(c => c.linkedInUrl);
+
+                        // Ensure the target BDR is tied to this hypothesis group
+                        const bdrEmails = new Set((data.bdrEmails?.length ? data.bdrEmails : (data.bdrEmail ? [data.bdrEmail] : [])));
+                        bdrEmails.add(targetEmail);
+                        await updateDoc(groupRef, { bdrEmails: [...bdrEmails], bdrEmail: data.bdrEmail || targetEmail });
+
+                        await writeHypothesisGroupContacts(groupRef, mergedUrls, mergedTagged);
+                        addLog('success', `✅ Assigned ${newTagged.length} contact(s) to Hypothesis Group "${data.name}" (${mergedTagged.length} total)`);
+                        summaryParts.push(`Hypothesis Group "${data.name}"`);
+                    }
+                }
+
+                showProspectAlert(`✅ Assigned ${lastUploadBatchContacts.length} contact(s) to ${summaryParts.join(' and ')}.`, 'success');
+                statusEl.textContent = '';
+
+                // Reset the "create new" inputs and refresh dropdowns so the new groups show up
+                document.getElementById('assignNewGroupName').value = '';
+                document.getElementById('assignNewGroupName').style.display = 'none';
+                document.getElementById('assignNewHypothesisName').value = '';
+                document.getElementById('assignNewHypothesisName').style.display = 'none';
+                document.getElementById('assignGroupSelect').value = '';
+                document.getElementById('assignHypothesisSelect').value = '';
+                await loadGroupAssignmentDropdowns();
+            } catch (error) {
+                console.error('Error saving group assignments:', error);
+                addLog('error', `❌ Error assigning contacts to Group/Hypothesis Group: ${error.message}`);
+                showProspectAlert(`Error assigning contacts: ${error.message}`, 'danger');
+                statusEl.textContent = '';
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-save"></i> Assign Uploaded Contacts';
+            }
+        };
 
         // Make loadUploadedData available globally for the refresh button
         window.loadUploadedData = loadUploadedData;
