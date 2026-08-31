@@ -1113,7 +1113,10 @@
             </div>
             <div class="modal-footer">
                 <button class="btn" onclick="hypoMergeDuplicates()" id="btnHypoMergeDupes" style="background: var(--danger); color: white;">
-                    <i class="fas fa-compress-arrows-alt"></i> Merge &amp; Remove Duplicates (<span id="hypoDupeRemoveCount">0</span>)
+                    <i class="fas fa-compress-arrows-alt"></i> Merge Selected (<span id="hypoDupeRemoveCount">0</span>)
+                </button>
+                <button class="btn" onclick="hypoMergeAllDuplicates()" id="btnHypoMergeAllDupes" style="background: var(--secondary); color: white;">
+                    <i class="fas fa-layer-group"></i> Merge <u>All</u> Duplicates in Group (<span id="hypoDupeTotalCount">0</span>)
                 </button>
                 <button class="btn" onclick="closeHypoDupeModal()" style="background: var(--gray); color: white;">
                     <i class="fas fa-times"></i> Close
@@ -15091,7 +15094,8 @@
             const shown = _hypoDupeSets.slice(0, HYPO_DUPE_RENDER_CAP);
             const overflowNotice = _hypoDupeSets.length > shown.length
                 ? `<div style="padding:8px 12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; font-size:0.83rem; color:#1d4ed8; margin-bottom:0.9rem;">
-                       Showing the first ${shown.length} of ${_hypoDupeSets.length} duplicate sets. Merge these, then run <strong>Find Duplicate Organizations</strong> again for the rest.
+                       Showing the first ${shown.length} of ${_hypoDupeSets.length} duplicate sets for review. Use <strong>Merge Selected</strong> for just these, or
+                       <strong>Merge All Duplicates in Group</strong> below to clean up every duplicate set in one go (auto-picking the best record to keep for the ones not shown).
                    </div>`
                 : '';
 
@@ -15156,6 +15160,12 @@
             const n = _hypoDupeSets.filter(s => s.include).reduce((sum, s) => sum + s.orgs.length - 1, 0);
             document.getElementById('hypoDupeRemoveCount').textContent = n;
             document.getElementById('btnHypoMergeDupes').disabled = n === 0;
+
+            const total = _hypoDupeSets.reduce((sum, s) => sum + s.orgs.length - 1, 0);
+            const totalCountEl = document.getElementById('hypoDupeTotalCount');
+            const allBtn = document.getElementById('btnHypoMergeAllDupes');
+            if (totalCountEl) totalCountEl.textContent = total;
+            if (allBtn) allBtn.disabled = total === 0;
         }
 
         window.hypoToggleDupeSet = function(idx, checked) {
@@ -15266,6 +15276,61 @@
             return moved;
         }
 
+        // Shared merge loop used by both "Merge Selected" (only the reviewed sets
+        // shown on screen) and "Merge All" (every duplicate set in the group,
+        // regardless of the render cap). Each set keeps whichever org is currently
+        // marked as its keeper — auto-picked by hypoDupeScore unless the user
+        // changed it via the radio buttons for a set that was actually shown.
+        async function hypoRunDupeMerge(sets, onProgress) {
+            let mergedSets = 0, removed = 0, contactsMoved = 0;
+            const errors = [];
+            for (let i = 0; i < sets.length; i++) {
+                const set = sets[i];
+                if (onProgress) onProgress(i, sets.length);
+                const keeper = set.orgs.find(o => o.id === set.keeperId) || set.orgs[0];
+                const dupes = set.orgs.filter(o => o.id !== keeper.id);
+                try {
+                    const update = hypoBuildMergeUpdate(keeper, dupes);
+                    if (Object.keys(update).length) {
+                        await updateDoc(doc(db, 'prospect_organizations', keeper.id), update);
+                        const liveKeeper = hypoOrgsData.find(o => o.id === keeper.id);
+                        if (liveKeeper) Object.assign(liveKeeper, update);
+                    }
+                    for (const dupe of dupes) {
+                        if (hypoDupeWillBeDeleted(dupe)) {
+                            contactsMoved += await hypoRepointOrgContacts(dupe.id, keeper.id);
+                        }
+                        await hypoUnlinkOrgDoc(dupe);
+                        hypoOrgsData = hypoOrgsData.filter(o => o.id !== dupe.id);
+                        hypoSelectedOrgIds.delete(dupe.id);
+                        removed++;
+                    }
+                    mergedSets++;
+                } catch (err) {
+                    console.error(`Error merging duplicates for ${keeper.company_name}:`, err);
+                    errors.push(`${keeper.company_name}: ${err.message}`);
+                }
+            }
+            return { mergedSets, removed, contactsMoved, errors };
+        }
+
+        function hypoFinishDupeMerge() {
+            hypoUpdateStats();
+            hypoRenderOrgsTable();
+            hypoRenderScanNamesSummary();
+            hypoUpdateSelectionCounts();
+            _hypoDupeSets = hypoBuildDupeSets(document.getElementById('hypoDupeLooseMatch').checked);
+            hypoRenderDupeModal();
+            hypoUpdateDupeHint();
+        }
+
+        function hypoDupeMergeResultMessage({ mergedSets, removed, contactsMoved, errors }) {
+            let msg = `✅ Merged ${mergedSets} duplicate set(s) — ${removed} record(s) removed from the group.`;
+            if (contactsMoved) msg += `\n📋 ${contactsMoved} contact(s) re-pointed to the kept organizations.`;
+            if (errors.length) msg += `\n\n⚠️ ${errors.length} error(s):\n${errors.slice(0, 5).join('\n')}`;
+            return msg;
+        }
+
         window.hypoMergeDuplicates = async function() {
             const sets = _hypoDupeSets.filter(s => s.include && s.orgs.length > 1);
             if (sets.length === 0) { alert('No duplicate sets are checked.'); return; }
@@ -15273,54 +15338,58 @@
             if (!confirm(`Merge ${sets.length} duplicate set(s) and remove ${removeCount} organization record(s) from "${hypoCurrentGroupName}"?\n\nThe kept record inherits missing details, scan names and contacts. Records that exist only in this group's pool are deleted; records owned by a BDR/workspace just lose their link to this group.`)) return;
 
             const btn = document.getElementById('btnHypoMergeDupes');
+            const allBtn = document.getElementById('btnHypoMergeAllDupes');
             const originalHtml = btn.innerHTML;
-            let mergedSets = 0, removed = 0, contactsMoved = 0;
-            const errors = [];
-
             try {
                 btn.disabled = true;
-                for (let i = 0; i < sets.length; i++) {
-                    const set = sets[i];
-                    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Merging ${i + 1}/${sets.length}…`;
-                    const keeper = set.orgs.find(o => o.id === set.keeperId) || set.orgs[0];
-                    const dupes = set.orgs.filter(o => o.id !== keeper.id);
-                    try {
-                        const update = hypoBuildMergeUpdate(keeper, dupes);
-                        if (Object.keys(update).length) {
-                            await updateDoc(doc(db, 'prospect_organizations', keeper.id), update);
-                            const liveKeeper = hypoOrgsData.find(o => o.id === keeper.id);
-                            if (liveKeeper) Object.assign(liveKeeper, update);
-                        }
-                        for (const dupe of dupes) {
-                            if (hypoDupeWillBeDeleted(dupe)) {
-                                contactsMoved += await hypoRepointOrgContacts(dupe.id, keeper.id);
-                            }
-                            await hypoUnlinkOrgDoc(dupe);
-                            hypoOrgsData = hypoOrgsData.filter(o => o.id !== dupe.id);
-                            hypoSelectedOrgIds.delete(dupe.id);
-                            removed++;
-                        }
-                        mergedSets++;
-                    } catch (err) {
-                        console.error(`Error merging duplicates for ${keeper.company_name}:`, err);
-                        errors.push(`${keeper.company_name}: ${err.message}`);
-                    }
-                }
-
-                hypoUpdateStats();
-                hypoRenderOrgsTable();
-                hypoRenderScanNamesSummary();
-                hypoUpdateSelectionCounts();
-                _hypoDupeSets = hypoBuildDupeSets(document.getElementById('hypoDupeLooseMatch').checked);
-                hypoRenderDupeModal();
-                hypoUpdateDupeHint();
-
-                let msg = `✅ Merged ${mergedSets} duplicate set(s) — ${removed} record(s) removed from the group.`;
-                if (contactsMoved) msg += `\n📋 ${contactsMoved} contact(s) re-pointed to the kept organizations.`;
-                if (errors.length) msg += `\n\n⚠️ ${errors.length} error(s):\n${errors.slice(0, 5).join('\n')}`;
-                alert(msg);
+                if (allBtn) allBtn.disabled = true;
+                const result = await hypoRunDupeMerge(sets, (i, total) => {
+                    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Merging ${i + 1}/${total}…`;
+                });
+                hypoFinishDupeMerge();
+                alert(hypoDupeMergeResultMessage(result));
             } finally {
                 btn.innerHTML = originalHtml;
+                hypoUpdateDupeCount();
+            }
+        };
+
+        // Merges every duplicate set found in the group in one pass — not just the
+        // first HYPO_DUPE_RENDER_CAP sets rendered on screen — so a group with
+        // several hundred duplicates can be fully cleaned up without reopening this
+        // modal repeatedly. Each set's keeper is auto-picked by hypoDupeScore (any
+        // manual keeper choice made for a set currently shown on screen is respected).
+        window.hypoMergeAllDuplicates = async function() {
+            if (!hypoCurrentGroupId) { alert('Select a hypothesis group first.'); return; }
+            const looseEl = document.getElementById('hypoDupeLooseMatch');
+            const allSets = hypoBuildDupeSets(looseEl ? looseEl.checked : true).filter(s => s.orgs.length > 1);
+            if (allSets.length === 0) { alert('No duplicate organizations found in this group.'); return; }
+
+            // Preserve any keeper the user manually chose among the sets currently
+            // shown, since hypoBuildDupeSets() above recomputed fresh auto-picks.
+            const chosenKeepers = new Map(_hypoDupeSets.map(s => [s.orgs.map(o => o.id).sort().join(','), s.keeperId]));
+            allSets.forEach(s => {
+                const key = s.orgs.map(o => o.id).sort().join(',');
+                if (chosenKeepers.has(key)) s.keeperId = chosenKeepers.get(key);
+            });
+
+            const removeCount = allSets.reduce((n, s) => n + s.orgs.length - 1, 0);
+            if (!confirm(`Merge ALL ${allSets.length} duplicate set(s) found in "${hypoCurrentGroupName}" and remove ${removeCount} organization record(s)?\n\nThis covers every duplicate in the group — not just the sets shown below — so nothing needs to be reopened afterward. Each set automatically keeps its best record (scan history > richer data > real owner > oldest), except where you already picked a keeper above.\n\nThe kept record inherits missing details, scan names and contacts. Records that exist only in this group's pool are deleted; records owned by a BDR/workspace just lose their link to this group.`)) return;
+
+            const btn = document.getElementById('btnHypoMergeAllDupes');
+            const selBtn = document.getElementById('btnHypoMergeDupes');
+            const originalHtml = btn.innerHTML;
+            try {
+                btn.disabled = true;
+                if (selBtn) selBtn.disabled = true;
+                const result = await hypoRunDupeMerge(allSets, (i, total) => {
+                    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Merging ${i + 1}/${total}…`;
+                });
+                hypoFinishDupeMerge();
+                alert(hypoDupeMergeResultMessage(result));
+            } finally {
+                btn.innerHTML = originalHtml;
+                if (selBtn) selBtn.disabled = false;
                 hypoUpdateDupeCount();
             }
         };
