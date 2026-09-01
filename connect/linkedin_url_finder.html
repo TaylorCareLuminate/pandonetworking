@@ -686,13 +686,15 @@ async function runSearch() {
         setPipe('pipeRun', 'active');
         log(`  Job started: ${activeJobId}`, 'log-ok');
 
-        // Poll until done. If the backend restarted mid-job (Railway redeploy/crash
-        // wipes its in-memory job store), the job id becomes permanently unknown to
-        // it (404s). In that case, transparently restart the job instead of
-        // spinning forever. If the backend is still settling right after a
-        // restart, even the restarted job can die again immediately — so retry
-        // a few times with backoff rather than giving up after just one attempt.
+        // Poll until done. The server mirrors job progress to Firestore so any
+        // Railway replica can answer a poll (see server.js), so a genuinely
+        // lost job now really does mean the job is gone (e.g. an actual
+        // restart/redeploy). In that rare case, transparently start a new job
+        // instead of spinning forever — but only for whatever contacts in this
+        // range weren't already searched, using the local checkpoint to figure
+        // out what's left, so a restart doesn't throw away completed work.
         const MAX_JOB_RESTARTS = 3;
+        let contactsToSearch = searchContacts;
         let serverResults;
         for (let restartAttempt = 0; ; restartAttempt++) {
             try {
@@ -700,11 +702,40 @@ async function runSearch() {
                 break;
             } catch (pollErr) {
                 if (!pollErr.jobLost || restartAttempt >= MAX_JOB_RESTARTS) throw pollErr;
+
+                const cp = loadJobCheckpoint(activeJobId);
+                let remaining = contactsToSearch;
+                if (cp && cp.results && cp.results.length) {
+                    const doneRowIdxs = new Set(cp.results.map(r => r.contact?._rowIdx));
+                    remaining = contactsToSearch.filter(c => !doneRowIdxs.has(c._rowIdx));
+                    mergeMatchResults(cp.results.map(r => ({
+                        contact:  r.contact,
+                        match:    r.match || null,
+                        aiReason: r.aiReason || '',
+                        selected: !!r.match
+                    })));
+                    // Update the underlying data now, but don't jump the UI to
+                    // the Review step yet — the search is still running.
+                    renderStats();
+                    renderResultRows();
+                    updateSaveCount();
+                }
+
+                if (remaining.length === 0) {
+                    // The lost job had actually already finished everyone in this range.
+                    serverResults = cp.results;
+                    break;
+                }
+
                 const backoff = Math.min(4000 * (restartAttempt + 1), 20000);
-                log(`⚠ The server restarted and lost track of this job (restart ${restartAttempt + 1}/${MAX_JOB_RESTARTS}). Waiting ${Math.round(backoff / 1000)}s before trying again…`, 'log-dim');
+                const resumeNote = remaining.length < contactsToSearch.length
+                    ? ` — resuming with the ${remaining.length} not yet searched (${contactsToSearch.length - remaining.length} already have results)`
+                    : '';
+                log(`⚠ Lost track of this job (restart ${restartAttempt + 1}/${MAX_JOB_RESTARTS}). Waiting ${Math.round(backoff / 1000)}s before trying again${resumeNote}…`, 'log-dim');
                 await sleep(backoff);
                 setPipe('pipeRun', 'active');
-                activeJobId = await startJob(searchContacts);
+                contactsToSearch = remaining;
+                activeJobId = await startJob(contactsToSearch);
                 jobIdsThisRun.push(activeJobId);
                 log(`  Job restarted: ${activeJobId}`, 'log-ok');
             }
@@ -760,10 +791,11 @@ async function runSearch() {
 }
 
 // ── Local checkpointing ─────────────────────────────────────────────────────
-// The backend keeps job state in memory only (no DB), so a Railway restart
-// permanently wipes any in-flight job. To avoid losing partial progress when
-// that happens, we mirror every poll response into localStorage and can
-// recover from it if the job is later reported lost.
+// The server also mirrors job progress to Firestore (so any Railway replica
+// can answer a poll — see server.js), but a genuine restart still wipes both
+// that and the in-memory job. As a last line of defense against actually
+// losing partial progress in that case, we also mirror every poll response
+// into localStorage and can recover from it if the job is later reported lost.
 function checkpointKey(jobId) { return `urlFinderJob_${jobId}`; }
 
 function saveJobCheckpoint(jobId, results) {
@@ -1035,7 +1067,13 @@ async function pollJobUntilDone(jobId) {
     let lastLogTs = '';   // ISO timestamp of the newest log line already shown
     let consecutiveNotFound = 0;
     let consecutiveErrors = 0;
-    const MAX_NOT_FOUND = 2;       // confirm the job is really gone (not a one-off blip) before giving up
+    // The server mirrors job progress to Firestore so any Railway replica can
+    // answer a poll, so a 404 here should be rare and usually means the job
+    // is genuinely gone (real restart) rather than just landing on a replica
+    // that didn't start it. Still confirm with a couple of retries — not a
+    // one-off blip — before giving up, since a fresh job's Firestore mirror
+    // write can very briefly lag the in-memory job existing.
+    const MAX_NOT_FOUND = 3;
     const MAX_CONSEC_ERRORS = 8;   // give up if the server is unreachable for too long
     let pollDelay = 5000;
 
@@ -1055,15 +1093,15 @@ async function pollJobUntilDone(jobId) {
             continue;
         }
 
-        // The backend keeps jobs in memory only, so a redeploy/crash/restart
-        // wipes them out and every future poll 404s forever. Detect that
-        // quickly (instead of retrying for up to an hour) and bail out so the
-        // caller can restart the job.
+        // A redeploy/crash/restart wipes the server's job state (both the
+        // in-memory copy and, eventually, nothing left to mirror), so every
+        // future poll 404s forever. Detect that (instead of retrying for up
+        // to an hour) and bail out so the caller can restart the job.
         if (resp.status === 404) {
             consecutiveNotFound++;
-            log(`  ⚠ Job not found on server (${consecutiveNotFound}/${MAX_NOT_FOUND}) — it may have restarted.`, 'log-dim');
+            log(`  ⚠ Job not found on server (${consecutiveNotFound}/${MAX_NOT_FOUND})…`, 'log-dim');
             if (consecutiveNotFound >= MAX_NOT_FOUND) {
-                const err = new Error('Job lost — the server restarted mid-run.');
+                const err = new Error('Job lost — the server may have restarted mid-run.');
                 err.jobLost = true;
                 throw err;
             }
