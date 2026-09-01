@@ -250,6 +250,15 @@
             <span class="range-of" id="rangeOfLabel"></span>
             <button class="btn btn-ghost btn-sm" onclick="resetRange()"><i class="fas fa-undo"></i> All</button>
         </div>
+        <div class="range-box" id="strictnessBox">
+            <label for="matchStrictness"><i class="fas fa-sliders"></i> Match strictness</label>
+            <select id="matchStrictness" style="padding:0.4rem 0.6rem;border:2px solid var(--border);border-radius:6px;font-size:0.85rem;background:white;">
+                <option value="strict">Strict — only near-certain matches</option>
+                <option value="balanced" selected>Balanced — allows nicknames &amp; sister hospitals (recommended)</option>
+                <option value="liberal">Liberal — accepts the most plausible candidate</option>
+            </select>
+            <span class="range-of">Looser finds more but needs more double-checking. Near-misses that fall below the bar are shown on their "Not Found" rows so you can verify them yourself.</span>
+        </div>
         <div class="pipeline" id="pipeline" style="display:none;">
             <div class="pipe-step" id="pipeStart"><i class="fas fa-play"></i>Starting</div>
             <div class="pipe-step" id="pipeRun"><i class="fas fa-spinner"></i>Running</div>
@@ -580,6 +589,7 @@ function mergeMatchResults(newRows) {
             contact:  r.contact,
             match:    r.match || null,
             aiReason: r.aiReason || '',
+            confidence: r.confidence || null,
             selected: !!r.match,
             notes:    (prev && prev.notes) || r.notes || '',
             source:   r.match ? 'ai' : null,
@@ -606,13 +616,19 @@ function renderTermsPreview() {
     }).join('\n') + (contacts.length > 8 ? `\n<span style="color:#94a3b8;">…and ${contacts.length - 8} more</span>` : '');
     document.getElementById('termsPreviewBox').innerHTML = `
         <div style="font-size:0.82rem;font-weight:600;color:var(--secondary);margin-bottom:0.4rem;">
-            Each contact gets its own apimaestro search (up to 10 candidates) → Llama picks the best match:
+            Each contact: one name-only search (up to 10 candidates) → Llama checks for a match →
+            only if none is accepted, a second search adds one distinctive company keyword.
+            The second search is skipped whenever the first already finds the person, which keeps costs down:
         </div>
         <div class="terms-list">${html}</div>`;
 }
 
 // ── Run Search (v2: job-based, one contact at a time) ──────────────────────
 let activeJobId = null;
+
+function getMatchStrictness() {
+    return document.getElementById('matchStrictness')?.value || 'balanced';
+}
 
 function log(msg, cls = 'log-dim') {
     const box = document.getElementById('logBox');
@@ -678,7 +694,7 @@ async function runSearch() {
         const rangeDesc = isPartialRange
             ? `records ${searchContacts[0]._rowIdx + 1}–${searchContacts[searchContacts.length - 1]._rowIdx + 1} (${searchContacts.length} of ${contacts.length} contacts)`
             : `${searchContacts.length} contacts`;
-        log(`▶ Starting job for ${rangeDesc} (apimaestro + Llama)…`, 'log-info');
+        log(`▶ Starting job for ${rangeDesc} (apimaestro + Llama, ${getMatchStrictness()} matching)…`, 'log-info');
 
         activeJobId = await startJob(searchContacts);
         jobIdsThisRun.push(activeJobId);
@@ -712,6 +728,7 @@ async function runSearch() {
                         contact:  r.contact,
                         match:    r.match || null,
                         aiReason: r.aiReason || '',
+                        confidence: r.confidence || null,
                         selected: !!r.match
                     })));
                     // Update the underlying data now, but don't jump the UI to
@@ -752,6 +769,7 @@ async function runSearch() {
             contact:  r.contact,
             match:    r.match || null,
             aiReason: r.aiReason || '',
+            confidence: r.confidence || null,
             selected: !!r.match
         })));
 
@@ -776,6 +794,7 @@ async function runSearch() {
                 contact:  r.contact,
                 match:    r.match || null,
                 aiReason: r.aiReason || '',
+                confidence: r.confidence || null,
                 selected: !!r.match
             })));
             const found = checkpoint.results.filter(r => r.match).length;
@@ -962,7 +981,7 @@ async function recoverJob(jobId, onServer) {
 
     contacts = results.map(r => r.contact);
     mergeMatchResults(results.map(r => ({
-        contact: r.contact, match: r.match || null, aiReason: r.aiReason || '', selected: !!r.match
+        contact: r.contact, match: r.match || null, aiReason: r.aiReason || '', confidence: r.confidence || null, selected: !!r.match
     })));
     renderResults();   // unlocks + scrolls to the Review/Save steps
     updateSaveCount();
@@ -994,7 +1013,7 @@ async function watchJob(jobId) {
         setPipe('pipeDone', 'done');
         contacts = results.map(r => r.contact);
         mergeMatchResults(results.map(r => ({
-            contact: r.contact, match: r.match || null, aiReason: r.aiReason || '', selected: !!r.match
+            contact: r.contact, match: r.match || null, aiReason: r.aiReason || '', confidence: r.confidence || null, selected: !!r.match
         })));
         renderResults();
         updateSaveCount();
@@ -1006,7 +1025,7 @@ async function watchJob(jobId) {
         if (cp && cp.results && cp.results.length) {
             contacts = cp.results.map(r => r.contact);
             mergeMatchResults(cp.results.map(r => ({
-                contact: r.contact, match: r.match || null, aiReason: r.aiReason || '', selected: !!r.match
+                contact: r.contact, match: r.match || null, aiReason: r.aiReason || '', confidence: r.confidence || null, selected: !!r.match
             })));
             renderResults();
             updateSaveCount();
@@ -1030,7 +1049,7 @@ async function startJob(contactsToSearch) {
             resp = await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/start`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ contacts: contactsToSearch })
+                body: JSON.stringify({ contacts: contactsToSearch, matchStrictness: getMatchStrictness() })
             });
         } catch (netErr) {
             if (attempt === MAX_ATTEMPTS) {
@@ -1301,6 +1320,7 @@ function renderResultRows() {
                         <div class="match-name">${escHtml(profileName(r) || '–')}</div>
                         <div class="match-meta">${escHtml(profileTitle(r) || profileHeadline(r) || '–')}</div>
                         <div class="match-meta">${escHtml(profileCompany(r))}${profileLocation(r) ? ' · ' + escHtml(profileLocation(r)) : ''}</div>
+                        ${m.aiReason ? `<div class="match-meta" style="margin-top:2px;font-style:italic;"><i class="fas fa-robot" style="opacity:.5;font-size:.68rem;"></i> ${escHtml(m.aiReason)}</div>` : ''}
                     </div>
                 </div>`;
         } else {
@@ -1330,8 +1350,11 @@ function renderResultRows() {
             </div>`;
         }
 
+        const confCls = m.confidence === 'medium' ? 'conf-medium'
+                      : m.confidence === 'low'    ? 'conf-low'
+                      : 'conf-high';
         const badge = isAiRow(m)
-            ? `<span class="conf-badge conf-high">✓ AI Match</span>`
+            ? `<span class="conf-badge ${confCls}">✓ AI Match${m.confidence ? ' · ' + m.confidence : ''}</span>`
             : (manual
                 ? `<span class="conf-badge conf-manual">✎ Manual</span>`
                 : `<span class="conf-badge conf-none">— Not found</span>`);
@@ -1372,7 +1395,8 @@ function toggleAll(checked) {
 
 function selectByConf(mode) {
     matchResults.forEach(m => {
-        if (mode === 'high')      m.selected = isAiRow(m);
+        // Rows from before confidence tracking have none — treat them as high.
+        if (mode === 'high')      m.selected = isAiRow(m) && (!m.confidence || m.confidence === 'high');
         else if (mode === 'all')  m.selected = isFoundRow(m);
         else                      m.selected = false;
     });
@@ -1491,6 +1515,7 @@ async function exportToExcel() {
                 email: c.email || '',
                 status: statusLabel(m),
                 source: isAiRow(m) ? 'AI Match' : (isManualRow(m) ? 'Manually added' : '—'),
+                confidence: isAiRow(m) ? (m.confidence || '') : '',
                 linkedInUrl: url,
                 matchName: isAiRow(m) ? (profileName(r) || '') : (isManualRow(m) ? (c.name || '') : ''),
                 matchTitle: isAiRow(m) ? (profileTitle(r) || profileHeadline(r) || '') : '',
@@ -1665,6 +1690,7 @@ async function exportToExcel() {
             { header: 'Email', key: 'email', width: 28 },
             { header: 'LinkedIn URL', key: 'linkedInUrl', width: 42 },
             { header: 'Source', key: 'source', width: 16 },
+            { header: 'Confidence', key: 'confidence', width: 14 },
             { header: 'Matched Profile Name', key: 'matchName', width: 24 },
             { header: 'Matched Title', key: 'matchTitle', width: 28 },
             { header: 'Matched Company', key: 'matchCompany', width: 24 },
@@ -1839,7 +1865,8 @@ window._urlFinder_save = async function(toSave, targetBDR) {
             createdAt:    now,
             source:       isManual ? 'linkedin_url_finder_manual' : 'linkedin_url_finder',
             aiMatched:    !isManual,
-            aiMatchReason: m.aiReason || ''
+            aiMatchReason: m.aiReason || '',
+            aiMatchConfidence: m.confidence || ''
         };
 
         try {
