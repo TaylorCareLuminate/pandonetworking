@@ -560,6 +560,16 @@
                     </label>
                     <div class="form-help">When a contact has no worthy posts, no About Me match, and no usable news story, write a message from their profile itself — the same last-resort flow Full AI Generate uses on Generate Messages. Without this, those contacts get no message at all.</div>
                 </div>
+                <div class="form-group">
+                    <label><i class="fas fa-ranking-star"></i> Top Contacts Cap (per organization, per BDR)</label>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" id="fpTopContactsEnabled" style="width: auto;">
+                        <span style="font-size: 13px;">Only use the top</span>
+                        <input type="number" id="fpTopContactsLimit" value="5" min="1" style="width: 70px;">
+                        <span style="font-size: 13px;">matched contacts per organization for each BDR</span>
+                    </div>
+                    <div class="form-help">Off by default. When on, after the Target Contact rules filter, only the top N contacts at each organization (ranked by LinkedIn connection count) move on to message generation for the BDR. The additional good-fit contacts are <strong>not lost</strong> — they stay saved to the BDR in prospect_contacts and are tagged with this hypothesis group so they can be used later. This limits how many contacts at the same organization are messaged at once.</div>
+                </div>
             </div>
         </div>
 
@@ -4493,6 +4503,13 @@
             const opusExcludeMode = document.getElementById('fpOpusExcludeMode').value;
             const crossBdrEnabled = document.getElementById('fpCrossBdrEnabled').checked;
             const finalReviewEnabled = document.getElementById('fpFinalReviewEnabled').checked;
+            const topContactsEnabled = document.getElementById('fpTopContactsEnabled').checked;
+            const topContactsLimit = Math.max(1, parseInt(document.getElementById('fpTopContactsLimit').value) || 5);
+            if (topContactsEnabled) {
+                addLog(`🔝 Top Contacts Cap is ON — at each organization, only the top ${topContactsLimit} matched contact(s) per BDR (ranked by LinkedIn connection count) will move on to message generation. Additional good-fit contacts stay saved to the BDR and tagged with this hypothesis group for later use.`, 'info');
+            } else {
+                addLog('🔝 Top Contacts Cap is OFF (default) — every rule-matched contact is eligible for message generation.', 'dim');
+            }
             // Pull the latest shared rule set from Firestore before the run so the same
             // rules fire here as on every other browser/device/page.
             let finalReviewRules = [];
@@ -4670,6 +4687,7 @@
                 settings: {
                     routingMode, connectionFilterEnabled: connFilterOn, minConnectionCount: connFilterMin,
                     opusExcludeMode, crossBdrEnabled, finalReviewEnabled, profileMsgFallback: profileMsgFallbackOn,
+                    topContactsCap: { enabled: topContactsEnabled, limit: topContactsLimit },
                     scanCriteria, secondScan: secondScanConfig, orgTypeMode: orgTypeConfig,
                     costGuard: { costPerMessage, apifyPerMessageLimit, minSpendBeforeEnforcing: costMinSpend },
                     scanName, skipAlreadyScanned, alreadyScannedSkippedAtStart: skipAlreadyScanned ? alreadyScannedCount : 0,
@@ -5075,22 +5093,51 @@
                                 continue;
                             }
 
+                            // ── 4.5 Top Contacts Cap (optional, default OFF) ── limits how many
+                            // contacts at THIS organization move on to message generation for this
+                            // BDR. Ranked by LinkedIn connection count (highest first; contacts with
+                            // no recorded count sort last, original order preserved on ties). The
+                            // overflow contacts are already saved to the BDR in prospect_contacts
+                            // and were tagged with the hypothesis group above, so they remain
+                            // available for later runs — nothing is deleted or archived here.
+                            let contactsForMessaging = kept;
+                            if (topContactsEnabled && kept.length > topContactsLimit) {
+                                const connCount = c => parseInt(c.linkedInConnectionCount ?? c.connectionCount ?? c.connectionsCount) || 0;
+                                const ranked = [...kept].sort((a, b) => connCount(b) - connCount(a));
+                                contactsForMessaging = ranked.slice(0, topContactsLimit);
+                                const overflow = ranked.slice(topContactsLimit);
+                                orgReport.topContactsCap = {
+                                    applied: true, limit: topContactsLimit,
+                                    matched: kept.length, used: contactsForMessaging.length, savedForLater: overflow.length,
+                                    savedForLaterContacts: overflow.slice(0, 100).map(c => ({
+                                        name: `${c.firstName || ''} ${c.lastName || ''}`.trim() || null,
+                                        title: c.title || '', linkedInUrl: c.linkedInUrl || ''
+                                    }))
+                                };
+                                const usedNames = contactsForMessaging.map(c => `${`${c.firstName || ''} ${c.lastName || ''}`.trim() || c.title || 'unknown'} (${connCount(c)} conn)`).join(', ');
+                                const overflowNames = overflow.slice(0, 5).map(c => `${c.firstName || ''} ${c.lastName || ''}`.trim() || c.title || c.linkedInUrl).join(', ');
+                                addLog(`   🔝 Top Contacts Cap: ${kept.length} contact(s) matched at ${org.company_name} but the cap is ${topContactsLimit} — using the top ${contactsForMessaging.length} for ${bdrRec.name || bdrEmail}: ${usedNames}.`, 'info');
+                                addLog(`   💾 ${overflow.length} additional good-fit contact(s) saved to ${bdrEmail} (prospect_contacts) and tagged with hypothesis group "${groupName}" for later use: ${overflowNames}${overflow.length > 5 ? ` +${overflow.length - 5} more` : ''}.`, 'dim');
+                            } else if (topContactsEnabled) {
+                                addLog(`   🔝 Top Contacts Cap: ${kept.length} matched contact(s) at ${org.company_name} — at or under the cap of ${topContactsLimit}, all move on.`, 'dim');
+                            }
+
                             // ── 5. Org news — ONCE per organization ──
                             const { items: orgNewsItems, refreshedToken: newsRefreshedToken } = await fpPrefetchOrgNews({
-                                token, bdrEmail, org, sampleTitle: kept[0]?.title || ''
+                                token, bdrEmail, org, sampleTitle: contactsForMessaging[0]?.title || ''
                             });
                             if (newsRefreshedToken) { token = newsRefreshedToken; lastTokenRefreshAt = Date.now(); }
                             orgReport.newsStories = orgNewsItems === null ? null : orgNewsItems.length;
 
                             // ── 6. Full AI init — pass matched contact URLs as the URL filter ──
-                            const matchedUrls = kept
+                            const matchedUrls = contactsForMessaging
                                 .map(c => (c.linkedInUrl || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/+$/, ''))
                                 .filter(Boolean);
                             const remaining = plan.target - plan.generated;
 
                             const buildInitBody = () => JSON.stringify({
                                 bdrEmail,
-                                count: Math.min(remaining, kept.length),
+                                count: Math.min(remaining, contactsForMessaging.length),
                                 connectionFilterEnabled: connFilterOn,
                                 minConnectionCount: connFilterMin,
                                 hypothesisGroupUrls: matchedUrls,

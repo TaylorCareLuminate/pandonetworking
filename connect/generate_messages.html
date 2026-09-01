@@ -1193,6 +1193,36 @@
             </div>
         </div>
 
+        <!-- ── Global 30-Day Organization Message Limit (default OFF) ───────── -->
+        <div id="orgMsgLimitBar" style="
+            background: linear-gradient(135deg, #faf5ff, #f3e8ff);
+            border: 1.5px solid #d8b4fe;
+            border-radius: 10px;
+            padding: 14px 20px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        ">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;font-weight:600;font-size:14px;color:#7e22ce;">
+                <input type="checkbox" id="orgMsgLimitEnabled" onchange="saveOrgMsgLimitSettings()"
+                    style="width:16px;height:16px;accent-color:#7e22ce;cursor:pointer;">
+                <i class="fas fa-building-circle-exclamation" style="color:#7e22ce;"></i>
+                30-Day Organization Limit — allow no more than
+            </label>
+            <input type="number" id="orgMsgLimitMax" value="3" min="1" max="1000"
+                oninput="saveOrgMsgLimitSettings()"
+                style="width:70px;padding:6px 10px;border:1.5px solid #d8b4fe;border-radius:6px;font-size:14px;font-weight:700;color:#581c87;text-align:center;">
+            <span style="font-size:14px;font-weight:600;color:#7e22ce;">contacts per organization to have a message created in the past 30 days</span>
+            <div style="display:flex;flex-direction:column;gap:2px;align-items:flex-end;flex:1;min-width:220px;">
+                <span id="orgMsgLimitStatus" style="font-size:12px;color:#7e22ce;text-align:right;"></span>
+                <span style="font-size:11px;color:#7e22ce;opacity:0.8;text-align:right;">
+                    <i class="fas fa-clock-rotate-left"></i> Counts messages created in <code style="background:#e9d5ff;padding:1px 5px;border-radius:3px;font-size:11px;">connect_queue</code> across all BDRs (deleted messages excluded)
+                </span>
+            </div>
+        </div>
+
         <!-- Tabs -->
         <div class="tabs">
             <button class="tab active" data-tab="bulk">
@@ -10884,6 +10914,10 @@
                             const _typeCheck1 = await checkContactTypeFilter(contact, (msg, type) => addLog(`   ${msg}`, type));
                             if (_typeCheck1.skip) { totalErrors++; continue; }
 
+                            // --- 30-day organization message limit (default OFF) ---
+                            const _orgCheck1 = await checkOrgMessageLimit30Days(contact, (msg, type) => addLog(`   ${msg}`, type));
+                            if (_orgCheck1.skip) { totalErrors++; continue; }
+
                             // Fetch profile — cache-first via linkedin_profile_cache
                             const rawProfile = await getOrFetchProfile(
                                 contact.linkedInUrl,
@@ -11593,6 +11627,10 @@
                         // --- Contact type filter (pre-profile-fetch) ---
                         const _typeCheck2 = await checkContactTypeFilter(contact, addProfileLog);
                         if (_typeCheck2.skip) { results.failed++; continue; }
+
+                        // --- 30-day organization message limit (default OFF) ---
+                        const _orgCheck2 = await checkOrgMessageLimit30Days(contact, addProfileLog);
+                        if (_orgCheck2.skip) { results.failed++; continue; }
 
                         // Step 1: Fetch profile — cache-first via linkedin_profile_cache
                         addProfileLog(`   🔍 Fetching LinkedIn profile data...`, 'info');
@@ -12308,6 +12346,182 @@
                 logFn(`   ⚠️ Contact type filter unavailable (${e.message}) — proceeding`, 'warning');
                 return { skip: false, reason: '' };
             }
+        }
+
+        // =====================================================================
+        // 30-DAY ORGANIZATION MESSAGE LIMIT (default OFF)
+        //
+        // When enabled, before a message is generated for a contact we count how
+        // many DISTINCT contacts at the same organization already had a message
+        // created (any non-deleted connect_queue doc) in the past 30 days —
+        // across ALL BDRs. If that count is at or over the configured maximum,
+        // the contact is skipped so the organization isn't over-messaged.
+        //
+        // Contacts that PASS the check reserve a slot in the in-memory tally, so
+        // the limit also holds within a single generation run (contact #4 at the
+        // same org is skipped even before its message doc lands in Firestore).
+        // =====================================================================
+
+        const ORG_MSG_LIMIT_WINDOW_DAYS = 30;
+        const ORG_MSG_LIMIT_CACHE_MS = 5 * 60 * 1000; // re-query Firestore at most every 5 minutes
+        let _orgMsgLimitCache = null; // { loadedAt: number, orgs: Map<orgKey, Set<contactUrl>> }
+
+        /** Returns true when the 30-day org limit checkbox is checked (default OFF). */
+        function isOrgMsgLimitEnabled() {
+            const cb = document.getElementById('orgMsgLimitEnabled');
+            return cb ? cb.checked : false;
+        }
+
+        /** Returns the max contacts-per-org threshold from the UI (default 3). */
+        function getOrgMsgLimitMax() {
+            const input = document.getElementById('orgMsgLimitMax');
+            return input ? (parseInt(input.value, 10) || 3) : 3;
+        }
+
+        /** Persists 30-day org limit settings to localStorage and updates the status badge. */
+        window.saveOrgMsgLimitSettings = function() {
+            const enabled = isOrgMsgLimitEnabled();
+            const max = getOrgMsgLimitMax();
+            localStorage.setItem('omlEnabled', enabled ? '1' : '0');
+            localStorage.setItem('omlMax', String(max));
+            const status = document.getElementById('orgMsgLimitStatus');
+            if (status) {
+                status.textContent = enabled
+                    ? `Limit ON — organizations with ≥ ${max} contact(s) messaged in the past ${ORG_MSG_LIMIT_WINDOW_DAYS} days are skipped`
+                    : 'Limit OFF (default) — no per-organization cap on message creation';
+            }
+            console.log(`🏢 30-day org limit setting: ${enabled ? `ON (max ${max} contacts/org)` : 'OFF'}`);
+        };
+
+        // Restore 30-day org limit settings from localStorage on page load
+        (function restoreOrgMsgLimitSettings() {
+            const cb = document.getElementById('orgMsgLimitEnabled');
+            const input = document.getElementById('orgMsgLimitMax');
+            if (!cb || !input) return;
+            const savedEnabled = localStorage.getItem('omlEnabled');
+            const savedMax = localStorage.getItem('omlMax');
+            if (savedEnabled !== null) cb.checked = savedEnabled === '1';
+            if (savedMax !== null) input.value = savedMax;
+            window.saveOrgMsgLimitSettings();
+        })();
+
+        /**
+         * Normalizes an organization name so the same company matches across the
+         * slightly-different strings stored on contacts vs. queue docs
+         * ("Acme, Inc." / "acme inc" / "The Acme Group" → "acme").
+         */
+        function normalizeOrgNameForLimit(name) {
+            return String(name || '')
+                .toLowerCase()
+                .replace(/[.,'’"()&\-\/]/g, ' ')
+                .replace(/\b(inc|incorporated|llc|llp|lp|ltd|limited|corp|corporation|company|co|the|group|holdings|pllc|pc|plc)\b/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        /** Normalizes a LinkedIn URL for distinct-contact counting within an org. */
+        function normalizeContactUrlForOrgLimit(url) {
+            return String(url || '').toLowerCase()
+                .replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/+$/, '').trim();
+        }
+
+        /**
+         * Loads all non-deleted connect_queue messages created in the past 30
+         * days (across ALL BDRs) and groups the distinct contacts by normalized
+         * organization name. Result is cached for 5 minutes.
+         *
+         * @returns {Map<string, Set<string>>} orgKey -> Set of contact URLs
+         */
+        async function loadOrgMessageCounts30Days(logFn) {
+            logFn = logFn || ((msg, type) => console.log(msg));
+            if (_orgMsgLimitCache && (Date.now() - _orgMsgLimitCache.loadedAt) < ORG_MSG_LIMIT_CACHE_MS) {
+                return _orgMsgLimitCache.orgs;
+            }
+            const cutoffISO = new Date(Date.now() - ORG_MSG_LIMIT_WINDOW_DAYS * 86400000).toISOString();
+            logFn(`   🏢 30-day org limit: loading messages created since ${cutoffISO.slice(0, 10)} from connect_queue…`, 'info');
+            const queueRef = collection(db, 'connect_queue');
+            // Timestamps on connect_queue docs are ISO strings. Newer docs always
+            // carry uploaded_date; some older writers only set created_at — query
+            // both ranges and merge by doc id so nothing recent is missed.
+            const [snapUploaded, snapCreated] = await Promise.all([
+                getDocs(query(queueRef, where('uploaded_date', '>=', cutoffISO))),
+                getDocs(query(queueRef, where('created_at', '>=', cutoffISO)))
+            ]);
+            const docsById = new Map();
+            [...snapUploaded.docs, ...snapCreated.docs].forEach(d => docsById.set(d.id, d.data()));
+
+            const orgs = new Map();
+            let counted = 0, skippedDeleted = 0, skippedNoOrg = 0;
+            for (const [docId, data] of docsById.entries()) {
+                if (data.deleted) { skippedDeleted++; continue; }
+                const ts = data.created_at || data.generated_at || data.uploaded_date || '';
+                if (!ts || ts < cutoffISO) continue;
+                const orgKey = normalizeOrgNameForLimit(
+                    data.prospect_company || data.contactCompany || data.company || data.company_name || data.org_name || ''
+                );
+                if (!orgKey) { skippedNoOrg++; continue; }
+                const contactUrl = normalizeContactUrlForOrgLimit(
+                    data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || data.linkedInUrl || ''
+                ) || `doc:${docId}`; // a doc with no contact URL still counts once
+                if (!orgs.has(orgKey)) orgs.set(orgKey, new Set());
+                orgs.get(orgKey).add(contactUrl);
+                counted++;
+            }
+            _orgMsgLimitCache = { loadedAt: Date.now(), orgs };
+            logFn(`   🏢 30-day org limit: ${counted} message(s) in the window across ${orgs.size} organization(s) (${skippedDeleted} deleted excluded, ${skippedNoOrg} without an org name).`, 'info');
+            console.log(`🏢 30-day org limit cache built: ${orgs.size} orgs, ${counted} messages (window ${ORG_MSG_LIMIT_WINDOW_DAYS}d, cutoff ${cutoffISO})`);
+            return orgs;
+        }
+
+        /**
+         * Checks a contact against the 30-day organization message limit.
+         * No-op ({skip:false}) when the toggle is OFF (the default).
+         *
+         * When the contact passes, its URL is added to the in-memory tally so the
+         * cap holds within the current run too.
+         *
+         * @param {object}   contact - Contact/prospect object (needs company + linkedInUrl fields)
+         * @param {function} logFn   - Logging function (msg, type)
+         * @returns {{ skip: boolean, count: number|null }}
+         */
+        async function checkOrgMessageLimit30Days(contact, logFn) {
+            if (!isOrgMsgLimitEnabled()) return { skip: false, count: null };
+            const maxPerOrg = getOrgMsgLimitMax();
+            const orgName = contact.company || contact.companyName || contact.organization || contact.searchedOrganization || '';
+            const orgKey = normalizeOrgNameForLimit(orgName);
+            if (!orgKey) {
+                logFn(`   🏢 30-day org limit: contact has no organization name on record — limit can't be applied, proceeding`, 'warning');
+                return { skip: false, count: null };
+            }
+
+            let orgs;
+            try {
+                orgs = await loadOrgMessageCounts30Days(logFn);
+            } catch (e) {
+                logFn(`   ⚠️ 30-day org limit: failed to load recent messages (${e.message}) — proceeding WITHOUT the check`, 'warning');
+                console.error('30-day org limit load failed:', e);
+                return { skip: false, count: null };
+            }
+
+            const contactSet = orgs.get(orgKey);
+            const count = contactSet ? contactSet.size : 0;
+            const contactUrl = normalizeContactUrlForOrgLimit(contact.linkedInUrl || contact.li_url || contact.linkedin_url || '');
+            const alreadyCounted = !!(contactSet && contactUrl && contactSet.has(contactUrl));
+
+            if (count >= maxPerOrg && !alreadyCounted) {
+                logFn(`   ⛔ 30-day org limit: skipped — "${orgName}" already has ${count} contact(s) with a message created in the past ${ORG_MSG_LIMIT_WINDOW_DAYS} days (limit: ${maxPerOrg})`, 'warning');
+                console.log(`🏢 30-day org limit BLOCKED: "${orgName}" (key "${orgKey}") — ${count}/${maxPerOrg} slots used, contact ${contactUrl || 'unknown'}`);
+                return { skip: true, count };
+            }
+
+            // Reserve this contact's slot in the in-memory tally so later contacts
+            // at the same org in THIS run see the updated count immediately.
+            if (!alreadyCounted && contactUrl) {
+                if (!orgs.has(orgKey)) orgs.set(orgKey, new Set());
+                orgs.get(orgKey).add(contactUrl);
+            }
+            logFn(`   ✅ 30-day org limit: "${orgName}" at ${count}/${maxPerOrg} contact(s) in the past ${ORG_MSG_LIMIT_WINDOW_DAYS} days — OK${alreadyCounted ? ' (this contact already counted)' : ', slot reserved'}`, 'dim');
+            return { skip: false, count };
         }
 
         /**
@@ -13121,6 +13335,10 @@
                         // --- Contact type filter (pre-profile-fetch) ---
                         const _typeCheck3 = await checkContactTypeFilter(contact, addAMCLog);
                         if (_typeCheck3.skip) { results.failed++; continue; }
+
+                        // --- 30-day organization message limit (default OFF) ---
+                        const _orgCheck3 = await checkOrgMessageLimit30Days(contact, addAMCLog);
+                        if (_orgCheck3.skip) { results.failed++; continue; }
 
                         // Step A: Fetch profile — cache-first via linkedin_profile_cache
                         addAMCLog(`   🔍 Fetching LinkedIn profile...`, 'info');
@@ -16242,7 +16460,7 @@
                 }
 
                 // Counters
-                let processed = 0, postReplyCount = 0, postReplyRepostCount = 0, aboutMeCount = 0, internetSearchCount = 0, profileMsgCount = 0, errorCount = 0, noMsgCount = 0, skippedConnLive = 0;
+                let processed = 0, postReplyCount = 0, postReplyRepostCount = 0, aboutMeCount = 0, internetSearchCount = 0, profileMsgCount = 0, errorCount = 0, noMsgCount = 0, skippedConnLive = 0, skippedOrgLimit = 0;
                 const total = prospectList.length;
                 document.getElementById('fullAiProgressLabel').textContent = `Processing prospect 0 of ${total}...`;
 
@@ -16267,6 +16485,10 @@
                         try { if (window.auth.currentUser) token = await window.auth.currentUser.getIdToken(true); }
                         catch (tokenErr) { console.warn('Token refresh skipped:', tokenErr.message); }
                     }
+
+                    // --- 30-day organization message limit (default OFF) ---
+                    const _orgCheckFai = await checkOrgMessageLimit30Days(prospect, addLog);
+                    if (_orgCheckFai.skip) { skippedOrgLimit++; processed++; continue; }
 
                     try {
                         // ── Pre-Step: Enrichment freshness check ─────────────────────────────
@@ -16712,6 +16934,9 @@
                 const genCount = postReplyCount + aboutMeCount + internetSearchCount + profileMsgCount;
                 const repostNote = postReplyRepostCount > 0 ? ` (${postReplyRepostCount} of which were built from a repost/quote, not the prospect's own original post)` : '';
                 addLog(`\n✅ Smart generation complete! ${genCount} messages generated (${postReplyCount} Post Reply${repostNote}, ${aboutMeCount} About Me, ${internetSearchCount} Internet Search, ${profileMsgCount} Profile Message), ${noMsgCount} contacts with no message, ${errorCount} errors.`, 'success');
+                if (skippedOrgLimit > 0) {
+                    addLog(`🏢 30-day org limit: ${skippedOrgLimit} contact(s) skipped because their organization already had ${getOrgMsgLimitMax()}+ contacts with a message created in the past ${ORG_MSG_LIMIT_WINDOW_DAYS} days.`, 'warning');
+                }
                 if (opusReviewEnabled) {
                     addLog(`🔬 Opus Review complete for all ${fullAiCreatedDocIds.length} saved message(s): ${opusApprovedCount} approved (7+), ${opusNeedsAttentionCount} need attention, ${opusExcludedCount} flagged to exclude. Open Fast Connect Review to send them.`, 'success');
                 } else if (document.getElementById('fullAiOpusReviewEnabled')?.checked && fullAiCreatedDocIds.length === 0) {
@@ -17908,6 +18133,10 @@
                     // --- Contact type filter (pre-profile-fetch) ---
                     const _typeCheck4 = await checkContactTypeFilter(contact, mrLog);
                     if (_typeCheck4.skip) { errors++; continue; }
+
+                    // --- 30-day organization message limit (default OFF) ---
+                    const _orgCheck4 = await checkOrgMessageLimit30Days(contact, mrLog);
+                    if (_orgCheck4.skip) { errors++; continue; }
 
                     // Fetch profile — cache-first via linkedin_profile_cache
                     const rawProfileMR = await getOrFetchProfile(contact.linkedInUrl, mrLog);

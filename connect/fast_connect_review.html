@@ -2932,6 +2932,24 @@
                 </span>
             </div>
 
+            <!-- 30-Day Organization Limit Row -->
+            <div class="ai-review-toggle-row" style="background:#faf5ff; border-color:#d8b4fe;">
+                <label class="toggle-switch" for="orgLimit30Toggle" title="Enable / disable the 30-day organization limit check on submit">
+                    <input type="checkbox" id="orgLimit30Toggle">
+                    <span class="toggle-slider"></span>
+                </label>
+                <span class="ai-review-toggle-label" style="color:#7e22ce;">
+                    <i class="fas fa-building-circle-exclamation"></i>
+                    30-Day Organization Limit
+                </span>
+                <span class="ai-review-toggle-hint" style="color:#7e22ce;">
+                    <span id="orgLimit30Status">Off (default)</span> — when enabled, an approval is blocked at submit time if
+                    <input type="number" id="orgLimit30Max" value="3" min="1" max="1000"
+                        style="width:58px; padding:2px 6px; border:1px solid #d8b4fe; border-radius:4px; font-weight:700; color:#581c87; text-align:center;">
+                    or more contacts at the same organization (across all BDRs) already had a message approved for sending in the past 30 days. Blocked messages stay in Queue 1. Details are logged to the console.
+                </span>
+            </div>
+
             <!-- Opus AI Quick Review -->
             <div class="opus-review-section">
                 <div class="opus-review-header">
@@ -4739,6 +4757,164 @@
                 console.error('❌ Error loading approved messages for 75-day check:', error);
                 approvedMessagesFor45DayCheck = [];
             }
+        }
+
+        // =====================================================================
+        // 30-DAY ORGANIZATION LIMIT CHECK (default OFF)
+        //
+        // When the "30-Day Organization Limit" toggle is on, submit-time approvals
+        // are checked against how many DISTINCT contacts at the same organization
+        // (across ALL BDRs) already had a message approved for sending in the past
+        // 30 days. Approvals that would push an organization over the configured
+        // maximum are blocked and stay in Queue 1. Approvals that pass reserve a
+        // slot in the in-memory tally, so the limit also holds WITHIN one batch.
+        //
+        // Only "committed" messages count toward the limit (reviewStatus of
+        // 'approved' / 'pending_customer_review', or the legacy reviewed=true) —
+        // still-pending Queue 1 docs like the batch on screen do not.
+        // =====================================================================
+
+        const ORG_LIMIT_30_WINDOW_DAYS = 30;
+
+        /** Returns true when the 30-day org limit toggle is checked (default OFF). */
+        function isOrgLimit30Enabled() {
+            const cb = document.getElementById('orgLimit30Toggle');
+            return cb ? cb.checked : false;
+        }
+
+        /** Returns the max contacts-per-org threshold from the UI (default 3). */
+        function getOrgLimit30Max() {
+            const input = document.getElementById('orgLimit30Max');
+            return input ? (parseInt(input.value, 10) || 3) : 3;
+        }
+
+        function updateOrgLimit30Status() {
+            const el = document.getElementById('orgLimit30Status');
+            if (el) {
+                el.textContent = isOrgLimit30Enabled()
+                    ? `ON — max ${getOrgLimit30Max()} contact(s) per organization per ${ORG_LIMIT_30_WINDOW_DAYS} days`
+                    : 'Off (default)';
+            }
+        }
+
+        // Restore + persist the toggle/threshold (default OFF, like a brand-new browser)
+        (function initOrgLimit30Toggle() {
+            const cb = document.getElementById('orgLimit30Toggle');
+            const input = document.getElementById('orgLimit30Max');
+            if (!cb) return;
+            cb.checked = localStorage.getItem('orgLimit30Enabled') === 'true'; // default OFF
+            if (input) {
+                const savedMax = localStorage.getItem('orgLimit30Max');
+                if (savedMax) input.value = savedMax;
+                input.addEventListener('input', () => {
+                    localStorage.setItem('orgLimit30Max', String(getOrgLimit30Max()));
+                    updateOrgLimit30Status();
+                });
+            }
+            cb.addEventListener('change', () => {
+                localStorage.setItem('orgLimit30Enabled', cb.checked);
+                updateOrgLimit30Status();
+                console.log(`🏢 30-day organization limit check ${cb.checked ? 'ENABLED' : 'disabled'} (max ${getOrgLimit30Max()} contacts/org)`);
+            });
+            updateOrgLimit30Status();
+        })();
+
+        /**
+         * Normalizes an organization name so the same company matches across the
+         * slightly-different strings stored on queue docs
+         * ("Acme, Inc." / "acme inc" / "The Acme Group" → "acme").
+         */
+        function normalizeOrgNameForLimit(name) {
+            return String(name || '')
+                .toLowerCase()
+                .replace(/[.,'’"()&\-\/]/g, ' ')
+                .replace(/\b(inc|incorporated|llc|llp|lp|ltd|limited|corp|corporation|company|co|the|group|holdings|pllc|pc|plc)\b/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
+
+        /**
+         * Loads every committed (approved / pending_customer_review / reviewed)
+         * non-deleted connect_queue message from the past 30 days — across ALL
+         * BDRs — and groups the distinct contacts by normalized organization name.
+         *
+         * @returns {Map<string, Set<string>>} orgKey -> Set of contact URLs
+         */
+        async function loadOrgLimit30Counts() {
+            const cutoffISO = new Date(Date.now() - ORG_LIMIT_30_WINDOW_DAYS * 86400000).toISOString();
+            console.log(`🏢 30-day org limit: loading committed messages since ${cutoffISO} from connect_queue (all BDRs)…`);
+            const connectQueueRef = collection(emailDB, 'connect_queue');
+            // Timestamps are ISO strings. Query creation AND approval timestamp
+            // ranges and merge by doc id, so a message created >30 days ago but
+            // approved within the window is still counted.
+            const [snapUploaded, snapCreated, snapApproved] = await Promise.all([
+                getDocs(query(connectQueueRef, where('uploaded_date', '>=', cutoffISO))),
+                getDocs(query(connectQueueRef, where('created_at', '>=', cutoffISO))),
+                getDocs(query(connectQueueRef, where('adminApprovedAt', '>=', cutoffISO)))
+            ]);
+            const docsById = new Map();
+            [snapUploaded, snapCreated, snapApproved].forEach(snap => {
+                snap.forEach(d => docsById.set(d.id, d.data()));
+            });
+
+            const orgs = new Map();
+            let counted = 0, skippedUncommitted = 0, skippedNoOrg = 0;
+            for (const [docId, data] of docsById.entries()) {
+                if (data.deleted) continue;
+                const committed = data.reviewStatus === 'approved'
+                    || data.reviewStatus === 'pending_customer_review'
+                    || data.reviewed === true;
+                if (!committed) { skippedUncommitted++; continue; }
+                const ts = data.adminApprovedAt || data.customerApprovedAt || data.review_date
+                    || data.pushed_at || data.created_at || data.uploaded_date || '';
+                if (!ts || ts < cutoffISO) continue;
+                const orgKey = normalizeOrgNameForLimit(
+                    data.prospect_company || data.contactCompany || data.company || data.company_name || data.org_name || ''
+                );
+                if (!orgKey) { skippedNoOrg++; continue; }
+                const contactUrl = normalizeLinkedInUrl(
+                    data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || ''
+                ) || `doc:${docId}`; // a doc with no contact URL still counts once
+                if (!orgs.has(orgKey)) orgs.set(orgKey, new Set());
+                orgs.get(orgKey).add(contactUrl);
+                counted++;
+            }
+            console.log(`🏢 30-day org limit: ${counted} committed message(s) in the window across ${orgs.size} organization(s) (${skippedUncommitted} still-pending excluded, ${skippedNoOrg} without an org name).`);
+            return orgs;
+        }
+
+        /**
+         * Checks one message about to be approved against the 30-day org limit.
+         * When it passes, the contact's slot is reserved in the in-memory tally
+         * so later approvals in the same batch see the updated count.
+         *
+         * @param {object} message - connect_queue message doc (or a minimal {prospect_company, prospect_li_url})
+         * @param {Map}    orgData - result of loadOrgLimit30Counts()
+         * @param {string} label   - context tag for console logs ('submit' | 'org-contact' | 'reserve')
+         * @returns {{ blocked: boolean, orgName: string, count: number|null }}
+         */
+        function checkOrgLimit30ForMessage(message, orgData, label) {
+            const maxPerOrg = getOrgLimit30Max();
+            const orgName = message.prospect_company || message.contactCompany || message.company || message.company_name || message.org_name || '';
+            const orgKey = normalizeOrgNameForLimit(orgName);
+            if (!orgKey) {
+                console.log(`🏢 30-day org limit [${label}]: message has no organization name — check can't apply, allowing (${message.prospect_li_url || 'unknown contact'})`);
+                return { blocked: false, orgName, count: null };
+            }
+            const set = orgData.get(orgKey);
+            const count = set ? set.size : 0;
+            const contactUrl = normalizeLinkedInUrl(message.prospect_li_url || message.contact_linkedin_url || message.linkedin_url || '');
+            const alreadyCounted = !!(set && contactUrl && set.has(contactUrl));
+            if (count >= maxPerOrg && !alreadyCounted) {
+                console.log(`⛔ 30-day org limit [${label}]: BLOCKED — "${orgName}" already has ${count} contact(s) with a message approved in the past ${ORG_LIMIT_30_WINDOW_DAYS} days (limit ${maxPerOrg}): ${contactUrl || 'unknown contact'}`);
+                return { blocked: true, orgName, count };
+            }
+            if (!alreadyCounted && contactUrl) {
+                if (!orgData.has(orgKey)) orgData.set(orgKey, new Set());
+                orgData.get(orgKey).add(contactUrl);
+            }
+            console.log(`✅ 30-day org limit [${label}]: "${orgName}" at ${count}/${maxPerOrg} contact(s) in the past ${ORG_LIMIT_30_WINDOW_DAYS} days — OK${alreadyCounted ? ' (this contact already counted)' : ', slot reserved'} (${contactUrl || 'unknown contact'})`);
+            return { blocked: false, orgName, count };
         }
 
         // Normalize LinkedIn URL for comparison (strips protocol, www, trailing slashes)
@@ -12334,6 +12510,7 @@ Rules:
                 let successCount = 0;
                 let errorCount = 0;
                 let blockedBy45DayRule = 0;
+                let blockedByOrgLimit30 = 0;
                 let directSlotsScheduled = 0;
                 let campaignApproved = 0;
                 let quickMessageSent = 0;
@@ -12344,7 +12521,22 @@ Rules:
                 // are expected to coexist with a prior connect record.
                 const approvedConnectContacts = [];
                 const errors = [];
-                
+
+                // ── 30-day organization limit (optional, default OFF) ──────────
+                // Loaded once per submit; every approval route below (campaign,
+                // direct slot, quick message, reserve, org-contact sharing) is
+                // checked against it before any Firestore write happens.
+                let orgLimit30Data = null;
+                if (isOrgLimit30Enabled()) {
+                    try {
+                        orgLimit30Data = await loadOrgLimit30Counts();
+                        console.log(`🏢 30-day org limit check is ON for this submit (max ${getOrgLimit30Max()} contacts per organization).`);
+                    } catch (orgLimitErr) {
+                        console.error('❌ 30-day org limit: failed to load recent messages — submitting WITHOUT the check:', orgLimitErr);
+                        showAlert(`⚠️ 30-day organization limit check could not load recent messages (${orgLimitErr.message}) — submitting without it.`, 'warning');
+                    }
+                }
+
                 // Pre-collect messages that need direct LinkedIn slots so we can
                 // fetch all available slot times in a single query.
                 const directSlotMessages = []; // { messageId, message, messageToSave, convData }
@@ -12377,7 +12569,17 @@ Rules:
                             blockedBy45DayRule++;
                             continue;
                         }
-                        
+
+                        // 30-day organization limit (when enabled). Follow-up messages to an
+                        // existing conversation are exempt, matching the 75-day rule above.
+                        if (orgLimit30Data && !isFollowUpMessage) {
+                            const _orgLimitRes = checkOrgLimit30ForMessage(message, orgLimit30Data, 'submit');
+                            if (_orgLimitRes.blocked) {
+                                blockedByOrgLimit30++;
+                                continue;
+                            }
+                        }
+
                         let messageToSave = editedMessages.get(messageId) || message.message_to_contact;
                         if (prefix) messageToSave = prefix + ' ' + messageToSave;
                         const timingData = approvalTimestamps.get(messageId) || {};
@@ -12894,6 +13096,19 @@ Rules:
                         // Create new messages for each selected org contact
                         for (const contact of checkedContacts) {
                             try {
+                                // 30-day organization limit (when enabled) — these docs are created
+                                // already approved, so they must pass (and reserve) an org slot too.
+                                if (orgLimit30Data) {
+                                    const _orgLimitRes = checkOrgLimit30ForMessage(
+                                        { prospect_company: message.prospect_company, prospect_li_url: contact.linkedInUrl },
+                                        orgLimit30Data, 'org-contact'
+                                    );
+                                    if (_orgLimitRes.blocked) {
+                                        blockedByOrgLimit30++;
+                                        continue;
+                                    }
+                                }
+
                                 // Use per-contact variation if one was confirmed via Diversify, else fall back to base
                                 const contactMessage = (confirmedVariations && confirmedVariations.has(contact.index))
                                     ? confirmedVariations.get(contact.index)
@@ -13096,7 +13311,12 @@ Rules:
                 if (blockedBy45DayRule > 0) {
                     showAlert(`⚠️ ${blockedBy45DayRule} messages blocked - contacts already received messages in past 75 days`, 'warning');
                 }
-                
+
+                if (blockedByOrgLimit30 > 0) {
+                    showAlert(`🏢 ${blockedByOrgLimit30} message(s) blocked by the 30-day organization limit — their organizations already had ${getOrgLimit30Max()} or more contacts with a message approved in the past ${ORG_LIMIT_30_WINDOW_DAYS} days. They remain in Queue 1 (details in console).`, 'warning');
+                    console.log(`🏢 30-day org limit summary: ${blockedByOrgLimit30} approval(s) blocked this submit (limit ${getOrgLimit30Max()} contacts/org).`);
+                }
+
                 if (errorCount > 0) {
                     showAlert(`⚠️ ${errorCount} messages failed to process. Check console for details.`, 'warning');
                     console.error('Batch processing errors:', errors);
@@ -13674,8 +13894,21 @@ Rules:
             const excludeMessages = [];
             const deleteMessages = [];
             let blockedBy45DayRule = 0;
+            let blockedByOrgLimit30 = 0;
 
             const groupOnlyReserveMessages = [];
+
+            // ── 30-day organization limit (optional, default OFF) ──────────
+            let orgLimit30Data = null;
+            if (isOrgLimit30Enabled()) {
+                try {
+                    orgLimit30Data = await loadOrgLimit30Counts();
+                    console.log(`🏢 30-day org limit check is ON for this reserve move (max ${getOrgLimit30Max()} contacts per organization).`);
+                } catch (orgLimitErr) {
+                    console.error('❌ 30-day org limit: failed to load recent messages — moving to reserve WITHOUT the check:', orgLimitErr);
+                    showAlert(`⚠️ 30-day organization limit check could not load recent messages (${orgLimitErr.message}) — proceeding without it.`, 'warning');
+                }
+            }
 
             for (const [messageId, action] of messageSelections) {
                 const message = loadedMessages.find(m => m.id === messageId);
@@ -13689,6 +13922,14 @@ Rules:
                         console.log(`⚠️ Blocked reserve move - contact has message in past 75 days: ${message.prospect_li_url}`);
                         blockedBy45DayRule++;
                         continue;
+                    }
+                    // 30-day organization limit (when enabled)
+                    if (orgLimit30Data && !isFollowUpMessage) {
+                        const _orgLimitRes = checkOrgLimit30ForMessage(message, orgLimit30Data, 'reserve');
+                        if (_orgLimitRes.blocked) {
+                            blockedByOrgLimit30++;
+                            continue;
+                        }
                     }
                     approveMessages.push({ messageId, message });
                 } else if (action === 'exclude') {
@@ -13708,7 +13949,8 @@ Rules:
                 `Exclude: ${excludeMessages.length}\n` +
                 `Delete: ${deleteMessages.length}` +
                 `${groupOnlyReserveLine}` +
-                `${blockedBy45DayRule > 0 ? `\n\n⚠️ ${blockedBy45DayRule} approvals are blocked by the 75-day rule.` : ''}\n\nContinue?`;
+                `${blockedBy45DayRule > 0 ? `\n\n⚠️ ${blockedBy45DayRule} approvals are blocked by the 75-day rule.` : ''}` +
+                `${blockedByOrgLimit30 > 0 ? `\n\n🏢 ${blockedByOrgLimit30} approvals are blocked by the 30-day organization limit (max ${getOrgLimit30Max()} contacts/org).` : ''}\n\nContinue?`;
             if (!confirm(confirmMessage)) return;
 
             loadingContainer.style.display = 'block';
@@ -13928,6 +14170,9 @@ Rules:
                 }
                 if (blockedBy45DayRule > 0) {
                     showAlert(`⚠️ ${blockedBy45DayRule} messages blocked - contacts already received messages in past 75 days`, 'warning');
+                }
+                if (blockedByOrgLimit30 > 0) {
+                    showAlert(`🏢 ${blockedByOrgLimit30} message(s) blocked by the 30-day organization limit — their organizations already had ${getOrgLimit30Max()} or more contacts with a message approved in the past ${ORG_LIMIT_30_WINDOW_DAYS} days (details in console).`, 'warning');
                 }
                 if (errorCount > 0) {
                     showAlert(`⚠️ ${errorCount} messages failed to process. Check console for details.`, 'warning');
