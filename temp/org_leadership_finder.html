@@ -166,6 +166,11 @@
         .warn-box  { background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 0.7rem 1rem; margin-bottom: 1rem; font-size: 0.8rem; color: #92400e; }
         .error-box { background: #fee2e2; color: #991b1b; border: 1.5px solid #fca5a5; border-radius: 8px; padding: 12px 16px; font-size: 13px; margin-top: 10px; }
         .auth-gate { text-align: center; padding: 3rem; }
+
+        .ws-panel { background: #f0fdfa; border: 2px solid #5eead4; border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+        .ws-panel-row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+        .ws-panel select { flex: 1; min-width: 200px; max-width: 360px; padding: 0.5rem 0.75rem; border: 2px solid #5eead4; border-radius: 8px; font-size: 0.88rem; background: white; }
+        .ws-status { margin-top: 0.5rem; font-size: 0.8rem; color: #0f766e; min-height: 1.2em; }
     </style>
 </head>
 <body>
@@ -325,6 +330,22 @@
     <!-- Step 5: Results -->
     <div class="section section-locked" id="sec5">
         <div class="section-title"><i class="fas fa-list-check"></i> Step 5 — Results &amp; Export</div>
+
+        <div class="ws-panel">
+            <div class="ws-panel-row">
+                <i class="fas fa-folder-plus" style="color:#0d9488;font-size:1.1rem;flex-shrink:0;"></i>
+                <span style="font-weight:700;color:#0f766e;white-space:nowrap;font-size:0.92rem;">Save contacts to</span>
+                <select id="wsTargetSelect">
+                    <option value="">-- Select BDR or Workspace --</option>
+                </select>
+                <button class="btn btn-teal" id="btnSaveContacts" onclick="saveContactsToWorkspace()">
+                    <i class="fas fa-save"></i> Save All Found Contacts (<span id="saveContactCount">0</span>)
+                </button>
+            </div>
+            <div class="form-help">Saves every named contact currently in the results below into <code>prospect_contacts</code> for the selected BDR/workspace, so you can work them later. Contacts whose LinkedIn URL is already saved there are skipped automatically.</div>
+            <div class="ws-status" id="wsStatus"></div>
+        </div>
+
         <div class="stats-row" id="statsRow"></div>
         <div class="filter-row">
             <input type="text" id="searchFilter" placeholder="Filter by organization name…" oninput="renderResultsTable()">
@@ -356,6 +377,7 @@
 <script src="../js/ai-model-catalog.js"></script>
 <script src="../js/clemail-firestore-wrapper.js"></script>
 <script src="../js/contact-fields.js"></script>
+<script src="../connect/workspace-routing.js?v=3"></script>
 <script type="module">
 await window.firebaseReady;
 
@@ -365,6 +387,9 @@ const START_ENDPOINT  = `${RAILWAY}/api/connect/org-leadership-finder/start`;
 const JOB_ENDPOINT    = (id) => `${RAILWAY}/api/connect/org-leadership-finder/job/${id}`;
 const CANCEL_ENDPOINT = (id) => `${RAILWAY}/api/connect/org-leadership-finder/job/${id}/cancel`;
 const MAX_ORGS = 400;
+
+const { collection, getDocs, addDoc, query, where, orderBy } = window.clemailFirestore;
+const db = window.clemailDb;
 
 const DEFAULT_TITLES = [
     { key: 'CIO',  abbr: 'CIO',  fullName: 'Chief Information Officer',            enabled: true },
@@ -386,6 +411,7 @@ let vpTitles = []; // [{ text, enabled }] — one search box per VP-level title
 let jobResults = [];      // [{org, contacts}] — accumulated across runs/ranges
 let resultFilter = 'all';
 let activeJobId = null;
+let wsUser = null;
 
 function escHtml(str) {
     return String(str ?? '')
@@ -400,6 +426,7 @@ onAuthStateChanged(window.auth, user => {
     const gate = document.getElementById('authGate');
     const app  = document.getElementById('mainApp');
     if (user) {
+        wsUser = user;
         gate.style.display = 'none';
         app.style.display = 'block';
         init();
@@ -420,7 +447,149 @@ function init() {
     renderTitlesTable();
     renderVpTitlesTable();
     setupModelSelect().catch(err => console.warn('Model catalog load failed:', err));
+    loadWSDropdown().catch(err => console.warn('Workspace dropdown load failed:', err));
 }
+
+// ── Save to BDR / Workspace ─────────────────────────────────────────────────
+async function loadWSDropdown() {
+    const sel = document.getElementById('wsTargetSelect');
+    if (!sel) return;
+    sel.innerHTML = '<option value="">-- Select BDR or Workspace --</option>';
+
+    try {
+        const snap = await getDocs(query(collection(db, 'linkedin_accounts'), orderBy('accountName')));
+        if (!snap.empty) {
+            const grp = document.createElement('optgroup');
+            grp.label = '── BDR Accounts ──';
+            snap.forEach(d => {
+                const a = d.data(), o = document.createElement('option');
+                o.value = a.bdrEmail;
+                o.textContent = `${a.accountName} (${a.bdrEmail})`;
+                grp.appendChild(o);
+            });
+            sel.appendChild(grp);
+        }
+    } catch (e) { console.warn('BDR load failed:', e.message); }
+
+    if (!wsUser) return;
+    try {
+        const wsSnap = await getDocs(query(collection(db, 'workspaces'), where('createdBy', '==', wsUser.email)));
+        if (!wsSnap.empty) {
+            const wsList = wsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+            const WR = window.WorkspaceRouting;
+            const active = WR ? WR.filterActiveWorkspaces(wsList) : wsList;
+            if (WR) {
+                const customerMap = await WR.loadCustomerMap(db, { getDocs, collection });
+                WR.appendWorkspaceOptgroups(sel, active, { customerMap, flatLabel: '── My Workspaces ──' });
+            } else {
+                const grp = document.createElement('optgroup');
+                grp.label = '── My Workspaces ──';
+                active.forEach(ws => {
+                    const o = document.createElement('option');
+                    o.value = `__ws__:${ws.id}`;
+                    o.textContent = ws.name;
+                    o.dataset.workspaceName = ws.name;
+                    grp.appendChild(o);
+                });
+                sel.appendChild(grp);
+            }
+        }
+    } catch (e) { console.warn('Workspace load failed:', e.message); }
+}
+
+// Flattens every currently-found, named contact out of jobResults into a flat
+// list ready to save, tagged with which org/role they came from.
+function collectSavableContacts() {
+    const out = [];
+    jobResults.forEach(r => {
+        Object.entries(r.contacts || {}).forEach(([roleKey, value]) => {
+            flattenRoleContacts(value).forEach(contact => {
+                if (contact && contact.name) out.push({ org: r.org, roleKey, contact });
+            });
+        });
+    });
+    return out;
+}
+
+function updateSaveContactCount() {
+    const el = document.getElementById('saveContactCount');
+    if (el) el.textContent = String(collectSavableContacts().length);
+}
+
+window.saveContactsToWorkspace = async function() {
+    const sel = document.getElementById('wsTargetSelect');
+    const targetBDR = sel?.value || '';
+    const statusEl = document.getElementById('wsStatus');
+    const btn = document.getElementById('btnSaveContacts');
+    if (!targetBDR) { alert('Choose a BDR or workspace to save into first.'); return; }
+
+    const toSave = collectSavableContacts();
+    if (toSave.length === 0) { alert('No named contacts in the results to save yet.'); return; }
+
+    statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…';
+    btn.disabled = true;
+
+    // Fetch existing LinkedIn URLs already saved in this BDR/workspace to dedupe.
+    let existingUrls = new Set();
+    try {
+        for (const field of ['bdrEmail', 'userEmail']) {
+            const snap = await getDocs(query(collection(db, 'prospect_contacts'), where(field, '==', targetBDR)));
+            if (!snap.empty) {
+                snap.docs.forEach(d => {
+                    const u = (d.data().linkedInUrl || '').toLowerCase().replace(/\/$/, '');
+                    if (u) existingUrls.add(u);
+                });
+                break;
+            }
+        }
+    } catch (e) { console.warn('Dedup check failed:', e.message); }
+
+    const now = new Date().toISOString();
+    let saved = 0, skipped = 0, failed = 0;
+
+    for (const { org, roleKey, contact } of toSave) {
+        const linkedInUrl = contact.linkedin_url || '';
+        const normUrl = linkedInUrl.toLowerCase().replace(/\/$/, '');
+        if (normUrl && existingUrls.has(normUrl)) { skipped++; continue; }
+
+        const nameParts = (contact.name || '').trim().split(/\s+/);
+        const roleTitle = contact.title_text || (enabledTitleList().find(t => t.key === roleKey)?.fullName) || '';
+        const fields = window.ContactFields ? window.ContactFields.buildCanonicalFields(roleTitle, org.name) : {
+            title: roleTitle, position: roleTitle, jobTitle: roleTitle,
+            company: org.name, companyName: org.name, organization: org.name
+        };
+        const docData = {
+            firstName: nameParts[0] || '',
+            lastName:  nameParts.slice(1).join(' ') || '',
+            fullName:  contact.name || '',
+            ...fields,
+            location:  [org.city, org.state].filter(Boolean).join(', '),
+            linkedInUrl,
+            userEmail: targetBDR,
+            bdrEmail:  targetBDR,
+            uploadedAt: now,
+            createdAt:  now,
+            uploadedBy: wsUser?.email || '',
+            source: 'org_leadership_finder',
+            searchedOrganization: org.name,
+            roleKey,
+            aiMatched: contact.source !== 'database',
+            aiMatchConfidence: contact.confidence || '',
+            foundVia: contact.source || 'apify'
+        };
+
+        try {
+            await addDoc(collection(db, 'prospect_contacts'), docData);
+            if (normUrl) existingUrls.add(normUrl);
+            saved++;
+        } catch (e) { console.error('Save failed:', e.message); failed++; }
+    }
+
+    statusEl.textContent = `✅ Saved ${saved} contact${saved !== 1 ? 's' : ''}` +
+        (skipped ? ` · ${skipped} already existed there` : '') +
+        (failed  ? ` · ${failed} failed` : '') + '.';
+    btn.disabled = false;
+};
 
 // ── Step navigation ────────────────────────────────────────────────────────
 function activateStep(n) {
@@ -1252,6 +1421,7 @@ function renderResults() {
 
     renderResultsTableHead(cols);
     renderResultsTable();
+    updateSaveContactCount();
     activateStep(5);
 }
 
