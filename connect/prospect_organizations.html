@@ -6893,43 +6893,102 @@
                 console.warn('Could not load linkedin_accounts for ID mapping:', e);
             }
 
+            // 5b. Reverse liAccountIdMap to find the numeric HeyReach account ID(s) that
+            //     belong to THIS BDR — lets steps 6/6b below query heyreach_activity scoped
+            //     to just this BDR instead of pulling the whole collection. Push BOTH the
+            //     string and parsed-number form of each ID (mirrors outcomes.html's
+            //     getHeyreachAccountIdsForEmails()) since heyreach_activity.linkedInAccountId
+            //     has been written as either type by different webhook paths over time, and
+            //     Firestore/the backend's equality check is type-sensitive.
+            const bdrAccountIds = [];
+            liAccountIdMap.forEach((email, hrid) => {
+                if (!queryEmails.includes(email)) return;
+                const asNum = parseInt(hrid, 10);
+                if (!isNaN(asNum)) bdrAccountIds.push(asNum);
+                bdrAccountIds.push(hrid);
+            });
+
+            // Fetches every heyreach_activity doc of a given eventType for THIS BDR.
+            // BUG THIS FIXES: the old code ran a single global query
+            // (where eventType == X, limitFn(10000)) with NO account/BDR filter, then
+            // matched the BDR client-side. Once the org-wide total for an eventType passed
+            // 10,000 docs, Firestore/the wrapper returned only the first page and silently
+            // dropped the rest — including this BDR's own events — before the client-side
+            // filter ever saw them (e.g. Christian Espinosa showing 366 accepted connections
+            // in the UI despite 600+ actually existing). Passing limit() also disables the
+            // clemail-firestore-wrapper's auto-pagination (getAllDocs), which otherwise
+            // fetches the COMPLETE result set in 5,000-doc pages for any query with no
+            // explicit limit(). Fix: scope the query to this BDR's own HeyReach account
+            // ID(s) via a chunked `in` filter (30 IDs/query, Firestore's cap) plus an
+            // accountEmail/bdrEmail fallback for docs missing linkedInAccountId, and drop
+            // limit() entirely so results can never be truncated.
+            async function fetchBdrScopedActivity(eventType) {
+                const fetches = [];
+                if (bdrAccountIds.length > 0) {
+                    for (let i = 0; i < bdrAccountIds.length; i += 30) {
+                        const chunk = bdrAccountIds.slice(i, i + 30);
+                        fetches.push(getDocs(query(
+                            collection(db, 'heyreach_activity'),
+                            where('eventType', '==', eventType),
+                            where('linkedInAccountId', 'in', chunk)
+                        )).catch(e => { console.warn(`heyreach_activity ${eventType} linkedInAccountId query failed:`, e); return null; }));
+                    }
+                } else {
+                    console.warn(`⚠️ No HeyReach account ID resolved for ${bdrEmail} — heyreach_activity ${eventType} events will only be matched by email; some may be missed if a webhook only stamped a numeric account ID.`);
+                }
+                // Legacy fallback for docs whose webhook payload never got a linkedInAccountId
+                for (const field of ['accountEmail', 'bdrEmail']) {
+                    fetches.push(getDocs(query(
+                        collection(db, 'heyreach_activity'),
+                        where('eventType', '==', eventType),
+                        where(field, 'in', queryEmails)
+                    )).catch(e => { console.warn(`heyreach_activity ${eventType} ${field} query failed:`, e); return null; }));
+                }
+                const results = await Promise.all(fetches);
+                const seenIds = new Set();
+                const docs = [];
+                results.forEach(snap => {
+                    if (!snap) return;
+                    snap.docs.forEach(d => {
+                        if (seenIds.has(d.id)) return;
+                        seenIds.add(d.id);
+                        docs.push(d);
+                    });
+                });
+                return docs;
+            }
+
             // 6. heyreach_activity — CONNECTION_REQUEST_ACCEPTED events → who actually connected
             const allAcceptedUrls = new Set();
             const acceptedContactDetails = new Map(); // url -> contact detail
             try {
-                const actSnap = await getDocs(query(
-                    collection(db, 'heyreach_activity'),
-                    where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
-                    limitFn(10000)
-                )).catch(() => null);
-                if (actSnap) {
-                    const emailSet = new Set(queryEmails);
-                    actSnap.docs.forEach(d => {
-                        const data = d.data();
-                        let bdrMatch =
-                            (data.bdrEmail     && emailSet.has(data.bdrEmail.toLowerCase()))     ||
-                            (data.accountEmail && emailSet.has(data.accountEmail.toLowerCase())) ||
-                            (data.linkedInAccountEmail && emailSet.has(data.linkedInAccountEmail.toLowerCase()));
-                        if (!bdrMatch && data.linkedInAccountId) {
-                            const mapped = liAccountIdMap.get(String(data.linkedInAccountId));
-                            if (mapped && emailSet.has(mapped)) bdrMatch = true;
-                        }
-                        if (!bdrMatch) return;
-                        const url = normalizeUrl(data.leadProfileUrl || '');
-                        if (!url) return;
-                        allAcceptedUrls.add(url);
-                        if (!acceptedContactDetails.has(url)) {
-                            acceptedContactDetails.set(url, {
-                                name: [data.leadFirstName || data.firstName || '', data.leadLastName || data.lastName || '']
-                                    .filter(Boolean).join(' ') || '(Unknown)',
-                                url,
-                                rawUrl: data.leadProfileUrl || '',
-                                company: data.leadCompany || data.companyName || '',
-                                isHL: true
-                            });
-                        }
-                    });
-                }
+                const acceptedDocs = await fetchBdrScopedActivity('CONNECTION_REQUEST_ACCEPTED');
+                const emailSet = new Set(queryEmails);
+                acceptedDocs.forEach(d => {
+                    const data = d.data();
+                    let bdrMatch =
+                        (data.bdrEmail     && emailSet.has(data.bdrEmail.toLowerCase()))     ||
+                        (data.accountEmail && emailSet.has(data.accountEmail.toLowerCase())) ||
+                        (data.linkedInAccountEmail && emailSet.has(data.linkedInAccountEmail.toLowerCase()));
+                    if (!bdrMatch && data.linkedInAccountId) {
+                        const mapped = liAccountIdMap.get(String(data.linkedInAccountId));
+                        if (mapped && emailSet.has(mapped)) bdrMatch = true;
+                    }
+                    if (!bdrMatch) return;
+                    const url = normalizeUrl(data.leadProfileUrl || '');
+                    if (!url) return;
+                    allAcceptedUrls.add(url);
+                    if (!acceptedContactDetails.has(url)) {
+                        acceptedContactDetails.set(url, {
+                            name: [data.leadFirstName || data.firstName || '', data.leadLastName || data.lastName || '']
+                                .filter(Boolean).join(' ') || '(Unknown)',
+                            url,
+                            rawUrl: data.leadProfileUrl || '',
+                            company: data.leadCompany || data.companyName || '',
+                            isHL: true
+                        });
+                    }
+                });
             } catch (e) {
                 console.warn('Could not load heyreach_activity for accepted connections:', e);
             }
@@ -6941,30 +7000,24 @@
             //     outcomes.html's loadActuallySentConnections() three-path matching strategy.
             const confirmedSentUrls = new Set(); // normalized URLs + LinkedIn /in/ slugs
             try {
-                const sentEvtSnap = await getDocs(query(
-                    collection(db, 'heyreach_activity'),
-                    where('eventType', '==', 'CONNECTION_REQUEST_SENT'),
-                    limitFn(10000)
-                )).catch(() => null);
-                if (sentEvtSnap) {
-                    const emailSet = new Set(queryEmails);
-                    sentEvtSnap.docs.forEach(d => {
-                        const data = d.data();
-                        let bdrMatch =
-                            (data.bdrEmail     && emailSet.has(data.bdrEmail.toLowerCase()))     ||
-                            (data.accountEmail && emailSet.has(data.accountEmail.toLowerCase())) ||
-                            (data.linkedInAccountEmail && emailSet.has(data.linkedInAccountEmail.toLowerCase()));
-                        if (!bdrMatch && data.linkedInAccountId) {
-                            const mapped = liAccountIdMap.get(String(data.linkedInAccountId));
-                            if (mapped && emailSet.has(mapped)) bdrMatch = true;
-                        }
-                        if (!bdrMatch) return;
-                        const url  = normalizeUrl(data.leadProfileUrl || '');
-                        const slug = liSlug(data.leadProfileUrl || '');
-                        if (url)  confirmedSentUrls.add(url);
-                        if (slug) confirmedSentUrls.add(slug);
-                    });
-                }
+                const sentEvtDocs = await fetchBdrScopedActivity('CONNECTION_REQUEST_SENT');
+                const emailSet = new Set(queryEmails);
+                sentEvtDocs.forEach(d => {
+                    const data = d.data();
+                    let bdrMatch =
+                        (data.bdrEmail     && emailSet.has(data.bdrEmail.toLowerCase()))     ||
+                        (data.accountEmail && emailSet.has(data.accountEmail.toLowerCase())) ||
+                        (data.linkedInAccountEmail && emailSet.has(data.linkedInAccountEmail.toLowerCase()));
+                    if (!bdrMatch && data.linkedInAccountId) {
+                        const mapped = liAccountIdMap.get(String(data.linkedInAccountId));
+                        if (mapped && emailSet.has(mapped)) bdrMatch = true;
+                    }
+                    if (!bdrMatch) return;
+                    const url  = normalizeUrl(data.leadProfileUrl || '');
+                    const slug = liSlug(data.leadProfileUrl || '');
+                    if (url)  confirmedSentUrls.add(url);
+                    if (slug) confirmedSentUrls.add(slug);
+                });
             } catch (e) {
                 console.warn('Could not load heyreach_activity for CONNECTION_REQUEST_SENT events:', e);
             }

@@ -1780,6 +1780,10 @@
     // Accepted connections computed by renderRecentConnections — reused by the BDR filter + PDF export
     let _recentConnectionsItems = [];
 
+    // In-flight prospect_contacts title/company backfill for the list above —
+    // the PDF export awaits this so exported reports include the enriched data.
+    let _recentConnectionsEnrichPromise = null;
+
     // URL sets from the most recent analysis — used to compute outcomes per group
     let _grouperAcceptedUrls  = new Map();
     let _grouperRepliedUrls   = new Set();
@@ -4865,6 +4869,184 @@
 
     // ── Render results ────────────────────────────────────────────────────
     // ── Recent Connections List ────────────────────────────────────────────
+
+    // ── prospect_contacts enrichment helpers ──────────────────────────────
+    // Many connect_queue records were never stamped with prospect_title /
+    // prospect_company, so the Recent Connections cards (and the PDF export built
+    // from them) showed "—" for contacts whose enriched data DOES exist in the
+    // prospect_contacts collection. The helpers below mirror the battle-tested
+    // title/company resolution logic in fast_connect_review.html.
+
+    // Canonical LinkedIn URL normalization — mirrors profile_search_job_processor.js's
+    // normalizeLinkedInUrl(), which is what populates the linkedInUrlNormalized field
+    // on prospect_contacts docs. Real URL parsing collapses protocol/www./trailing-slash
+    // /query-param/casing differences to one key. (Distinct from this page's
+    // normalizeUrl(), whose output format doesn't match linkedInUrlNormalized.)
+    function canonicalizeLinkedInUrlForLookup(url) {
+        if (!url) return '';
+        try {
+            const u = new URL(url.startsWith('http') ? url : `https://${url}`);
+            const parts = u.pathname.replace(/\/$/, '').split('/').filter(Boolean);
+            const inIdx = parts.indexOf('in');
+            if (inIdx >= 0 && parts[inIdx + 1]) {
+                return `https://www.linkedin.com/in/${parts[inIdx + 1].toLowerCase()}`;
+            }
+        } catch (_) { /* fall through to best-effort string normalization below */ }
+        return url.toLowerCase().trim().replace(/\/$/, '');
+    }
+
+    // Some prospect_contacts docs have a garbled/stale linkedInUrlNormalized field
+    // despite a correct raw linkedInUrl. Build the literal formats that raw field is
+    // commonly stored in so a fallback `in` query can still find those docs.
+    function buildLinkedInUrlVariants(canonicalUrl) {
+        const m = canonicalUrl.match(/\/in\/([^\/?]+)/);
+        const username = m ? m[1] : null;
+        if (!username) return [];
+        const variants = new Set();
+        for (const proto of ['https://', '']) {
+            for (const www of ['www.', '']) {
+                for (const slash of ['', '/']) {
+                    variants.add(`${proto}${www}linkedin.com/in/${username}${slash}`);
+                }
+            }
+        }
+        return Array.from(variants);
+    }
+
+    // Duplicate prospect_contacts docs for the same URL vary wildly in quality —
+    // score each candidate by how much trustworthy enrichment data it carries.
+    function pickBestProspectDoc(docsData) {
+        if (!docsData || docsData.length === 0) return {};
+        if (docsData.length === 1) return docsData[0];
+        let best = docsData[0];
+        let bestScore = -1;
+        for (const pd of docsData) {
+            let score = 0;
+            if (pd.searchedOrganization) score += 3;
+            if (pd.title || pd.position || pd.jobTitle) score += 2;
+            if (pd.company || pd.companyName || pd.organization) score += 1;
+            if (pd.headline) score += 1;
+            let hasExperience = false;
+            if (pd.experience) {
+                try {
+                    const expArr = typeof pd.experience === 'string' ? JSON.parse(pd.experience) : pd.experience;
+                    hasExperience = Array.isArray(expArr) && expArr.length > 0;
+                } catch (_) { /* malformed experience JSON — don't count it */ }
+            }
+            if (hasExperience) score += 3;
+            // Title exactly matching company is a red flag for a corrupted record.
+            const t = (pd.title || pd.position || pd.jobTitle || '').trim().toLowerCase();
+            const c = (pd.company || pd.companyName || pd.organization || '').trim().toLowerCase();
+            if (t && c && t === c) score -= 4;
+            if (score > bestScore) { bestScore = score; best = pd; }
+        }
+        return best;
+    }
+
+    // Resolve title + company from a prospect_contacts doc. Intentionally does NOT
+    // use pd.headline (often just the org name, which would pollute the title).
+    // Falls back to the structured experience[0] entry, whose separate title/company
+    // fields can't cross-contaminate.
+    function extractTitleCompanyFromProspectDoc(pd) {
+        let title   = pd.title || pd.position || pd.jobTitle || '';
+        let company = pd.company || pd.companyName || pd.organization || pd.searchedOrganization || '';
+        if ((!title || !company) && pd.experience) {
+            try {
+                const expArr = typeof pd.experience === 'string' ? JSON.parse(pd.experience) : pd.experience;
+                if (Array.isArray(expArr) && expArr.length > 0) {
+                    const mostRecent = expArr[0];
+                    if (!title)   title   = mostRecent.title || mostRecent.jobTitle || mostRecent.position || '';
+                    if (!company) company = mostRecent.companyName || mostRecent.company || mostRecent.subtitle || mostRecent.organization || '';
+                }
+            } catch (_) { /* malformed experience JSON — skip the fallback */ }
+        }
+        title   = (title   || '').trim();
+        company = (company || '').trim();
+        // Safety net: identical title/company means a corrupted company field —
+        // keep the title (more informative) and blank the company.
+        if (title && company && title.toLowerCase() === company.toLowerCase()) company = '';
+        return { title, company };
+    }
+
+    // Backfill missing title/company on the accepted-connections items from
+    // prospect_contacts, using batched `in` queries (30 keys per Firestore query).
+    // Mutates the item objects in place, then re-renders the cards if this list is
+    // still the one on screen. The PDF export awaits this promise so exported
+    // reports always include the backfilled data.
+    async function enrichRecentConnectionsFromProspectContacts(items) {
+        const needy = items.filter(c => (!c.title || !c.company) && c.linkedInUrl);
+        if (!needy.length) return;
+
+        // canonical URL → items awaiting enrichment
+        const byCanonical = new Map();
+        needy.forEach(c => {
+            const canon = canonicalizeLinkedInUrlForLookup(c.linkedInUrl);
+            if (!canon) return;
+            if (!byCanonical.has(canon)) byCanonical.set(canon, []);
+            byCanonical.get(canon).push(c);
+        });
+        if (!byCanonical.size) return;
+
+        const canonUrls = [...byCanonical.keys()];
+        const docsByCanonical = new Map(); // canonical URL → [docData]
+        const addDoc = (pd) => {
+            const key = canonicalizeLinkedInUrlForLookup(pd.linkedInUrlNormalized || pd.linkedInUrl || '');
+            if (!key || !byCanonical.has(key)) return;
+            if (!docsByCanonical.has(key)) docsByCanonical.set(key, []);
+            docsByCanonical.get(key).push(pd);
+        };
+
+        // Primary lookup: linkedInUrlNormalized, batched 30 per query
+        for (let i = 0; i < canonUrls.length; i += 30) {
+            const chunk = canonUrls.slice(i, i + 30);
+            try {
+                const snap = await getDocs(query(
+                    collection(emailDB, 'prospect_contacts'),
+                    where('linkedInUrlNormalized', 'in', chunk)
+                ));
+                snap.docs.forEach(d => addDoc(d.data()));
+            } catch (e) {
+                console.warn('⚠️ [RecentConnEnrichment] prospect_contacts batch lookup failed:', e.message || e);
+            }
+        }
+
+        // Fallback for URLs whose docs have a missing/garbled linkedInUrlNormalized:
+        // match the raw linkedInUrl field against its common literal formats.
+        const missingUrls = canonUrls.filter(u => !docsByCanonical.has(u));
+        if (missingUrls.length) {
+            const allVariants = missingUrls.flatMap(buildLinkedInUrlVariants);
+            for (let i = 0; i < allVariants.length; i += 30) {
+                const chunk = allVariants.slice(i, i + 30);
+                try {
+                    const snap = await getDocs(query(
+                        collection(emailDB, 'prospect_contacts'),
+                        where('linkedInUrl', 'in', chunk)
+                    ));
+                    snap.docs.forEach(d => addDoc(d.data()));
+                } catch (e) {
+                    console.warn('⚠️ [RecentConnEnrichment] prospect_contacts fallback lookup failed:', e.message || e);
+                }
+            }
+        }
+
+        let filled = 0;
+        docsByCanonical.forEach((docs, canon) => {
+            const { title, company } = extractTitleCompanyFromProspectDoc(pickBestProspectDoc(docs));
+            (byCanonical.get(canon) || []).forEach(c => {
+                let changed = false;
+                if (!c.title && title)     { c.title   = title;   changed = true; }
+                if (!c.company && company) { c.company = company; changed = true; }
+                if (changed) filled++;
+            });
+        });
+
+        console.log(`🔎 [RecentConnEnrichment] ${needy.length} contact(s) missing title/company — matched ${docsByCanonical.size} of ${canonUrls.length} URL(s) in prospect_contacts, backfilled ${filled} contact(s).`);
+
+        // Re-render only if this list is still the current one (a newer analysis
+        // run may have replaced it while the lookups were in flight).
+        if (filled && _recentConnectionsItems === items) renderRecentConnectionsCards();
+    }
+
     function renderRecentConnections(sentItems, acceptedUrls, targetBdrs) {
         const card = document.getElementById('recentConnectionsCard');
         const list = document.getElementById('recentConnectionsList');
@@ -4894,10 +5076,16 @@
             const nameFromQueue = (item.prospect_name || item.contact_name ||
                                    item.contact_first_name || item.first_name || '').trim();
             const accountEmail = (evtMeta.accountEmail || item.account_email || '').toLowerCase();
+            let title   = (item.prospect_title  || item.contact_title  || '').trim();
+            let company = (item.prospect_company || item.contact_company || '').trim();
+            // Some upstream write paths stamped the SAME string into both fields
+            // (corrupted company). Treat company as unset so the prospect_contacts
+            // backfill below is free to fill it in properly.
+            if (title && company && title.toLowerCase() === company.toLowerCase()) company = '';
             items.push({
                 name:         nameFromEvent || nameFromQueue || 'Unknown',
-                title:        (item.prospect_title  || item.contact_title  || '').trim(),
-                company:      (item.prospect_company || item.contact_company || '').trim(),
+                title,
+                company,
                 linkedInUrl:  raw,
                 acceptedAt:   evtMeta.acceptedAt || null,
                 accountEmail,
@@ -4909,6 +5097,11 @@
         // Sort newest accepted first
         items.sort((a, b) => (b.acceptedAt || 0) - (a.acceptedAt || 0));
         _recentConnectionsItems = items;
+
+        // Backfill missing titles/organizations from prospect_contacts (async — the
+        // cards re-render when it finishes, and the PDF export awaits this promise).
+        _recentConnectionsEnrichPromise = enrichRecentConnectionsFromProspectContacts(items)
+            .catch(e => console.warn('⚠️ [RecentConnEnrichment] enrichment failed:', e.message || e));
 
         if (!items.length) {
             card.style.display = 'none';
@@ -5506,6 +5699,7 @@
         _grouperSentItems           = [];
         _grouperTargetBdrs          = [];
         _recentConnectionsItems     = [];
+        _recentConnectionsEnrichPromise = null;
         _grouperAcceptedUrls        = new Map();
         _grouperRepliedUrls         = new Set();
         _grouperScheduledUrls       = new Set();
@@ -6169,7 +6363,14 @@
     }
 
     // ── PDF Export ────────────────────────────────────────────────────────
-    window.exportOutcomesPdf = function() {
+    window.exportOutcomesPdf = async function() {
+        // Make sure the prospect_contacts title/company backfill has finished so the
+        // Recent Connections table isn't exported with "—" placeholders while the
+        // enrichment lookups are still in flight.
+        if (_recentConnectionsEnrichPromise) {
+            try { await _recentConnectionsEnrichPromise; } catch (_) { /* export proceeds with whatever data we have */ }
+        }
+
         // Collect visible sections from the live DOM
         const meta        = document.getElementById('funnelMeta')?.textContent || '';
         const summaryGrid = document.getElementById('summaryGrid')?.innerHTML || '';
