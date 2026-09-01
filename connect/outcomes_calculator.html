@@ -1710,15 +1710,15 @@
             </div>
             <div class="market-response-panel" id="marketResponsePanel">
                 <p class="market-response-intro">
-                    Set how hard or responsive each market is relative to its baseline. Left is more difficult
-                    (lower accept / reply / schedule rates); right is a stronger positive response.
-                    <strong>Save for all users</strong> writes this to the shared Connect settings store so every
-                    calculator on Pando and HealthLuminate uses the same factors.
+                    Each slider is capped by real Connect analysis rates — the low end is the weakest
+                    observed market versus the overall average, the high end is Vendor / Tech.
+                    100% keeps that market’s own baseline. <strong>Save for all users</strong> writes
+                    this to the shared Connect settings store so every calculator uses the same factors.
                 </p>
                 <div class="market-response-scale">
-                    <span>More difficult</span>
-                    <span>Baseline</span>
-                    <span>Higher response</span>
+                    <span id="mrScaleLow">Weakest observed market</span>
+                    <span>This market</span>
+                    <span id="mrScaleHigh">Vendor / Tech</span>
                 </div>
                 <div class="market-response-list" id="marketResponseList"></div>
                 <div class="market-response-actions">
@@ -2600,18 +2600,95 @@
     const MARKET_FACTORS_COLLECTION = 'connect_settings';
     const MARKET_FACTORS_DOC = 'outcomes_market_response';
     const MARKET_FACTORS_LS = 'outcomes_market_response_factors';
-    const MARKET_FACTOR_MIN = 0.5;
-    const MARKET_FACTOR_MAX = 1.5;
-    const MARKET_FACTOR_STEP = 0.05;
+    // Fallback bounds from the latest analysis (Physician Group vs Vendor / Tech
+    // vs overall baseline). Replaced with live numbers once analysis loads.
+    let MARKET_FACTOR_MIN = 0.48;
+    let MARKET_FACTOR_MAX = 1.20;
+    const MARKET_FACTOR_STEP = 0.01;
     let MARKET_FACTORS = {};
     let MARKET_FACTORS_SAVED = {};
     let MARKET_FACTORS_META = { updatedAt: '', updatedBy: '' };
+    let MARKET_FACTOR_ANCHORS = { lowLabel: 'Physician Group', highLabel: 'Vendor / Tech' };
+
+    function sliderMinPct() { return Math.round(MARKET_FACTOR_MIN * 100); }
+    function sliderMaxPct() { return Math.round(MARKET_FACTOR_MAX * 100); }
+    function sliderStepPct() { return Math.round(MARKET_FACTOR_STEP * 100); }
 
     function sanitizeMarketFactor(v) {
         const n = parseFloat(v);
         if (!Number.isFinite(n)) return 1;
         const stepped = Math.round(n / MARKET_FACTOR_STEP) * MARKET_FACTOR_STEP;
-        return clamp(stepped, MARKET_FACTOR_MIN, MARKET_FACTOR_MAX);
+        return clamp(Number(stepped.toFixed(2)), MARKET_FACTOR_MIN, MARKET_FACTOR_MAX);
+    }
+
+    function orgResponseIndex(row, baseline) {
+        if (!row || !baseline) return null;
+        const pairs = [
+            [row.connect_rate, baseline.connect],
+            [row.reply_rate, baseline.reply],
+            [row.meeting_rate, baseline.meeting]
+        ];
+        const ratios = pairs
+            .filter(([rate, base]) => rate > 0 && base > 0)
+            .map(([rate, base]) => rate / base);
+        if (!ratios.length) return null;
+        return Math.exp(ratios.reduce((sum, v) => sum + Math.log(v), 0) / ratios.length);
+    }
+
+    function isUsableResponseAnchor(row) {
+        if (!row || row.estimated || row.level === 'Unknown' || !(row.n > 0)) return false;
+        if (!(row.connect_rate > 0) || !(row.reply_rate > 0) || !(row.meeting_rate > 0)) return false;
+        // Unknown-like rows have incoherent meeting rates (often > connect).
+        if (row.meeting_rate > row.connect_rate) return false;
+        return true;
+    }
+
+    function updateMarketResponseScaleLabels() {
+        const lowEl = document.getElementById('mrScaleLow');
+        const highEl = document.getElementById('mrScaleHigh');
+        if (lowEl) lowEl.textContent = `${MARKET_FACTOR_ANCHORS.lowLabel} · ${sliderMinPct()}%`;
+        if (highEl) highEl.textContent = `${MARKET_FACTOR_ANCHORS.highLabel} · ${sliderMaxPct()}%`;
+    }
+
+    function setMarketFactorBoundsFromAnalysis() {
+        const baseline = ANALYSIS_DATA?.baseline;
+        const real = (ANALYSIS_DATA?.orgTypes || []).filter(isUsableResponseAnchor);
+        if (!baseline || !real.length) {
+            updateMarketResponseScaleLabels();
+            return;
+        }
+
+        const scored = real
+            .map(row => ({ row, index: orgResponseIndex(row, baseline) }))
+            .filter(s => s.index > 0);
+        if (!scored.length) {
+            updateMarketResponseScaleLabels();
+            return;
+        }
+
+        const lowAnchor = scored.reduce((a, b) => a.index < b.index ? a : b);
+        const highAnchor = scored.reduce((a, b) => a.index > b.index ? a : b);
+
+        const snap = (v, dir) => {
+            const stepped = v / MARKET_FACTOR_STEP;
+            const n = dir === 'down' ? Math.floor(stepped + 1e-9) : Math.ceil(stepped - 1e-9);
+            return Number((n * MARKET_FACTOR_STEP).toFixed(2));
+        };
+
+        MARKET_FACTOR_MIN = Math.min(1, snap(lowAnchor.index, 'down'));
+        MARKET_FACTOR_MAX = Math.max(1, snap(highAnchor.index, 'up'));
+        MARKET_FACTOR_ANCHORS = {
+            lowLabel: lowAnchor.row.label || humanizeOrgLevel(lowAnchor.row.level),
+            highLabel: highAnchor.row.label || humanizeOrgLevel(highAnchor.row.level)
+        };
+        updateMarketResponseScaleLabels();
+
+        Object.keys(MARKET_FACTORS).forEach(level => {
+            MARKET_FACTORS[level] = sanitizeMarketFactor(MARKET_FACTORS[level]);
+        });
+        Object.keys(MARKET_FACTORS_SAVED).forEach(level => {
+            MARKET_FACTORS_SAVED[level] = sanitizeMarketFactor(MARKET_FACTORS_SAVED[level]);
+        });
     }
 
     function getMarketFactor(level) {
@@ -2730,6 +2807,7 @@
     }
 
     function renderMarketResponseList() {
+        updateMarketResponseScaleLabels();
         const host = document.getElementById('marketResponseList');
         if (!host) return;
         const selected = document.getElementById('genOrgType')?.value || '';
@@ -2743,7 +2821,7 @@
             ].filter(Boolean).join(' ');
             return `<div class="${rowClass}" data-level="${escapeHtml(m.level)}">
                 <div class="mr-name" title="${escapeHtml(m.label || humanizeOrgLevel(m.level))}">${escapeHtml(m.label || humanizeOrgLevel(m.level))}</div>
-                <input type="range" class="mr-slider" min="50" max="150" step="5"
+                <input type="range" class="mr-slider" min="${sliderMinPct()}" max="${sliderMaxPct()}" step="${sliderStepPct()}"
                     value="${pct}" data-market-level="${escapeHtml(m.level)}"
                     aria-label="Positive response for ${escapeHtml(m.label || m.level)}"
                     oninput="onMarketFactorInput(this)">
@@ -2992,6 +3070,7 @@
             document.getElementById('genBtn').disabled = false;
             metaEl.innerHTML = `<i class="fas fa-check-circle" style="color:#4E6E4A;"></i> Analysis run ${escapeHtml(ANALYSIS_DATA.runDate)} · ${ANALYSIS_DATA.nContacts.toLocaleString()} contacts analyzed`;
             updateGenTotalReadout();
+            setMarketFactorBoundsFromAnalysis();
             renderMarketResponseList();
             updateOrgFactorBadge();
         } catch (e) {

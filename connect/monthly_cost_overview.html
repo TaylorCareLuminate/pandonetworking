@@ -141,6 +141,8 @@
                 &nbsp;·&nbsp;
                 <a href="ai_cost_tracking.html">AI Cost Tracking (full ledger detail)</a>
                 &nbsp;·&nbsp;
+                <a href="brave_cost_tracking.html">Brave Search Cost Tracking (full ledger detail)</a>
+                &nbsp;·&nbsp;
                 <a href="full_pipeline_dashboard.html">Full Pipeline Dashboard</a>
             </div>
         </div>
@@ -185,6 +187,15 @@
                     <code>connect_queue</code> with an account tag.
                 </div>
             </div>
+            <div class="note info">
+                <i class="fas fa-magnifying-glass"></i>
+                <div>
+                    <strong>Brave $</strong> is a flat $0.003/request from the Brave usage ledger (<code>brave_usage_ledger</code>) —
+                    every successful News/Web search call is recorded (total is always accurate), tagged by BDR where the calling
+                    route passes one. Covers Internet Search, Org Story Search, Harvest, Org Complement, and Post Reply's
+                    news-lookup steps. See <a href="brave_cost_tracking.html">Brave Search Cost Tracking</a> for full detail.
+                </div>
+            </div>
         </div>
 
         <!-- Stats -->
@@ -199,10 +210,15 @@
                 <div class="stat-value" id="statAi">$0.00</div>
                 <div class="stat-sub" id="statAiSub"></div>
             </div>
+            <div class="stat-card" style="border-left-color:#d97706;">
+                <div class="stat-label">Total Brave Cost <span title="Brave Search usage ledger — $0.003/request, always fully counted">ⓘ</span></div>
+                <div class="stat-value" id="statBrave">$0.00</div>
+                <div class="stat-sub" id="statBraveSub"></div>
+            </div>
             <div class="stat-card">
                 <div class="stat-label">Combined Cost (shown)</div>
                 <div class="stat-value" id="statCombined">$0.00</div>
-                <div class="stat-sub">Apify + tracked AI — may still understate true total</div>
+                <div class="stat-sub">Apify + tracked AI + Brave — may still understate true total</div>
             </div>
             <div class="stat-card gray">
                 <div class="stat-label">Total Messages Generated</div>
@@ -242,6 +258,7 @@
                                 <th class="num" data-sort="otherMessages">Other Tools</th>
                                 <th class="num" data-sort="apifyUsd">Apify $</th>
                                 <th class="num" data-sort="aiUsd">AI $</th>
+                                <th class="num" data-sort="braveUsd">Brave $</th>
                                 <th class="num" data-sort="combinedUsd">Combined $</th>
                             </tr>
                         </thead>
@@ -291,6 +308,28 @@
                         <table>
                             <thead><tr><th>Source</th><th class="num">Generations</th><th class="num">Cost</th></tr></thead>
                             <tbody id="byAiSourceBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Brave ledger by search type / source -->
+            <div class="two-col">
+                <div class="section">
+                    <div class="section-title"><i class="fas fa-magnifying-glass"></i> Brave Cost by Search Type <span class="muted small" id="braveLedgerCountLabel" style="font-weight:400;"></span></div>
+                    <div class="table-scroll">
+                        <table>
+                            <thead><tr><th>Type</th><th class="num">Searches</th><th class="num">Cost</th></tr></thead>
+                            <tbody id="byBraveTypeBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="section">
+                    <div class="section-title"><i class="fas fa-code-branch"></i> Brave Cost by Source</div>
+                    <div class="table-scroll">
+                        <table>
+                            <thead><tr><th>Source</th><th class="num">Searches</th><th class="num">Cost</th></tr></thead>
+                            <tbody id="byBraveSourceBody"></tbody>
                         </table>
                     </div>
                 </div>
@@ -432,18 +471,20 @@
                 document.getElementById('periodLabel').textContent =
                     until ? `(${since.toLocaleDateString()} – ${until.toLocaleDateString()})` : `(since ${since.toLocaleDateString()})`;
 
-                const [apify, aiLedger, fp, msgs] = await Promise.all([
+                const [apify, aiLedger, braveLedger, fp, msgs] = await Promise.all([
                     loadApifySpend(since, until),
                     loadAiLedgerSpend(since, until),
+                    loadBraveLedgerSpend(since, until),
                     loadFullPipelineAiCost(since, until),
                     loadMessages(since, until)
                 ]);
 
-                renderStats(apify, aiLedger, fp, msgs);
-                renderByAccount(apify, aiLedger, fp, msgs);
+                renderStats(apify, aiLedger, braveLedger, fp, msgs);
+                renderByAccount(apify, aiLedger, braveLedger, fp, msgs);
                 renderBySource(msgs);
                 renderByActor(apify);
                 renderAiLedgerBreakdown(aiLedger);
+                renderBraveLedgerBreakdown(braveLedger);
                 renderFpRuns(fp);
 
                 document.getElementById('loadingBox').style.display = 'none';
@@ -546,6 +587,50 @@
             };
         }
 
+        // ── Brave ledger spend — reuses /api/brave-ledger/summary exactly like loadApifySpend
+        // reuses /api/apify-ledger/summary. Every successful Brave call is always recorded (no
+        // instrumentation gaps for the total), but bdrEmail attribution is only populated for
+        // the routes that have been wired up with a ledgerContext so far.
+        async function loadBraveLedgerSpend(since, until) {
+            if (!until) {
+                return await authedFetch(`/api/brave-ledger/summary?since=${since.toISOString().split('T')[0]}`);
+            }
+            const untilMs = until.getTime();
+            const all = [];
+            let offset = 0;
+            const limit = 500;
+            for (let page = 0; page < 40; page++) { // safety cap: 20k searches
+                const data = await authedFetch(`/api/brave-ledger/runs?since=${since.toISOString().split('T')[0]}&limit=${limit}&offset=${offset}`);
+                const runs = data.runs || [];
+                all.push(...runs);
+                if (runs.length < limit) break;
+                offset += limit;
+            }
+            const inWindow = all.filter(r => r.recordedAt && new Date(r.recordedAt).getTime() < untilMs);
+            const byBdr = {}, bySearchType = {}, bySource = {};
+            let totalUsd = 0, totalSearches = 0, unattributedUsd = 0, unattributedSearches = 0;
+            inWindow.forEach(d => {
+                const cost = d.costUsd || 0;
+                totalUsd += cost; totalSearches++;
+                let bdrEmail = d.bdrEmail || null, workspaceId = d.workspaceId || null;
+                if (typeof bdrEmail === 'string' && bdrEmail.startsWith('__ws__:')) { workspaceId = workspaceId || bdrEmail.slice(7); bdrEmail = null; }
+                if (!bdrEmail && !workspaceId) { unattributedUsd += cost; unattributedSearches++; }
+                const bdr = bdrEmail || (workspaceId ? `workspace:${workspaceId}` : 'unattributed');
+                (byBdr[bdr] ||= { bdrEmail: bdr, totalUsd: 0, searches: 0 }); byBdr[bdr].totalUsd += cost; byBdr[bdr].searches++;
+                const st = d.searchType || 'unknown';
+                (bySearchType[st] ||= { searchType: st, totalUsd: 0, searches: 0 }); bySearchType[st].totalUsd += cost; bySearchType[st].searches++;
+                const src = d.source || 'unknown';
+                (bySource[src] ||= { source: src, totalUsd: 0, searches: 0 }); bySource[src].totalUsd += cost; bySource[src].searches++;
+            });
+            return {
+                success: true, since: since.toISOString(), totalUsd: +totalUsd.toFixed(4), totalSearches,
+                unattributedUsd: +unattributedUsd.toFixed(4), unattributedSearches,
+                byBdr: Object.values(byBdr).sort((a, b) => b.totalUsd - a.totalUsd),
+                bySearchType: Object.values(bySearchType).sort((a, b) => b.totalUsd - a.totalUsd),
+                bySource: Object.values(bySource).sort((a, b) => b.totalUsd - a.totalUsd)
+            };
+        }
+
         // ── Full Pipeline AI cost estimate — separate from ai_usage_ledger above. Full Pipeline
         // runs aren't (yet) instrumented against the new ledger, so this remains the only source
         // for their AI $: full_pipeline_runs' totals.realCostBreakdown.aiEstimate.totalUsd, saved
@@ -627,29 +712,34 @@
             };
         }
 
-        function renderStats(apify, aiLedger, fp, msgs) {
+        function renderStats(apify, aiLedger, braveLedger, fp, msgs) {
             const total = apify.totalUsd || 0;
             const unattributed = apify.unattributedUsd || 0;
             const totalAi = (aiLedger.totalUsd || 0) + (fp.totalAiUsd || 0);
+            const totalBrave = braveLedger.totalUsd || 0;
             document.getElementById('statApify').textContent = money(total, 2);
             document.getElementById('statApifySub').textContent = `${(apify.totalRuns || 0).toLocaleString()} Apify run(s)`;
             document.getElementById('statAi').textContent = money(totalAi, 2);
             document.getElementById('statAiSub').textContent =
                 `${(aiLedger.totalRuns || 0).toLocaleString()} ledger generation(s) + ${fp.runs.filter(r => r._aiUsd > 0).length} Full Pipeline run(s)`;
-            document.getElementById('statCombined').textContent = money(total + totalAi, 2);
+            document.getElementById('statBrave').textContent = money(totalBrave, 2);
+            document.getElementById('statBraveSub').textContent = `${(braveLedger.totalSearches || 0).toLocaleString()} Brave search(es)`;
+            document.getElementById('statCombined').textContent = money(total + totalAi + totalBrave, 2);
             document.getElementById('statMessages').textContent = msgs.total.toLocaleString();
             document.getElementById('statMessagesSub').textContent = `${msgs.sent.toLocaleString()} sent to HeyReach`;
             document.getElementById('statUnattributed').textContent = money(unattributed, 2);
             document.getElementById('statUnattributedSub').textContent = total ? `${Math.round(unattributed / total * 100)}% of Apify spend has no account tag` : '';
         }
 
-        function renderByAccount(apify, aiLedger, fp, msgs) {
+        function renderByAccount(apify, aiLedger, braveLedger, fp, msgs) {
             const apifyByBdr = {};
             (apify.byBdr || []).forEach(r => { apifyByBdr[r.bdrEmail] = r.totalUsd; });
             const aiLedgerByBdr = {};
             (aiLedger.byBdr || []).forEach(r => { aiLedgerByBdr[r.bdrEmail] = r.totalUsd; });
+            const braveLedgerByBdr = {};
+            (braveLedger.byBdr || []).forEach(r => { braveLedgerByBdr[r.bdrEmail] = r.totalUsd; });
 
-            const keys = new Set([...Object.keys(msgs.byAccount), ...Object.keys(apifyByBdr), ...Object.keys(fp.byBdr), ...Object.keys(aiLedgerByBdr)]);
+            const keys = new Set([...Object.keys(msgs.byAccount), ...Object.keys(apifyByBdr), ...Object.keys(fp.byBdr), ...Object.keys(aiLedgerByBdr), ...Object.keys(braveLedgerByBdr)]);
             keys.delete('unattributed');
 
             byAccountRows = [...keys].map(key => {
@@ -658,23 +748,26 @@
                 const fpAiUsd = fp.byBdr[key] ?? 0;
                 const ledgerAiUsd = aiLedgerByBdr[key] ?? 0;
                 const aiUsd = (fp.byBdr[key] != null || aiLedgerByBdr[key] != null) ? (fpAiUsd + ledgerAiUsd) : null;
-                const combinedUsd = (apifyUsd || 0) + (aiUsd || 0);
+                const braveUsd = braveLedgerByBdr[key] ?? null;
+                const combinedUsd = (apifyUsd || 0) + (aiUsd || 0) + (braveUsd || 0);
                 return {
                     account: key, name: m.name, totalMessages: m.total, sentMessages: m.sent,
-                    fpMessages: m.fp, otherMessages: m.other, apifyUsd, aiUsd, combinedUsd
+                    fpMessages: m.fp, otherMessages: m.other, apifyUsd, aiUsd, braveUsd, combinedUsd
                 };
             });
 
-            // Unattributed spend (Apify and/or AI ledger) gets its own summary row since it can't join to an account.
-            if (apifyByBdr['unattributed'] || aiLedgerByBdr['unattributed']) {
+            // Unattributed spend (Apify and/or AI/Brave ledger) gets its own summary row since it can't join to an account.
+            if (apifyByBdr['unattributed'] || aiLedgerByBdr['unattributed'] || braveLedgerByBdr['unattributed']) {
                 const apifyU = apifyByBdr['unattributed'] || 0;
                 const aiU = aiLedgerByBdr['unattributed'] || 0;
+                const braveU = braveLedgerByBdr['unattributed'] || 0;
                 byAccountRows.push({
                     account: 'unattributed', name: null, totalMessages: 0, sentMessages: 0,
                     fpMessages: 0, otherMessages: 0,
                     apifyUsd: apifyByBdr['unattributed'] != null ? apifyU : null,
                     aiUsd: aiLedgerByBdr['unattributed'] != null ? aiU : null,
-                    combinedUsd: apifyU + aiU
+                    braveUsd: braveLedgerByBdr['unattributed'] != null ? braveU : null,
+                    combinedUsd: apifyU + aiU + braveU
                 });
             }
 
@@ -697,7 +790,7 @@
         function drawByAccountTable() {
             const tbody = document.getElementById('byAccountBody');
             if (!byAccountRows.length) {
-                tbody.innerHTML = '<tr><td colspan="8" class="muted">No messages, Apify spend, or AI cost in this range.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" class="muted">No messages, Apify spend, or AI/Brave cost in this range.</td></tr>';
                 return;
             }
             tbody.innerHTML = byAccountRows.map(r => `
@@ -709,6 +802,7 @@
                     <td class="num">${r.otherMessages.toLocaleString()}</td>
                     <td class="num">${r.apifyUsd != null ? money(r.apifyUsd) : '<span class="muted">—</span>'}</td>
                     <td class="num">${r.aiUsd != null ? money(r.aiUsd) : '<span class="muted">—</span>'}</td>
+                    <td class="num">${r.braveUsd != null ? money(r.braveUsd) : '<span class="muted">—</span>'}</td>
                     <td class="num"><strong>${r.combinedUsd ? money(r.combinedUsd) : '<span class="muted">—</span>'}</strong></td>
                 </tr>`).join('');
         }
@@ -767,6 +861,28 @@
                 </tr>`).join('') : '<tr><td colspan="3" class="muted">No AI ledger generations in this range.</td></tr>';
         }
 
+        function renderBraveLedgerBreakdown(braveLedger) {
+            document.getElementById('braveLedgerCountLabel').textContent = `— ${(braveLedger.totalSearches || 0).toLocaleString()} search(es) in range`;
+
+            const typeBody = document.getElementById('byBraveTypeBody');
+            const types = braveLedger.bySearchType || [];
+            typeBody.innerHTML = types.length ? types.map(r => `
+                <tr>
+                    <td class="small">${escapeHtml(r.searchType)}</td>
+                    <td class="num">${r.searches.toLocaleString()}</td>
+                    <td class="num"><strong>${money(r.totalUsd)}</strong></td>
+                </tr>`).join('') : '<tr><td colspan="3" class="muted">No Brave searches in this range.</td></tr>';
+
+            const sourceBody = document.getElementById('byBraveSourceBody');
+            const sources = braveLedger.bySource || [];
+            sourceBody.innerHTML = sources.length ? sources.map(r => `
+                <tr>
+                    <td class="small"><code>${escapeHtml(r.source)}</code></td>
+                    <td class="num">${r.searches.toLocaleString()}</td>
+                    <td class="num"><strong>${money(r.totalUsd)}</strong></td>
+                </tr>`).join('') : '<tr><td colspan="3" class="muted">No Brave searches in this range.</td></tr>';
+        }
+
         function renderFpRuns(fp) {
             document.getElementById('fpRunsCountLabel').textContent = `— ${fp.runs.length} run(s) in range`;
             const tbody = document.getElementById('fpRunsBody');
@@ -786,12 +902,13 @@
 
         window.exportCsv = function () {
             if (!byAccountRows.length) { alert('No data loaded to export.'); return; }
-            const headers = ['Account', 'Total Messages', 'Sent to HeyReach', 'Full Pipeline Messages', 'Other Tool Messages', 'Apify USD', 'AI USD (ledger + Full Pipeline)', 'Combined USD'];
+            const headers = ['Account', 'Total Messages', 'Sent to HeyReach', 'Full Pipeline Messages', 'Other Tool Messages', 'Apify USD', 'AI USD (ledger + Full Pipeline)', 'Brave USD', 'Combined USD'];
             const csvEscape = v => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
             const rows = byAccountRows.map(r => [
                 r.name ? `${r.name} (${r.account})` : r.account,
                 r.totalMessages, r.sentMessages, r.fpMessages, r.otherMessages,
-                r.apifyUsd != null ? r.apifyUsd.toFixed(4) : '', r.aiUsd != null ? r.aiUsd.toFixed(4) : '', r.combinedUsd.toFixed(4)
+                r.apifyUsd != null ? r.apifyUsd.toFixed(4) : '', r.aiUsd != null ? r.aiUsd.toFixed(4) : '',
+                r.braveUsd != null ? r.braveUsd.toFixed(4) : '', r.combinedUsd.toFixed(4)
             ].map(csvEscape).join(','));
             const csv = [headers.join(','), ...rows].join('\n');
             const blob = new Blob([csv], { type: 'text/csv' });

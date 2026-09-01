@@ -256,7 +256,7 @@
         <!-- ══════════ STEP 3: Organizations preview ══════════ -->
         <div class="section">
             <div class="section-title"><span class="step-num">3</span> Organizations to Scan (preview)</div>
-            <p class="section-help">Read-only preview, in the exact order this run will process them: organizations never scanned under the Scan Name below come first, then — as a tie-breaker, so even a brand-new Scan Name doesn't just restart from the top of the priority list — organizations scanned the fewest total times across ALL scan names (organizations pulled in from a BDR/workspace that were already scanned <em>before</em> joining this hypothesis group are treated as partially-covered here too, so they're queued behind truly never-scanned organizations). Add / remove / re-prioritize organizations in <a href="prospect_organizations_admin.html" target="_blank">Prospect Organizations Admin</a> (that priority still breaks any remaining ties — the AI Priority Scorer there can also set it for you). Organizations without a LinkedIn URL are researched automatically during the run.</p>
+            <p class="section-help">Read-only preview, in the exact order this run will process them: organizations never scanned under the Scan Name below come first, then — as a tie-breaker, so even a brand-new Scan Name doesn't just restart from the top of the priority list — organizations scanned the fewest total times across ALL scan names (organizations pulled in from a BDR/workspace that were already scanned <em>before</em> joining this hypothesis group are treated as partially-covered here too, so they're queued behind truly never-scanned organizations). Add / remove / re-prioritize organizations in <a href="prospect_organizations_admin.html" target="_blank">Prospect Organizations Admin</a> (that priority still breaks any remaining ties — the AI Priority Scorer there can also set it for you). Organizations without a LinkedIn URL are researched automatically during the run. <strong>Contacts Scanned</strong> and <strong>Messages Sent</strong> are cumulative for this hypothesis group (past Full Pipeline scans, and connect_queue messages actually pushed to HeyReach) — export the preview as CSV from the button under the tiles.</p>
 
             <div class="form-group" style="margin-bottom: 14px;">
                 <label for="fpScanName"><i class="fas fa-tag"></i> Scan Name <span style="color: var(--danger); font-weight: 400;">(required)</span></label>
@@ -295,12 +295,31 @@
                 <div class="stat-tile"><div class="num" id="fpOrgCountUrlNotFound">–</div><div class="lbl">URL Not Found (skipped)</div></div>
                 <div class="stat-tile"><div class="num" id="fpOrgCountScanned">–</div><div class="lbl">Previously Scanned</div></div>
                 <div class="stat-tile"><div class="num" id="fpOrgCountThisName">–</div><div class="lbl">Already Scanned as This Name</div></div>
+                <div class="stat-tile"><div class="num" id="fpOrgCountContactsScanned">–</div><div class="lbl">Contacts Scanned</div></div>
+                <div class="stat-tile"><div class="num" id="fpOrgCountMessagesSent">–</div><div class="lbl">Messages Sent</div></div>
             </div>
-            <div id="fpDupeStatus" style="font-size: 12.5px; font-weight: 600; margin: 8px 0 4px;"></div>
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin: 8px 0 4px;">
+                <div id="fpDupeStatus" style="font-size: 12.5px; font-weight: 600;"></div>
+                <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                    <span id="fpOrgActivityStatus" style="font-size: 12px; color: var(--gray-500);"></span>
+                    <button class="btn" id="fpExportOrgReportBtn" onclick="fpExportOrgActivityReport()" disabled title="Download a CSV of contacts scanned and messages sent for every organization in this preview">
+                        <i class="fas fa-file-csv"></i> Export Organization Report
+                    </button>
+                </div>
+            </div>
             <div style="max-height: 300px; overflow-y: auto; border: 1px solid var(--gray-200); border-radius: 8px;">
                 <table class="data-table" id="fpOrgTable">
-                    <thead><tr><th>#</th><th>Priority</th><th>Organization</th><th>LinkedIn URL</th><th title="Distinct scan names ever run against this org — the tie-breaker for queue order">Total Scans</th><th>Scan Names</th></tr></thead>
-                    <tbody id="fpOrgTableBody"><tr><td colspan="6" style="text-align:center; color: var(--gray-400); padding: 20px;">Select a hypothesis group above.</td></tr></tbody>
+                    <thead><tr>
+                        <th>#</th>
+                        <th>Priority</th>
+                        <th>Organization</th>
+                        <th>LinkedIn URL</th>
+                        <th title="Distinct scan names ever run against this org — the tie-breaker for queue order">Total Scans</th>
+                        <th title="Contacts saved from Full Pipeline / group scans of this organization (cumulative)">Contacts Scanned</th>
+                        <th title="connect_queue messages for this hypothesis group that were pushed to HeyReach">Messages Sent</th>
+                        <th>Scan Names</th>
+                    </tr></thead>
+                    <tbody id="fpOrgTableBody"><tr><td colspan="8" style="text-align:center; color: var(--gray-400); padding: 20px;">Select a hypothesis group above.</td></tr></tbody>
                 </table>
             </div>
         </div>
@@ -756,6 +775,9 @@
         let fpGroups = [];           // hypothesis_groups docs
         let fpBdrs = [];             // bdr_leaders docs
         let fpGroupOrgs = [];        // prospect_organizations for the selected group (priority order)
+        let fpOrgActivityById = new Map(); // orgId -> { contactsScanned, messagesGenerated, messagesSent }
+        let fpOrgActivityLoaded = false;
+        let fpOrgActivityLoadId = 0; // increment to ignore stale async loads when the group changes
         let fpCurrentGroupScanPresets = {}; // { [scanName]: { criteria, secondScan, orgTypeMode, updatedAt } } — from the selected group's hypothesis_groups doc
         let fpLastAppliedPresetName = null; // avoids re-clobbering Step 4 fields on every keystroke once a preset has loaded
         let fpRunning = false;
@@ -1731,6 +1753,7 @@
             fpRenderGroupOrgsTable();
             fpUpdateScanNameStatus();
             fpUpdateDupeStatus();
+            fpRefreshOrgActivityTiles();
             const totalEl = document.getElementById('fpOrgCountTotal');
             if (totalEl) totalEl.textContent = fpGroupOrgs.length;
 
@@ -1751,6 +1774,7 @@
             fpRenderGroupOrgsTable();
             fpUpdateScanNameStatus();
             fpUpdateDupeStatus();
+            fpRefreshOrgActivityTiles();
             const totalEl = document.getElementById('fpOrgCountTotal');
             if (totalEl) totalEl.textContent = fpGroupOrgs.length;
 
@@ -1950,10 +1974,20 @@
         function fpResetGroupDependentUi() {
             document.getElementById('fpInstructionsBlock').style.display = 'none';
             fpGroupOrgs = [];
+            fpOrgActivityById = new Map();
+            fpOrgActivityLoaded = false;
+            fpOrgActivityLoadId++;
             fpCurrentGroupScanPresets = {};
             fpLastAppliedPresetName = null;
-            document.getElementById('fpOrgTableBody').innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--gray-400); padding: 20px;">Select a hypothesis group above.</td></tr>';
-            ['fpOrgCountTotal','fpOrgCountWithUrl','fpOrgCountScanned','fpOrgCountThisName'].forEach(id => document.getElementById(id).textContent = '–');
+            document.getElementById('fpOrgTableBody').innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--gray-400); padding: 20px;">Select a hypothesis group above.</td></tr>';
+            ['fpOrgCountTotal','fpOrgCountWithUrl','fpOrgCountScanned','fpOrgCountThisName','fpOrgCountContactsScanned','fpOrgCountMessagesSent'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = '–';
+            });
+            const actStatus = document.getElementById('fpOrgActivityStatus');
+            if (actStatus) actStatus.textContent = '';
+            const exportBtn = document.getElementById('fpExportOrgReportBtn');
+            if (exportBtn) exportBtn.disabled = true;
             document.getElementById('fpScanName').value = '';
             document.getElementById('fpScanNameStatus').textContent = '';
             document.getElementById('fpScanRulesPresetStatus').textContent = '';
@@ -2054,7 +2088,7 @@
         // section of prospect_organizations_admin.html uses, ordered by hypothesis_priority.
         async function fpLoadGroupOrgs(groupId) {
             const tbody = document.getElementById('fpOrgTableBody');
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--gray-400); padding: 20px;"><i class="fas fa-spinner fa-spin"></i> Loading organizations…</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--gray-400); padding: 20px;"><i class="fas fa-spinner fa-spin"></i> Loading organizations…</td></tr>';
             try {
                 const snap = await getDocs(query(
                     collection(db, 'prospect_organizations'),
@@ -2089,9 +2123,10 @@
                 fpRenderGroupOrgsTable();
                 fpUpdateScanNameStatus();
                 fpUpdateDupeStatus();
+                fpLoadOrgActivityReport(groupId);
             } catch (e) {
                 console.error('Failed to load group orgs:', e);
-                tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color: var(--danger); padding: 20px;">Error: ${escHtml(e.message)}</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color: var(--danger); padding: 20px;">Error: ${escHtml(e.message)}</td></tr>`;
             }
         }
 
@@ -2437,7 +2472,7 @@
             const tbody = document.getElementById('fpOrgTableBody');
             const currentName = (document.getElementById('fpScanName')?.value || '').trim();
             if (fpGroupOrgs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--gray-400); padding: 20px;">No organizations tied to this group yet — add them in Prospect Organizations Admin.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color: var(--gray-400); padding: 20px;">No organizations tied to this group yet — add them in Prospect Organizations Admin.</td></tr>';
                 return;
             }
             // Preview in the exact order the run would use: with a Scan Name typed, that's
@@ -2480,12 +2515,226 @@
                         <td><strong>${escHtml(o.company_name || '(unnamed)')}</strong>${o.company_state ? ` <span style="color: var(--gray-400); font-size: 11px;">${escHtml(o.company_state)}</span>` : ''}${dupeBadge}</td>
                         <td>${urlCell}</td>
                         <td style="text-align:center; color: var(--gray-500);">${fpOrgTotalScanCount(o)}</td>
+                        <td style="text-align:center;">${fpOrgActivityCell(o.id, 'contactsScanned')}</td>
+                        <td style="text-align:center;">${fpOrgActivityCell(o.id, 'messagesSent')}</td>
                         <td style="font-size: 12px;">${scanCell}</td>
                     </tr>
                 `;
             }).join('');
             fpUpdateDupeStatus();
         }
+
+        function fpOrgActivityEmpty() {
+            return { contactsScanned: 0, messagesGenerated: 0, messagesSent: 0 };
+        }
+        function fpOrgActivityEnsure(orgId) {
+            if (!orgId) return fpOrgActivityEmpty();
+            if (!fpOrgActivityById.has(orgId)) fpOrgActivityById.set(orgId, fpOrgActivityEmpty());
+            return fpOrgActivityById.get(orgId);
+        }
+        function fpOrgActivityCell(orgId, field) {
+            if (!fpOrgActivityLoaded) {
+                return '<span style="color: var(--gray-400);" title="Loading activity…">…</span>';
+            }
+            const n = fpOrgActivityEnsure(orgId)[field] || 0;
+            const title = field === 'contactsScanned'
+                ? 'Contacts saved from Full Pipeline / group scans of this organization (cumulative)'
+                : 'Messages for this hypothesis group that were pushed to HeyReach';
+            return `<span title="${escHtml(title)}"${n === 0 ? ' style="color: var(--gray-400);"' : ''}>${n.toLocaleString()}</span>`;
+        }
+        function fpOrgActivityTotals(orgs) {
+            let contactsScanned = 0, messagesGenerated = 0, messagesSent = 0;
+            (orgs || fpGroupOrgs).forEach(o => {
+                const s = fpOrgActivityById.get(o.id);
+                if (!s) return;
+                contactsScanned += s.contactsScanned || 0;
+                messagesGenerated += s.messagesGenerated || 0;
+                messagesSent += s.messagesSent || 0;
+            });
+            return { contactsScanned, messagesGenerated, messagesSent };
+        }
+        function fpRefreshOrgActivityTiles() {
+            const contactsTile = document.getElementById('fpOrgCountContactsScanned');
+            const sentTile = document.getElementById('fpOrgCountMessagesSent');
+            if (!fpOrgActivityLoaded) return;
+            const totals = fpOrgActivityTotals();
+            if (contactsTile) contactsTile.textContent = totals.contactsScanned.toLocaleString();
+            if (sentTile) sentTile.textContent = totals.messagesSent.toLocaleString();
+        }
+        function fpOrgActivityPreviewRows() {
+            const currentName = (document.getElementById('fpScanName')?.value || '').trim();
+            const skip = document.getElementById('fpSkipAlreadyScanned')?.checked ?? true;
+            return currentName ? fpBuildRunQueue(currentName, skip) : fpGroupOrgs;
+        }
+        function fpMatchMessageToOrgId(msg, byName, byLi) {
+            const company = msg.prospect_company || msg.company_name || msg.contactCompany || '';
+            const nameKey = fpNormOrgName(company);
+            if (nameKey && byName.has(nameKey)) return byName.get(nameKey);
+            const liKey = fpNormOrgLinkedIn(msg.company_linkedin_url || msg.prospect_company_linkedin_url || '');
+            if (liKey && byLi.has(liKey)) return byLi.get(liKey);
+            return null;
+        }
+        function fpScanJobOrgId(job, byName) {
+            const id = job.companies?.[0]?.prospect_org_id || job.prospect_org_id || null;
+            if (id) return id;
+            const name = job.companies?.[0]?.company_name || job.company_name || '';
+            const n = fpNormOrgName(name);
+            return (n && byName && byName.has(n)) ? byName.get(n) : null;
+        }
+
+        // Cumulative contacts-scanned + messages-sent for the selected hypothesis
+        // group's preview table. Contacts come from connect_contact_search_log
+        // (fallback: full_pipeline_runs.orgs[]); messages come from connect_queue
+        // docs stamped with this group (sent = pushed_to_heyreach === true).
+        async function fpLoadOrgActivityReport(groupId) {
+            const statusEl = document.getElementById('fpOrgActivityStatus');
+            const exportBtn = document.getElementById('fpExportOrgReportBtn');
+            const contactsTile = document.getElementById('fpOrgCountContactsScanned');
+            const sentTile = document.getElementById('fpOrgCountMessagesSent');
+            const loadId = ++fpOrgActivityLoadId;
+            fpOrgActivityById = new Map();
+            fpOrgActivityLoaded = false;
+            if (exportBtn) exportBtn.disabled = true;
+            if (contactsTile) contactsTile.textContent = '…';
+            if (sentTile) sentTile.textContent = '…';
+            if (statusEl) statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading contacts scanned &amp; messages sent…';
+            fpRenderGroupOrgsTable();
+            if (!groupId || !fpGroupOrgs.length) {
+                if (statusEl) statusEl.textContent = '';
+                if (contactsTile) contactsTile.textContent = '–';
+                if (sentTile) sentTile.textContent = '–';
+                return;
+            }
+
+            fpGroupOrgs.forEach(o => fpOrgActivityEnsure(o.id));
+            const byName = new Map();
+            const byLi = new Map();
+            fpGroupOrgs.forEach(o => {
+                const n = fpNormOrgName(o.company_name);
+                if (n && !byName.has(n)) byName.set(n, o.id);
+                const li = fpNormOrgLinkedIn(o.company_linkedin_url);
+                if (li && !byLi.has(li)) byLi.set(li, o.id);
+            });
+
+            try {
+                const [scanSnap, msgSnap] = await Promise.all([
+                    getDocs(query(collection(db, 'connect_contact_search_log'), where('hypothesisGroupId', '==', groupId))),
+                    getDocs(query(collection(db, 'connect_queue'), where('hypothesisGroupId', '==', groupId)))
+                ]);
+                if (loadId !== fpOrgActivityLoadId) return;
+
+                const scannedFromLogs = new Set();
+                scanSnap.forEach(d => {
+                    const job = d.data();
+                    if (job.status && job.status !== 'completed') return;
+                    const orgId = fpScanJobOrgId(job, byName);
+                    if (!orgId || !fpOrgActivityById.has(orgId)) return;
+                    fpOrgActivityEnsure(orgId).contactsScanned += Number(job.results?.contacts_saved) || 0;
+                    scannedFromLogs.add(orgId);
+                });
+
+                // Pipeline run reports are large; only pull them when this group has
+                // no tagged scan jobs at all (older runs / missing hypothesisGroupId on the job).
+                if (scanSnap.empty) {
+                    const runSnap = await getDocs(query(collection(db, 'full_pipeline_runs'), where('hypothesisGroupId', '==', groupId)));
+                    if (loadId !== fpOrgActivityLoadId) return;
+                    runSnap.forEach(d => {
+                        const run = d.data();
+                        (run.orgs || []).forEach(o => {
+                            if (!o.orgId || !fpOrgActivityById.has(o.orgId)) return;
+                            if (scannedFromLogs.has(o.orgId)) return;
+                            fpOrgActivityEnsure(o.orgId).contactsScanned += Number(o.contactsScanned) || 0;
+                        });
+                    });
+                }
+
+                let unmatchedGenerated = 0, unmatchedSent = 0;
+                msgSnap.forEach(d => {
+                    const msg = d.data();
+                    const orgId = fpMatchMessageToOrgId(msg, byName, byLi);
+                    const sent = msg.pushed_to_heyreach === true;
+                    if (!orgId) {
+                        unmatchedGenerated++;
+                        if (sent) unmatchedSent++;
+                        return;
+                    }
+                    const stats = fpOrgActivityEnsure(orgId);
+                    stats.messagesGenerated++;
+                    if (sent) stats.messagesSent++;
+                });
+
+                if (loadId !== fpOrgActivityLoadId) return;
+                fpOrgActivityLoaded = true;
+                const totals = fpOrgActivityTotals();
+                if (contactsTile) contactsTile.textContent = totals.contactsScanned.toLocaleString();
+                if (sentTile) sentTile.textContent = totals.messagesSent.toLocaleString();
+                if (exportBtn) exportBtn.disabled = false;
+                const unmatchedNote = unmatchedSent
+                    ? ` · ${unmatchedSent.toLocaleString()} sent message(s) did not match a preview organization`
+                    : (unmatchedGenerated ? ` · ${unmatchedGenerated.toLocaleString()} generated message(s) did not match a preview organization` : '');
+                if (statusEl) {
+                    statusEl.innerHTML = `<span style="color: var(--gray-500);">${totals.contactsScanned.toLocaleString()} contact(s) scanned · ${totals.messagesGenerated.toLocaleString()} message(s) generated · ${totals.messagesSent.toLocaleString()} sent${unmatchedNote}</span>`;
+                }
+                fpRenderGroupOrgsTable();
+            } catch (e) {
+                if (loadId !== fpOrgActivityLoadId) return;
+                console.error('Failed to load organization activity report:', e);
+                fpOrgActivityLoaded = true;
+                if (contactsTile) contactsTile.textContent = '–';
+                if (sentTile) sentTile.textContent = '–';
+                if (exportBtn) exportBtn.disabled = fpGroupOrgs.length === 0;
+                if (statusEl) statusEl.innerHTML = `<span style="color: var(--danger);">Could not load activity: ${escHtml(e.message)}</span>`;
+                fpRenderGroupOrgsTable();
+            }
+        }
+
+        function fpCsvEscape(v) {
+            const s = String(v ?? '');
+            return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        }
+        window.fpExportOrgActivityReport = function() {
+            if (!fpGroupOrgs.length) { alert('Select a hypothesis group first.'); return; }
+            const groupId = document.getElementById('fpGroupSelect')?.value || '';
+            const group = fpGroups.find(g => g.id === groupId) || {};
+            const customer = document.getElementById('fpCustomerSelect')?.value || '';
+            const scanName = (document.getElementById('fpScanName')?.value || '').trim();
+            const rows = fpOrgActivityPreviewRows();
+            const cols = [
+                { label: 'Queue #', get: (o, i) => i + 1 },
+                { label: 'Priority', get: o => o.hypothesis_priority ?? '' },
+                { label: 'Organization', get: o => o.company_name || '' },
+                { label: 'State', get: o => o.company_state || '' },
+                { label: 'LinkedIn URL', get: o => o.company_linkedin_url || '' },
+                { label: 'Total Scans', get: o => fpOrgTotalScanCount(o) },
+                { label: 'Scan Names', get: o => fpOrgScanLabels(o).join('; ') },
+                { label: 'Contacts Scanned', get: o => fpOrgActivityEnsure(o.id).contactsScanned },
+                { label: 'Messages Generated', get: o => fpOrgActivityEnsure(o.id).messagesGenerated },
+                { label: 'Messages Sent', get: o => fpOrgActivityEnsure(o.id).messagesSent }
+            ];
+            const header = cols.map(c => fpCsvEscape(c.label)).join(',');
+            const body = rows.map((o, i) => cols.map(c => fpCsvEscape(c.get(o, i))).join(',')).join('\n');
+            const totals = fpOrgActivityTotals(rows);
+            const totalLine = [
+                '', '', 'TOTAL', '', '', '', '',
+                totals.contactsScanned, totals.messagesGenerated, totals.messagesSent
+            ].map(fpCsvEscape).join(',');
+            const stamp = new Date().toISOString().slice(0, 10);
+            const safeGroup = (group.name || groupId || 'group').replace(/[^\w\-]+/g, '_').slice(0, 40);
+            const blob = new Blob(['\uFEFF' + header + '\n' + body + '\n' + totalLine + '\n'], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `org_scan_report_${safeGroup}_${stamp}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            const statusEl = document.getElementById('fpOrgActivityStatus');
+            if (statusEl) {
+                const extra = [customer, group.name || groupId, scanName ? `scan "${scanName}"` : ''].filter(Boolean).join(' · ');
+                statusEl.innerHTML = `<span style="color: var(--success);"><i class="fas fa-check"></i> Exported ${rows.length.toLocaleString()} organization(s)${extra ? ` (${escHtml(extra)})` : ''}.</span>`;
+            }
+        };
 
         // Live count/status of how many group organizations already carry the
         // currently-typed scan name — drives Step 3's warning line and re-highlights
