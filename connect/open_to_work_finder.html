@@ -136,11 +136,18 @@
     <!-- STEP 1: Scan -->
     <div class="section">
         <div class="section-title"><span class="step-badge">Step 1</span> <i class="fas fa-database"></i> Scan Database for "Open to Work" Contacts</div>
-        <p class="section-help">
+        <p class="section-help" id="scanHelpText">
             Reads the <code>openToWork</code> flag already stored on every <code>prospect_contacts</code> document (set by your existing LinkedIn scraping pipelines) — no live re-scraping, so this is fast and free.
             It scans <strong>system-wide</strong>, across every BDR and workspace.
         </p>
-        <button class="btn btn-teal" id="btnScan" onclick="runScan()"><i class="fas fa-search"></i> Scan for Open to Work Contacts</button>
+        <div class="radio-row" style="margin-bottom:0.85rem;">
+            <label><input type="radio" name="scanScope" value="all" checked onchange="onScanScopeChange()"> Scan all contacts (system-wide)</label>
+            <label><input type="radio" name="scanScope" value="workspace" onchange="onScanScopeChange()"> Scan a single workspace only</label>
+        </div>
+        <select id="scanWorkspaceSelect" style="display:none; margin-bottom:0.85rem; padding:0.6rem 0.9rem; border:2px solid var(--border); border-radius:8px; font-size:0.88rem; min-width:320px;"><option value="">— Select workspace —</option></select>
+        <div>
+            <button class="btn btn-teal" id="btnScan" onclick="runScan()"><i class="fas fa-search"></i> Scan for Open to Work Contacts</button>
+        </div>
         <div class="totals-grid" id="scanTotals" style="display:none; margin-top:1rem;"></div>
         <div id="scanStatus" style="margin-top:0.75rem;"></div>
     </div>
@@ -219,9 +226,10 @@ Exclude individual contributors with no sales or leadership scope, purely B2C/re
     await window.firebaseReady;
     const db = window.clemailDb;
     const {
-        collection, doc, getDoc, getDocs, addDoc, updateDoc, query, where, writeBatch
+        collection, doc, getDoc, getDocs, getAllDocs, addDoc, updateDoc, query, where, writeBatch
     } = window.clemailFirestoreModule;
     const WR = window.WorkspaceRouting;
+    function fsApi() { return { getDocs, getAllDocs, query, where, collection }; }
 
     let currentUser = null;
     let allBdrs = [];
@@ -321,6 +329,38 @@ Exclude individual contributors with no sales or leadership scope, purely B2C/re
             snap.forEach(d => allWorkspaces.push({ id: d.id, ...d.data() }));
         } catch (e) { console.warn('loadWorkspaces:', e.message); }
     }
+
+    // ── Scan scope (all contacts vs. a single workspace) ────────────────────
+    let scanWorkspaceSelectPopulated = false;
+    window.onScanScopeChange = function() {
+        const mode = document.querySelector('input[name="scanScope"]:checked').value;
+        document.getElementById('scanWorkspaceSelect').style.display = mode === 'workspace' ? '' : 'none';
+        document.getElementById('scanHelpText').innerHTML = mode === 'workspace'
+            ? `Reads the <code>openToWork</code> flag already stored on every <code>prospect_contacts</code> document (set by your existing LinkedIn scraping pipelines) — no live re-scraping, so this is fast and free.
+               It scans <strong>only the workspace selected below</strong> (including anything merged into it).`
+            : `Reads the <code>openToWork</code> flag already stored on every <code>prospect_contacts</code> document (set by your existing LinkedIn scraping pipelines) — no live re-scraping, so this is fast and free.
+               It scans <strong>system-wide</strong>, across every BDR and workspace.`;
+        if (mode === 'workspace' && !scanWorkspaceSelectPopulated) {
+            scanWorkspaceSelectPopulated = true;
+            populateScanWorkspaceSelect();
+        }
+    };
+    async function populateScanWorkspaceSelect() {
+        if (!allWorkspaces.length) await loadWorkspaces();
+        const sel = document.getElementById('scanWorkspaceSelect');
+        sel.innerHTML = `<option value="">\u2014 Select workspace \u2014</option>`;
+        if (WR) {
+            const customerMap = await WR.loadCustomerMap(db, { getDocs, collection });
+            WR.appendWorkspaceOptgroups(sel, WR.filterActiveWorkspaces(allWorkspaces), { customerMap });
+        } else {
+            allWorkspaces.forEach(ws => {
+                const opt = document.createElement('option');
+                opt.value = `__ws__:${ws.id}`;
+                opt.textContent = ws.name || ws.id;
+                sel.appendChild(opt);
+            });
+        }
+    }
     function resolveOwner(c) {
         const raw = c.userEmail || c.bdrEmail || c.linkedInAccountEmail || c.accountEmail || '';
         if (!raw) return 'Unowned';
@@ -337,9 +377,19 @@ Exclude individual contributors with no sales or leadership scope, purely B2C/re
     window.runScan = async function() {
         const btn = document.getElementById('btnScan');
         const statusEl = document.getElementById('scanStatus');
+        const scope = document.querySelector('input[name="scanScope"]:checked').value;
+        const wsVal = document.getElementById('scanWorkspaceSelect').value;
+
+        if (scope === 'workspace' && !wsVal) {
+            statusEl.innerHTML = `<div class="alert alert-warning"><i class="fas fa-exclamation-circle"></i> Please select a workspace to scan.</div>`;
+            return;
+        }
+
         btn.disabled = true;
         btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Scanning…';
-        statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Querying prospect_contacts for openToWork = true (this can take a moment across the full collection)…</div>`;
+        statusEl.innerHTML = scope === 'workspace'
+            ? `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Querying prospect_contacts for this workspace…</div>`
+            : `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Querying prospect_contacts for openToWork = true (this can take a moment across the full collection)…</div>`;
         document.getElementById('candidateSection').style.display = 'none';
         document.getElementById('aiSection').style.display = 'none';
         document.getElementById('saveSection').style.display = 'none';
@@ -350,16 +400,33 @@ Exclude individual contributors with no sales or leadership scope, purely B2C/re
                 (allWorkspaces.length ? Promise.resolve() : loadWorkspaces())
             ]);
 
-            const snap = await getDocs(query(collection(db, 'prospect_contacts'), where('openToWork', '==', true)));
+            let rawDocs;
+            let scopeLabel = 'system-wide';
+            if (scope === 'workspace') {
+                const wsId = WR ? WR.parseIdFromSentinel(wsVal) : wsVal.replace('__ws__:', '');
+                const ws = allWorkspaces.find(w => w.id === wsId);
+                scopeLabel = `in workspace "${ws?.name || wsId}"`;
+                const sentinels = WR
+                    ? await WR.getRoutingSentinelsForCanonical(db, { getDoc, doc }, wsId)
+                    : [wsVal];
+                rawDocs = WR
+                    ? await WR.queryUnionByField(db, 'prospect_contacts', 'userEmail', sentinels, fsApi())
+                    : (await getAllDocs(query(collection(db, 'prospect_contacts'), where('userEmail', '==', wsVal)))).docs.map(d => ({ id: d.id, ...d.data() }));
+                rawDocs = rawDocs.filter(c => c.openToWork === true);
+            } else {
+                const snap = await getDocs(query(collection(db, 'prospect_contacts'), where('openToWork', '==', true)));
+                rawDocs = [];
+                snap.forEach(d => rawDocs.push({ id: d.id, ...d.data() }));
+            }
+
             const seen = new Set();
             candidates = [];
-            snap.forEach(d => {
-                const data = d.data();
+            rawDocs.forEach(data => {
                 const url = data.linkedInUrl || '';
-                const key = (url && url.toLowerCase().trim()) || d.id;
+                const key = (url && url.toLowerCase().trim()) || data.id;
                 if (seen.has(key)) return;
                 seen.add(key);
-                candidates.push({ id: d.id, ...data });
+                candidates.push(data);
             });
 
             aiResults.clear();
@@ -374,8 +441,8 @@ Exclude individual contributors with no sales or leadership scope, purely B2C/re
             `;
 
             statusEl.innerHTML = candidates.length
-                ? `<div class="alert alert-success"><i class="fas fa-check-circle"></i> Found ${candidates.length.toLocaleString()} Open to Work contact(s) system-wide.</div>`
-                : `<div class="alert alert-warning"><i class="fas fa-exclamation-circle"></i> No contacts currently have <code>openToWork = true</code> on file.</div>`;
+                ? `<div class="alert alert-success"><i class="fas fa-check-circle"></i> Found ${candidates.length.toLocaleString()} Open to Work contact(s) ${scopeLabel}.</div>`
+                : `<div class="alert alert-warning"><i class="fas fa-exclamation-circle"></i> No contacts currently have <code>openToWork = true</code> on file ${scopeLabel}.</div>`;
 
             document.getElementById('candidateSection').style.display = candidates.length ? 'block' : 'none';
             document.getElementById('aiSection').style.display = candidates.length ? 'block' : 'none';
@@ -383,6 +450,19 @@ Exclude individual contributors with no sales or leadership scope, purely B2C/re
             renderCandidateShell();
             renderAiStats();
             updateSaveSelectedLabel();
+
+            // Scanning a single workspace almost always means "save back into that same
+            // workspace" — default Step 3 to it (user can still switch to "new"/another).
+            if (scope === 'workspace' && candidates.length) {
+                const existingRadio = document.querySelector('input[name="saveTarget"][value="existing"]');
+                if (existingRadio) {
+                    existingRadio.checked = true;
+                    document.getElementById('newWorkspaceName').style.display = 'none';
+                    document.getElementById('existingWorkspaceSelect').style.display = '';
+                    await populateExistingWorkspaceSelect();
+                    document.getElementById('existingWorkspaceSelect').value = wsVal;
+                }
+            }
         } catch (e) {
             statusEl.innerHTML = `<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> Scan failed: ${escHtml(e.message)}</div>`;
         } finally {
