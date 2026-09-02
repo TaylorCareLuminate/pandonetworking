@@ -3609,6 +3609,16 @@
                 if (matchedGroup) {
                     _fcrMsgGroupMap.set(m.id, matchedGroup.id);
                     perGroupCount.set(matchedGroup.id, (perGroupCount.get(matchedGroup.id) || 0) + 1);
+                    // Default to whichever variation this message was actually generated with
+                    // (stamped by Full Pipeline as hypothesisVariationId) rather than "No variation" —
+                    // so Opus reviews it against the same angle it was written for. Only pre-fill when
+                    // the reviewer hasn't already made their own pick for this message.
+                    if (!_fcrMsgVariationMap.has(m.id) && m.hypothesisVariationId) {
+                        const variations = matchedGroup.messageVariations || [];
+                        if (variations.some(v => v.id === m.hypothesisVariationId)) {
+                            _fcrMsgVariationMap.set(m.id, m.hypothesisVariationId);
+                        }
+                    }
                 } else {
                     _fcrNoGroupCount++;
                 }
@@ -11119,43 +11129,51 @@
             // flows through into MESSAGE REVIEW INSTRUCTIONS below so Opus rates/edits messages
             // against this specific variation's angle, on top of the group's base instructions.
             const selectedVariation = (typeof _fcrGetSelectedVariation === 'function') ? _fcrGetSelectedVariation() : null;
-            const variationInstr    = (selectedVariation?.prompt || '').trim();
+
+            // Assembles one review prompt from target/message instructions + an optional Message
+            // Variation's own writing instructions + BDR-specific + legacy + text-edit toggle.
+            // Shared by the default (whole-run) prompt and every per-group/per-variation bucket
+            // below, so every code path applies a variation's instructions the same way.
+            function buildOpusPrompt({ targetInstr, messageInstr, variation }) {
+                const parts = [];
+                const vInstr = (variation?.prompt || '').trim();
+                if (targetInstr)  parts.push(`TARGET CONTACT / EXCLUDE RULES:\n${targetInstr}`);
+                if (messageInstr) parts.push(`MESSAGE REVIEW INSTRUCTIONS:\n${messageInstr}`);
+                if (vInstr) parts.push(`MESSAGE VARIATION INSTRUCTIONS — "${variation.label || variation.id}" (apply this specific angle on top of the review instructions above):\n${vInstr}`);
+                if (bdrInstr)     parts.push(`BDR-SPECIFIC INSTRUCTIONS (tone, voice, things to avoid for this BDR):\n${bdrInstr}`);
+                if (legacyPrompt) parts.push(`ADDITIONAL INSTRUCTIONS:\n${legacyPrompt}`);
+                if (noTextEditsForRun) parts.push(`TEXT EDITING DISABLED: Do not rewrite or improve message text — set improvedMessage to null (or omit it) for every item. Still make the exclude/rating decision normally so approve/delete/exclude (and Reserve Queue routing) work as usual; only the message wording must stay untouched.`);
+                return parts.join('\n\n');
+            }
 
             // When no single hypothesis group filter is active, split the review by each message's
             // OWN hypothesis group (matched by LinkedIn URL) so every group is fed its own Target
-            // Contact / Exclude Rules + Message Review Instructions. Messages that belong to no
-            // group fall back to the default instructions shown in the boxes above.
+            // Contact / Exclude Rules + Message Review Instructions (and, per-message, its own
+            // variation instructions below). Messages that belong to no group fall back to the
+            // default instructions shown in the boxes above. Also triggers when a group merely
+            // defines Message Variations (even with no custom target/message instructions) so
+            // per-message variation instructions still get resolved and applied below.
             const selectedHypGroupId = document.getElementById('fcrHypothesisSelect')?.value || '';
             const splitByHypGroup = !selectedHypGroupId && _hypothesisGroups.some(g =>
-                (g.targetContactInstructions || '').trim() || (g.messageReviewInstructions || '').trim()
+                (g.targetContactInstructions || '').trim() || (g.messageReviewInstructions || '').trim() || (g.messageVariations || []).length > 0
             );
             if (splitByHypGroup) await computeFcrHypothesisBreakdown();
 
             // Assemble the default prompt — used for the whole run when not splitting by group,
             // and as the fallback for messages that don't match any hypothesis group.
-            const promptParts = [];
-            if (targetInstr)  promptParts.push(`TARGET CONTACT / EXCLUDE RULES:\n${targetInstr}`);
-            if (messageInstr) promptParts.push(`MESSAGE REVIEW INSTRUCTIONS:\n${messageInstr}`);
-            if (variationInstr) promptParts.push(`MESSAGE VARIATION INSTRUCTIONS — "${selectedVariation.label || selectedVariation.id}" (apply this specific angle on top of the review instructions above):\n${variationInstr}`);
-            if (bdrInstr)     promptParts.push(`BDR-SPECIFIC INSTRUCTIONS (tone, voice, things to avoid for this BDR):\n${bdrInstr}`);
-            if (legacyPrompt) promptParts.push(`ADDITIONAL INSTRUCTIONS:\n${legacyPrompt}`);
-            if (noTextEditsForRun) promptParts.push(`TEXT EDITING DISABLED: Do not rewrite or improve message text — set improvedMessage to null (or omit it) for every item. Still make the exclude/rating decision normally so approve/delete/exclude (and Reserve Queue routing) work as usual; only the message wording must stay untouched.`);
-            const prompt = promptParts.join('\n\n');
+            const prompt = buildOpusPrompt({ targetInstr, messageInstr, variation: selectedVariation });
 
             // Builds the prompt for one hypothesis group's own instructions (falls back to the
-            // default prompt above if the group has neither instruction field filled in).
-            function buildGroupOpusPrompt(group) {
-                const parts = [];
+            // default prompt above if the group has neither instruction field filled in), with
+            // the given variation's writing instructions (if any) layered on top.
+            function buildGroupOpusPrompt(group, variation) {
                 const gTarget  = (group.targetContactInstructions || '').trim();
                 const gMessage = (group.messageReviewInstructions || '').trim();
-                if (gTarget)  parts.push(`TARGET CONTACT / EXCLUDE RULES:\n${gTarget}`);
-                if (gMessage) parts.push(`MESSAGE REVIEW INSTRUCTIONS:\n${gMessage}`);
-                if (bdrInstr)     parts.push(`BDR-SPECIFIC INSTRUCTIONS (tone, voice, things to avoid for this BDR):\n${bdrInstr}`);
-                if (legacyPrompt) parts.push(`ADDITIONAL INSTRUCTIONS:\n${legacyPrompt}`);
-                return parts.join('\n\n') || prompt;
+                if (!gTarget && !gMessage) return buildOpusPrompt({ targetInstr, messageInstr, variation }) || prompt;
+                return buildOpusPrompt({ targetInstr: gTarget, messageInstr: gMessage, variation });
             }
 
-            if (!prompt && !(splitByHypGroup && _fcrGroupBreakdown.length > 0)) {
+            if (!prompt && !(splitByHypGroup && _fcrGroupBreakdown.length > 0) && !loadedMessages.some(m => !!_fcrMsgVariationMap.get(m.id))) {
                 showAlert(`Please enter review instructions before running ${modelLabel}.`, 'warning');
                 return;
             }
@@ -11279,25 +11297,29 @@
                 let batchErrors = 0;
                 let token = await auth.currentUser.getIdToken(); // kept in outer scope for post-loop passes
 
-                // ── Build batches — split per hypothesis group when applicable, otherwise a
-                // simple flat batching (duplicates handled by post-processing either way) ──
+                // ── Build batches — split per hypothesis group when applicable, AND split per
+                // Message Variation whenever any loaded message carries one (defaulted from how
+                // it was generated in Full Pipeline, bulk-assigned, or picked per-message below) —
+                // so Opus always gets that specific variation's writing instructions for that
+                // message. Falls back to a simple flat batching when neither applies (duplicates
+                // handled by post-processing either way). ──
+                const anyMsgHasVariation = toReview.some(m => !!_fcrMsgVariationMap.get(m.id));
                 const batches = [];
-                if (splitByHypGroup) {
+                if (splitByHypGroup || anyMsgHasVariation) {
                     const buckets = new Map(); // bucketKey -> { label, prompt, messages: [] }
                     toReview.forEach(m => {
-                        const groupId = _fcrMsgGroupMap.get(m.id) || null;
-                        const bucketKey = groupId || '__default__';
+                        const groupId = splitByHypGroup ? (_fcrMsgGroupMap.get(m.id) || null) : (selectedHypGroupId || null);
+                        const group = groupId ? _hypothesisGroups.find(g => g.id === groupId) : null;
+                        const variationId = group ? (_fcrMsgVariationMap.get(m.id) || '') : '';
+                        const variation = variationId ? (group.messageVariations || []).find(v => v.id === variationId) : null;
+                        const bucketKey = `${groupId || '__default__'}::${variationId}`;
                         if (!buckets.has(bucketKey)) {
-                            if (groupId) {
-                                const group = _hypothesisGroups.find(g => g.id === groupId);
-                                buckets.set(bucketKey, {
-                                    label: group?.name || groupId,
-                                    prompt: group ? buildGroupOpusPrompt(group) : prompt,
-                                    messages: []
-                                });
-                            } else {
-                                buckets.set(bucketKey, { label: 'No hypothesis group (default)', prompt, messages: [] });
-                            }
+                            const groupLabel = splitByHypGroup ? (group ? (group.name || groupId) : 'No hypothesis group (default)') : null;
+                            const label = [groupLabel, variation ? (variation.label || variation.id) : null].filter(Boolean).join(' · ') || null;
+                            const bucketPrompt = splitByHypGroup
+                                ? (group ? buildGroupOpusPrompt(group, variation) : prompt)
+                                : (variation ? buildOpusPrompt({ targetInstr, messageInstr, variation }) : prompt);
+                            buckets.set(bucketKey, { label, prompt: bucketPrompt, messages: [] });
                         }
                         buckets.get(bucketKey).messages.push(m);
                     });
@@ -11310,7 +11332,7 @@
                             });
                         }
                     });
-                    console.log(`[OpusReview] Split by hypothesis group — ${[...buckets.values()].map(b => `${b.label}: ${b.messages.length}`).join(', ')}`);
+                    console.log(`[OpusReview] Split by hypothesis group/variation — ${[...buckets.values()].map(b => `${b.label || 'default'}: ${b.messages.length}`).join(', ')}`);
                 } else {
                     for (let i = 0; i < toReview.length; i += OPUS_BATCH_SIZE) {
                         batches.push({ messages: toReview.slice(i, i + OPUS_BATCH_SIZE), prompt, groupLabel: null });

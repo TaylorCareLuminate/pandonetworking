@@ -1178,6 +1178,9 @@
             <button class="btn btn-white" onclick="openCreateModal()">
                 <i class="fas fa-plus"></i> New Hypothesis Group
             </button>
+            <button class="btn btn-white" onclick="openDocImportModal()">
+                <i class="fas fa-file-import"></i> Import from Document
+            </button>
             <a href="outcomes.html" class="btn btn-white">
                 <i class="fas fa-chart-bar"></i> View Outcomes
             </a>
@@ -2606,6 +2609,69 @@
         </div>
     </div>
 </div><!-- end locate modal -->
+
+<!-- ── Import from Document Modal (Opus AI extraction) ── -->
+<div id="docImportModal" class="modal-overlay hidden">
+    <div class="modal" style="max-width:1050px;">
+        <div class="modal-header">
+            <h2><i class="fas fa-file-import"></i> Import Hypothesis Groups from Document</h2>
+            <button class="modal-close" onclick="closeDocImportModal()"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="modal-body" style="padding:1.75rem 2rem;max-height:82vh;overflow-y:auto;">
+            <p style="font-size:0.88rem;color:var(--gray-600);margin-bottom:1.25rem;line-height:1.6;">
+                Paste an outreach strategy document below (any format — campaign briefs, persona breakdowns, messaging
+                matrices). <strong>Claude Opus</strong> reads it and drafts hypothesis groups with the group name, hypothesis
+                statement, Target Contact / Title Instructions, Message Review Instructions, and message variations.
+                If the document contains reply / follow-up content, it's also extracted as
+                <a href="about_me.html" target="_blank" style="color:var(--primary);">About Me Quick Text Inserts</a>.
+                Everything is shown as an editable preview — nothing is saved until you click "Create Selected Groups".
+            </p>
+
+            <div class="form-group">
+                <label><i class="fas fa-users"></i> Assign BDRs <span style="color:var(--danger);font-weight:700;">*</span>
+                    <span class="label-sub">— every created group is assigned to these BDRs (ties the groups to a company)</span>
+                </label>
+                <div id="docImportBdrList" style="max-height:180px;overflow-y:auto;border:1.5px solid var(--border);border-radius:10px;background:#fff;padding:0.3rem 0;margin-bottom:0.45rem;"></div>
+                <div id="docImportBdrPills" style="display:flex;flex-wrap:wrap;gap:0.35rem;min-height:24px;"></div>
+            </div>
+
+            <div class="form-group">
+                <label><i class="fas fa-file-alt"></i> Strategy Document</label>
+                <textarea id="docImportText" class="form-textarea" style="min-height:260px;font-size:0.84rem;"
+                    placeholder="Paste the full strategy document here — target organizations, titles to target, connection request messaging, follow-up messaging, etc."></textarea>
+            </div>
+
+            <div style="display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap;margin-bottom:1rem;">
+                <button class="btn btn-accent" id="docImportExtractBtn" onclick="runDocImportExtract()">
+                    <i class="fas fa-crown"></i> Extract with Opus
+                </button>
+                <span id="docImportStatus" style="font-size:0.83rem;color:var(--gray-500);"></span>
+            </div>
+
+            <div id="docImportNotes" style="display:none;margin-bottom:1rem;padding:0.75rem 1rem;background:#fef3c7;border:1.5px solid #fde68a;border-radius:10px;font-size:0.84rem;color:#92400e;line-height:1.55;"></div>
+
+            <div id="docImportResults"></div>
+
+            <div id="docImportInsertsWrap" style="display:none;margin-top:1.5rem;border-top:2px solid var(--border);padding-top:1.25rem;">
+                <h3 style="font-size:1rem;font-weight:700;color:var(--gray-800);display:flex;align-items:center;gap:0.5rem;margin-bottom:0.35rem;">
+                    <i class="fas fa-bolt" style="color:#d97706;"></i> Quick Text Inserts
+                </h3>
+                <p style="font-size:0.83rem;color:var(--gray-500);margin-bottom:1rem;line-height:1.55;">
+                    Reply / follow-up content found in the document. Checked inserts are added to the
+                    <strong>About Me profile → Quick Text Inserts</strong> of every BDR selected above when you create the groups
+                    (existing inserts are kept; duplicates by label are skipped).
+                </p>
+                <div id="docImportInsertsList"></div>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeDocImportModal()">Cancel</button>
+            <button class="btn btn-primary" id="docImportCreateBtn" onclick="createDocImportGroups()" style="display:none;">
+                <i class="fas fa-save"></i> Create Selected Groups
+            </button>
+        </div>
+    </div>
+</div><!-- end doc import modal -->
 
 <!-- ══════════════════════════════════════════════════════════════════
      TEMP DEBUG SECTION — All Hypothesis Groups (Unfiltered)
@@ -10659,6 +10725,334 @@
             showAlert('Split failed: ' + e.message, 'error');
             btn.disabled = false;
             btn.innerHTML = '<i class="fas fa-code-branch"></i> Execute Split';
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // IMPORT FROM DOCUMENT — Opus AI extraction of hypothesis groups
+    // Paste a strategy document → /api/connect/hypothesis-doc-extract (Opus)
+    // → editable preview → create hypothesis_groups docs + optionally push
+    // reply content into each BDR's About Me Quick Text Inserts.
+    // ═══════════════════════════════════════════════════════════════════════
+    let _docImportGroups  = [];   // [{ _include, name, hypothesisStatement, targetContactInstructions, messageReviewInstructions, messageVariations:[{label,exampleMessage,prompt}] }]
+    let _docImportInserts = [];   // [{ _include, label, text }]
+
+    window.openDocImportModal = function() {
+        _docImportGroups  = [];
+        _docImportInserts = [];
+        document.getElementById('docImportText').value = '';
+        document.getElementById('docImportStatus').textContent = '';
+        document.getElementById('docImportResults').innerHTML = '';
+        document.getElementById('docImportNotes').style.display = 'none';
+        document.getElementById('docImportInsertsWrap').style.display = 'none';
+        document.getElementById('docImportCreateBtn').style.display = 'none';
+        // Pre-select the current company's BDRs (same default as the create modal)
+        const list = document.getElementById('docImportBdrList');
+        list.innerHTML = _renderGroupedBdrRows({
+            inputName: 'docImportBdrCheck',
+            onchange: 'refreshDocImportBdrPills()',
+            selectedEmails: _currentCompanyBdrEmails()
+        });
+        refreshDocImportBdrPills();
+        document.getElementById('docImportModal').classList.remove('hidden');
+    };
+
+    window.closeDocImportModal = function() {
+        document.getElementById('docImportModal').classList.add('hidden');
+    };
+
+    window.refreshDocImportBdrPills = function() {
+        const checked = [...document.querySelectorAll('input[name="docImportBdrCheck"]:checked')];
+        const pillsEl = document.getElementById('docImportBdrPills');
+        if (!pillsEl) return;
+        if (!checked.length) {
+            pillsEl.innerHTML = '<span style="font-size:0.8rem;color:var(--gray-400);font-style:italic;">No BDRs selected</span>';
+            return;
+        }
+        pillsEl.innerHTML = checked.map(cb => {
+            const bdr  = allBdrs.find(b => (b.primaryEmail||b.id) === cb.value);
+            const name = bdr?.name || cb.value;
+            return `<span class="bdr-pill">
+                ${escHtml(name)}
+                <button class="remove-pill" onclick="uncheckDocImportBdr('${escHtml(cb.value)}')" title="Remove"><i class="fas fa-times"></i></button>
+            </span>`;
+        }).join('');
+    };
+
+    window.uncheckDocImportBdr = function(email) {
+        const cb = document.querySelector(`input[name="docImportBdrCheck"][value="${CSS.escape(email)}"]`);
+        if (cb) { cb.checked = false; refreshDocImportBdrPills(); }
+    };
+
+    function _getDocImportBdrEmails() {
+        return [...document.querySelectorAll('input[name="docImportBdrCheck"]:checked')].map(cb => cb.value);
+    }
+
+    window.runDocImportExtract = async function() {
+        const documentText = document.getElementById('docImportText').value.trim();
+        if (!documentText) { showAlert('Paste a strategy document first.', 'warning'); return; }
+        if (documentText.length < 200) { showAlert('That document looks too short to extract hypothesis groups from.', 'warning'); return; }
+
+        const btn    = document.getElementById('docImportExtractBtn');
+        const status = document.getElementById('docImportStatus');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Opus is reading the document…';
+        status.textContent = 'This can take a minute or two for long documents.';
+
+        try {
+            // Company context for the prompt: derived from the first selected BDR
+            const firstBdr = allBdrs.find(b => (b.primaryEmail||b.id) === _getDocImportBdrEmails()[0]);
+            const companyName = firstBdr?._company || (_selectedCompany !== '__unassigned__' ? _selectedCompany : '') || '';
+
+            const token = await auth.currentUser.getIdToken();
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 8 * 60 * 1000);
+            const resp = await fetch(`${RAILWAY_BASE}/api/connect/hypothesis-doc-extract`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                body: JSON.stringify({ documentText, companyName }),
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok || !data.success) throw new Error(data.error || `Server error (${resp.status})`);
+
+            _docImportGroups  = (data.groups || []).map(g => ({ _include: true, ...g }));
+            _docImportInserts = (data.quickTextInserts || []).map(i => ({ _include: true, ...i }));
+
+            const notesEl = document.getElementById('docImportNotes');
+            if (data.notes || data.docTruncated) {
+                notesEl.innerHTML = `<i class="fas fa-info-circle"></i> ${escHtml(data.notes || '')}` +
+                    (data.docTruncated ? ' <strong>Note: the document was too long and was truncated before extraction.</strong>' : '');
+                notesEl.style.display = '';
+            } else {
+                notesEl.style.display = 'none';
+            }
+
+            renderDocImportResults();
+            renderDocImportInserts();
+            document.getElementById('docImportCreateBtn').style.display = '';
+            status.textContent = `Opus found ${_docImportGroups.length} group(s)${_docImportInserts.length ? ` and ${_docImportInserts.length} quick text insert(s)` : ''}. Review and edit below, then create.`;
+        } catch(e) {
+            console.error('[DocImport] Extract error:', e);
+            status.textContent = '';
+            showAlert('Extraction failed: ' + (e.name === 'AbortError' ? 'timed out after 8 minutes' : e.message), 'danger', 8000);
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fas fa-crown"></i> Extract with Opus';
+        }
+    };
+
+    // Field edits write straight back into _docImportGroups so the preview is the source of truth
+    window.docImportSetField = function(gi, field, value) {
+        if (_docImportGroups[gi]) _docImportGroups[gi][field] = value;
+    };
+    window.docImportSetVarField = function(gi, vi, field, value) {
+        if (_docImportGroups[gi]?.messageVariations?.[vi]) _docImportGroups[gi].messageVariations[vi][field] = value;
+    };
+    window.docImportToggleGroup = function(gi, checked) {
+        if (_docImportGroups[gi]) _docImportGroups[gi]._include = checked;
+        const card = document.getElementById(`docImportCard${gi}`);
+        if (card) card.style.opacity = checked ? '1' : '0.45';
+        _updateDocImportCreateBtn();
+    };
+    window.docImportRemoveVariation = function(gi, vi) {
+        if (!_docImportGroups[gi]?.messageVariations) return;
+        _docImportGroups[gi].messageVariations.splice(vi, 1);
+        renderDocImportResults();
+    };
+    window.docImportSetInsertField = function(ii, field, value) {
+        if (_docImportInserts[ii]) _docImportInserts[ii][field] = value;
+    };
+    window.docImportToggleInsert = function(ii, checked) {
+        if (_docImportInserts[ii]) _docImportInserts[ii]._include = checked;
+    };
+
+    function _updateDocImportCreateBtn() {
+        const n = _docImportGroups.filter(g => g._include).length;
+        const btn = document.getElementById('docImportCreateBtn');
+        btn.innerHTML = `<i class="fas fa-save"></i> Create ${n} Selected Group${n !== 1 ? 's' : ''}`;
+        btn.disabled = n === 0;
+    }
+
+    function renderDocImportResults() {
+        const wrap = document.getElementById('docImportResults');
+        if (!_docImportGroups.length) { wrap.innerHTML = ''; return; }
+
+        wrap.innerHTML = _docImportGroups.map((g, gi) => {
+            const color = GROUP_COLORS[gi % GROUP_COLORS.length];
+            const variationsHtml = (g.messageVariations || []).map((v, vi) => `
+                <div style="border:1.5px solid var(--border);border-radius:10px;padding:0.75rem 0.9rem;margin-bottom:0.6rem;background:var(--gray-50);">
+                    <div style="display:flex;gap:0.6rem;align-items:center;margin-bottom:0.5rem;">
+                        <input type="text" class="form-input" style="flex:1;font-weight:600;" value="${escHtml(v.label)}"
+                            placeholder="Variation label" oninput="docImportSetVarField(${gi},${vi},'label',this.value)">
+                        <button class="btn btn-xs btn-danger" onclick="docImportRemoveVariation(${gi},${vi})" title="Remove variation">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                    <label style="font-size:0.73rem;font-weight:700;color:var(--gray-500);text-transform:uppercase;letter-spacing:0.04em;">Example Message</label>
+                    <textarea class="form-textarea" style="min-height:52px;font-size:0.83rem;margin-bottom:0.5rem;"
+                        oninput="docImportSetVarField(${gi},${vi},'exampleMessage',this.value)">${escHtml(v.exampleMessage)}</textarea>
+                    <label style="font-size:0.73rem;font-weight:700;color:var(--gray-500);text-transform:uppercase;letter-spacing:0.04em;">AI Writing Prompt</label>
+                    <textarea class="form-textarea" style="min-height:52px;font-size:0.83rem;"
+                        oninput="docImportSetVarField(${gi},${vi},'prompt',this.value)">${escHtml(v.prompt)}</textarea>
+                </div>`).join('');
+
+            return `
+            <div id="docImportCard${gi}" style="border:2px solid var(--border);border-left:6px solid ${color};border-radius:14px;padding:1.25rem 1.4rem;margin-bottom:1.1rem;background:#fff;">
+                <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.9rem;">
+                    <input type="checkbox" checked style="width:17px;height:17px;cursor:pointer;accent-color:var(--primary);flex-shrink:0;"
+                        onchange="docImportToggleGroup(${gi}, this.checked)" title="Include this group when creating">
+                    <input type="text" class="form-input" style="flex:1;font-weight:700;font-size:1rem;" value="${escHtml(g.name)}"
+                        placeholder="Group name" oninput="docImportSetField(${gi},'name',this.value)">
+                    <span style="font-size:0.76rem;color:var(--gray-400);white-space:nowrap;">${(g.messageVariations||[]).length} variation${(g.messageVariations||[]).length !== 1 ? 's' : ''}</span>
+                </div>
+
+                <label style="font-size:0.78rem;font-weight:700;color:var(--gray-600);"><i class="fas fa-lightbulb" style="color:${color};"></i> Hypothesis Statement</label>
+                <textarea class="form-textarea" style="min-height:56px;font-size:0.86rem;margin-bottom:0.85rem;"
+                    oninput="docImportSetField(${gi},'hypothesisStatement',this.value)">${escHtml(g.hypothesisStatement)}</textarea>
+
+                <label style="font-size:0.78rem;font-weight:700;color:var(--gray-600);"><i class="fas fa-ban" style="color:var(--danger);"></i> Target Contact / Title Instructions</label>
+                <textarea class="form-textarea" style="min-height:120px;font-size:0.83rem;margin-bottom:0.85rem;"
+                    oninput="docImportSetField(${gi},'targetContactInstructions',this.value)">${escHtml(g.targetContactInstructions)}</textarea>
+
+                <label style="font-size:0.78rem;font-weight:700;color:var(--gray-600);"><i class="fas fa-edit" style="color:var(--primary);"></i> Message Review Instructions</label>
+                <textarea class="form-textarea" style="min-height:110px;font-size:0.83rem;${(g.messageVariations||[]).length ? 'margin-bottom:0.85rem;' : ''}"
+                    oninput="docImportSetField(${gi},'messageReviewInstructions',this.value)">${escHtml(g.messageReviewInstructions)}</textarea>
+
+                ${(g.messageVariations||[]).length ? `
+                <label style="font-size:0.78rem;font-weight:700;color:var(--gray-600);display:block;margin-bottom:0.5rem;"><i class="fas fa-vial" style="color:var(--accent);"></i> Message Variations</label>
+                ${variationsHtml}` : ''}
+            </div>`;
+        }).join('');
+
+        _updateDocImportCreateBtn();
+    }
+
+    function renderDocImportInserts() {
+        const wrap = document.getElementById('docImportInsertsWrap');
+        const list = document.getElementById('docImportInsertsList');
+        if (!_docImportInserts.length) { wrap.style.display = 'none'; list.innerHTML = ''; return; }
+        wrap.style.display = '';
+        list.innerHTML = _docImportInserts.map((ins, ii) => `
+            <div style="display:flex;gap:0.75rem;align-items:flex-start;border:1.5px solid #fde68a;background:#fffbeb;border-radius:10px;padding:0.75rem 0.9rem;margin-bottom:0.6rem;">
+                <input type="checkbox" checked style="width:16px;height:16px;cursor:pointer;accent-color:#d97706;margin-top:0.55rem;flex-shrink:0;"
+                    onchange="docImportToggleInsert(${ii}, this.checked)" title="Include this insert">
+                <div style="flex:1;">
+                    <input type="text" class="form-input" maxlength="40" style="font-weight:600;margin-bottom:0.45rem;" value="${escHtml(ins.label)}"
+                        placeholder="Button label (max 40 chars)" oninput="docImportSetInsertField(${ii},'label',this.value)">
+                    <textarea class="form-textarea" style="min-height:80px;font-size:0.83rem;"
+                        oninput="docImportSetInsertField(${ii},'text',this.value)">${escHtml(ins.text)}</textarea>
+                </div>
+            </div>`).join('');
+    }
+
+    window.createDocImportGroups = async function() {
+        const bdrEmails = _getDocImportBdrEmails();
+        if (!bdrEmails.length) {
+            showAlert('Select at least one BDR — every hypothesis group must be tied to a company.', 'warning');
+            return;
+        }
+        const groupsToCreate = _docImportGroups.filter(g => g._include && (g.name || '').trim());
+        if (!groupsToCreate.length) { showAlert('No groups selected to create.', 'warning'); return; }
+
+        const insertsToSave = _docImportInserts.filter(i => i._include && i.text.trim());
+        if (!confirm(`Create ${groupsToCreate.length} hypothesis group(s) assigned to ${bdrEmails.length} BDR(s)?` +
+            (insertsToSave.length ? `\n\n${insertsToSave.length} Quick Text Insert(s) will also be added to each selected BDR's About Me profile.` : ''))) return;
+
+        const btn = document.getElementById('docImportCreateBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creating…';
+
+        let created = 0;
+        try {
+            for (let gi = 0; gi < groupsToCreate.length; gi++) {
+                const g = groupsToCreate[gi];
+                const messageVariations = (g.messageVariations || [])
+                    .filter(v => (v.label || '').trim() || (v.prompt || '').trim() || (v.exampleMessage || '').trim())
+                    .map((v, vi) => ({
+                        id:             _newVariationId(),
+                        label:          (v.label || '').trim(),
+                        color:          VARIATION_COLORS[vi % VARIATION_COLORS.length],
+                        prompt:         (v.prompt || '').trim(),
+                        exampleMessage: (v.exampleMessage || '').trim(),
+                        sharePercent:   0,
+                        aiCriteria:     ''
+                    }));
+
+                await addDoc(collection(db, 'hypothesis_groups'), {
+                    name:                      g.name.trim(),
+                    description:               (g.hypothesisStatement || '').trim(),
+                    color:                     GROUP_COLORS[gi % GROUP_COLORS.length],
+                    bdrEmails:                 bdrEmails,
+                    bdrEmail:                  bdrEmails[0] || null,
+                    contactSource:             `Imported from strategy document via Opus AI on ${new Date().toLocaleDateString()}`,
+                    workspaceId:               null,
+                    workspaceName:             null,
+                    importBatchGroupId:        null,
+                    sourcePrompts:             [],
+                    messageVariations:         messageVariations,
+                    sourceBatchIds:            [],
+                    targetContactInstructions: (g.targetContactInstructions || '').trim(),
+                    messageReviewInstructions: (g.messageReviewInstructions || '').trim(),
+                    contactLinkedInUrls:       [],
+                    taggedContacts:            [],
+                    contactNames:              [],
+                    createdAt:                 Timestamp.now(),
+                    createdBy:                 auth.currentUser?.email || '',
+                    updatedAt:                 Timestamp.now()
+                });
+                created++;
+                btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Creating… (${created}/${groupsToCreate.length})`;
+            }
+
+            // ── Quick Text Inserts → each BDR's About Me profile (contact_profiles) ──
+            let insertsSavedTo = 0;
+            if (insertsToSave.length) {
+                for (const email of bdrEmails) {
+                    // contact_profiles doc IDs are always lowercase (see about_me.html)
+                    const profileId  = email.toLowerCase();
+                    const profileRef = doc(db, 'contact_profiles', profileId);
+                    try {
+                        const snap = await getDoc(profileRef);
+                        const existing = snap.exists ? (snap.data().textInserts || []) : [];
+                        const existingLabels = new Set(existing.map(i => (i.label || '').toLowerCase().trim()));
+                        const toAdd = insertsToSave
+                            .filter(i => !existingLabels.has(i.label.toLowerCase().trim()))
+                            .map(i => ({ label: i.label.trim(), text: i.text.trim() }));
+                        if (!toAdd.length) continue;
+                        if (snap.exists) {
+                            await updateDoc(profileRef, {
+                                textInserts: [...existing, ...toAdd],
+                                updatedAt:   Timestamp.now(),
+                                updatedBy:   auth.currentUser?.email || ''
+                            });
+                        } else {
+                            await setDoc(profileRef, {
+                                email:       profileId,
+                                textInserts: toAdd,
+                                updatedAt:   Timestamp.now(),
+                                updatedBy:   auth.currentUser?.email || ''
+                            });
+                        }
+                        insertsSavedTo++;
+                    } catch(e) {
+                        console.warn(`[DocImport] Failed to save Quick Text Inserts for ${email}:`, e.message);
+                    }
+                }
+            }
+
+            showAlert(`✓ Created ${created} hypothesis group${created !== 1 ? 's' : ''}` +
+                (insertsToSave.length ? ` and saved Quick Text Inserts to ${insertsSavedTo} BDR profile${insertsSavedTo !== 1 ? 's' : ''}` : '') + '.',
+                'success', 8000);
+            closeDocImportModal();
+            await loadGroups();
+        } catch(e) {
+            console.error('[DocImport] Create error:', e);
+            showAlert(`Error after creating ${created} group(s): ${e.message}`, 'danger', 8000);
+        } finally {
+            btn.disabled = false;
+            _updateDocImportCreateBtn();
         }
     };
 

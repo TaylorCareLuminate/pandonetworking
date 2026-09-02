@@ -25,6 +25,9 @@
   
   <!-- CLEmail Secure API Wrapper (replaces direct Firebase access) -->
   <script src="../js/clemail-firestore-wrapper.js"></script>
+
+  <!-- Shared HeyReach campaign definitions + build pipeline (Easy Enrollment / Audit & Fix) -->
+  <script src="../js/heyreach-campaigns.js"></script>
   
   <!-- Email Controls Firebase Functions -->
   <script type="module">
@@ -4434,6 +4437,16 @@ HealthLuminate
         displayBDRLeaders();
         updateStats();
         
+        // Load LinkedIn accounts in the background so the setup-health chips
+        // on the BDR cards can show real status (re-renders when done)
+        if (window.linkedInAccounts === null) {
+          const card = document.getElementById('card-linkedin-accounts');
+          if (card) card.dataset.loaded = '1';
+          loadLinkedInAccounts()
+            .then(() => displayBDRLeaders())
+            .catch(err => console.warn('Background LinkedIn accounts load failed:', err));
+        }
+        
       } catch (error) {
         console.error('❌ Error loading BDR leaders:', error);
         showAlert('Error loading BDR leaders: ' + error.message, 'error');
@@ -4467,8 +4480,11 @@ HealthLuminate
             <i class="fas fa-user-tie"></i>
             <h3>No BDR Leaders Configured</h3>
             <p>Add your first BDR leader to manage multi-channel outreach campaigns.</p>
+            <button onclick="showEasyEnrollModal()" class="btn btn-success">
+              <i class="fas fa-magic"></i> Easy Enroll First BDR
+            </button>
             <button onclick="showBDRLeaderForm()" class="btn btn-primary">
-              <i class="fas fa-plus"></i> Add First BDR Leader
+              <i class="fas fa-plus"></i> Add Manually
             </button>
           </div>
         `;
@@ -4482,8 +4498,11 @@ HealthLuminate
             <i class="fas fa-filter"></i>
             <h3>No BDR Leaders for ${selectedCustomerName}</h3>
             <p>Add a BDR leader for this customer.</p>
+            <button onclick="showEasyEnrollModal()" class="btn btn-success">
+              <i class="fas fa-magic"></i> Easy Enroll
+            </button>
             <button onclick="showBDRLeaderForm()" class="btn btn-primary">
-              <i class="fas fa-plus"></i> Add BDR Leader
+              <i class="fas fa-plus"></i> Add Manually
             </button>
           </div>
         `;
@@ -4499,9 +4518,14 @@ HealthLuminate
             BDR Leaders - ${customerName}
             <span class="account-count-badge">(${filteredBDRLeaders.length}${window.selectedCustomer === 'all' ? ` of ${window.bdrLeaders.length}` : ''})</span>
           </h3>
-          <button onclick="showBDRLeaderForm()" class="btn btn-primary">
-            <i class="fas fa-plus"></i> Add BDR Leader
-          </button>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <button onclick="showEasyEnrollModal()" class="btn btn-success">
+              <i class="fas fa-magic"></i> Easy Enroll
+            </button>
+            <button onclick="showBDRLeaderForm()" class="btn btn-primary">
+              <i class="fas fa-plus"></i> Add BDR Leader
+            </button>
+          </div>
         </div>
       `;
       
@@ -4557,6 +4581,9 @@ HealthLuminate
                 <div class="metric-value">${bdr.primaryPhone}</div>
               </div>
               <div class="account-actions">
+                <button onclick="auditBDR('${bdr.id}')" class="btn-small btn-success" title="Check this BDR's setup and auto-fix anything missing">
+                  <i class="fas fa-stethoscope"></i> Audit &amp; Fix
+                </button>
                 <button onclick="editBDRLeader('${bdr.id}')" class="btn-small btn-primary">
                   <i class="fas fa-edit"></i> Edit
                 </button>
@@ -4571,6 +4598,8 @@ HealthLuminate
                 </button>
               </div>
             </div>
+            
+            ${renderBDRSetupChips(bdr)}
             
             <div class="account-details">
               <div class="account-metrics">
@@ -5483,6 +5512,697 @@ HealthLuminate
     window.manageBDRAccounts = (bdrId) => {
       const bdr = window.bdrLeaders.find(b => b.id === bdrId);
       showAlert(`Account management for ${bdr.name} will be available in future updates.`, 'info');
+    };
+
+    // =========================================================================
+    // EASY BDR ENROLLMENT & AUDIT / AUTO-FIX
+    // =========================================================================
+    // One-click BDR setup: creates the bdr_leaders record, finds the matching
+    // HeyReach LinkedIn account, creates/links the linkedin_accounts record,
+    // sets the LinkedIn email association, caches the HeyReach account, and
+    // builds + launches the standard campaign set (Connect / Message /
+    // Quick Message) via the shared HeyReachCampaigns library.
+    //
+    // The same auditAndFixBDR() engine powers both "Easy Enroll" (apply
+    // everything for a new BDR) and the per-card "Audit & Fix" button
+    // (report what's missing, then heal on demand).
+
+    const BDR_REQUIRED_CAMPAIGN_TYPES = ['connect', 'message', 'quick_message'];
+
+    function bdrFirstNameOf(bdr) {
+      return String(bdr?.name || '').trim().split(/\s+/)[0] || '';
+    }
+
+    // Find the linkedin_accounts record for a BDR (by direct link, back-ref, or email)
+    function findLinkedInAccountForBDR(bdr) {
+      if (!Array.isArray(window.linkedInAccounts)) return null;
+      const email = (bdr.primaryEmail || '').toLowerCase();
+      return window.linkedInAccounts.find(a => a.id === bdr.linkedInAccountId && !a.outdated)
+          || window.linkedInAccounts.find(a => a.bdrLeaderId === bdr.id && !a.outdated)
+          || window.linkedInAccounts.find(a => (a.bdrEmail || '').toLowerCase() === email && !a.outdated)
+          || null;
+    }
+
+    function bdrMissingCampaignTypes(bdr) {
+      const have = new Set((bdr.heyreachCampaigns || []).map(c => c.type));
+      return BDR_REQUIRED_CAMPAIGN_TYPES.filter(t => !have.has(t));
+    }
+
+    // Setup-health chip row rendered on every BDR card (uses only already-loaded data)
+    function renderBDRSetupChips(bdr) {
+      const chip = (ok, label, title = '') => {
+        const bg = ok === true ? '#dcfce7' : ok === false ? '#fee2e2' : '#f1f5f9';
+        const fg = ok === true ? '#166534' : ok === false ? '#991b1b' : '#64748b';
+        const icon = ok === true ? 'fa-check-circle' : ok === false ? 'fa-times-circle' : 'fa-question-circle';
+        return `<span class="bdr-setup-chip" style="background:${bg}; color:${fg};" title="${title}">
+          <i class="fas ${icon}"></i> ${label}</span>`;
+      };
+
+      // LinkedIn account + HeyReach ID
+      let liChip;
+      if (!Array.isArray(window.linkedInAccounts)) {
+        liChip = chip(null, 'LinkedIn: not loaded', 'Load the LinkedIn Accounts section (or run Audit & Fix) to check');
+      } else {
+        const liDoc = findLinkedInAccountForBDR(bdr);
+        if (!liDoc) liChip = chip(false, 'No LinkedIn account', 'No linkedin_accounts record linked to this BDR');
+        else if (!liDoc.heyreachAccountId) liChip = chip(false, 'HeyReach ID missing', 'LinkedIn account record has no heyreachAccountId (needed for webhook filtering)');
+        else liChip = chip(true, `HeyReach ID ${liDoc.heyreachAccountId}`, 'LinkedIn account linked with HeyReach account ID');
+      }
+
+      // LinkedIn email association
+      const liEmail = window.linkedInEmailAssociations.get(bdr.primaryEmail);
+      const emailChip = liEmail
+        ? chip(true, 'LinkedIn email set', `LinkedIn email: ${liEmail}`)
+        : chip(false, 'LinkedIn email missing', 'No linkedin_email_associations entry for this BDR');
+
+      // Standard campaign coverage
+      const missing = bdrMissingCampaignTypes(bdr);
+      const campaignChip = missing.length === 0
+        ? chip(true, 'Campaigns 3/3', 'Connect, Message, and Quick Message campaigns all associated')
+        : chip(false, `Campaigns ${3 - missing.length}/3`, `Missing: ${missing.join(', ')}`);
+
+      return `<div class="bdr-setup-chips">${liChip}${emailChip}${campaignChip}</div>`;
+    }
+
+    /**
+     * Core audit / heal engine. Returns an array of check results:
+     *   [{ key, label, ok, detail, canFix, fixed }]
+     * With apply=false it only reports; with apply=true it fixes what it can.
+     */
+    async function auditAndFixBDR(bdr, {
+      apply = false,
+      onLog = () => {},
+      linkedInUrlHint = '',
+      preferredHeyreachAccountId = null,
+      skipCampaigns = false
+    } = {}) {
+      const lib = window.HeyReachCampaigns;
+      const checks = [];
+      const add = (key, label, ok, detail = '', canFix = false, fixed = false) => {
+        checks.push({ key, label, ok, detail, canFix, fixed });
+        onLog(`${fixed ? '🔧' : ok ? '✔' : '✘'} ${label}${detail ? ' — ' + detail : ''}`, fixed || ok ? 'ok' : 'err');
+      };
+
+      // Ensure supporting data is loaded
+      if (window.linkedInAccounts === null) await loadLinkedInAccounts();
+      if (window.linkedInEmailAssociations.size === 0) await loadLinkedInEmailAssociations();
+
+      // ── 1. Basics ──────────────────────────────────────────────────────────
+      const primaryEmail = (bdr.primaryEmail || '').trim().toLowerCase();
+      add('email', 'BDR has a primary email', !!primaryEmail,
+        primaryEmail || 'Set a primary email on the BDR record first');
+
+      const customer = window.customers.find(c => c.id === bdr.customerId);
+      add('customer', 'BDR is assigned to a customer', !!customer,
+        customer ? customer.name : 'No customer assigned');
+
+      const heyreachReady = !!(customer && customer.heyreachEnabled && customer.heyreachApiKey);
+      add('heyreach_enabled', 'Customer has HeyReach enabled + API key', heyreachReady,
+        heyreachReady ? '' : 'Enable HeyReach and set the API key on the customer record (Customer Management)');
+
+      if (!primaryEmail || !customer || !heyreachReady) {
+        onLog('Cannot continue — fix the items above first.', 'err');
+        return checks;
+      }
+
+      // ── 2. Resolve the HeyReach LinkedIn account ───────────────────────────
+      let senders = [];
+      try {
+        senders = await lib.fetchLinkedInSenders({ railwayUrl: window.railwayApiUrl, apiKey: customer.heyreachApiKey });
+      } catch (err) {
+        add('heyreach_api', 'HeyReach API reachable', false, err.message);
+        return checks;
+      }
+
+      let liDoc = findLinkedInAccountForBDR(bdr);
+      const assocEmail = window.linkedInEmailAssociations.get(bdr.primaryEmail) || '';
+
+      let hrAccount = null;
+      let hrHow = '';
+      if (preferredHeyreachAccountId) {
+        hrAccount = senders.find(a => String(a.id) === String(preferredHeyreachAccountId)) || null;
+        hrHow = 'selected in enrollment form';
+      }
+      if (!hrAccount && liDoc?.heyreachAccountId) {
+        hrAccount = senders.find(a => String(a.id) === String(liDoc.heyreachAccountId)) || null;
+        hrHow = 'from linked LinkedIn account record';
+      }
+      if (!hrAccount) {
+        const matches = lib.findAccountMatches(senders, bdr.name, assocEmail);
+        if (matches.length > 0 && matches[0].score >= 75) {
+          hrAccount = matches[0].account;
+          hrHow = `matched by name (score ${matches[0].score})`;
+        }
+      }
+
+      add('heyreach_account', 'HeyReach LinkedIn account found', !!hrAccount,
+        hrAccount
+          ? `${hrAccount.firstName} ${hrAccount.lastName} (ID ${hrAccount.id}) — ${hrHow}`
+          : `No confident match for "${bdr.name}" among ${senders.length} HeyReach account(s). Use Easy Enroll to pick manually.`);
+
+      if (!hrAccount) return checks;
+
+      // ── 3. linkedin_accounts record ────────────────────────────────────────
+      if (!liDoc) {
+        if (apply) {
+          const docId = `linkedin_${Date.now()}`;
+          const profileUrl = linkedInUrlHint || hrAccount.profileUrl || '';
+          const liData = {
+            accountName: `${bdr.name} - LinkedIn`,
+            customerId: bdr.customerId,
+            bdrLeaderId: bdr.id,
+            linkedInProfileUrl: profileUrl,
+            bdrEmail: primaryEmail,
+            heyreachAccountId: String(hrAccount.id),
+            linkedInUrl: profileUrl,
+            phantomBusterCookie: '',
+            cookieStatus: 'unknown',
+            cookieLastValidated: new Date(),
+            connectionsPerDay: 20,
+            messagesPerDay: 30,
+            otherActivitiesPerDay: 25,
+            status: 'active',
+            createdVia: 'easy_enroll',
+            createdAt: new Date(),
+            updatedAt: new Date()
+          };
+          await setDoc(doc(window.emailDB, 'linkedin_accounts', docId), liData);
+          liDoc = { id: docId, ...liData };
+          if (Array.isArray(window.linkedInAccounts)) window.linkedInAccounts.push(liDoc);
+          add('linkedin_record', 'LinkedIn account record exists', true, `created ${docId}`, true, true);
+        } else {
+          add('linkedin_record', 'LinkedIn account record exists', false,
+            'No linkedin_accounts record for this BDR', true);
+        }
+      } else {
+        // Record exists — make sure the key fields are filled in
+        const updates = {};
+        if (!liDoc.heyreachAccountId) updates.heyreachAccountId = String(hrAccount.id);
+        if (!liDoc.bdrLeaderId) updates.bdrLeaderId = bdr.id;
+        if (!liDoc.bdrEmail) updates.bdrEmail = primaryEmail;
+        if (!liDoc.linkedInProfileUrl && (linkedInUrlHint || hrAccount.profileUrl)) {
+          updates.linkedInProfileUrl = linkedInUrlHint || hrAccount.profileUrl;
+        }
+        if (!liDoc.linkedInUrl && (liDoc.linkedInProfileUrl || updates.linkedInProfileUrl)) {
+          updates.linkedInUrl = liDoc.linkedInProfileUrl || updates.linkedInProfileUrl;
+        }
+        const needsUpdate = Object.keys(updates).length > 0;
+        if (needsUpdate && apply) {
+          updates.updatedAt = new Date();
+          await updateDoc(doc(window.emailDB, 'linkedin_accounts', liDoc.id), updates);
+          Object.assign(liDoc, updates);
+          add('linkedin_record', 'LinkedIn account record complete', true,
+            `filled in: ${Object.keys(updates).filter(k => k !== 'updatedAt').join(', ')}`, true, true);
+        } else {
+          add('linkedin_record', 'LinkedIn account record complete', !needsUpdate,
+            needsUpdate ? `missing: ${Object.keys(updates).join(', ')}` : `record ${liDoc.id}`, true);
+        }
+      }
+
+      // ── 4. BDR → LinkedIn account link ─────────────────────────────────────
+      const linked = !!liDoc && bdr.linkedInAccountId === liDoc.id;
+      if (!linked && liDoc && apply) {
+        await setDoc(doc(window.emailDB, 'bdr_leaders', bdr.id), {
+          linkedInAccountId: liDoc.id, updatedAt: new Date()
+        }, { merge: true });
+        bdr.linkedInAccountId = liDoc.id;
+        add('bdr_link', 'BDR record links to LinkedIn account', true, `set to ${liDoc.id}`, true, true);
+      } else {
+        add('bdr_link', 'BDR record links to LinkedIn account', linked,
+          linked ? liDoc.id : 'bdr_leaders.linkedInAccountId not set', true);
+      }
+
+      // ── 5. LinkedIn email association (used by @connect) ───────────────────
+      const wantedLiEmail = (hrAccount.email || '').toLowerCase();
+      const currentAssoc = (window.linkedInEmailAssociations.get(bdr.primaryEmail) || '').toLowerCase();
+      const assocOk = !!currentAssoc;
+      if (!assocOk && wantedLiEmail && apply) {
+        await setDoc(doc(window.emailDB, 'linkedin_email_associations', bdr.primaryEmail), {
+          authEmail: bdr.primaryEmail,
+          linkedInEmail: wantedLiEmail,
+          updatedAt: new Date().toISOString(),
+          updatedBy: window.currentUser?.email || 'easy_enroll'
+        });
+        window.linkedInEmailAssociations.set(bdr.primaryEmail, wantedLiEmail);
+        add('li_email', 'LinkedIn email association set', true, wantedLiEmail, true, true);
+      } else if (!assocOk && !wantedLiEmail) {
+        add('li_email', 'LinkedIn email association set', false,
+          'HeyReach account has no email address — set it manually on the BDR card', false);
+      } else {
+        add('li_email', 'LinkedIn email association set', assocOk, currentAssoc || wantedLiEmail, true);
+      }
+
+      // ── 6. HeyReach account cache doc ──────────────────────────────────────
+      const cacheId = `${bdr.customerId}_${hrAccount.id}`;
+      let cacheOk = false;
+      try {
+        const cacheSnap = await getDoc(doc(window.emailDB, 'heyreach_linkedin_accounts', cacheId));
+        cacheOk = cacheSnap && (typeof cacheSnap.exists === 'function' ? cacheSnap.exists() : cacheSnap.exists);
+      } catch (_) { cacheOk = false; }
+      if (!cacheOk && apply) {
+        await setDoc(doc(window.emailDB, 'heyreach_linkedin_accounts', cacheId), {
+          id: hrAccount.id,
+          name: `${hrAccount.firstName} ${hrAccount.lastName}`.trim(),
+          email: hrAccount.email || '',
+          customerId: bdr.customerId,
+          customerName: customer.name || '',
+          status: hrAccount.active ? 'active' : 'inactive',
+          syncedAt: new Date().toISOString(),
+          rawData: hrAccount.raw || {}
+        });
+        add('hr_cache', 'HeyReach account cached in Firebase', true, cacheId, true, true);
+      } else {
+        add('hr_cache', 'HeyReach account cached in Firebase', cacheOk, cacheId, true);
+      }
+
+      // ── 7. Standard campaign set ───────────────────────────────────────────
+      if (!skipCampaigns) {
+        const missing = bdrMissingCampaignTypes(bdr);
+        if (missing.length === 0) {
+          add('campaigns', 'Standard campaigns associated (Connect / Message / Quick Message)', true,
+            `${(bdr.heyreachCampaigns || []).length} campaign(s) on record`);
+        } else if (!apply) {
+          add('campaigns', 'Standard campaigns associated (Connect / Message / Quick Message)', false,
+            `missing: ${missing.join(', ')} — will be created and launched`, true);
+        } else {
+          onLog(`Building ${missing.length} missing campaign(s): ${missing.join(', ')}...`, 'head');
+          const firstName = bdrFirstNameOf(bdr);
+          const results = await lib.buildCampaignSet({
+            railwayUrl: window.railwayApiUrl,
+            apiKey: customer.heyreachApiKey,
+            namePrefix: firstName,
+            accountIds: [Number(hrAccount.id)],
+            types: missing,
+            start: true,
+            onLog
+          });
+          const entries = lib.toBdrCampaignEntries(results, { accountId: hrAccount.id, namePrefix: firstName });
+          const failedTypes = results.filter(r => r.error).map(r => r.type);
+          if (entries.length > 0) {
+            const existing = Array.isArray(bdr.heyreachCampaigns) ? [...bdr.heyreachCampaigns] : [];
+            entries.forEach(e => { if (!existing.some(c => String(c.id) === String(e.id))) existing.push(e); });
+            await setDoc(doc(window.emailDB, 'bdr_leaders', bdr.id), {
+              heyreachCampaigns: existing, updatedAt: new Date()
+            }, { merge: true });
+            bdr.heyreachCampaigns = existing;
+          }
+          add('campaigns', 'Standard campaigns associated (Connect / Message / Quick Message)',
+            failedTypes.length === 0,
+            failedTypes.length === 0
+              ? `created & launched: ${entries.map(e => e.name).join(', ')}`
+              : `failed: ${failedTypes.join(', ')} — see log above`,
+            true, entries.length > 0);
+        }
+      }
+
+      return checks;
+    }
+
+    // Render a list of audit check results as HTML
+    function renderAuditChecklist(checks) {
+      return `
+        <div class="audit-checklist">
+          ${checks.map(c => `
+            <div class="audit-check-row ${c.ok ? 'ok' : 'fail'}">
+              <i class="fas ${c.fixed ? 'fa-wrench' : c.ok ? 'fa-check-circle' : 'fa-times-circle'}"></i>
+              <div>
+                <div class="audit-check-label">${c.label}${c.fixed ? ' <span class="audit-fixed-tag">FIXED</span>' : ''}</div>
+                ${c.detail ? `<div class="audit-check-detail">${c.detail}</div>` : ''}
+              </div>
+            </div>
+          `).join('')}
+        </div>`;
+    }
+
+    function appendAuditLog(containerId, message, level) {
+      const el = document.getElementById(containerId);
+      if (!el) return;
+      el.style.display = 'block';
+      const line = document.createElement('div');
+      line.className = `audit-log-${level || 'info'}`;
+      line.textContent = message;
+      el.appendChild(line);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    // ── Audit & Fix modal (per-BDR button) ───────────────────────────────────
+    window.auditBDR = async (bdrId) => {
+      const bdr = window.bdrLeaders.find(b => b.id === bdrId);
+      if (!bdr) return;
+      window._currentAuditBdrId = bdrId;
+
+      const modalHtml = `
+        <div id="bdr-audit-modal" class="modal">
+          <div class="modal-content" style="max-width: 700px;">
+            <div class="modal-header">
+              <h3><i class="fas fa-stethoscope"></i> BDR Setup Audit — ${bdr.name}</h3>
+              <button onclick="closeBDRAuditModal()" class="modal-close">&times;</button>
+            </div>
+            <div style="padding: 1.5rem 2rem;">
+              <div id="bdr-audit-body">
+                <div style="text-align: center; color: #666; padding: 2rem;">
+                  <i class="fas fa-spinner fa-spin"></i> Running checks...
+                </div>
+              </div>
+              <div id="bdr-audit-log" class="audit-log" style="display: none;"></div>
+              <div id="bdr-audit-actions" style="margin-top: 1rem; display: flex; gap: 0.75rem; flex-wrap: wrap;"></div>
+            </div>
+          </div>
+        </div>`;
+      document.body.insertAdjacentHTML('beforeend', modalHtml);
+
+      try {
+        const checks = await auditAndFixBDR(bdr, { apply: false });
+        renderAuditResults(bdr, checks);
+      } catch (err) {
+        document.getElementById('bdr-audit-body').innerHTML =
+          `<div style="color: #991b1b;"><i class="fas fa-times-circle"></i> Audit failed: ${err.message}</div>`;
+      }
+    };
+
+    function renderAuditResults(bdr, checks) {
+      const body = document.getElementById('bdr-audit-body');
+      const actions = document.getElementById('bdr-audit-actions');
+      if (!body) return;
+
+      const failures = checks.filter(c => !c.ok);
+      const fixable = failures.filter(c => c.canFix);
+
+      let headline;
+      if (failures.length === 0) {
+        headline = `<div class="audit-headline ok"><i class="fas fa-check-circle"></i>
+          Everything is set up correctly for ${bdr.name}.</div>`;
+      } else {
+        headline = `<div class="audit-headline fail"><i class="fas fa-exclamation-triangle"></i>
+          ${failures.length} issue(s) found${fixable.length > 0 ? ` — ${fixable.length} can be fixed automatically` : ''}.</div>`;
+      }
+      body.innerHTML = headline + renderAuditChecklist(checks);
+
+      actions.innerHTML = '';
+      if (fixable.length > 0) {
+        actions.innerHTML = `
+          <button onclick="runBDRAuditFix()" class="btn btn-success">
+            <i class="fas fa-wrench"></i> Fix All Issues Automatically
+          </button>
+          <button onclick="closeBDRAuditModal()" class="btn btn-secondary">Close</button>
+          <small style="flex-basis: 100%; color: #666;">
+            Fixing will create/link any missing records and build + launch any missing campaigns
+            (with the standard sequences, starter contacts, and every-day 12:00–21:00 Denver schedule).
+          </small>`;
+      } else {
+        actions.innerHTML = `<button onclick="closeBDRAuditModal()" class="btn btn-secondary">Close</button>`;
+      }
+    }
+
+    window.runBDRAuditFix = async () => {
+      const bdr = window.bdrLeaders.find(b => b.id === window._currentAuditBdrId);
+      if (!bdr) return;
+
+      const actions = document.getElementById('bdr-audit-actions');
+      actions.innerHTML = '<div style="color: #666;"><i class="fas fa-spinner fa-spin"></i> Fixing — do not close this window...</div>';
+      document.getElementById('bdr-audit-log').innerHTML = '';
+
+      try {
+        const checks = await auditAndFixBDR(bdr, {
+          apply: true,
+          onLog: (msg, level) => appendAuditLog('bdr-audit-log', msg, level)
+        });
+        renderAuditResults(bdr, checks);
+        await loadBDRLeaders();
+        showAlert(`Audit fix complete for ${bdr.name}`, 'success');
+      } catch (err) {
+        appendAuditLog('bdr-audit-log', `FAILED: ${err.message}`, 'err');
+        actions.innerHTML = `<button onclick="closeBDRAuditModal()" class="btn btn-secondary">Close</button>`;
+        showAlert(`Audit fix failed: ${err.message}`, 'error');
+      }
+    };
+
+    window.closeBDRAuditModal = () => {
+      const modal = document.getElementById('bdr-audit-modal');
+      if (modal) modal.remove();
+    };
+
+    // ── Easy BDR Enrollment modal ────────────────────────────────────────────
+    window._enrollState = null;
+
+    window.showEasyEnrollModal = () => {
+      // Kick off BDR load in the background if not loaded yet (needed for duplicate check)
+      if (window.bdrLeaders === null) loadBDRLeaders();
+
+      const heyreachCustomers = window.customers.filter(c => c.heyreachEnabled && c.heyreachApiKey);
+      const customerOptions = window.customers
+        .slice()
+        .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+        .map(c => {
+          const ready = c.heyreachEnabled && c.heyreachApiKey;
+          const preselect = window.selectedCustomer !== 'all' && c.id === window.selectedCustomer && ready;
+          return `<option value="${c.id}" ${ready ? '' : 'disabled'} ${preselect ? 'selected' : ''}>
+            ${c.name || c.id}${ready ? '' : ' (HeyReach not configured)'}</option>`;
+        }).join('');
+
+      const modalHtml = `
+        <div id="easy-enroll-modal" class="modal">
+          <div class="modal-content" style="max-width: 720px;">
+            <div class="modal-header">
+              <h3><i class="fas fa-magic"></i> Easy BDR Enrollment</h3>
+              <button onclick="closeEasyEnrollModal()" class="modal-close">&times;</button>
+            </div>
+            <div style="padding: 1.5rem 2rem;">
+              <p style="margin-top: 0; color: #666; font-size: 0.9rem;">
+                Enter the new BDR's details. The system finds their HeyReach account, links the LinkedIn
+                account record, sets the email association, and builds + launches their standard campaigns.
+              </p>
+
+              <div id="enroll-step-1">
+                <div class="form-row">
+                  <div class="form-group">
+                    <label>Customer *</label>
+                    <select id="enroll-customer" class="customer-selector">
+                      <option value="">Select a customer...</option>
+                      ${customerOptions}
+                    </select>
+                    ${heyreachCustomers.length === 0 ? '<small style="color:#991b1b;">No customers have HeyReach configured yet.</small>' : ''}
+                  </div>
+                  <div class="form-group">
+                    <label>Full Name *</label>
+                    <input type="text" id="enroll-name" placeholder="Chris Johnson">
+                  </div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group">
+                    <label>Email *</label>
+                    <input type="email" id="enroll-email" placeholder="chris@company.com">
+                  </div>
+                  <div class="form-group">
+                    <label>Phone (optional)</label>
+                    <input type="tel" id="enroll-phone" placeholder="+1-555-0123">
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label>LinkedIn Profile URL *</label>
+                  <input type="text" id="enroll-linkedin-url" placeholder="https://www.linkedin.com/in/chrisjohnson/">
+                </div>
+                <button onclick="enrollFindHeyReachAccount()" class="btn btn-primary" id="enroll-find-btn">
+                  <i class="fas fa-search"></i> Find HeyReach Account &rarr;
+                </button>
+                <div id="enroll-find-status" style="margin-top: 0.5rem; font-size: 0.9rem; color: #666;"></div>
+              </div>
+
+              <div id="enroll-step-2" style="display: none;">
+                <h4 style="margin-bottom: 0.5rem;"><i class="fab fa-linkedin" style="color:#0077b5;"></i> Confirm HeyReach account</h4>
+                <div id="enroll-candidates"></div>
+                <label class="checkbox-label" style="margin-top: 1rem;">
+                  <input type="checkbox" id="enroll-create-campaigns" checked>
+                  Build &amp; launch standard campaigns (Connect / Message / Quick Message)
+                </label>
+                <div style="margin-top: 1rem; display: flex; gap: 0.75rem;">
+                  <button onclick="runEasyEnroll()" class="btn btn-success" id="enroll-go-btn">
+                    <i class="fas fa-magic"></i> Enroll BDR
+                  </button>
+                  <button onclick="enrollBackToStep1()" class="btn btn-secondary">&larr; Back</button>
+                </div>
+              </div>
+
+              <div id="enroll-step-3" style="display: none;">
+                <div id="enroll-log" class="audit-log" style="display: block;"></div>
+                <div id="enroll-result"></div>
+                <div id="enroll-final-actions" style="margin-top: 1rem;"></div>
+              </div>
+            </div>
+          </div>
+        </div>`;
+      document.body.insertAdjacentHTML('beforeend', modalHtml);
+    };
+
+    window.closeEasyEnrollModal = () => {
+      const modal = document.getElementById('easy-enroll-modal');
+      if (modal) modal.remove();
+      window._enrollState = null;
+    };
+
+    window.enrollBackToStep1 = () => {
+      document.getElementById('enroll-step-2').style.display = 'none';
+      document.getElementById('enroll-step-1').style.display = 'block';
+    };
+
+    window.enrollFindHeyReachAccount = async () => {
+      const customerId = document.getElementById('enroll-customer').value;
+      const name = document.getElementById('enroll-name').value.trim();
+      const email = document.getElementById('enroll-email').value.trim().toLowerCase();
+      const linkedInUrl = document.getElementById('enroll-linkedin-url').value.trim();
+      const phone = document.getElementById('enroll-phone').value.trim();
+      const statusEl = document.getElementById('enroll-find-status');
+
+      if (!customerId) { statusEl.innerHTML = '<span style="color:#991b1b;">Select a customer.</span>'; return; }
+      if (!name) { statusEl.innerHTML = '<span style="color:#991b1b;">Enter the BDR\'s full name.</span>'; return; }
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { statusEl.innerHTML = '<span style="color:#991b1b;">Enter a valid email.</span>'; return; }
+      if (!linkedInUrl || !/linkedin\.com\//i.test(linkedInUrl)) { statusEl.innerHTML = '<span style="color:#991b1b;">Enter the LinkedIn profile URL.</span>'; return; }
+
+      const customer = window.customers.find(c => c.id === customerId);
+      const findBtn = document.getElementById('enroll-find-btn');
+      findBtn.disabled = true;
+      statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Searching HeyReach accounts...';
+
+      try {
+        const lib = window.HeyReachCampaigns;
+        const senders = await lib.fetchLinkedInSenders({ railwayUrl: window.railwayApiUrl, apiKey: customer.heyreachApiKey });
+        const matches = lib.findAccountMatches(senders, name, email);
+
+        window._enrollState = { customerId, name, email, linkedInUrl, phone, senders };
+
+        // Candidate list: scored matches first, then the rest
+        const matchedIds = new Set(matches.map(m => String(m.account.id)));
+        const others = senders.filter(a => !matchedIds.has(String(a.id)));
+        const rows = [];
+        matches.forEach((m, i) => rows.push({ account: m.account, score: m.score, checked: i === 0 }));
+        others.forEach(a => rows.push({ account: a, score: 0, checked: false }));
+
+        let html;
+        if (rows.length === 0) {
+          html = `<div style="color:#991b1b; padding: 0.5rem 0;">
+            No LinkedIn accounts found in this HeyReach workspace. Connect the account in HeyReach first,
+            then enroll again. You can still enroll now — HeyReach linking will be skipped.</div>
+            <label class="enroll-candidate"><input type="radio" name="enroll-account" value="" checked>
+              <div><strong>Skip HeyReach linking for now</strong></div></label>`;
+        } else {
+          html = rows.map(r => `
+            <label class="enroll-candidate ${r.checked ? 'best' : ''}">
+              <input type="radio" name="enroll-account" value="${r.account.id}" ${r.checked ? 'checked' : ''}>
+              <div>
+                <strong>${r.account.firstName} ${r.account.lastName}</strong>
+                ${r.score >= 75 ? '<span class="enroll-match-tag">BEST MATCH</span>' : r.score > 0 ? '<span class="enroll-match-tag weak">possible</span>' : ''}
+                ${r.account.active ? '' : '<span style="color:#991b1b; font-size:0.75rem;"> (inactive)</span>'}
+                <div style="font-size: 0.8rem; color: #666;">ID: ${r.account.id}${r.account.email ? ' · ' + r.account.email : ''}</div>
+              </div>
+            </label>`).join('') +
+            `<label class="enroll-candidate">
+              <input type="radio" name="enroll-account" value="">
+              <div><strong>None of these</strong> — skip HeyReach linking for now</div>
+            </label>`;
+          if (matches.length === 0) {
+            html = `<div style="color:#854d0e; background:#fef9c3; border:1px solid #fde68a; border-radius:6px; padding:0.5rem 0.75rem; margin-bottom:0.5rem; font-size:0.85rem;">
+              No account matched "${name}" by name — pick the right one below.</div>` + html;
+          }
+        }
+
+        document.getElementById('enroll-candidates').innerHTML = html;
+        document.getElementById('enroll-step-1').style.display = 'none';
+        document.getElementById('enroll-step-2').style.display = 'block';
+        statusEl.innerHTML = '';
+      } catch (err) {
+        statusEl.innerHTML = `<span style="color:#991b1b;">Error: ${err.message}</span>`;
+      } finally {
+        findBtn.disabled = false;
+      }
+    };
+
+    window.runEasyEnroll = async () => {
+      const st = window._enrollState;
+      if (!st) return;
+
+      const selectedAccountId = document.querySelector('input[name="enroll-account"]:checked')?.value || '';
+      const createCampaigns = document.getElementById('enroll-create-campaigns').checked;
+
+      // Make sure BDR list is loaded for the duplicate check
+      if (window.bdrLeaders === null) await loadBDRLeaders();
+
+      const existing = (window.bdrLeaders || []).find(b => (b.primaryEmail || '').toLowerCase() === st.email);
+      if (existing && !confirm(
+        `A BDR with email ${st.email} already exists ("${existing.name}").\n\n` +
+        `Continue and complete THEIR setup instead of creating a duplicate?`
+      )) return;
+
+      document.getElementById('enroll-step-2').style.display = 'none';
+      document.getElementById('enroll-step-3').style.display = 'block';
+      const log = (msg, level) => appendAuditLog('enroll-log', msg, level);
+
+      try {
+        let bdr;
+        if (existing) {
+          bdr = existing;
+          log(`Using existing BDR record: ${bdr.name} (${bdr.id})`, 'info');
+          if (st.phone && !bdr.primaryPhone) {
+            await setDoc(doc(window.emailDB, 'bdr_leaders', bdr.id), { primaryPhone: st.phone, updatedAt: new Date() }, { merge: true });
+            bdr.primaryPhone = st.phone;
+          }
+        } else {
+          const docId = `bdr_${Date.now()}`;
+          const bdrData = {
+            name: st.name,
+            customerId: st.customerId,
+            primaryEmail: st.email,
+            primaryPhone: st.phone || '',
+            loginUID: null,
+            emailAccountIds: [],
+            phoneNumbers: [],
+            linkedInAccountId: '',
+            heyreachCampaigns: [],
+            limits: {
+              emailsPerDay: 60,
+              linkedInConnectionsPerDay: 20,
+              linkedInMessagesPerDay: 30,
+              callsPerDay: 25,
+              otherActivitiesPerDay: 25
+            },
+            status: 'active',
+            createdVia: 'easy_enroll',
+            createdAt: new Date(),
+            updatedAt: new Date()
+          };
+          await setDoc(doc(window.emailDB, 'bdr_leaders', docId), bdrData);
+          bdr = { id: docId, ...bdrData };
+          window.bdrLeaders.push(bdr);
+          log(`✔ Created BDR record: ${st.name} (${docId})`, 'ok');
+        }
+
+        const checks = await auditAndFixBDR(bdr, {
+          apply: true,
+          onLog: log,
+          linkedInUrlHint: st.linkedInUrl,
+          preferredHeyreachAccountId: selectedAccountId || null,
+          skipCampaigns: !createCampaigns || !selectedAccountId
+        });
+
+        const failures = checks.filter(c => !c.ok);
+        document.getElementById('enroll-result').innerHTML =
+          `<div class="audit-headline ${failures.length === 0 ? 'ok' : 'fail'}" style="margin-top: 1rem;">
+            <i class="fas ${failures.length === 0 ? 'fa-check-circle' : 'fa-exclamation-triangle'}"></i>
+            ${failures.length === 0
+              ? `${bdr.name} is fully enrolled and ready to go!`
+              : `Enrollment finished with ${failures.length} outstanding issue(s) — run Audit & Fix on their card for details.`}
+          </div>` + renderAuditChecklist(checks);
+
+        document.getElementById('enroll-final-actions').innerHTML =
+          `<button onclick="closeEasyEnrollModal()" class="btn btn-success"><i class="fas fa-check"></i> Done</button>`;
+
+        await loadBDRLeaders();
+        showAlert(`BDR enrollment ${failures.length === 0 ? 'complete' : 'finished with issues'}: ${bdr.name}`, failures.length === 0 ? 'success' : 'warning');
+      } catch (err) {
+        log(`FAILED: ${err.message}`, 'err');
+        document.getElementById('enroll-final-actions').innerHTML =
+          `<button onclick="closeEasyEnrollModal()" class="btn btn-secondary">Close</button>`;
+        showAlert(`Enrollment failed: ${err.message}`, 'error');
+      }
     };
 
     // ======= LINKEDIN ACCOUNTS MANAGEMENT =======
@@ -9301,6 +10021,101 @@ HealthLuminate
     .section-not-loaded i { font-size: 2rem; opacity: 0.5; }
     .section-not-loaded p  { margin: 0; font-size: 0.95rem; }
     .btn-sm { padding: 6px 14px; font-size: 0.85rem; }
+
+    /* ── BDR setup-health chips (on each BDR card) ── */
+    .bdr-setup-chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 0.5rem 0 0.75rem;
+    }
+    .bdr-setup-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: default;
+    }
+
+    /* ── BDR audit / enrollment modals ── */
+    .audit-headline {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      font-weight: 600;
+      margin-bottom: 1rem;
+    }
+    .audit-headline.ok   { background: #dcfce7; color: #166534; }
+    .audit-headline.fail { background: #fef9c3; color: #854d0e; }
+    .audit-checklist { display: flex; flex-direction: column; gap: 6px; }
+    .audit-check-row {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid #e2e8f0;
+      background: #fff;
+    }
+    .audit-check-row.ok   i { color: #16a34a; margin-top: 2px; }
+    .audit-check-row.fail { background: #fef2f2; border-color: #fecaca; }
+    .audit-check-row.fail i { color: #dc2626; margin-top: 2px; }
+    .audit-check-label { font-weight: 600; font-size: 0.9rem; }
+    .audit-check-detail { font-size: 0.8rem; color: #666; margin-top: 2px; word-break: break-word; }
+    .audit-fixed-tag {
+      background: #16a34a;
+      color: #fff;
+      font-size: 0.65rem;
+      padding: 1px 6px;
+      border-radius: 8px;
+      vertical-align: middle;
+    }
+    .audit-log {
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-top: 1rem;
+      font-family: 'Courier New', monospace;
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .audit-log-ok   { color: #4ade80; }
+    .audit-log-err  { color: #f87171; }
+    .audit-log-warn { color: #fbbf24; }
+    .audit-log-head { color: #60a5fa; font-weight: 700; }
+
+    .enroll-candidate {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      padding: 8px 12px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      background: #fff;
+    }
+    .enroll-candidate:hover { border-color: #44A1C4; }
+    .enroll-candidate.best { border-color: #16a34a; background: #f0fdf4; }
+    .enroll-match-tag {
+      background: #16a34a;
+      color: #fff;
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 8px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .enroll-match-tag.weak { background: #f59e0b; }
   </style>
   <link rel="icon" type="image/png" href="../images/HealthLuminate-Bright.png">
 </head>
@@ -9388,6 +10203,9 @@ HealthLuminate
       <div class="admin-card">
         <h3><i class="fas fa-bolt"></i> Quick Actions</h3>
         <div class="quick-actions">
+          <button onclick="showEasyEnrollModal()" class="btn btn-success">
+            <i class="fas fa-magic"></i> Easy BDR Enrollment
+          </button>
           <button onclick="showEmailScheduler()" class="btn btn-primary">
             <i class="fas fa-paper-plane"></i> Schedule Email
           </button>
