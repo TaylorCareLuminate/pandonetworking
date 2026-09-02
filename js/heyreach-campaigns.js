@@ -56,6 +56,14 @@
     { key: 'quick_message', suffix: 'Quick Message' }
   ];
 
+  // Wait between liking the lead's post and sending the connection request /
+  // message (Connect and Message campaigns only; Quick Message is unaffected).
+  const DELAY_CHOICES = {
+    '3h': { actionDelay: 3, actionDelayUnit: 'HOUR', label: '3 hours' },
+    '2d': { actionDelay: 2, actionDelayUnit: 'DAY', label: '2 days' }
+  };
+  const DEFAULT_DELAY_CHOICE = '3h';
+
   // ── Sequences (HeyReach Campaign API PublicSequenceNodeDto) ───────────────
   // Translated from the exported Kevin-Connect / Kevin-Message /
   // Kevin-Quick-Message sequences. HeyReach's validator requires a delay of at
@@ -70,12 +78,13 @@
     skipDelayIfCannotLike: false
   });
 
-  function buildSequence(typeKey, fallbackMessage) {
+  function buildSequence(typeKey, fallbackMessage, options = {}) {
     const fallback = fallbackMessage || DEFAULT_FALLBACK_MESSAGE;
+    const delay = DELAY_CHOICES[options.delayChoice] || DELAY_CHOICES[DEFAULT_DELAY_CHOICE];
 
     if (typeKey === 'connect') {
-      // Like post → (3h) already connected? yes: end / no: connection request
-      // with {content}, withdraw after 21 days → accepted: end (1d) /
+      // Like post → (3h or 2d) already connected? yes: end / no: connection
+      // request with {content}, withdraw after 21 days → accepted: end (1d) /
       // not accepted: view profile (5d) → end (5d)
       return {
         nodeType: 'LIKE_POST',
@@ -83,7 +92,7 @@
         payload: likePayload(),
         unconditionalNode: {
           nodeType: 'CHECK_IS_CONNECTION',
-          actionDelay: 3, actionDelayUnit: 'HOUR',
+          actionDelay: delay.actionDelay, actionDelayUnit: delay.actionDelayUnit,
           conditionalNode: END(3, 'HOUR'),
           unconditionalNode: {
             nodeType: 'CONNECTION_REQUEST',
@@ -105,15 +114,15 @@
     }
 
     if (typeKey === 'message') {
-      // Like post → (1d) connected? yes: message {content} → replied: end (1d) /
-      // no reply: view profile (1d) → end (1d); not connected: end
+      // Like post → (3h or 2d) connected? yes: message {content} → replied:
+      // end (1d) / no reply: view profile (1d) → end (1d); not connected: end
       return {
         nodeType: 'LIKE_POST',
         actionDelay: 0, actionDelayUnit: 'HOUR',
         payload: likePayload(),
         unconditionalNode: {
           nodeType: 'CHECK_IS_CONNECTION',
-          actionDelay: 1, actionDelayUnit: 'DAY',
+          actionDelay: delay.actionDelay, actionDelayUnit: delay.actionDelayUnit,
           conditionalNode: {
             nodeType: 'MESSAGE',
             actionDelay: 0, actionDelayUnit: 'HOUR',
@@ -242,6 +251,8 @@
    *   schedule               — CampaignScheduleApiDto (defaults to DEFAULT_SCHEDULE)
    *   fallbackMessage        — back-up message (defaults to DEFAULT_FALLBACK_MESSAGE)
    *   types                  — array of type keys (defaults to all three)
+   *   delayChoice            — '3h' (default) or '2d': wait between liking the post
+   *                            and the connect/message step (Connect + Message types)
    *   start                  — launch after create (default true)
    *   onLog(message, level)  — optional progress callback ('info'|'ok'|'warn'|'err'|'head')
    *
@@ -255,6 +266,7 @@
       schedule = DEFAULT_SCHEDULE,
       fallbackMessage = DEFAULT_FALLBACK_MESSAGE,
       types = CAMPAIGN_TYPES.map((t) => t.key),
+      delayChoice = DEFAULT_DELAY_CHOICE,
       start = true,
       onLog = () => {}
     } = opts;
@@ -264,6 +276,10 @@
     if (!Array.isArray(accountIds) || accountIds.length === 0) throw new Error('buildCampaignSet: accountIds is required');
 
     const selectedTypes = CAMPAIGN_TYPES.filter((t) => types.includes(t.key));
+    const delayLabel = (DELAY_CHOICES[delayChoice] || DELAY_CHOICES[DEFAULT_DELAY_CHOICE]).label;
+    if (selectedTypes.some((t) => t.key !== 'quick_message')) {
+      onLog(`Connect/Message delay after liking the post: ${delayLabel}`, 'info');
+    }
     const results = [];
 
     for (const type of selectedTypes) {
@@ -292,7 +308,7 @@
           linkedInUserListId: result.listId,
           linkedInAccountIds: accountIds.map(Number),
           schedule,
-          sequence: buildSequence(type.key, fallbackMessage)
+          sequence: buildSequence(type.key, fallbackMessage, { delayChoice })
         });
         result.campaignId = campResp?.campaignId ?? campResp?.id;
         if (!result.campaignId) throw new Error(`Could not read campaign ID from response: ${JSON.stringify(campResp).slice(0, 200)}`);
@@ -345,6 +361,8 @@
     DEFAULT_SCHEDULE,
     DEFAULT_STARTER_LEADS,
     CAMPAIGN_TYPES,
+    DELAY_CHOICES,
+    DEFAULT_DELAY_CHOICE,
     buildSequence,
     call,
     fetchLinkedInSenders,
