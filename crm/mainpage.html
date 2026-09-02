@@ -1982,7 +1982,7 @@
         <!-- Auto duplicates panel -->
         <div id="mergeTabAuto" class="merge-tab-panel">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
-            <small style="color: #666;">Matches by normalized name and/or domain.</small>
+            <small style="color: #666;">Matches by normalized name (Corp, Corporation, Inc, etc. stripped, including glued suffixes like 314ecorp) and/or domain.</small>
             <button class="btn btn-secondary" onclick="findDuplicates()" style="padding: 6px 12px; font-size: 0.85rem;">
               <i class="fas fa-sync"></i> Rescan
             </button>
@@ -4030,15 +4030,81 @@
     // State for the merge workflow
     let _mergeCompareState = null; // { primary, secondary, fieldChoices, primaryRaw, secondaryRaw }
 
+    // Legal suffixes stripped from names. Spaced tokens may include short ones (inc, co, pc).
+    // Glued tokens omit those so Cisco/Zinc do not collapse.
+    const _MERGE_SPACED_SUFFIX = /,?\s+(inc|llc|ltd|corp|corporation|incorporated|co|company|plc|pllc|pc|group|holdings|partners|associates)\.?$/i;
+    const _MERGE_GLUED_SUFFIX = /(corporation|incorporated|company|holdings|partners|associates|group|pllc|llc|ltd|corp|plc)$/i;
+    const _MERGE_SUFFIX_REMAINDERS = new Set([
+      'inc', 'llc', 'ltd', 'corp', 'corporation', 'incorporated', 'co', 'company',
+      'plc', 'pllc', 'pc', 'group', 'holdings', 'partners', 'associates'
+    ]);
+
     // Normalize a name for duplicate detection
     function _normalizeMergeKey(s) {
       if (!s) return '';
-      return s.toString().toLowerCase()
+      let t = s.toString().toLowerCase()
         .replace(/[\u2018\u2019\u201c\u201d]/g, "'")
-        .replace(/,?\s+(inc|llc|ltd|corp|co|company|plc|pllc|pc|group|holdings|partners|associates)\.?$/gi, '')
-        .replace(/&/g, 'and')
-        .replace(/[^a-z0-9]/g, '')
-        .trim();
+        .replace(/&/g, 'and');
+
+      for (let i = 0; i < 4; i++) {
+        const next = t.replace(_MERGE_SPACED_SUFFIX, '');
+        if (next === t) break;
+        t = next;
+      }
+
+      t = t.replace(/[^a-z0-9]/g, '');
+
+      for (let i = 0; i < 4; i++) {
+        const next = t.replace(_MERGE_GLUED_SUFFIX, '');
+        if (next === t || next.length < 3) break;
+        t = next;
+      }
+
+      return t.trim();
+    }
+
+    // True when one compact key is the other plus a legal suffix (backup if strip misses).
+    function _nameKeysAreVariants(a, b) {
+      if (!a || !b || a === b) return false;
+      const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+      if (!longer.startsWith(shorter)) return false;
+      return _MERGE_SUFFIX_REMAINDERS.has(longer.slice(shorter.length));
+    }
+
+    function _mergeNameVariantBuckets(byName) {
+      const keys = Array.from(byName.keys());
+      const parent = new Map(keys.map(k => [k, k]));
+      const find = (k) => {
+        while (parent.get(k) !== k) {
+          parent.set(k, parent.get(parent.get(k)));
+          k = parent.get(k);
+        }
+        return k;
+      };
+      for (let i = 0; i < keys.length; i++) {
+        for (let j = i + 1; j < keys.length; j++) {
+          if (_nameKeysAreVariants(keys[i], keys[j])) {
+            const ra = find(keys[i]);
+            const rb = find(keys[j]);
+            if (ra !== rb) parent.set(rb, ra);
+          }
+        }
+      }
+      const merged = new Map();
+      keys.forEach(k => {
+        const root = find(k);
+        if (!merged.has(root)) merged.set(root, []);
+        merged.get(root).push(...byName.get(k));
+      });
+      merged.forEach((list, root) => {
+        const seen = new Set();
+        merged.set(root, list.filter(a => {
+          if (seen.has(a.id)) return false;
+          seen.add(a.id);
+          return true;
+        }));
+      });
+      return merged;
     }
 
     function _normalizeDomain(d) {
@@ -4127,8 +4193,8 @@
         const key = accounts.map(a => a.id).sort().join('|');
         if (!groupMap.has(key)) groupMap.set(key, { reason, accounts });
       };
-      byName.forEach((list, k) => addGroup('Name match', list));
-      byDomain.forEach((list, k) => addGroup('Domain match', list));
+      _mergeNameVariantBuckets(byName).forEach((list) => addGroup('Name match', list));
+      byDomain.forEach((list) => addGroup('Domain match', list));
 
       const groups = Array.from(groupMap.values())
         .sort((g1, g2) => g2.accounts.length - g1.accounts.length);
