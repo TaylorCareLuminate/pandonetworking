@@ -577,10 +577,10 @@
         <div class="section">
             <div class="section-title"><span class="step-num">6</span> Cost Shut-Down Rates</div>
             <p class="section-help">
-                The pipeline stops automatically when contact-search spend gets out of line with messages produced.
-                Of the target cost per message, roughly <strong>$0.03</strong> goes to AI (build + reviews) and
-                <strong>$0.02</strong> to post scrapes, so the rest is the Apify contact-search budget. When the
-                <em>average</em> Apify cost per generated message exceeds that budget, the run shuts down — that
+                The pipeline stops automatically when spend gets out of line with messages produced. After every
+                organization, the run's <em>all-in</em> cost so far — contact search (larger of ledger-measured vs
+                formula estimate) + LinkedIn profile/post scrapes from the Apify ledger + estimated AI — is divided
+                by messages generated. When that average exceeds the target below, the run shuts down — that
                 usually means the Step 4 scan rules are finding too few usable contacts and need adjusting.
             </p>
             <div class="grid-3">
@@ -590,12 +590,12 @@
                     <div class="form-help">Default $0.20 per generated message.</div>
                 </div>
                 <div class="form-group">
-                    <label><i class="fas fa-hand"></i> Apify Shut-Down Rate (computed)</label>
-                    <div id="fpCostGuardComputed" style="padding: 10px 12px; background: var(--gray-50); border: 1px solid var(--gray-200); border-radius: 8px; font-size: 13.5px; font-weight: 700; color: #b91c1c;">$0.15 per message</div>
-                    <div class="form-help">Target minus $0.03 AI and $0.02 post scrapes. The run stops when average Apify spend per generated message exceeds this.</div>
+                    <label><i class="fas fa-hand"></i> All-In Shut-Down Rate</label>
+                    <div id="fpCostGuardComputed" style="padding: 10px 12px; background: var(--gray-50); border: 1px solid var(--gray-200); border-radius: 8px; font-size: 13.5px; font-weight: 700; color: #b91c1c;">$0.20 per message</div>
+                    <div class="form-help">The run stops when average all-in spend (contact search + profile/post scrapes + AI estimate) per generated message exceeds the target.</div>
                 </div>
                 <div class="form-group">
-                    <label for="fpCostMinSpend"><i class="fas fa-scale-balanced"></i> Minimum Apify Spend Before Enforcing</label>
+                    <label for="fpCostMinSpend"><i class="fas fa-scale-balanced"></i> Minimum Spend Before Enforcing</label>
                     <input type="number" id="fpCostMinSpend" value="1.00" min="0" max="100" step="0.25" />
                     <div class="form-help">Grace amount so one small unlucky organization doesn't kill the run. Checked after every organization.</div>
                 </div>
@@ -607,7 +607,7 @@
             <button class="btn btn-primary btn-large" id="fpRunBtn" disabled onclick="fpRunPipeline()">
                 <i class="fas fa-rocket"></i> Run Full Pipeline
             </button>
-            <button class="btn btn-danger btn-large" id="fpStopBtn" style="display:none;" onclick="fpRequestStop(); this.disabled = true; this.innerHTML = '<i class=&quot;fas fa-spinner fa-spin&quot;></i> Stopping after current step…';">
+            <button class="btn btn-danger btn-large" id="fpStopBtn" style="display:none;" onclick="window.fpStopRequested = true; fpRequestStop(); this.disabled = true; this.innerHTML = '<i class=&quot;fas fa-spinner fa-spin&quot;></i> Stopping after current step…';">
                 <i class="fas fa-stop"></i> Stop
             </button>
             <div id="fpRunHint" style="font-size: 12.5px; color: var(--gray-500); margin-top: 8px;">Select a hypothesis group and at least one BDR with a message count to enable.</div>
@@ -2882,11 +2882,13 @@
             }
         };
 
-        // ── Step 6: computed Apify shut-down rate display ──
+        // ── Step 6: shut-down rate display ──
+        // The guard now enforces the all-in cost per message, so the shut-down rate IS the
+        // target (no more "target minus $0.05" carve-out for AI/post scrapes — those costs
+        // are counted in the guard's spend instead).
         window.fpUpdateCostGuardHelp = function() {
             const total = parseFloat(document.getElementById('fpCostPerMessage').value) || 0.20;
-            const limit = Math.max(0.01, total - 0.05);
-            document.getElementById('fpCostGuardComputed').textContent = `$${limit.toFixed(2)} per message`;
+            document.getElementById('fpCostGuardComputed').textContent = `$${total.toFixed(2)} per message`;
         };
 
         window.fpUpdateRunButton = function() {
@@ -3155,10 +3157,12 @@
         // so a stop always leaves an explicit, unmistakable line in the log — the run's own
         // checkpoints intentionally break out silently (no distinct log line) once the flag
         // is set, which previously made a manual stop look identical to some mystery hang.
-        function fpRequestStop() {
+        // Must live on window: this file is a module, so a bare function fpRequestStop()
+        // is invisible to the button's inline onclick and the click did nothing.
+        window.fpRequestStop = function fpRequestStop() {
             window.fpStopRequested = true;
             addLog('\n⛔ Stop requested from the button — finishing the current step, then stopping. Nothing is lost: every organization completed so far is saved, and re-running with the same Scan Name will pick up where this left off (already-scanned orgs are skipped/pushed to the back of the queue).', 'warning');
-        }
+        };
 
         // Full plain-text transcript of every log line this run has produced, in order —
         // kept in sync with the on-screen log by addLog/addLogHtml below and reset when a
@@ -4641,12 +4645,15 @@
             await fpSaveScanNamePreset(groupId, scanName, scanCriteria, secondScanConfig, orgTypeConfig);
 
             // ── Step 6: cost shut-down rates ──
-            // Of the target cost per message, ~$0.03 is AI and ~$0.02 is post scrapes;
-            // the remainder is the Apify contact-search budget per generated message.
+            // The guard enforces the ALL-IN cost per generated message — contact search
+            // (larger of ledger-measured vs formula estimate) + measured profile/post
+            // scrapes + estimated AI — against the target. It previously watched only the
+            // scan job's Apify ledger cost against (target − $0.05), a number that ran at
+            // ~1/3 of the true all-in spend and let runs sit exactly at the ceiling
+            // without ever tripping.
             const costPerMessage = parseFloat(document.getElementById('fpCostPerMessage').value) || 0.20;
-            const apifyPerMessageLimit = Math.max(0.01, costPerMessage - 0.05);
             const costMinSpend = Math.max(0, parseFloat(document.getElementById('fpCostMinSpend').value) || 0);
-            let costLimitHit = null; // { avgPerMessage, apifyCost, messages } when the guard trips
+            let costLimitHit = null; // { avgPerMessage, allInUsd, breakdown, messages, limitPerMessage } when the guard trips
 
             // Opus review runs whenever Message Review Instructions exist (same requirement
             // as generate_messages.html — no instructions means nothing to review against).
@@ -4698,7 +4705,7 @@
                     opusExcludeMode, crossBdrEnabled, finalReviewEnabled, profileMsgFallback: profileMsgFallbackOn,
                     topContactsCap: { enabled: topContactsEnabled, limit: topContactsLimit },
                     scanCriteria, secondScan: secondScanConfig, orgTypeMode: orgTypeConfig,
-                    costGuard: { costPerMessage, apifyPerMessageLimit, minSpendBeforeEnforcing: costMinSpend },
+                    costGuard: { costPerMessage, enforcesAllInCost: true, minSpendBeforeEnforcing: costMinSpend },
                     scanName, skipAlreadyScanned, alreadyScannedSkippedAtStart: skipAlreadyScanned ? alreadyScannedCount : 0,
                     duplicateRecordsSkippedAtStart: dupeCollapse.extraCount
                 },
@@ -5027,7 +5034,12 @@
                             const ledger = await fpLedgerCostForJob(jobId);
                             orgReport.costs.apifyLedgerUsd = ledger.totalUsd;
                             orgReport.costs.ledgerRuns = ledger.runs;
-                            fpStats.apifyCost += ledger.totalUsd > 0 ? ledger.totalUsd : (orgReport.costs.scanJobHarvestUsd + orgReport.costs.scanJobBebityUsd);
+                            // Take the LARGER of measured-vs-formula for this org's contact-search
+                            // cost. Apify frequently hasn't finished tallying usageTotalUsd when the
+                            // ledger is read right after the run, so "measured" can undercount badly
+                            // (e.g. $1.51 measured vs $2.90 formula on the same run) — the cost
+                            // guard below must not be fed the optimistic number.
+                            fpStats.apifyCost += Math.max(ledger.totalUsd, orgReport.costs.scanJobHarvestUsd + orgReport.costs.scanJobBebityUsd);
                             fpRenderStats();
 
                             // ── 3. Optional: cross-BDR contacts (refresh + import) ──
@@ -5772,24 +5784,44 @@
                         await saveReport();
 
                         // ── Step 6 cost guard — checked after every organization ──
-                        // Stops the run when the average Apify contact-search spend per
-                        // generated message exceeds the shut-down rate (once past the
-                        // minimum-spend grace amount).
-                        if (fpStats.apifyCost >= costMinSpend && fpStats.apifyCost > 0) {
+                        // Stops the run when the ALL-IN average spend per generated message
+                        // exceeds the target (once past the minimum-spend grace amount).
+                        // Uses the SAME buckets as the end-of-run "real cost breakdown", so
+                        // the guard watches the number the run is actually judged by:
+                        // contact search + measured profile/post scrapes + estimated AI.
+                        if (fpStats.apifyCost > 0) {
                             const messagesSoFar = bdrPlan.reduce((s, b) => s + b.generated, 0);
-                            const avgPerMessage = messagesSoFar > 0 ? fpStats.apifyCost / messagesSoFar : Infinity;
+                            let ledgerBuckets = { contactSearch: 0, profileScrape: 0, postScrape: 0, other: 0 };
+                            try {
+                                ledgerBuckets = await fpFetchRealApifyCosts({ bdrEmails: bdrPlan.map(b => b.bdrEmail), sinceIso: report.startedAt });
+                            } catch (e) { console.warn('Cost guard ledger query failed (guard falls back to scan cost + AI only):', e.message); }
+                            const aiEstimateSoFar = fpEstimateAiCost(report.aiCallCounts).totalUsd;
+                            // fpStats.apifyCost already holds max(job-ledger, formula) per org; the
+                            // bdr-window ledger bucket can still be higher when jobId attribution
+                            // missed runs. Take the largest — never the optimistic number.
+                            const contactSearchUsd = Math.max(fpStats.apifyCost, ledgerBuckets.contactSearch || 0);
+                            const allInUsd = contactSearchUsd + (ledgerBuckets.profileScrape || 0) + (ledgerBuckets.postScrape || 0) + (ledgerBuckets.other || 0) + aiEstimateSoFar;
+                            const avgPerMessage = messagesSoFar > 0 ? allInUsd / messagesSoFar : Infinity;
                             // Small epsilon so hitting the limit exactly doesn't trip it
-                            // (e.g. 1.05 / 7 computes to 0.15000000000000002 > 0.15).
-                            if (avgPerMessage > apifyPerMessageLimit + 0.000001) {
+                            // (e.g. 1.4 / 7 computes to 0.20000000000000002 > 0.20).
+                            if (allInUsd >= costMinSpend && avgPerMessage > costPerMessage + 0.000001) {
                                 costLimitHit = {
                                     avgPerMessage: messagesSoFar > 0 ? Number(avgPerMessage.toFixed(4)) : null,
-                                    apifyCost: Number(fpStats.apifyCost.toFixed(4)),
+                                    allInUsd: Number(allInUsd.toFixed(4)),
+                                    apifyCost: Number(fpStats.apifyCost.toFixed(4)), // contact-search spend (kept for older dashboards)
+                                    breakdown: {
+                                        contactSearchUsd: Number(contactSearchUsd.toFixed(4)),
+                                        profileScrapeUsd: Number((ledgerBuckets.profileScrape || 0).toFixed(4)),
+                                        postScrapeUsd: Number((ledgerBuckets.postScrape || 0).toFixed(4)),
+                                        otherApifyUsd: Number((ledgerBuckets.other || 0).toFixed(4)),
+                                        aiEstimateUsd: Number(aiEstimateSoFar.toFixed(4))
+                                    },
                                     messages: messagesSoFar,
-                                    limitPerMessage: apifyPerMessageLimit
+                                    limitPerMessage: costPerMessage
                                 };
-                                addLog(`\n🛑 COST SHUT-DOWN: Apify spend is $${fpStats.apifyCost.toFixed(2)} for ${messagesSoFar} generated message(s)` +
+                                addLog(`\n🛑 COST SHUT-DOWN: all-in spend is $${allInUsd.toFixed(2)} for ${messagesSoFar} generated message(s)` +
                                     (messagesSoFar > 0 ? ` — $${avgPerMessage.toFixed(2)}/message` : '') +
-                                    `, over the $${apifyPerMessageLimit.toFixed(2)}/message limit (target $${costPerMessage.toFixed(2)} total minus ~$0.03 AI + ~$0.02 post scrapes).`, 'error');
+                                    `, over the $${costPerMessage.toFixed(2)}/message target. Breakdown: contact search $${contactSearchUsd.toFixed(2)} + profile scrapes $${(ledgerBuckets.profileScrape || 0).toFixed(2)} + post scrapes $${(ledgerBuckets.postScrape || 0).toFixed(2)} + other Apify $${(ledgerBuckets.other || 0).toFixed(2)} + AI (estimated) $${aiEstimateSoFar.toFixed(2)}.`, 'error');
                                 addLog(`   The Step 4 scan rules are likely finding too few usable contacts per organization — tighten the Job Title Keywords / functions / seniority (or use AI Fill) and run again.`, 'warning');
                                 window.fpStopRequested = true;
                                 break;
