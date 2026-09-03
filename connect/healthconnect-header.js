@@ -70,6 +70,7 @@ const HEALTHCONNECT_CONFIG = {
             items: [
                 // Admin Dashboard & Guide
                 { label: 'Admin Dashboard', href: 'index_admin.html', icon: 'fa-tachometer-alt' },
+                { label: 'Lead Pause Manager', href: 'lead_pause_manager.html', icon: 'fa-circle-pause' },
                 { label: 'Demo: Scheduled Meetings', href: 'demo_review_replies.html', icon: 'fa-calendar-check' },
                 { label: 'Catch Missed Meetings (AI)', href: 'catch_meetings.html', icon: 'fa-magnifying-glass-chart' },
                 { label: 'Scan Conversations (AI)', href: 'scan_conversations.html', icon: 'fa-search-plus' },
@@ -78,6 +79,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'divider' },
                 // Message Generation & Content
                 { label: 'Generate Messages', href: 'generate_messages.html', icon: 'fa-wand-magic-sparkles' },
+                { label: 'Quick Outreach', href: 'quick_outreach.html', icon: 'fa-bolt-lightning' },
                 { label: 'Fast Batch Review', href: 'fast_connect_review.html', icon: 'fa-bolt' },
                 { label: 'Elion Batch Review', href: 'elion_batch_review.html', icon: 'fa-file-import' },
                 { label: 'Reserve Queue', href: 'reserve_queue.html', icon: 'fa-boxes-stacked' },
