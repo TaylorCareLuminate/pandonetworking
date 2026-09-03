@@ -2352,6 +2352,39 @@
                         No message variations added yet. Click "Add Variation" to define a message approach to test.
                     </div>
                 </div>
+
+                <!-- AI Scan & Auto-Assign — retroactively stamps hypothesisVariationId onto
+                     connect_queue docs that were already sent for this group but never got a
+                     variation assigned (or got assigned one that no longer exists on this group).
+                     Reads each message's actual text and classifies it against the variations'
+                     labels/prompts/example messages above — no manual review required, though
+                     anything the AI isn't confident about is left alone. Only shown once the
+                     group is saved (needs a real id + persisted variations to stamp against). -->
+                <div id="variationAiAssignSection" style="display:none; margin-top:1.5rem; padding-top:1.25rem; border-top:2px dashed var(--border);">
+                    <div style="background:linear-gradient(135deg,#f5f3ff 0%,#ede9fe 100%); border:1.5px solid #c4b5fd; border-radius:14px; padding:1.25rem 1.5rem;">
+                        <div style="display:flex; align-items:center; gap:0.6rem; margin-bottom:0.5rem;">
+                            <i class="fas fa-robot" style="color:#7c3aed; font-size:1.1rem;"></i>
+                            <h4 style="margin:0; font-size:1rem; font-weight:800; color:#4c1d95;">AI Scan &amp; Auto-Assign Variations</h4>
+                        </div>
+                        <p style="font-size:0.83rem; color:#5b21b6; margin:0 0 1rem; line-height:1.6;">
+                            Finds every connection already sent for this group that's missing a variation stamp (or carries
+                            one that doesn't match a variation above), reads each message's actual text, and automatically
+                            assigns the variation it best matches — using each variation's label, prompt, and example
+                            message as the classification rules. This only edits reporting fields on already-sent
+                            <code>connect_queue</code> records — nothing gets re-sent — and anything the AI isn't confident
+                            about is left alone instead of guessed at.
+                        </p>
+                        <div id="variationAiAssignUnsavedWarn" style="display:none; font-size:0.78rem; color:#9a3412; background:#fff7ed; border:1px solid #fdba74; border-radius:8px; padding:0.5rem 0.75rem; margin-bottom:0.85rem;">
+                            <i class="fas fa-triangle-exclamation" style="margin-right:0.3rem;"></i>
+                            You have unsaved variation changes — <strong>Save Group</strong> first so the scan classifies
+                            against your latest labels/prompts/examples.
+                        </div>
+                        <button class="btn btn-primary" id="variationAiAssignBtn" onclick="runGroupAiAutoAssign()" style="background:#7c3aed;border-color:#7c3aed;">
+                            <i class="fas fa-robot"></i> Scan Sent Messages &amp; Auto-Assign
+                        </button>
+                        <div id="variationAiAssignStatus" style="margin-top:0.85rem; font-size:0.85rem; color:#5b21b6; line-height:1.6; white-space:pre-line;"></div>
+                    </div>
+                </div>
             </div>
         </div>
         <div class="modal-footer">
@@ -3996,6 +4029,7 @@
         const noMsg = document.getElementById('noVariationsMsg');
         const badge = document.getElementById('variationCountBadge');
         if (badge) badge.textContent = pendingVariations.length;
+        updateVariationAiAssignVisibility();
         if (!pendingVariations.length) {
             list.innerHTML = '';
             noMsg.style.display = '';
@@ -4060,6 +4094,242 @@
     window.updateVariationSharePercent = (idx, v) => { if (pendingVariations[idx]) pendingVariations[idx].sharePercent = v === '' ? 0 : Math.max(0, Math.min(100, parseFloat(v) || 0)); };
     window.updateVariationAiCriteria   = (idx, v) => { if (pendingVariations[idx]) pendingVariations[idx].aiCriteria = v; };
     window.updateVariationColor   = (idx, v) => { if (pendingVariations[idx]) pendingVariations[idx].color = v; };
+
+    // ── AI Scan & Auto-Assign Variations ──────────────────────────────────────
+    // Retroactively stamps hypothesisVariationId onto already-sent connect_queue docs
+    // for the currently-open group by reading each message's actual text and classifying
+    // it against the group's variations (label + prompt + example message), reusing the
+    // exact same AI classification approach as the "Queue 1 ↔ Message Variation Batcher"
+    // section's "AI: Group Messages into Variations" tool below (_q1AiBuildCriteria /
+    // _q1AiResolveVariation / contact-type-filter) — but fully automatic (no bucket-by-bucket
+    // review, no manual BDR checklist) since it resolves the group's own senders itself and
+    // applies every confident match immediately. Anything the AI can't confidently match is
+    // left untouched rather than guessed at.
+
+    // Fixed-order signature so comparing "saved vs. pending" variations doesn't depend on
+    // Firestore's/JS's arbitrary object key ordering (a naive JSON.stringify compare would
+    // false-positive on "unsaved changes" for identical data with keys in a different order).
+    function _variationsSignature(arr) {
+        return (arr || []).map(v => [v.id, v.label, v.prompt, v.exampleMessage, v.sharePercent, v.aiCriteria].join('\u0001')).join('\u0002');
+    }
+
+    // Shows the AI Scan & Auto-Assign box only for an already-saved group (a real
+    // hypothesisGroupId is required to query/stamp connect_queue) that currently has at
+    // least one variation. Warns if the Variations tab has unsaved edits, since the scan
+    // always classifies against the group's SAVED messageVariations — variation ids that
+    // only exist in pendingVariations (unsaved) can't be stamped meaningfully yet.
+    function updateVariationAiAssignVisibility() {
+        const section = document.getElementById('variationAiAssignSection');
+        const warn    = document.getElementById('variationAiAssignUnsavedWarn');
+        if (!section) return;
+        if (!currentGroupId || !pendingVariations.length) {
+            section.style.display = 'none';
+            return;
+        }
+        section.style.display = '';
+        const savedGroup      = allGroups.find(g => g.id === currentGroupId);
+        const savedVariations = savedGroup?.messageVariations || [];
+        const unsaved = _variationsSignature(savedVariations) !== _variationsSignature(pendingVariations);
+        if (warn) warn.style.display = unsaved ? '' : 'none';
+    }
+
+    window.runGroupAiAutoAssign = async function() {
+        const groupId = currentGroupId;
+        if (!groupId) return;
+        const btn    = document.getElementById('variationAiAssignBtn');
+        const status = document.getElementById('variationAiAssignStatus');
+        const setStatus = (html) => { if (status) status.innerHTML = html; };
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Scanning…'; }
+        setStatus('');
+
+        try {
+            // 1. Always re-read the SAVED group from Firestore — never pendingVariations —
+            // so every id we stamp onto connect_queue is guaranteed to match a variation
+            // that's actually persisted (avoids recreating the "unknown variation id" bug
+            // Outcomes/Fast Connect Review had to be hardened against).
+            setStatus('Loading saved group & variations…');
+            const groupSnap = await getDoc(doc(db, 'hypothesis_groups', groupId));
+            if (!groupSnap.exists) throw new Error('Group not found — save it first.');
+            let groupDoc = { id: groupId, ...groupSnap.data() };
+            const variations = groupDoc.messageVariations || [];
+            if (!variations.length) {
+                setStatus('This group has no <strong>saved</strong> message variations yet — add some above and click <strong>Save Group</strong> first.');
+                return;
+            }
+            const knownVarIds = new Set(variations.map(v => v.id));
+
+            if (groupDoc._chunked) {
+                setStatus('Resolving tagged contacts for this group…');
+                const { urls } = await _readGroupContacts(doc(db, 'hypothesis_groups', groupId), groupDoc);
+                groupDoc.contactLinkedInUrls = urls;
+            }
+            const groupUrlSet   = slugSet(groupDoc.contactLinkedInUrls || []);
+            const groupBatchSet = new Set(groupDoc.sourceBatchIds || []);
+
+            // 2. Resolve this group's real senders without requiring a manual BDR checklist:
+            // the group's own bdrEmails/bdrEmail, plus every account_email already found on a
+            // message stamped with this group's id (ground truth from Fast Connect Review /
+            // Full Pipeline / Full AI Generate), plus each of those emails' LinkedIn-login
+            // alias — same three-way resolution runQueue1CorrelationScan uses.
+            setStatus('Finding this group\'s senders…');
+            const groupBdrEmails = groupDoc.bdrEmails?.length ? groupDoc.bdrEmails : (groupDoc.bdrEmail ? [groupDoc.bdrEmail] : []);
+            let stampedSnapDocs = [];
+            try {
+                const stampSnap = await getAllDocs(
+                    query(collection(db, 'connect_queue'), where('hypothesisGroupId', '==', groupId)),
+                    { pageSize: 2000, timeoutMs: 120000, maxRetries: 3 }
+                );
+                stampedSnapDocs = stampSnap.docs;
+            } catch (e) { console.warn('[AI AutoAssign] stamp query failed:', e.message); }
+            const stampedSenderEmails = [...new Set(stampedSnapDocs.map(d => (d.data().account_email || '').trim()).filter(Boolean))];
+            const emailAssoc  = await _q1LoadEmailAssociations();
+            const baseEmails  = [...new Set([...groupBdrEmails, ...stampedSenderEmails])];
+            const aliasEmails = baseEmails.map(e => emailAssoc.get(e.toLowerCase())).filter(Boolean);
+            const effectiveBdrEmails = [...new Set([...baseEmails, ...aliasEmails])];
+            if (!effectiveBdrEmails.length) {
+                setStatus('No BDR(s) found for this group yet — assign at least one on the Overview tab and save first.');
+                return;
+            }
+
+            // 3. Load every connect_queue record for those senders.
+            setStatus(`Loading sent messages for ${effectiveBdrEmails.length} BDR(s)…`);
+            const seenIds = new Set();
+            const allDocs = [];
+            await Promise.all(effectiveBdrEmails.map(async (email) => {
+                const variants = [...new Set([email, email.toLowerCase()])];
+                const snaps = await Promise.all(variants.map(v => getAllDocs(
+                    query(collection(db, 'connect_queue'), where('account_email', '==', v)),
+                    { pageSize: 2000, timeoutMs: 150000, maxRetries: 3 }
+                ).catch(e => { console.warn('[AI AutoAssign] connect_queue load failed for', v, e.message); return null; })));
+                snaps.forEach(s => { if (!s) return; s.docs.forEach(d => { if (!seenIds.has(d.id)) { seenIds.add(d.id); allDocs.push(d); } }); });
+            }));
+            stampedSnapDocs.forEach(d => { if (!seenIds.has(d.id)) { seenIds.add(d.id); allDocs.push(d); } });
+
+            // 4. Filter to: belongs to this group (stamp/batch/URL), actually sent live,
+            // has message text, and is missing a variation or carries one that no longer
+            // matches anything defined on this group.
+            const belongsToGroup = d => {
+                if (d.hypothesisGroupId === groupId) return true;
+                if (d.source_batch_id && groupBatchSet.has(d.source_batch_id)) return true;
+                const rawUrl = d.prospect_li_url || d.contact_linkedin_url || d.linkedin_url || '';
+                return urlInSet(rawUrl, groupUrlSet);
+            };
+            const allDocsData = allDocs.map(d => ({ id: d.id, ...d.data() })).filter(d => !d.deleted);
+            const candidates = allDocsData
+                .filter(belongsToGroup)
+                .filter(_q1WasSentLive)
+                .filter(d => (d.message_to_contact || '').trim())
+                .filter(d => !d.hypothesisVariationId || !knownVarIds.has(d.hypothesisVariationId));
+
+            if (!candidates.length) {
+                setStatus('✅ Nothing to do — every sent message for this group already carries a variation that matches one defined above.');
+                return;
+            }
+
+            // 5. Classify each UNIQUE message text once (batches usually share a template).
+            setStatus(`Classifying ${candidates.length.toLocaleString()} message(s) (deduping identical text)…`);
+            const criteria = _q1AiBuildCriteria(variations);
+            const textToDocs = new Map();
+            candidates.forEach(d => {
+                const t = d.message_to_contact.trim();
+                if (!textToDocs.has(t)) textToDocs.set(t, []);
+                textToDocs.get(t).push(d);
+            });
+            const uniqueTexts = [...textToDocs.keys()];
+            const textResult = new Map(); // text -> variation | null
+            let completed = 0;
+            for (let i = 0; i < uniqueTexts.length; i += Q1_AI_CONCURRENCY) {
+                const slice = uniqueTexts.slice(i, i + Q1_AI_CONCURRENCY);
+                const results = await Promise.all(slice.map((text, idx) => new Promise(resolve => setTimeout(async () => {
+                    try {
+                        const resp = await fetch(`${RAILWAY_BASE}/api/connect/contact-type-filter`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                title: '', company: '',
+                                message: text.slice(0, 1500),
+                                filterCriteria: criteria,
+                                contactId: null, contactCollection: null
+                            })
+                        });
+                        if (!resp.ok) return resolve({ text, v: null });
+                        const d = await resp.json();
+                        resolve({ text, v: _q1AiResolveVariation(d.reason || '', variations) });
+                    } catch { resolve({ text, v: null }); }
+                }, idx * Q1_AI_CALL_DELAY_MS))));
+                results.forEach(({ text, v }) => { textResult.set(text, v); completed++; });
+                setStatus(`Classifying… ${completed.toLocaleString()} / ${uniqueTexts.length.toLocaleString()} unique message(s) (${candidates.length.toLocaleString()} total)`);
+            }
+
+            // 6. Auto-apply every confident match; leave "no clear match" docs untouched.
+            const tally = new Map(variations.map(v => [v.id, 0]));
+            const toWrite = [];
+            let unmatched = 0;
+            candidates.forEach(d => {
+                const v = textResult.get(d.message_to_contact.trim());
+                if (v) { tally.set(v.id, (tally.get(v.id) || 0) + 1); toWrite.push({ doc: d, variation: v }); }
+                else unmatched++;
+            });
+
+            if (toWrite.length) {
+                setStatus(`Saving ${toWrite.length.toLocaleString()} match(es)…`);
+                // Merge matched contacts' URLs / batch IDs into the group (chunk-safe), same as
+                // assignQ1CorrBucket/applyQ1CorrAiGroup, so outcomes.html's URL/batch matching
+                // stays in agreement with the stamps about to be written.
+                const groupRef = doc(db, 'hypothesis_groups', groupId);
+                const { urls: existingUrls, tagged: existingTagged } = await _readGroupContacts(groupRef, groupDoc);
+                const haveSet = slugSet(existingUrls);
+                const rawUrls = toWrite.map(j => j.doc.prospect_li_url || j.doc.contact_linkedin_url || j.doc.linkedin_url || '').filter(Boolean);
+                const newUrls = rawUrls.filter(u => !urlInSet(u, haveSet));
+                if (newUrls.length) await _writeGroupContacts(groupRef, [...existingUrls, ...newUrls], existingTagged);
+                const newBatches = [...new Set(toWrite.map(j => j.doc.source_batch_id).filter(Boolean))]
+                    .filter(bid => !(groupDoc.sourceBatchIds || []).includes(bid));
+                if (newUrls.length || newBatches.length) {
+                    await updateDoc(groupRef, {
+                        sourceBatchIds: [...(groupDoc.sourceBatchIds || []), ...newBatches],
+                        updatedAt: Timestamp.now()
+                    });
+                }
+
+                const who = auth.currentUser?.email || 'ai_auto_assign';
+                const nowIso = new Date().toISOString();
+                const CHUNK = 15;
+                let failed = 0;
+                for (let i = 0; i < toWrite.length; i += CHUNK) {
+                    const chunk = toWrite.slice(i, i + CHUNK);
+                    await Promise.all(chunk.map(j => updateDoc(doc(db, 'connect_queue', j.doc.id), {
+                        hypothesisGroupId:               groupId,
+                        hypothesisGroupName:              groupDoc.name || null,
+                        hypothesisVariationId:            j.variation.id,
+                        hypothesisVariationLabel:          j.variation.label || null,
+                        hypothesisVariationPriorValue:     j.doc.hypothesisVariationId || null,
+                        hypothesisVariationAiAssignedAt:   nowIso,
+                        hypothesisVariationAiAssignedBy:   who
+                    }).catch(e => { failed++; console.warn('[AI AutoAssign] write failed for', j.doc.id, e.message); })));
+                    setStatus(`Saving… ${Math.min(i + CHUNK, toWrite.length).toLocaleString()} / ${toWrite.length.toLocaleString()}`);
+                }
+
+                const perVarLines = variations
+                    .filter(v => tally.get(v.id))
+                    .map(v => `• ${escHtml(v.label || v.id)}: ${tally.get(v.id).toLocaleString()}`)
+                    .join('\n');
+                setStatus(
+                    `✅ Scanned ${candidates.length.toLocaleString()} message(s) → <strong>${(toWrite.length - failed).toLocaleString()} auto-assigned</strong>` +
+                    (unmatched ? `, ${unmatched.toLocaleString()} left unmatched (no confident variation match — safe to leave, or assign by hand in Fast Connect Review / the Queue 1 batcher below)` : '') +
+                    (failed ? `, ${failed.toLocaleString()} failed to save (see console)` : '') +
+                    (perVarLines ? `\n${perVarLines}` : '')
+                );
+                await loadGroups();
+            } else {
+                setStatus(`Scanned ${candidates.length.toLocaleString()} message(s) — the AI wasn't confident enough to match any of them to a variation. Nothing was changed; try tightening up the variations' prompts/example messages, or assign these by hand in Fast Connect Review / the Queue 1 batcher below.`);
+            }
+        } catch (e) {
+            console.error('[AI AutoAssign]', e);
+            setStatus(`❌ Error: ${escHtml(e.message)}`);
+        } finally {
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-robot"></i> Scan Sent Messages &amp; Auto-Assign'; }
+        }
+    };
 
     // ── Scan Mode UI toggle ──
     window.updateScanModeUI = function() {
