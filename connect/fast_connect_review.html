@@ -3599,12 +3599,25 @@
             const perGroupCount = new Map(); // groupId -> count
             const perGroupRotationIdx = new Map(); // groupId -> next round-robin index for un-stamped messages
             loadedMessages.forEach(m => {
-                const url = _fcrNormalizeUrl(_fcrMsgUrl(m));
-                let matchedGroup = null;
-                if (url) {
-                    for (const g of _hypothesisGroups) {
-                        const urlSet = _fcrHypUrlCache.get(g.id);
-                        if (urlSet && urlSet.has(url)) { matchedGroup = g; break; }
+                // Ground truth first: if the doc was already stamped with a hypothesisGroupId at
+                // generation time (Full Pipeline / Full AI Generate), trust that over re-deriving
+                // the group purely by URL match. A contact's LinkedIn URL can legitimately be
+                // tagged in more than one hypothesis group (e.g. a broad company-wide group plus a
+                // narrower A/B test group) — blind URL-matching would then pick whichever group
+                // happens to come first in _hypothesisGroups, which can silently move the message
+                // to a group with no/different messageVariations and wipe its hypothesisVariationId
+                // when approved (see full_pipeline.html's Data Repair tool for the same root cause
+                // on the generation side). Only fall back to URL-matching when there's no stamp.
+                let matchedGroup = m.hypothesisGroupId
+                    ? (_hypothesisGroups.find(g => g.id === m.hypothesisGroupId) || null)
+                    : null;
+                if (!matchedGroup) {
+                    const url = _fcrNormalizeUrl(_fcrMsgUrl(m));
+                    if (url) {
+                        for (const g of _hypothesisGroups) {
+                            const urlSet = _fcrHypUrlCache.get(g.id);
+                            if (urlSet && urlSet.has(url)) { matchedGroup = g; break; }
+                        }
                     }
                 }
                 if (matchedGroup) {
@@ -3680,6 +3693,22 @@
             if (!groupId && !variationId) return {};
             const group = groupId ? _hypothesisGroups.find(g => g.id === groupId) : null;
             const variation = variationId ? (group?.messageVariations || []).find(v => v.id === variationId) : null;
+            // Safety net: if the group we matched this message to (by stamp or URL — see
+            // computeFcrHypothesisBreakdown) defines NO variations at all, there's neither a
+            // reviewer pick nor a round-robin default to fall back on for variationId. Rather than
+            // writing hypothesisVariationId: null and silently erasing a variation this message was
+            // actually generated with, preserve whatever the doc already carries in that case.
+            if (!variation && !(group?.messageVariations || []).length) {
+                const original = loadedMessages.find(m => m.id === messageId);
+                if (original?.hypothesisVariationId) {
+                    return {
+                        hypothesisGroupId:        groupId || null,
+                        hypothesisGroupName:      group?.name || null,
+                        hypothesisVariationId:    original.hypothesisVariationId,
+                        hypothesisVariationLabel: original.hypothesisVariationLabel || null
+                    };
+                }
+            }
             return {
                 hypothesisGroupId:        groupId || null,
                 hypothesisGroupName:      group?.name || null,

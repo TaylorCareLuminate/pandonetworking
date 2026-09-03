@@ -1473,7 +1473,12 @@
                 <h3 style="color:#9a3412;">
                     <i class="fas fa-vial" style="color:#ea580c;"></i> Outcomes by Message Variation
                 </h3>
-                <div class="card-meta" id="variationBreakdownMeta"></div>
+                <div style="display:flex;align-items:center;gap:0.9rem;flex-wrap:wrap;">
+                    <div class="card-meta" id="variationBreakdownMeta"></div>
+                    <button id="variationCleanupOpenBtn" onclick="openVariationCleanup()" style="display:none;background:#fff7ed;border:1.5px solid #fdba74;color:#9a3412;font-weight:700;font-size:0.8rem;padding:0.4rem 0.8rem;border-radius:8px;cursor:pointer;white-space:nowrap;">
+                        <i class="fas fa-broom"></i> <span id="variationCleanupOpenBtnLabel">Fix Missing Variations</span>
+                    </button>
+                </div>
             </div>
             <div class="card-body">
                 <table class="outcome-table">
@@ -1496,6 +1501,55 @@
                         Define variations on this group's Message Variations tab in
                         <a href="connect_hypothesis_documentation.html" target="_blank">Hypothesis Documentation</a>.
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Message Variation Cleanup — backfill/repair hypothesisVariationId on connect_queue
+             docs that were already sent but never got a variation stamped (or got stamped with
+             an id that no longer matches any variation on this group). This does NOT re-send
+             anything — it only edits the reporting fields on already-sent connect_queue docs. -->
+        <div class="card" id="variationCleanupCard" style="display:none; border-top:4px solid #9a3412;">
+            <div class="card-header">
+                <h3 style="color:#9a3412;">
+                    <i class="fas fa-broom"></i> Fix Missing / Unmatched Variations
+                </h3>
+                <div class="card-meta" id="variationCleanupMeta"></div>
+            </div>
+            <div class="card-body" style="padding:1.25rem 1.75rem;">
+                <div style="font-size:0.85rem;color:var(--gray-600);background:#fff7ed;border:1px solid #fdba74;border-radius:8px;padding:0.75rem 1rem;margin-bottom:1rem;line-height:1.5;">
+                    <i class="fas fa-info-circle" style="color:#ea580c;margin-right:0.3rem;"></i>
+                    These connections were already sent, but their <code>hypothesisVariationId</code> is missing or doesn't match a
+                    variation currently defined on this group. Assign the variation each contact actually received below — this only
+                    edits reporting fields on the existing <code>connect_queue</code> record, nothing gets re-sent.
+                </div>
+                <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;margin-bottom:1rem;">
+                    <button onclick="variationCleanupSelectAll(true)" style="background:#fff;border:1.5px solid #d1d5db;color:#374151;font-weight:600;font-size:0.78rem;padding:0.4rem 0.7rem;border-radius:6px;cursor:pointer;">Select All</button>
+                    <button onclick="variationCleanupSelectAll(false)" style="background:#fff;border:1.5px solid #d1d5db;color:#374151;font-weight:600;font-size:0.78rem;padding:0.4rem 0.7rem;border-radius:6px;cursor:pointer;">Select None</button>
+                    <span style="width:1px;height:22px;background:#e5e7eb;"></span>
+                    <label style="font-size:0.8rem;color:#374151;font-weight:600;">Bulk-assign selected to:</label>
+                    <select id="variationCleanupBulkSelect" style="font-size:0.8rem;padding:0.35rem 0.6rem;border:1.5px solid #fdba74;border-radius:6px;background:#fff7ed;color:#9a3412;font-weight:600;"></select>
+                    <button onclick="variationCleanupApplyBulk()" style="background:#0F2D4D;color:#fff;font-weight:700;font-size:0.78rem;padding:0.45rem 0.9rem;border-radius:6px;border:none;cursor:pointer;">Apply to Selected</button>
+                    <span style="flex:1;"></span>
+                    <button onclick="variationCleanupSaveAll()" id="variationCleanupSaveBtn" style="background:#10b981;color:#fff;font-weight:700;font-size:0.8rem;padding:0.5rem 1.1rem;border-radius:6px;border:none;cursor:pointer;">
+                        <i class="fas fa-save"></i> Save Changes
+                    </button>
+                </div>
+                <div id="variationCleanupStatus" style="font-size:0.82rem;color:var(--gray-500);margin-bottom:0.75rem;"></div>
+                <div style="max-height:520px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;">
+                    <table class="outcome-table" style="margin:0;">
+                        <thead>
+                            <tr>
+                                <th style="width:32px;"></th>
+                                <th>Contact</th>
+                                <th>Company / Title</th>
+                                <th>Message Sent</th>
+                                <th>Current Stamp</th>
+                                <th style="width:220px;">Assign Variation</th>
+                            </tr>
+                        </thead>
+                        <tbody id="variationCleanupBody"></tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -1743,7 +1797,7 @@
     const auth   = window.auth;
     const emailDB = window.clemailDb;
     const {
-        collection, query, where, getDocs, getDoc, doc, orderBy, limit, Timestamp, setDoc
+        collection, query, where, getDocs, getDoc, doc, orderBy, limit, Timestamp, setDoc, updateDoc, writeBatch
     } = window.clemailFirestore;
 
     // ── State ──────────────────────────────────────────────────────────────
@@ -1754,6 +1808,7 @@
     let linkedInAccountIdMapping = new Map(); // heyreachAccountId → bdrEmail
     let linkedInEmailAssociations = new Map(); // authEmail → linkedInEmail
     let _outcomeGroups       = [];       // all hypothesis_groups docs — shared across tabs
+    let _varCleanupState     = null;     // { group, variations, candidates: [{docData, selected, assign}] } — Fix Missing Variations panel
     let _hypoBreakdownView   = 'overview'; // 'overview' | 'bdr' | 'month'
     let _hypoLastData        = null;    // cached render data for view switching
 
@@ -2808,6 +2863,31 @@
 
         if (!rows.length) { card.style.display = 'none'; return; }
 
+        // ── Cleanup candidates: every sent connect_queue doc with no hypothesisVariationId,
+        // or one that doesn't match any variation currently defined on this group. Stashed on
+        // module state so the "Fix Missing Variations" panel can edit them without re-querying.
+        const cleanupCandidates = sentItems.filter(m => !m.hypothesisVariationId || !knownVarIds.has(m.hypothesisVariationId));
+        _varCleanupState = {
+            group, variations,
+            acceptedUrlSet, repliedUrlSet, scheduledUrlSet,
+            candidates: cleanupCandidates.map(m => ({
+                docData: m,
+                selected: true,
+                assign: '' // variation id chosen in the panel; '' = leave alone
+            }))
+        };
+        const openBtn = document.getElementById('variationCleanupOpenBtn');
+        const openBtnLabel = document.getElementById('variationCleanupOpenBtnLabel');
+        if (openBtn) {
+            if (cleanupCandidates.length) {
+                openBtn.style.display = '';
+                openBtnLabel.textContent = `Fix ${cleanupCandidates.length.toLocaleString()} Missing Variation${cleanupCandidates.length !== 1 ? 's' : ''}`;
+            } else {
+                openBtn.style.display = 'none';
+                document.getElementById('variationCleanupCard').style.display = 'none';
+            }
+        }
+
         meta.textContent = `${variations.length} variation${variations.length !== 1 ? 's' : ''} defined · assigned in Fast Connect Review, or automatically by Full AI Generate / Full Pipeline`;
 
         body.innerHTML = rows.map(r => {
@@ -2832,6 +2912,161 @@
 
         card.style.display = '';
     }
+
+    // ── Message Variation Cleanup panel ───────────────────────────────────
+    // Lets an admin backfill hypothesisVariationId on connect_queue docs that were already
+    // sent but never got a variation stamped (or got stamped with a since-deleted/renamed
+    // variation id) — see _varCleanupState, populated by renderVariationBreakdown() above.
+    // This only edits reporting fields on the existing doc; nothing is re-sent.
+    function _varCleanupMsgLabel(m) {
+        const first = m.contactFirstName || m.contact_first_name || m.prospect_first_name || '';
+        const last  = m.contactLastName  || m.contact_last_name  || m.prospect_last_name  || '';
+        const full  = `${first} ${last}`.trim();
+        return full || m.prospect_name || m.contact_linkedin_url || m.prospect_li_url || m.id;
+    }
+
+    window.openVariationCleanup = function() {
+        if (!_varCleanupState) return;
+        renderVariationCleanupPanel();
+        const card = document.getElementById('variationCleanupCard');
+        card.style.display = '';
+        card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+
+    function renderVariationCleanupPanel() {
+        const st = _varCleanupState;
+        if (!st) return;
+        const meta = document.getElementById('variationCleanupMeta');
+        const body = document.getElementById('variationCleanupBody');
+        const bulkSel = document.getElementById('variationCleanupBulkSelect');
+        if (!body) return;
+
+        meta.textContent = `${st.candidates.length.toLocaleString()} sent connection${st.candidates.length !== 1 ? 's' : ''} need${st.candidates.length === 1 ? 's' : ''} a variation assigned`;
+
+        const variationOptions = st.variations.map(v => `<option value="${v.id}">${escHtml(v.label || v.id)}</option>`).join('');
+        bulkSel.innerHTML = `<option value="">— Select a variation —</option>${variationOptions}`;
+
+        if (!st.candidates.length) {
+            body.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--gray-400);padding:1.5rem;">Nothing left to fix — every sent connection in this group carries a valid variation stamp. 🎉</td></tr>`;
+            return;
+        }
+
+        body.innerHTML = st.candidates.map((c, idx) => {
+            const m = c.docData;
+            const company = m.prospect_company || m.contactCompany || m.company_name || '';
+            const title = m.prospect_title || m.contactTitle || '';
+            const msgSnippet = (m.message_to_contact || m.original_ai_message || '').substring(0, 140);
+            const currentStamp = m.hypothesisVariationId
+                ? `<span style="background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:10px;padding:0.15rem 0.5rem;font-size:0.72rem;font-weight:600;">Unknown id: ${escHtml(m.hypothesisVariationId)}</span>`
+                : `<span style="background:#f3f4f6;color:#6b7280;border:1px solid #e5e7eb;border-radius:10px;padding:0.15rem 0.5rem;font-size:0.72rem;font-weight:600;">No variation</span>`;
+            const liUrl = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
+            return `<tr id="variationCleanupRow_${idx}">
+                <td><input type="checkbox" ${c.selected ? 'checked' : ''} onchange="variationCleanupToggleRow(${idx}, this.checked)"></td>
+                <td>
+                    ${liUrl ? `<a href="${escHtml(liUrl)}" target="_blank" style="color:#0F2D4D;font-weight:600;text-decoration:none;">${escHtml(_varCleanupMsgLabel(m))}</a>` : `<strong>${escHtml(_varCleanupMsgLabel(m))}</strong>`}
+                </td>
+                <td style="font-size:0.8rem;color:var(--gray-600);">${escHtml(company)}${title ? `<br><span style="color:var(--gray-400);">${escHtml(title)}</span>` : ''}</td>
+                <td style="font-size:0.78rem;color:var(--gray-500);max-width:280px;">${escHtml(msgSnippet)}${(m.message_to_contact || '').length > 140 ? '…' : ''}</td>
+                <td>${currentStamp}</td>
+                <td>
+                    <select style="width:100%;font-size:0.78rem;padding:0.3rem 0.5rem;border:1.5px solid #fdba74;border-radius:6px;background:#fff7ed;color:#9a3412;font-weight:600;" onchange="variationCleanupSetAssign(${idx}, this.value)">
+                        <option value="">— No change —</option>
+                        ${st.variations.map(v => `<option value="${v.id}" ${c.assign === v.id ? 'selected' : ''}>${escHtml(v.label || v.id)}</option>`).join('')}
+                    </select>
+                </td>
+            </tr>`;
+        }).join('');
+    }
+
+    window.variationCleanupSelectAll = function(sel) {
+        if (!_varCleanupState) return;
+        _varCleanupState.candidates.forEach(c => c.selected = sel);
+        renderVariationCleanupPanel();
+    };
+
+    window.variationCleanupToggleRow = function(idx, checked) {
+        if (!_varCleanupState?.candidates[idx]) return;
+        _varCleanupState.candidates[idx].selected = checked;
+    };
+
+    window.variationCleanupSetAssign = function(idx, variationId) {
+        if (!_varCleanupState?.candidates[idx]) return;
+        _varCleanupState.candidates[idx].assign = variationId;
+    };
+
+    window.variationCleanupApplyBulk = function() {
+        const st = _varCleanupState;
+        if (!st) return;
+        const variationId = document.getElementById('variationCleanupBulkSelect')?.value || '';
+        if (!variationId) { alert('Pick a variation to bulk-assign first.'); return; }
+        st.candidates.forEach(c => { if (c.selected) c.assign = variationId; });
+        renderVariationCleanupPanel();
+    };
+
+    window.variationCleanupSaveAll = async function() {
+        const st = _varCleanupState;
+        if (!st) return;
+        const toSave = st.candidates.filter(c => c.selected && c.assign);
+        const status = document.getElementById('variationCleanupStatus');
+        if (!toSave.length) { alert('Nothing to save — select at least one row and assign it a variation first.'); return; }
+
+        const btn = document.getElementById('variationCleanupSaveBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…';
+        status.textContent = `Saving ${toSave.length.toLocaleString()} record(s)…`;
+
+        const nowIso = new Date().toISOString();
+        const who = window.auth?.currentUser?.email || 'outcomes_variation_cleanup';
+        let ok = 0, failed = 0;
+        const CHUNK = 400; // writeBatch cap safety margin (1 op/doc)
+        for (let i = 0; i < toSave.length; i += CHUNK) {
+            const chunk = toSave.slice(i, i + CHUNK);
+            const batch = writeBatch(emailDB);
+            for (const c of chunk) {
+                const variation = st.variations.find(v => v.id === c.assign);
+                if (!variation) continue;
+                batch.update(doc(emailDB, 'connect_queue', c.docData.id), {
+                    hypothesisGroupId: st.group.id,
+                    hypothesisGroupName: st.group.name || st.group.id,
+                    hypothesisVariationId: variation.id,
+                    hypothesisVariationLabel: variation.label || variation.id,
+                    hypothesisVariationPriorValue: c.docData.hypothesisVariationId || null,
+                    hypothesisVariationBackfilledAt: nowIso,
+                    hypothesisVariationBackfilledBy: who
+                });
+            }
+            try {
+                await batch.commit();
+                ok += chunk.length;
+                // Reflect the fix locally so the funnel table + candidate list update without a re-query
+                chunk.forEach(c => {
+                    const variation = st.variations.find(v => v.id === c.assign);
+                    c.docData.hypothesisGroupId = st.group.id;
+                    c.docData.hypothesisGroupName = st.group.name || st.group.id;
+                    c.docData.hypothesisVariationId = variation.id;
+                    c.docData.hypothesisVariationLabel = variation.label || variation.id;
+                });
+            } catch (e) {
+                failed += chunk.length;
+                console.error('[VariationCleanup] batch save failed:', e);
+            }
+        }
+
+        status.textContent = `Done — ${ok.toLocaleString()} saved${failed ? `, ${failed.toLocaleString()} failed` : ''}.`;
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-save"></i> Save Changes';
+
+        // c.docData mutations above are in-place edits to the same objects held in
+        // _grouperSentItems (renderVariationBreakdown's sentItems), so re-running it recomputes
+        // both the funnel table and a fresh (now-shorter) cleanup candidate list with no re-fetch.
+        renderVariationBreakdown(st.group, _grouperSentItems, st.acceptedUrlSet, st.repliedUrlSet, st.scheduledUrlSet);
+        if (_varCleanupState && _varCleanupState.candidates.length) {
+            document.getElementById('variationCleanupCard').style.display = '';
+            renderVariationCleanupPanel();
+        } else {
+            document.getElementById('variationCleanupCard').style.display = 'none';
+        }
+    };
 
     // ── Hypothesis Group Breakdown (BDR / Company view) ──────────────────
     async function renderHypothesisGroupBreakdown(bdrEmailSet, sentItems, sentItemsAllTime, acceptedUrls, repliedUrls, scheduledUrls) {
