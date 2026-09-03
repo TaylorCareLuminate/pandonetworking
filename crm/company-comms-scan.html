@@ -4230,16 +4230,17 @@
     const staleReconnect = !hexOnly && last1to1 && daysAgo(last1to1) >= staleDays;
     const emailsForSummary = hexOnly ? hexEmails : otherEmails;
 
-    const emailLines = emailsForSummary.slice(0, 20).map(e => {
-      const daysAgo = e.date ? Math.floor((Date.now() - new Date(e.date)) / 86400000) : '?';
-      const dir     = (e.folder === 'SENT' || e.folder === 'SentItems') ? 'SENT' : 'RECEIVED';
-      return `  [${daysAgo}d ago | ${dir}] "${e.subject}" — from ${e.from || '?'} to ${e.to || '?'} | "${(e.snippet || '').slice(0, 120)}"`;
+    const emailLines = sortByDateDesc(emailsForSummary).slice(0, 20).map(e => {
+      const dir = (e.folder === 'SENT' || e.folder === 'SentItems') ? 'SENT by us' : 'RECEIVED';
+      return `  [${fuDateLabel(e.date)} | ${dir}] "${e.subject}" — from ${e.from || '?'} to ${e.to || '?'} | "${(e.snippet || '').slice(0, 120)}"`;
     }).join('\n');
 
-    const liLines = (scan.linkedInMessages || []).slice(0, 8).map(li => {
-      const daysAgo = li.date ? Math.floor((Date.now() - new Date(li.date)) / 86400000) : '?';
-      return `  [${daysAgo}d ago] ${li.leadName || '?'} (${li.leadPosition || ''}): "${(li.lastMessage || '').slice(0, 150)}" [${li.messageCount || '?'} msgs]`;
-    }).join('\n');
+    const liLines = [...(scan.linkedInMessages || [])]
+      .sort((a, b) => liEffectiveDate(b) - liEffectiveDate(a))
+      .slice(0, 8).map(li => {
+        const eff = liEffectiveDate(li);
+        return `  [${eff ? fuDateLabel(new Date(eff)) : 'unknown date'}] ${li.leadName || '?'} (${li.leadPosition || ''}): "${(li.lastMessage || '').slice(0, 150)}" [${li.messageCount || '?'} msgs]`;
+      }).join('\n');
 
     const noteLines = (scan.notes || []).slice(0, 5).map(n => {
       const d = n.date ? new Date(n.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'undated';
@@ -5709,22 +5710,35 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
     };
   }
 
+  // Renders LinkedIn conversations for AI prompts: newest conversation first, with
+  // the last few messages of each thread shown individually with absolute dates and
+  // an US/THEM label — instead of one undated "last message" blob per conversation.
+  function fuLiPromptLines(liMsgs, { convLimit = 6, msgLimit = 4 } = {}) {
+    const convs = [...(liMsgs || [])].sort((a, b) => liEffectiveDate(b) - liEffectiveDate(a));
+    return convs.slice(0, convLimit).map(li => {
+      const who  = `${li.leadName || '?'}${li.leadPosition || li.leadCompany ? ` (${li.leadPosition || li.leadCompany})` : ''}`;
+      const head = `  ${who} — ${li.messageCount || (li.messages || []).length || '?'} messages, last activity ${liEffectiveDate(li) ? fuDateLabel(new Date(liEffectiveDate(li))) : 'unknown date'}:`;
+      const msgs = (li.messages || []).filter(m => (m.text || '').trim()).slice(-msgLimit).map(m =>
+        `    [${m.date ? fuDateLabel(m.date) : 'undated'} | ${m.sender === 'ME' ? 'US' : 'THEM'}] "${(m.text || '').slice(0, 140)}"`);
+      if (!msgs.length && li.lastMessage) {
+        msgs.push(`    [${li.date ? fuDateLabel(li.date) : 'undated'} | THEM] "${(li.lastMessage || '').slice(0, 140)}"`);
+      }
+      return [head, ...msgs].join('\n');
+    }).join('\n');
+  }
+
   async function fuAnalyzeCompany(account, emails, liMsgs, notes,
-                                   screeningPrompt, contentPrompt, minDaysSince, skipScheduled, knownBrand) {
+                                   screeningPrompt, contentPrompt, minDaysSince, skipScheduled, knownBrand, facts) {
     const today = new Date().toLocaleDateString('en-US',
-      { month: 'long', day: 'numeric', year: 'numeric' });
+      { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
     const brand = knownBrand || detectKnownBrand(emails, liMsgs);
 
-    const emailLines = emails.slice(0, 15).map(e => {
-      const daysAgo = e.date ? Math.floor((Date.now() - new Date(e.date)) / 86400000) : '?';
-      const dir     = (e.folder === 'SENT' || e.folder === 'SentItems') ? 'SENT' : 'RECEIVED';
-      return `  [${daysAgo}d | ${dir}] "${e.subject}" — from: ${e.from || '?'} | "${(e.snippet || '').slice(0, 120)}"`;
+    const emailLines = sortByDateDesc(emails).slice(0, 15).map(e => {
+      const dir = (e.folder === 'SENT' || e.folder === 'SentItems') ? 'SENT by us' : 'RECEIVED from prospect';
+      return `  [${fuDateLabel(e.date)} | ${dir}] "${e.subject}" — from: ${e.from || '?'} | "${(e.snippet || '').slice(0, 120)}"`;
     }).join('\n');
 
-    const liLines = liMsgs.slice(0, 8).map(li => {
-      const daysAgo = li.date ? Math.floor((Date.now() - new Date(li.date)) / 86400000) : '?';
-      return `  [${daysAgo}d] ${li.leadName || '?'} (${li.leadPosition || li.leadCompany || ''}): "${(li.lastMessage || '').slice(0, 150)}" [${li.messageCount || '?'} msg total]`;
-    }).join('\n');
+    const liLines = fuLiPromptLines(liMsgs);
 
     const notesLines = notes.slice(0, 5).map(n => {
       const d = n.date ? new Date(n.date).toLocaleDateString('en-US',
@@ -5738,17 +5752,21 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
 TODAY: ${today}
 COMPANY: ${account.name}${account.domain ? ' (' + account.domain + ')' : ''}
 
-EMAILS (most recent first):
+${fuFactsBlock(facts)}
+
+EMAILS (sorted most recent first; each line shows the actual calendar date):
 ${emailLines || '  (none in lookback window)'}
 
-LINKEDIN CONVERSATIONS:
+LINKEDIN CONVERSATIONS (most recent first):
 ${liLines || '  (none in lookback window)'}
 ${notesLines ? '\nCRM NOTES:\n' + notesLines : ''}
 
 RULES:
+- RECENCY IS THE #1 FACTOR. Use the KEY DATES above as ground truth. If the prospect has not sent us anything in over 3 months, this is NOT urgent or pressing — urgency must be "low" and needScore at most 2, no matter how interested they once were. Old interest does not make a follow-up urgent.
+- "high" urgency is reserved for prospects who are waiting on OUR reply (their message is the most recent one) and wrote within the last ~6 weeks.
 - IGNORE any automated, marketing, or bulk emails (no-reply senders, newsletters, unsubscribe notices, out-of-office replies, receipts, delivery notifications, password resets). Only consider genuine person-to-person messages.
 - IGNORE DRI Monthly Healthcare Executive Exchange (HEX) group meeting emails. They are a shared-group connection, not a 1:1 sales conversation. They have already been stripped from this list when other messages exist.
-- Do NOT recommend follow-up if the BDR's most recent outbound message was sent fewer than ${minDaysSince} days ago with no reply yet.
+- Do NOT recommend follow-up if the BDR's most recent outbound message was sent fewer than ${minDaysSince} days ago with no reply yet (check "Our most recent message to them" in KEY DATES).
 - Do NOT recommend follow-up if the contact clearly declined, asked to stop, or unsubscribed.
 ${skipScheduled ? '- Do NOT recommend follow-up if a meeting or call is already scheduled, or the contact said they would book a time — they are already in motion.' : ''}
 - DO recommend follow-up if a contact replied with interest and the conversation has since gone quiet, there is an unanswered question, or it has been more than ${minDaysSince} days since meaningful two-way contact and the signals are positive.
@@ -5756,6 +5774,7 @@ ${screeningPrompt ? '- ADDITIONAL CRITERIA: ' + screeningPrompt : ''}
 - Our firm was previously ${brand} and is now Pando Executive Networking. If the follow-up mentions a former name, use ONLY "${brand}" — never mention both CareLuminate and HealthLuminate.
 
 MESSAGE STYLE: ${contentPrompt || 'Write a brief 2-3 sentence warm follow-up referencing specifics. Human and conversational.'}
+If the last contact was months ago, the message must acknowledge the time gap naturally (e.g. "It's been a while…") — never pretend the conversation is fresh.
 
 NEED SCORE:
 ${NEED_SCORE_RUBRIC}
@@ -5763,7 +5782,7 @@ ${NEED_SCORE_RUBRIC}
 TASK: Identify the single best follow-up opportunity at ${account.name}. Choose the most engaged contact and the best channel (email or linkedin).
 
 Respond ONLY with valid JSON (no markdown, no code fences):
-{"shouldFollowUp":true_or_false,"contactName":"best contact name or Unknown","contactTitle":"title if visible","channel":"email or linkedin","reason":"one concise sentence explaining the follow-up decision","summary":"2-3 sentence narrative of the full communication history and current relationship status (use names and dates)","urgency":"high, medium, or low","fitScore":integer_1_to_10,"needScore":integer_1_to_5,"needReason":"one short phrase matching the 1-5 rubric","message":"the follow-up message or empty string if no follow-up"}`;
+{"shouldFollowUp":true_or_false,"contactName":"best contact name or Unknown","contactTitle":"title if visible","channel":"email or linkedin","reason":"one concise sentence explaining the follow-up decision","summary":"2-3 sentence narrative of the full communication history and current relationship status (use names and calendar dates)","urgency":"high, medium, or low (high ONLY if they are waiting on our reply and wrote within ~6 weeks)","fitScore":integer_1_to_10,"needScore":integer_1_to_5,"needReason":"one short phrase matching the 1-5 rubric","message":"the follow-up message or empty string if no follow-up"}`;
 
     const MAX_RETRIES = 4;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -5818,15 +5837,13 @@ Respond ONLY with valid JSON (no markdown, no code fences):
   // Compact rating call for template follow-ups (HEX / rebrand / benefits) that skip
   // the full drafting prompt. Uses the same 1–5 need rubric as fuAnalyzeCompany.
   async function fuRateNeed(account, emails, liMsgs, extra = {}) {
-    const emailLines = (emails || []).slice(0, 10).map(e => {
-      const d = e.date ? Math.floor((Date.now() - new Date(e.date)) / 86400000) : '?';
-      const dir = (e.folder === 'SENT' || e.folder === 'SentItems') ? 'SENT' : 'RECEIVED';
-      return `  [${d}d | ${dir}] "${e.subject}" — "${(e.snippet || '').slice(0, 100)}"`;
+    const today = new Date().toLocaleDateString('en-US',
+      { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    const emailLines = sortByDateDesc(emails).slice(0, 10).map(e => {
+      const dir = (e.folder === 'SENT' || e.folder === 'SentItems') ? 'SENT by us' : 'RECEIVED from prospect';
+      return `  [${fuDateLabel(e.date)} | ${dir}] "${e.subject}" — "${(e.snippet || '').slice(0, 100)}"`;
     }).join('\n');
-    const liLines = (liMsgs || []).slice(0, 5).map(li => {
-      const d = li.date ? Math.floor((Date.now() - new Date(li.date)) / 86400000) : '?';
-      return `  [${d}d] ${li.leadName || '?'}: "${(li.lastMessage || '').slice(0, 120)}"`;
-    }).join('\n');
+    const liLines = fuLiPromptLines(liMsgs, { convLimit: 5, msgLimit: 3 });
     const context = extra.hexOnly
       ? 'This is a HEX-only connection (shared DRI Monthly meeting group; no 1:1 history).'
       : extra.staleReconnect
@@ -5838,14 +5855,17 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     const prompt =
 `You are rating how needed a follow-up is for ${account.name}.
 
+TODAY: ${today}
+
+${extra.facts ? fuFactsBlock(extra.facts) + '\n' : ''}
 ${NEED_SCORE_RUBRIC}
 
 ${context}
 
-EMAILS:
+EMAILS (most recent first):
 ${emailLines || '  (none)'}
 
-LINKEDIN:
+LINKEDIN (most recent first):
 ${liLines || '  (none)'}
 
 Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needReason":"one short phrase matching the rubric"}`;
@@ -5884,23 +5904,23 @@ Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needRea
   function fuBuildTranscript(emails, liMsgs) {
     const lines = [];
 
-    // Emails — filter marketing, then show up to 10 most recent
+    // Emails — filter marketing, sort newest-first, then show up to 10
     const incoming = emails || [];
     const nonHex = incoming.filter(e => !isNoiseEmail(e) && !isHexMeetingEmail(e));
-    const realEmails = nonHex.length ? nonHex : incoming.filter(e => !isNoiseEmail(e));
+    const realEmails = sortByDateDesc(nonHex.length ? nonHex : incoming.filter(e => !isNoiseEmail(e)));
     realEmails.slice(0, 10).forEach(e => {
-      const daysAgo = e.date ? Math.floor((Date.now() - new Date(e.date)) / 86400000) : '?';
       const isSent  = e.folder === 'SENT' || e.folder === 'SentItems';
       const who     = isSent ? 'BDR' : (e.from || 'Contact');
       const snippet = e.snippet ? ' — ' + e.snippet.slice(0, 160) : '';
-      lines.push(`[${daysAgo}d] ${who}: ${e.subject}${snippet}`);
+      lines.push(`[${fuDateLabel(e.date)}] ${who}: ${e.subject}${snippet}`);
     });
 
-    // LinkedIn — show up to 5
-    (liMsgs || []).slice(0, 5).forEach(li => {
-      const daysAgo = li.date ? Math.floor((Date.now() - new Date(li.date)) / 86400000) : '?';
-      const msg     = (li.lastMessage || '').slice(0, 160);
-      lines.push(`[${daysAgo}d] LinkedIn — ${li.leadName || '?'}: "${msg}"`);
+    // LinkedIn — newest conversation first, up to 5
+    [...(liMsgs || [])].sort((a, b) => liEffectiveDate(b) - liEffectiveDate(a)).slice(0, 5).forEach(li => {
+      const eff   = liEffectiveDate(li);
+      const label = eff ? fuDateLabel(new Date(eff)) : '?';
+      const msg   = (li.lastMessage || '').slice(0, 160);
+      lines.push(`[${label}] LinkedIn — ${li.leadName || '?'}: "${msg}"`);
     });
 
     return lines.join('\n');
@@ -5956,10 +5976,20 @@ Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needRea
 
   function sortFollowupsByUrgency(followUps) {
     if (!followUps || followUps.length < 2) return followUps;
+    const inboundTs = fu => {
+      const t = fu.lastInboundAt ? new Date(fu.lastInboundAt).getTime() : 0;
+      return Number.isFinite(t) ? t : 0;
+    };
     followUps.sort((a, b) => {
       const needA = clampNeedScore(a.needScore) || 0;
       const needB = clampNeedScore(b.needScore) || 0;
       if (needB !== needA) return needB - needA;
+
+      // Freshness tiebreak: the prospect who replied most recently comes first —
+      // never a months-stale thread above a fresh one at the same need level.
+      const inA = inboundTs(a);
+      const inB = inboundTs(b);
+      if (inB !== inA) return inB - inA;
 
       const urgA = URGENCY_RANK[(a.urgency || '').toLowerCase()] || 0;
       const urgB = URGENCY_RANK[(b.urgency || '').toLowerCase()] || 0;
@@ -5997,7 +6027,10 @@ Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needRea
       const name    = escHtml(fu.contactName || 'Unknown');
       const title   = escHtml(fu.contactTitle   || '');
       const company = escHtml(fu.contactCompany || fu._accountName || fu.company || '');
-      const date    = fu.lastMessageAt ? fmtRelDate(fu.lastMessageAt) : 'From comms scan';
+      const date    = [
+        fu.lastMessageAt ? `Last contact ${fmtRelDate(fu.lastMessageAt)}` : 'From comms scan',
+        fu.lastInboundAt ? `Their last reply ${fmtRelDate(fu.lastInboundAt)}` : 'No reply on record',
+      ].join(' · ');
       const score   = fu.llamaScore || fu.score || '?';
       const reason  = escHtml(fu.llamaReason || fu.reason || '');
       const urgency = (fu.urgency || '').toLowerCase();
@@ -6305,7 +6338,7 @@ Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needRea
   function _cardTabEmails(fu) {
     const emails = fu._emails || [];
     if (!emails.length) return `<div style="color:#94a3b8;font-size:0.83em;padding:8px 0;">No emails on record.</div>`;
-    return emails.map(e => {
+    return sortByDateDesc(emails).map(e => {
       const dateObj  = e.date ? new Date(e.date) : null;
       const validDate = dateObj && !isNaN(dateObj) && dateObj.getFullYear() > 2000;
       const daysAgo  = validDate ? Math.floor((Date.now() - dateObj) / 86400000) : null;
@@ -6346,8 +6379,9 @@ Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needRea
       return n === contactNameLower || (contactFirst.length > 1 && n.startsWith(contactFirst));
     }
 
-    const contactConvos = msgs.filter(li => isContactMatch(li));
-    const otherConvos   = msgs.filter(li => !isContactMatch(li));
+    const byRecency     = (a, b) => liEffectiveDate(b) - liEffectiveDate(a);
+    const contactConvos = msgs.filter(li => isContactMatch(li)).sort(byRecency);
+    const otherConvos   = msgs.filter(li => !isContactMatch(li)).sort(byRecency);
 
     // Render one message bubble in a conversation thread
     function msgBubble(m) {
@@ -6367,7 +6401,9 @@ Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needRea
 
     // Render a full conversation (with thread) or a compact row
     function renderConvo(li, expanded) {
-      const dateObj   = li.date ? new Date(li.date) : null;
+      // Real last-message date when available (conversation-level date can be a sync timestamp)
+      const effTs     = liEffectiveDate(li);
+      const dateObj   = effTs ? new Date(effTs) : null;
       const validDate = dateObj && !isNaN(dateObj) && dateObj.getFullYear() > 2000;
       const daysAgo   = validDate ? Math.floor((Date.now() - dateObj) / 86400000) : null;
       const ageLabel  = daysAgo === null ? 'date unknown'
