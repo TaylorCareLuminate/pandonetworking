@@ -2812,7 +2812,10 @@
       return (!isNaN(d) && d.getFullYear() > 2000) ? d : null;
     })();
 
-    const resolvedDate = doc._timestamp ?? latestMsgDate ?? rawDataDate ?? null;
+    // Prefer the real per-message dates over the doc-level timestamp: doc._timestamp
+    // is often a sync/import time (e.g. a historical backfill), which made old
+    // conversations look brand-new and badly skewed follow-up urgency.
+    const resolvedDate = latestMsgDate ?? doc._timestamp ?? rawDataDate ?? null;
 
     // 🔍 DATE DIAGNOSTICS — log when we still can't resolve a date
     if (!resolvedDate) {
@@ -4488,20 +4491,21 @@ Given our conversation before, I was hoping to ask your thoughts on the question
   }
 
   const NEED_SCORE_LABELS = {
-    5: 'Overdue and needed. Prospect was interested and has not received any follow-up.',
-    4: 'Client seems interested and it has been 2 weeks+ since follow-up.',
-    3: 'Some interest and no follow-up in 2+ months.',
-    2: 'No interest shown and no follow-up in 6+ months.',
-    1: 'Prospect has rejected any interest, or has had multiple outreach efforts with no reply.',
+    5: 'Hot: prospect is waiting on our reply — their message is the most recent and under ~45 days old.',
+    4: 'Warm: prospect engaged within the last ~2 months but the thread has gone quiet.',
+    3: 'Cooling: some interest, but the prospect last engaged 2–4 months ago.',
+    2: 'Stale: no engagement from the prospect in 4+ months (or none ever) — reconnect material, not urgent.',
+    1: 'Dead: declined, unsubscribed, or ignored multiple outreach attempts.',
   };
 
   const NEED_SCORE_RUBRIC =
-`Rate how needed a follow-up reply is on this 1–5 scale (pick exactly one integer):
-5 = Overdue and needed. Prospect was interested and has not received any follow-up.
-4 = Client seems interested and it has been 2 weeks+ since follow-up.
-3 = Some interest and no follow-up in 2+ months.
-2 = No interest shown and no follow-up in 6+ months.
-1 = Prospect has rejected any interest, or has had multiple outreach efforts with no reply.`;
+`Rate how needed a follow-up is on this 1–5 scale (pick exactly one integer).
+The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATES) — not our messages to them. Judge recency ONLY from the dates provided; do not estimate.
+5 = Hot. Prospect showed interest and is waiting on our reply — their message is the most recent one in the thread and is under 45 days old.
+4 = Warm. Prospect engaged within the last 2 months, but the thread has gone quiet for 2+ weeks.
+3 = Cooling. Some interest, but the prospect last engaged 2–4 months ago.
+2 = Stale. The prospect has not engaged in over 4 months, or never engaged at all. A reconnect may be worthwhile but it is NOT urgent or pressing.
+1 = Dead. Prospect declined, unsubscribed, or has ignored multiple outreach attempts.`;
 
   function clampNeedScore(n) {
     const v = parseInt(n, 10);
@@ -4547,8 +4551,10 @@ Given our conversation before, I was hoping to ask your thoughts on the question
       if (!isNaN(t) && t > max) max = t;
     }
     for (const li of liMsgs || []) {
-      const t = li.date ? new Date(li.date).getTime() : 0;
-      if (!isNaN(t) && t > max) max = t;
+      // Use real per-message dates when present — the conversation-level date can
+      // be a sync timestamp that makes an old thread look recent.
+      const t = liEffectiveDate(li);
+      if (t > max) max = t;
     }
     return max ? new Date(max) : null;
   }
@@ -4567,6 +4573,137 @@ Given our conversation before, I was hoping to ask your thoughts on the question
     }
     if (d >= 45) return `${Math.round(d / 30)} months ago`;
     return `${d} days ago`;
+  }
+
+  // Sort a list of {date} items newest-first (items with no/invalid date sink to the end).
+  function sortByDateDesc(items) {
+    return [...(items || [])].sort((a, b) => {
+      const ta = a?.date ? new Date(a.date).getTime() : 0;
+      const tb = b?.date ? new Date(b.date).getTime() : 0;
+      return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
+    });
+  }
+
+  // The real "last activity" time of a LinkedIn conversation: the latest per-message
+  // date when the thread has them, falling back to the conversation-level date only
+  // when it doesn't. The conversation-level date can be a sync/import timestamp, so
+  // trusting it first made old threads look fresh.
+  function liEffectiveDate(li) {
+    let maxMsg = 0;
+    for (const m of li?.messages || []) {
+      const t = m.date ? new Date(m.date).getTime() : 0;
+      if (Number.isFinite(t) && t > maxMsg) maxMsg = t;
+    }
+    if (maxMsg) return maxMsg;
+    const t = li?.date ? new Date(li.date).getTime() : 0;
+    return Number.isFinite(t) && t > 0 ? t : 0;
+  }
+
+  // "Aug 12, 2026 (22d ago)" — absolute date + relative age for AI prompts, so the
+  // model never has to do its own date math from bare day counts.
+  function fuDateLabel(d) {
+    const dt = d instanceof Date ? d : (d ? new Date(d) : null);
+    if (!dt || isNaN(dt.getTime())) return 'unknown date';
+    const days = daysAgo(dt);
+    const abs  = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    return `${abs} (${days}d ago)`;
+  }
+
+  // Deterministic communication facts, computed in code so urgency never depends on
+  // AI date math: when the prospect last wrote to us (inbound), when we last wrote
+  // to them (outbound), and who spoke last. LinkedIn per-message dates are used when
+  // available; a conversation with no dated messages counts as inbound on its
+  // conversation-level date (the stored lastMessage is the lead's).
+  function fuCommsFacts(emails, liMsgs) {
+    const isSentMsg = e => e.folder === 'SENT' || e.folder === 'SentItems';
+    let lastIn = 0, lastOut = 0, inboundCount = 0, outboundCount = 0;
+
+    for (const e of emails || []) {
+      const t = e.date ? new Date(e.date).getTime() : 0;
+      if (!Number.isFinite(t) || t <= 0) continue;
+      if (isSentMsg(e)) { outboundCount++; if (t > lastOut) lastOut = t; }
+      else             { inboundCount++;  if (t > lastIn)  lastIn  = t; }
+    }
+
+    for (const li of liMsgs || []) {
+      let sawDated = false;
+      for (const m of li.messages || []) {
+        const t = m.date ? new Date(m.date).getTime() : 0;
+        if (!Number.isFinite(t) || t <= 0) continue;
+        sawDated = true;
+        if (m.sender === 'ME') { outboundCount++; if (t > lastOut) lastOut = t; }
+        else                   { inboundCount++;  if (t > lastIn)  lastIn  = t; }
+      }
+      if (!sawDated) {
+        const t = liEffectiveDate(li);
+        if (t) { inboundCount++; if (t > lastIn) lastIn = t; }
+      }
+    }
+
+    const lastInboundDate  = lastIn  ? new Date(lastIn)  : null;
+    const lastOutboundDate = lastOut ? new Date(lastOut) : null;
+    const lastMs           = Math.max(lastIn, lastOut);
+    const lastContactDate  = lastMs ? new Date(lastMs) : null;
+    return {
+      lastInboundDate, lastOutboundDate, lastContactDate,
+      daysSinceInbound:  lastInboundDate  ? daysAgo(lastInboundDate)  : null,
+      daysSinceOutbound: lastOutboundDate ? daysAgo(lastOutboundDate) : null,
+      daysSinceContact:  lastContactDate  ? daysAgo(lastContactDate)  : null,
+      lastDirection: lastMs ? (lastIn >= lastOut ? 'inbound' : 'outbound') : null,
+      inboundCount, outboundCount,
+    };
+  }
+
+  // Authoritative dates block injected into AI prompts.
+  function fuFactsBlock(facts) {
+    if (!facts) return '';
+    const waiting = facts.lastDirection === 'inbound'
+      ? 'US — the prospect sent the most recent message and is waiting on our reply'
+      : facts.lastDirection === 'outbound'
+        ? 'THEM — we sent the most recent message and have not heard back since'
+        : 'n/a — no dated messages on record';
+    return `KEY DATES (computed from the raw data — these are authoritative; use them instead of doing your own date math):
+- Prospect's most recent message to us: ${facts.lastInboundDate ? fuDateLabel(facts.lastInboundDate) : 'NEVER — no reply on record'}
+- Our most recent message to them: ${facts.lastOutboundDate ? fuDateLabel(facts.lastOutboundDate) : 'never'}
+- Most recent activity on either side: ${facts.lastContactDate ? fuDateLabel(facts.lastContactDate) : 'none'}
+- Waiting on: ${waiting}`;
+  }
+
+  // Hard, deterministic recency caps applied AFTER the AI answers. The AI often
+  // over-rates stale threads ("they were interested!" — eight months ago), so the
+  // maximum needScore/urgency is bounded in code by when the prospect last actually
+  // engaged. A contact quiet for months can never come out urgent or pressing.
+  function fuApplyRecencyGuard(analysis, facts) {
+    if (!analysis || !facts) return analysis;
+    const inDays        = facts.daysSinceInbound;            // null → never replied
+    const theySpokeLast = facts.lastDirection === 'inbound';
+
+    let maxNeed, maxUrg, why;
+    if (inDays == null) {
+      maxNeed = 2; maxUrg = 'low';
+      why = 'no reply from the prospect on record';
+    } else if (inDays > 120) {
+      maxNeed = 2; maxUrg = 'low';
+      why = `prospect's last reply was ${inDays} days ago`;
+    } else if (inDays > 60) {
+      maxNeed = 3; maxUrg = 'medium';
+      why = `prospect's last reply was ${inDays} days ago`;
+    } else {
+      maxNeed = (theySpokeLast && inDays <= 45) ? 5 : 4;
+      maxUrg  = theySpokeLast ? 'high' : 'medium';
+      why = theySpokeLast ? '' : 'we sent the most recent message';
+    }
+
+    const need = clampNeedScore(analysis.needScore);
+    if (need && need > maxNeed) {
+      analysis.needScore  = maxNeed;
+      analysis.needReason = `${NEED_SCORE_LABELS[maxNeed]}${why ? ` (capped — ${why})` : ' (capped by recency)'}`;
+    }
+    const rank = { high: 3, medium: 2, low: 1 };
+    if ((rank[(analysis.urgency || '').toLowerCase()] || 0) > (rank[maxUrg] || 0)) {
+      analysis.urgency = maxUrg;
+    }
+    return analysis;
   }
 
   // Phrases that indicate a genuinely warm, personal sent email — e.g. after meeting
@@ -5103,8 +5240,12 @@ Given our conversation before, I was hoping to ask your thoughts on the question
     const allLiOf   = s => s.linkedInMessages || [];
     const realEmailsOf = s => allRealOf(s).filter(e =>
       !e.date || new Date(e.date) >= cutoff);
-    const liMsgsOf = s => allLiOf(s).filter(li =>
-      !li.date || new Date(li.date) >= cutoff);
+    const liMsgsOf = s => allLiOf(s).filter(li => {
+      // Real message dates only — the conversation-level date can be a sync
+      // timestamp that would wrongly pull a stale thread into the lookback window.
+      const t = liEffectiveDate(li);
+      return !t || t >= cutoff.getTime();
+    });
 
     // Target: scanned companies with HEX-only, recent 1:1, or stale 1:1 history.
     // Also identifies "Never Engaged" orgs along the way — outside of HEX emails, they
@@ -5197,6 +5338,12 @@ Given our conversation before, I was hoping to ask your thoughts on the question
         daysAgo(last1to1) >= staleDays || !lastInLookback
       );
       const knownBrand = detectKnownBrand(otherAll.length ? otherAll : hexAll, allLi);
+
+      // Deterministic recency facts over the FULL 1:1 history (not just the lookback
+      // window) — drives the recently-contacted skip, the KEY DATES prompt block,
+      // and the hard urgency/need caps applied after the AI answers.
+      const facts = fuCommsFacts(otherAll, allLi);
+
       const pct = Math.round((i / targetAccounts.length) * 90);
       fuSetStatus(`Analyzing ${account.name}… (${i + 1}/${targetAccounts.length})`, pct);
       if (hexOnly) {
@@ -5205,6 +5352,19 @@ Given our conversation before, I was hoping to ask your thoughts on the question
         fuLog(`[${account.name}] Last 1:1 was ${fmtDaysAgo(last1to1)} — using ${knownBrand} → Pando reconnect${hexAll.length ? ` · ignored ${hexAll.length} HEX meeting email${hexAll.length === 1 ? '' : 's'}` : ''}`);
       } else {
         fuLog(`[${account.name}] ${otherEmails.length} email(s), ${liMsgs.length} LinkedIn conv(s)${hexEmails.length ? ` · ignored ${hexEmails.length} HEX meeting email${hexEmails.length === 1 ? '' : 's'}` : ''}`);
+        fuLog(`  Their last reply: ${facts.lastInboundDate ? fuDateLabel(facts.lastInboundDate) : 'never'} · our last message: ${facts.lastOutboundDate ? fuDateLabel(facts.lastOutboundDate) : 'never'}`);
+      }
+
+      // Hard recency gate — if OUR most recent 1:1 message is fresher than the
+      // "min days between follow-ups" setting and they haven't replied since,
+      // skip entirely (no Brave/AI spend, and no chance the AI ignores the rule).
+      if (!hexOnly && facts.lastDirection === 'outbound'
+          && facts.daysSinceOutbound != null && facts.daysSinceOutbound < minDaysSince) {
+        fuLog(`  ⏭ Skipped — we messaged them ${facts.daysSinceOutbound}d ago (< ${minDaysSince}d min) with no reply yet`, 'info');
+        analyzed++;
+        document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
+        if (i < targetAccounts.length - 1 && !fuShouldStop) await sleep(150);
+        continue;
       }
 
       // Classification gate — verify via live Brave search + AI whether this is a
@@ -5245,17 +5405,21 @@ Given our conversation before, I was hoping to ask your thoughts on the question
           : staleReconnect
             ? fuStaleReconnectAnalysis(account, otherAll, allLi, last1to1, knownBrand)
             : await fuAnalyzeCompany(account, emailsForAi, liMsgs, notes,
-                                     screeningPrompt, contentPrompt, minDaysSince, skipScheduled, knownBrand);
+                                     screeningPrompt, contentPrompt, minDaysSince, skipScheduled, knownBrand, facts);
 
       if (usedTemplate && analysis) {
         const rating = await fuRateNeed(account, emailsForAi, liForCard, {
-          hexOnly, staleReconnect, benefitsPath, last1to1,
+          hexOnly, staleReconnect, benefitsPath, last1to1, facts,
         });
         if (rating?.needScore) {
           analysis.needScore  = rating.needScore;
           analysis.needReason = rating.needReason;
         }
       }
+
+      // Deterministic cap: no matter what the AI said, a prospect who hasn't
+      // engaged in months can never come out as urgent/pressing.
+      fuApplyRecencyGuard(analysis, facts);
 
       analyzed++;
       document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
@@ -5304,6 +5468,9 @@ Given our conversation before, I was hoping to ask your thoughts on the question
           aiSummary:         analysis.summary       || '',
           message:           analysis.message       || '',
           transcript:        fuBuildTranscript(emailsForAi, liForCard),
+          lastMessageAt:     facts.lastContactDate  ? facts.lastContactDate.toISOString()  : null,
+          lastInboundAt:     facts.lastInboundDate  ? facts.lastInboundDate.toISOString()  : null,
+          lastOutboundAt:    facts.lastOutboundDate ? facts.lastOutboundDate.toISOString() : null,
           contactEmail,
           contactLinkedInUrl: bestLi?.leadProfileUrl || '',
           conversationId:    bestLi?.id             || null,
