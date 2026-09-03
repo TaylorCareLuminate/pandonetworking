@@ -140,6 +140,10 @@
         }
         .pill.connect { background: #dbeafe; color: #1e40af; }
         .pill.message { background: #fef3c7; color: #92400e; }
+        .pill.inprogress { background: #dbeafe; color: #1e40af; }
+        .pill.pending { background: #fef3c7; color: #92400e; }
+        .pill.sequence { background: #ede9fe; color: #5b21b6; }
+        .pill.queueonly { background: #e2e8f0; color: #475569; }
         .rowmsg { font-size: .72rem; font-weight: 700; }
         .rowmsg.ok  { color: #059669; }
         .rowmsg.err { color: #dc2626; }
@@ -166,7 +170,7 @@
         <div class="icon-wrap"><i class="fas fa-circle-pause"></i></div>
         <div>
             <h1>Lead Pause Manager</h1>
-            <p>Loads leads currently in process the <strong>same way the BDR Dashboard on the Admin page does</strong> (connect_queue + sent-webhook + live HeyReach status + eligibility check) — not just "campaign says in progress" — so the count matches what you see there. Pause (stop) or unpause (re-enroll) some or all, by hand, by campaign/list, or with an AI scan of the actual outreach messages.</p>
+            <p>Starts from the same “still in queue” calculation as the BDR Dashboard, then adds every lead HeyReach still has going through (pending start <em>or</em> mid-sequence). Pause (stop) or unpause some or all — by BDR, campaign, uploaded list, or AI scan.</p>
         </div>
     </div>
 
@@ -187,9 +191,15 @@
             </button>
         </div>
         <label class="chk" style="margin-top:10px;">
+            <input type="checkbox" id="includeLiveHr" checked>
+            <span>Include leads still going through in HeyReach
+                <span class="sub-note">The dashboard number only counts people who were pushed from our queue and have <em>not</em> had a connection/message sent yet. HeyReach’s own “in process” count also includes people mid-sequence (connection already sent, waiting, messaging). Leave this on to match what you see in HeyReach.</span>
+            </span>
+        </label>
+        <label class="chk">
             <input type="checkbox" id="strictCheck" checked>
-            <span>Strict verification (matches the BDR Dashboard number exactly)
-                <span class="sub-note">Cross-checks each candidate against live HeyReach lead status, then — for anything not directly confirmed that way — against the prospect lead list + a live HeyReach lookup (<code>/api/connect-queue/in-process-refine-eligibility</code>). Uncheck for a faster, slightly looser pass (webhook + live-status exclusion only).</span>
+            <span>Strict verification on the queue-pending subset
+                <span class="sub-note">For leads that only appear in our queue (not confirmed live), cross-check the prospect lead list + HeyReach lookup. Does not drop anyone HeyReach still lists as going through.</span>
             </span>
         </label>
         <div class="progress-wrap" id="loadProg">
@@ -201,6 +211,8 @@
     <!-- Stats -->
     <div class="strip" id="strip" style="display:none;">
         <div class="stat slate"><div class="v" id="stTotal">0</div><div class="l">In Process</div></div>
+        <div class="stat blue"><div class="v" id="stQueue">0</div><div class="l">Queue Pending</div></div>
+        <div class="stat amber"><div class="v" id="stHrLive">0</div><div class="l">HeyReach Going Through</div></div>
         <div class="stat blue"><div class="v" id="stConnect">0</div><div class="l">Connect</div></div>
         <div class="stat amber"><div class="v" id="stMessage">0</div><div class="l">Message</div></div>
         <div class="stat green"><div class="v" id="stShown">0</div><div class="l">Matching Filters</div></div>
@@ -228,9 +240,13 @@
                 <select id="listFilter" onchange="applyFilters()"><option value="">All lists</option></select>
             </div>
         </div>
-        <div class="cg">
+        <div class="cg" style="margin-bottom:10px;">
             <label>Kind</label>
             <div class="chips" id="kindChips"></div>
+        </div>
+        <div class="cg">
+            <label>HeyReach status</label>
+            <div class="chips" id="statusChips"></div>
         </div>
     </div>
 
@@ -284,6 +300,7 @@
                         <th>Campaign</th>
                         <th>Uploaded List</th>
                         <th>Kind</th>
+                        <th>HR Status</th>
                         <th>Message</th>
                         <th>Result</th>
                     </tr>
@@ -441,6 +458,7 @@ let _customerNameById = new Map();
 let _leads = [];                // in-process rows currently loaded
 let _pausedSession = [];        // leads paused during this session (available to unpause)
 let _kindOn = new Set(['connect', 'message']);
+let _statusOn = new Set();           // enabled HR status chips; empty = all
 let _hrApiKeyCache = new Map();      // lowerEmail -> apiKey (or null)
 let _hrLiveStatusCache = new Map();  // campaignId -> Map<normalizedUrl, verdict>
 
@@ -524,6 +542,25 @@ async function getHeyReachApiKeyForBdr(bdrAuthEmail) {
     return apiKey;
 }
 
+function campaignStatusLabel(campaignStatus, isAlreadySent, isTerminal) {
+    const s = String(campaignStatus || '').toUpperCase().replace(/[\s_-]/g, '_');
+    if (isTerminal || s === 'FINISHED' || s === 'FAILED' || s === 'COMPLETED') return 'Finished';
+    if (s === 'STOPPED' || s === 'MANUALLY_STOPPED' || s === 'CANCELED' || s === 'CANCELLED') return 'Stopped';
+    if (s === 'EXCLUDED') return 'Excluded';
+    if (s === 'IN_PROGRESS' || s === 'INPROGRESS' || s === 'ACTIVE') return 'InProgress';
+    if (s === 'PENDING') return 'Pending';
+    if (isAlreadySent) return 'InSequence';
+    return s || 'Pending';
+}
+function isGoingThrough(verdict) {
+    if (!verdict || verdict.isTerminal) return false;
+    const label = verdict.hrStatus || '';
+    return !['Finished', 'Stopped', 'Excluded'].includes(label);
+}
+function pillClass(status) {
+    return { InProgress: 'inprogress', Pending: 'pending', InSequence: 'sequence', QueueOnly: 'queueonly', Finished: 'queueonly', Stopped: 'queueonly' }[status] || 'queueonly';
+}
+
 async function fetchLiveCampaignStatusMap(apiKey, campaignId) {
     const cId = String(campaignId);
     if (_hrLiveStatusCache.has(cId)) return _hrLiveStatusCache.get(cId);
@@ -538,7 +575,7 @@ async function fetchLiveCampaignStatusMap(apiKey, campaignId) {
             if (!ok) break;
             const page = data?.items || data?.leads || data?.data || (Array.isArray(data) ? data : []);
             for (const l of page) {
-                const prof = l.linkedInUserProfile || l.leadProfile || {};
+                const prof = l.linkedInUserProfile || l.leadProfile || l.lead || {};
                 const usernameUrl = prof.username ? `https://www.linkedin.com/in/${prof.username}` : '';
                 const rawUrl = l.profileUrl || l.linkedinUrl || l.linkedInUrl || l.leadProfileUrl
                     || prof.profileUrl || prof.linkedInUrl || prof.url || usernameUrl || '';
@@ -551,9 +588,20 @@ async function fetchLiveCampaignStatusMap(apiKey, campaignId) {
                 const hasFailed        = !!l.failedTime;
                 const isTerminal = hasFailed || campaignStatus === 'FAILED' || campaignStatus === 'FINISHED'
                     || HR_TERMINAL_STATUSES.has(campaignStatus)
+                    || campaignStatus === 'MANUALLY_STOPPED' || campaignStatus === 'EXCLUDED'
                     || (errCode != null && errCode !== 0 && String(errCode) !== '0' && String(errCode).toUpperCase() !== 'NONE');
                 const isAlreadySent = hrLooksAlreadySent(connectionStatus) || hrLooksAlreadySent(messageStatus);
-                map.set(u, { alreadySent: isAlreadySent || isTerminal });
+                const hrStatus = campaignStatusLabel(campaignStatus, isAlreadySent, isTerminal);
+                map.set(u, {
+                    alreadySent: isAlreadySent || isTerminal,
+                    isAlreadySent, isTerminal, campaignStatus, connectionStatus, messageStatus, hrStatus,
+                    rawUrl,
+                    firstName: prof.firstName || prof.first_name || l.firstName || '',
+                    lastName:  prof.lastName  || prof.last_name  || l.lastName  || '',
+                    company:   prof.companyName || prof.company || l.companyName || l.company || '',
+                    position:  prof.position || prof.headline || l.position || '',
+                    leadMemberId: l.leadMemberId || prof.memberId || null,
+                });
             }
             pages++;
             offset += PAGE;
@@ -772,22 +820,30 @@ async function computeInProcessRows(bdrAuthEmail, ctx, opts) {
         seenKeys.add(key);
         deduped.push(c);
     }
-    if (!deduped.length) return [];
-
-    // ── Live HeyReach status cross-check ──
+    // ── Live HeyReach pull (all of this BDR's campaigns) ──
     const apiKey = await getHeyReachApiKeyForBdr(bdrAuthEmail);
-    let liveStatusMap = new Map();
-    if (apiKey) {
-        const campaignIds = [...new Set((bdrLeaderInfo.heyreachCampaigns || []).map(c => c.id).filter(Boolean).map(String))];
+    const campaigns = bdrLeaderInfo.heyreachCampaigns || [];
+    const campaignIds = [...new Set(campaigns.map(c => c.id).filter(Boolean).map(String))];
+    const liveByCampaign = new Map(); // campaignId -> Map<url, verdict>
+    if (apiKey && campaignIds.length) {
         const maps = await Promise.all(campaignIds.map(cId => fetchLiveCampaignStatusMap(apiKey, cId)));
-        maps.forEach(m => m.forEach((v, u) => liveStatusMap.set(u, v)));
+        campaignIds.forEach((cId, i) => liveByCampaign.set(cId, maps[i]));
+    } else if (!campaignIds.length) {
+        log(`  ${bdrName}: no heyreachCampaigns on bdr_leaders — cannot pull HeyReach's live in-process list`, 'warn');
+    } else if (!apiKey) {
+        log(`  ${bdrName}: no HeyReach API key — cannot pull live campaign leads`, 'warn');
     }
+    const combinedLive = new Map();
+    liveByCampaign.forEach(m => m.forEach((v, u) => {
+        if (!combinedLive.has(u) || (v && !v.isTerminal)) combinedLive.set(u, v);
+    }));
 
     const confirmedPresent = [];
     const needsCheck = [];
+    let excludedAlreadySent = 0;
     for (const c of deduped) {
-        const verdict = liveStatusMap.get(normalizeUrlForHrLiveMatch(c.url));
-        if (verdict && verdict.alreadySent) continue; // excluded — HeyReach says already sent/terminal
+        const verdict = combinedLive.get(normalizeUrlForHrLiveMatch(c.url));
+        if (verdict && verdict.alreadySent) { excludedAlreadySent++; continue; }
         if (verdict) { confirmedPresent.push(c); continue; }
         needsCheck.push(c);
     }
@@ -813,12 +869,57 @@ async function computeInProcessRows(bdrAuthEmail, ctx, opts) {
         survivorsFromCheck = needsCheck.filter(c => keepSet.has(c.row.id));
     }
 
-    const finalCandidates = confirmedPresent.concat(survivorsFromCheck);
-    const campaigns = bdrLeaderInfo.heyreachCampaigns || [];
-    return finalCandidates.map(c => buildLeadRow(c, {
+    const meta = {
         bdrAuthEmail: lower, bdrName, customerId, customerName, apiKey,
         bdrLeaderAccountId, campaigns,
-    }));
+    };
+    const queueRowsOut = confirmedPresent.concat(survivorsFromCheck).map(c => {
+        const row = buildLeadRow(c, meta);
+        const verdict = combinedLive.get(normalizeUrlForHrLiveMatch(c.url));
+        row.hrStatus = verdict ? verdict.hrStatus : 'QueueOnly';
+        row.source = verdict ? 'both' : 'queue';
+        return row;
+    });
+
+    // ── Union in everyone HeyReach still has going through ──
+    // Dashboard "pending" drops anyone whose connection/message already sent.
+    // HeyReach's own "in process" still includes those people (mid-sequence).
+    const includeLive = opts.includeLive !== false;
+    const liveRows = [];
+    if (includeLive) {
+        const queueByUrl = new Map();
+        for (const c of deduped) {
+            const u = normalizeUrlForHrLiveMatch(c.url);
+            if (u && !queueByUrl.has(u)) queueByUrl.set(u, c);
+        }
+        const seen = new Set(queueRowsOut.map(r => `${r.campaignId}::${normalizeUrlForHrLiveMatch(r.profileUrl)}`));
+        for (const [cId, map] of liveByCampaign) {
+            const campMeta = campaigns.find(x => String(x.id || x.campaignId) === String(cId)) || {};
+            const campType = String(campMeta.type || '').toLowerCase();
+            const kind = (campType === 'message' || campType === 'quick_message' || campType === 'msg') ? 'message' : 'connect';
+            let going = 0, terminal = 0;
+            map.forEach((verdict, url) => {
+                if (!isGoingThrough(verdict)) { terminal++; return; }
+                going++;
+                const key = `${cId}::${url}`;
+                if (seen.has(key)) return;
+                seen.add(key);
+                const queued = queueByUrl.get(url);
+                if (queued) {
+                    const row = buildLeadRow(queued, meta);
+                    row.hrStatus = verdict.hrStatus || 'InSequence';
+                    row.source = 'both';
+                    liveRows.push(row);
+                } else {
+                    liveRows.push(buildHrOnlyLeadRow(verdict, url, cId, kind, meta, campMeta));
+                }
+            });
+            log(`    campaign ${cId} (${campMeta.name || campMeta.label || '?'}): ${going} going through, ${terminal} finished/failed/stopped`);
+        }
+    }
+
+    log(`  ${bdrName}: queue-pending ${queueRowsOut.length} (dropped ${excludedAlreadySent} already-sent by dashboard rules)${includeLive ? `; + ${liveRows.length} still going through in HeyReach` : ''}`);
+    return queueRowsOut.concat(liveRows);
 }
 
 function buildLeadRow(c, meta) {
@@ -851,6 +952,31 @@ function buildLeadRow(c, meta) {
         firstName, lastName, name, company, position, messageContent, profileUrl,
         pushedAt: row.heyreach_push_date || row.pushed_date || null,
         selected: false, aiPick: false, rowMsg: null,
+        hrStatus: 'QueueOnly', source: 'queue',
+    };
+}
+
+function buildHrOnlyLeadRow(verdict, url, campaignId, kind, meta, campMeta) {
+    const firstName = (verdict.firstName || '').trim();
+    const lastName  = (verdict.lastName || '').trim();
+    const name = [firstName, lastName].filter(Boolean).join(' ') || '(no name)';
+    const listId = campMeta.listId ? String(campMeta.listId) : '';
+    const campaignName = campMeta.name || campMeta.label || `Campaign ${campaignId}`;
+    const listName = campMeta.name || campMeta.label || (listId ? `List ${listId}` : '—');
+    const rawUrl = verdict.rawUrl || url;
+    const profileUrl = rawUrl ? (/^https?:\/\//i.test(rawUrl) ? rawUrl : 'https://' + rawUrl) : '';
+    const accountId = String(campMeta.accountId || campMeta.heyreachAccountId || meta.bdrLeaderAccountId || '').trim();
+    return {
+        uid: `${meta.bdrAuthEmail}::hr::${campaignId}::${url}`,
+        queueId: null, kind,
+        bdrEmail: meta.bdrAuthEmail, bdrName: meta.bdrName,
+        customerId: meta.customerId, customerName: meta.customerName, apiKey: meta.apiKey,
+        campaignId: String(campaignId), campaignName, listId, listName, accountId,
+        firstName, lastName, name, company: verdict.company || '', position: verdict.position || '',
+        messageContent: '', profileUrl,
+        pushedAt: null, selected: false, aiPick: false, rowMsg: null,
+        hrStatus: verdict.hrStatus || 'InSequence', source: 'heyreach',
+        leadMemberId: verdict.leadMemberId || null,
     };
 }
 
@@ -860,6 +986,7 @@ window.runLoad = async function() {
     if (!selVal) { alert('Select a BDR (or an "All BDRs" option).'); return; }
     const reportDays = parseInt(document.getElementById('reportDays').value, 10) || 30;
     const strict = document.getElementById('strictCheck').checked;
+    const includeLive = document.getElementById('includeLiveHr').checked;
 
     const btn = document.getElementById('loadBtn');
     btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading…';
@@ -871,7 +998,7 @@ window.runLoad = async function() {
     document.getElementById('tableCard').style.display = 'none';
 
     try {
-        log(`Loading eligibility context (last ${reportDays}d, strict=${strict})…`);
+        log(`Loading eligibility context (last ${reportDays}d, strict=${strict}, includeHeyReachLive=${includeLive})…`);
         const ctx = await loadEligibilityContext(reportDays);
 
         let targets;
@@ -888,11 +1015,13 @@ window.runLoad = async function() {
         for (const bdrEmail of targets) {
             setProg('loadProg', done, targets.length, `BDR ${done + 1}/${targets.length}: ${bdrEmail}`);
             try {
-                const rows = await computeInProcessRows(bdrEmail, ctx, { strict });
+                const rows = await computeInProcessRows(bdrEmail, ctx, { strict, includeLive });
                 _leads.push(...rows);
                 const nc = rows.filter(r => r.kind === 'connect').length;
                 const nm = rows.filter(r => r.kind === 'message').length;
-                log(`  ${bdrEmail}: ${rows.length} in-process (${nc} connect, ${nm} message)`, rows.length ? 'ok' : 'info');
+                const nHr = rows.filter(r => r.source === 'heyreach' || r.source === 'both').length;
+                const nQ  = rows.filter(r => r.source === 'queue' || r.source === 'both').length;
+                log(`  ${bdrEmail}: ${rows.length} total (${nc} connect, ${nm} message; ${nQ} from queue, ${nHr} still in HeyReach)`, rows.length ? 'ok' : 'info');
             } catch (e) {
                 log(`  ${bdrEmail}: failed — ${e.message}`, 'error');
             }
@@ -936,12 +1065,25 @@ function buildFilters() {
         const n = _leads.filter(l => l.kind === k).length;
         return `<span class="chip on" data-k="${k}" onclick="toggleKindChip(this)">${k === 'connect' ? 'Connect' : 'Message'} (${n})</span>`;
     }).join('');
+
+    const statuses = [...new Set(_leads.map(l => l.hrStatus || 'QueueOnly'))].sort();
+    _statusOn = new Set(statuses);
+    document.getElementById('statusChips').innerHTML = statuses.map(s => {
+        const n = _leads.filter(l => (l.hrStatus || 'QueueOnly') === s).length;
+        return `<span class="chip on" data-s="${escapeHtml(s)}" onclick="toggleStatusChip(this)">${escapeHtml(s)} (${n})</span>`;
+    }).join('');
 }
 
 window.toggleKindChip = function(el) {
     const k = el.dataset.k;
     if (_kindOn.has(k)) { _kindOn.delete(k); el.classList.remove('on'); }
     else { _kindOn.add(k); el.classList.add('on'); }
+    applyFilters();
+};
+window.toggleStatusChip = function(el) {
+    const s = el.dataset.s;
+    if (_statusOn.has(s)) { _statusOn.delete(s); el.classList.remove('on'); }
+    else { _statusOn.add(s); el.classList.add('on'); }
     applyFilters();
 };
 
@@ -952,6 +1094,7 @@ function filteredLeads() {
     const listId = document.getElementById('listFilter').value;
     return _leads.filter(l => {
         if (!_kindOn.has(l.kind)) return false;
+        if (_statusOn.size && !_statusOn.has(l.hrStatus || 'QueueOnly')) return false;
         if (bdrEmail && l.bdrEmail !== bdrEmail) return false;
         if (campId && String(l.campaignId) !== campId) return false;
         if (listId && String(l.listId || l.listName) !== listId) return false;
@@ -983,6 +1126,7 @@ function renderTable() {
             <td>${escapeHtml(l.campaignName)}</td>
             <td>${escapeHtml(l.listName)}</td>
             <td><span class="pill ${l.kind}">${l.kind === 'connect' ? 'Connect' : 'Message'}</span></td>
+            <td><span class="pill ${pillClass(l.hrStatus)}">${escapeHtml(l.hrStatus || '—')}</span></td>
             <td class="msg-preview">${escapeHtml((l.messageContent || '').slice(0, 160))}${(l.messageContent || '').length > 160 ? '…' : ''}</td>
             <td>${l.rowMsg ? `<span class="rowmsg ${l.rowMsg.ok ? 'ok' : 'err'}">${escapeHtml(l.rowMsg.text)}</span>` : ''}</td>
         </tr>`).join('');
@@ -993,6 +1137,8 @@ function updateStats() {
     const rows = filteredLeads();
     const selCount = _leads.filter(l => l.selected).length;
     document.getElementById('stTotal').textContent   = _leads.length;
+    document.getElementById('stQueue').textContent   = _leads.filter(l => l.source === 'queue' || l.source === 'both').length;
+    document.getElementById('stHrLive').textContent  = _leads.filter(l => l.source === 'heyreach' || l.source === 'both').length;
     document.getElementById('stConnect').textContent = _leads.filter(l => l.kind === 'connect').length;
     document.getElementById('stMessage').textContent = _leads.filter(l => l.kind === 'message').length;
     document.getElementById('stShown').textContent   = rows.length;
@@ -1044,7 +1190,7 @@ window.bulkPause = async function() {
 
     await runPool(targets, async lead => {
         const { ok, status, data } = await hrFetch(lead.apiKey, '/proxy/heyreach/campaign/stopleadincampaign', {
-            campaignId: lead.campaignId, leadUrl: lead.profileUrl
+            campaignId: lead.campaignId, leadUrl: lead.profileUrl, leadMemberId: lead.leadMemberId || null
         });
         if (ok) {
             okCount++;
