@@ -1138,7 +1138,10 @@ async function pollJobUntilDone(jobId) {
     const DEADLINE = Date.now() + 60 * 60 * 1000;
     let lastLogTs = '';
     let consecutiveNotFound = 0, consecutiveErrors = 0;
-    const MAX_NOT_FOUND = 2, MAX_CONSEC_ERRORS = 8;
+    // The server now answers polls from a Firestore mirror when the job lives on
+    // another replica, so a 404 should be rare and genuine — but allow a few in a
+    // row before declaring the job lost (mirror creation and deploys can lag).
+    const MAX_NOT_FOUND = 4, MAX_CONSEC_ERRORS = 8;
     let pollDelay = 4000;
 
     while (Date.now() < DEADLINE) {
@@ -1155,9 +1158,9 @@ async function pollJobUntilDone(jobId) {
         }
         if (resp.status === 404) {
             consecutiveNotFound++;
-            log(`  ⚠ Job not found (${consecutiveNotFound}/${MAX_NOT_FOUND}) — server may have restarted.`, 'log-dim');
+            log(`  ⚠ Job not found (${consecutiveNotFound}/${MAX_NOT_FOUND}) — retrying…`, 'log-dim');
             if (consecutiveNotFound >= MAX_NOT_FOUND) {
-                const err = new Error('Job lost — the server restarted mid-run.');
+                const err = new Error('Job lost — the server no longer knows this job.');
                 err.jobLost = true;
                 throw err;
             }
@@ -1221,7 +1224,13 @@ function syncLogsFromJob(logs, lastTs) {
 function checkpointKey(jobId) { return `orgLeadershipJob_${jobId}`; }
 function saveJobCheckpoint(jobId, results) {
     if (!jobId || !results || !results.length) return;
-    try { localStorage.setItem(checkpointKey(jobId), JSON.stringify({ results, savedAt: Date.now() })); } catch (e) {}
+    try {
+        // Never shrink a checkpoint: a poll answered by the Firestore mirror on
+        // another replica can briefly lag behind (or omit) the live results.
+        const existing = loadJobCheckpoint(jobId);
+        if (existing?.results?.length > results.length) return;
+        localStorage.setItem(checkpointKey(jobId), JSON.stringify({ results, savedAt: Date.now() }));
+    } catch (e) {}
 }
 function loadJobCheckpoint(jobId) {
     if (!jobId) return null;
@@ -1325,10 +1334,15 @@ window.runSearch = async function() {
                 log(`  Job restarted: ${activeJobId}`, 'log-ok');
             }
         }
-        jobIdsThisRun.forEach(clearJobCheckpoint);
-
         setPipe('pipeRun', 'done'); setPipe('pipeDone', 'done');
+        // Merge the checkpoint first, then the final server response (which wins
+        // per-organization) — the final poll can be answered by the Firestore
+        // mirror on another replica and lag slightly behind the live results.
+        const finalCp = jobIdsThisRun.map(loadJobCheckpoint).filter(cp => cp?.results?.length)
+            .sort((a, b) => b.results.length - a.results.length)[0];
+        if (finalCp) mergeJobResults(finalCp.results);
         mergeJobResults(serverResults);
+        jobIdsThisRun.forEach(clearJobCheckpoint);
         applyDbOverlay(dbContactsByOrg);
         renderResults();
 
