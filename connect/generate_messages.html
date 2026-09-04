@@ -16262,11 +16262,18 @@
 
             // ── Candidate gathering per colleague (mirrors generateSurroundConnections) ──
             const linkedInAccountIdMap = new Map();
+            const emailToAccountIds = new Map(); // bdrEmail(lowercase) -> Set of heyreachAccountId(s)
             try {
                 const liAccSnap = await fetchFn(col(db, 'linkedin_accounts'), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
                 liAccSnap.forEach(d => {
                     const data = d.data();
-                    if (data.heyreachAccountId && data.bdrEmail) linkedInAccountIdMap.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
+                    if (data.heyreachAccountId && data.bdrEmail) {
+                        const idStr = String(data.heyreachAccountId);
+                        const emailLower = data.bdrEmail.toLowerCase();
+                        linkedInAccountIdMap.set(idStr, emailLower);
+                        if (!emailToAccountIds.has(emailLower)) emailToAccountIds.set(emailLower, new Set());
+                        emailToAccountIds.get(emailLower).add(idStr);
+                    }
                 });
             } catch (_) { /* best effort */ }
 
@@ -16322,20 +16329,26 @@
                 }
 
                 const colleagueInboxByUrl = new Map();
+                let inboxDocsSeen = 0;
+                let inboxDocsWithUrl = 0;
                 try {
                     const inboxEmailCandidates = new Set([colleagueLinkedInEmail, colleague.primaryEmail].filter(Boolean));
                     const inboxFields = ['accountEmail', 'bdrEmail', 'linkedInAccountEmail', 'uploadedByEmail'];
                     function absorbInboxSnap(snap) {
                         snap.forEach(d => {
+                            inboxDocsSeen++;
                             const data = d.data();
                             const leadUrl = data.leadProfileUrl || data.linkedin_url || data.profileUrl || '';
                             const normUrl = normalizeLinkedInUrl(leadUrl);
-                            if (normUrl && !colleagueInboxByUrl.has(normUrl)) {
-                                colleagueInboxByUrl.set(normUrl, {
-                                    responseCategory: data.responseCategory || '',
-                                    followUpCategory: data.followUpCategory || '',
-                                    messages: data.messages || data.conversationMessages || []
-                                });
+                            if (normUrl) {
+                                inboxDocsWithUrl++;
+                                if (!colleagueInboxByUrl.has(normUrl)) {
+                                    colleagueInboxByUrl.set(normUrl, {
+                                        responseCategory: data.responseCategory || '',
+                                        followUpCategory: data.followUpCategory || '',
+                                        messages: data.messages || data.conversationMessages || []
+                                    });
+                                }
                             }
                         });
                     }
@@ -16349,6 +16362,44 @@
                         }
                     }
                     await Promise.all(inboxQueries);
+
+                    // Fallback: some heyreach_inbox records are missing/stale email fields but
+                    // do carry a valid linkedInAccountId. Resolve the colleague's known HeyReach
+                    // account ID(s) via linkedin_accounts and query heyreach_inbox by that ID too.
+                    if (colleagueInboxByUrl.size === 0) {
+                        const accountIdCandidates = new Set();
+                        for (const email of inboxEmailCandidates) {
+                            const ids = emailToAccountIds.get((email || '').toLowerCase());
+                            if (ids) ids.forEach(id => accountIdCandidates.add(id));
+                        }
+                        if (accountIdCandidates.size > 0) {
+                            const idFields = ['linkedInAccountId', 'accountId', 'heyreachAccountId'];
+                            const idQueries = [];
+                            for (const idVal of accountIdCandidates) {
+                                for (const field of idFields) {
+                                    idQueries.push(
+                                        fetchFn(q(col(db, 'heyreach_inbox'), wh(field, '==', idVal)), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 })
+                                            .then(absorbInboxSnap).catch(() => {})
+                                    );
+                                    // Also try as a number, since accountId may be stored numerically.
+                                    if (!isNaN(idVal)) {
+                                        idQueries.push(
+                                            fetchFn(q(col(db, 'heyreach_inbox'), wh(field, '==', Number(idVal))), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 })
+                                                .then(absorbInboxSnap).catch(() => {})
+                                        );
+                                    }
+                                }
+                            }
+                            await Promise.all(idQueries);
+                            addLog(`   🔁 Inbox email lookup found nothing for ${colleague.name || colleague.primaryEmail}; retried by HeyReach account ID (${[...accountIdCandidates].join(', ')}) — ${colleagueInboxByUrl.size} conversation(s) found.`,
+                                colleagueInboxByUrl.size > 0 ? 'info' : 'warning');
+                        } else {
+                            addLog(`   ⚠️ No linkedin_accounts mapping found for ${colleague.name || colleague.primaryEmail} either — can't retry inbox lookup by account ID. This colleague's replies will show as "No Reply" for the category filter.`, 'warning');
+                        }
+                    }
+
+                    addLog(`   💬 Inbox lookup for ${colleague.name || colleague.primaryEmail}: ${inboxDocsSeen} raw doc(s) matched (searched emails: ${[...inboxEmailCandidates].join(' / ')}), ${inboxDocsWithUrl} had a usable profile URL, ${colleagueInboxByUrl.size} unique conversation(s) indexed.`,
+                        colleagueInboxByUrl.size > 0 ? 'info' : 'warning');
                 } catch (e) {
                     addLog(`   ⚠️ Could not pre-load inbox for ${colleague.name || colleague.primaryEmail}: ${e.message}`, 'warning');
                 }
@@ -21259,12 +21310,17 @@
                 // Pre-load linkedin_accounts → build heyreachAccountId → bdrEmail map
                 // (same as review_replies.html does for its follow-up scan)
                 const linkedInAccountIdMap = new Map(); // heyreachAccountId (string) → bdrEmail (lowercase)
+                const emailToAccountIds = new Map(); // bdrEmail (lowercase) → Set of heyreachAccountId(s)
                 try {
                     const liAccSnap = await getDocs(collection(db, 'linkedin_accounts'));
                     liAccSnap.forEach(d => {
                         const data = d.data();
                         if (data.heyreachAccountId && data.bdrEmail) {
-                            linkedInAccountIdMap.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
+                            const idStr = String(data.heyreachAccountId);
+                            const emailLower = data.bdrEmail.toLowerCase();
+                            linkedInAccountIdMap.set(idStr, emailLower);
+                            if (!emailToAccountIds.has(emailLower)) emailToAccountIds.set(emailLower, new Set());
+                            emailToAccountIds.get(emailLower).add(idStr);
                         }
                     });
                     addSCLog(`   Loaded ${linkedInAccountIdMap.size} HeyReach account ID mapping(s).`);
@@ -21425,6 +21481,39 @@
                                 }
                             }
                             await Promise.all(inboxQueries);
+
+                            // Fallback: some heyreach_inbox records are missing/stale email fields
+                            // but do carry a valid linkedInAccountId. Resolve the colleague's known
+                            // HeyReach account ID(s) via linkedin_accounts and query by ID too.
+                            if (colleagueInboxByUrl.size === 0) {
+                                const accountIdCandidates = new Set();
+                                for (const email of inboxEmailCandidates) {
+                                    const ids = emailToAccountIds.get((email || '').toLowerCase());
+                                    if (ids) ids.forEach(id => accountIdCandidates.add(id));
+                                }
+                                if (accountIdCandidates.size > 0) {
+                                    const idFields = ['linkedInAccountId', 'accountId', 'heyreachAccountId'];
+                                    const idQueries = [];
+                                    for (const idVal of accountIdCandidates) {
+                                        for (const field of idFields) {
+                                            idQueries.push(
+                                                getDocs(query(collection(db, 'heyreach_inbox'), where(field, '==', idVal)))
+                                                    .then(absorbInboxSnap).catch(() => {})
+                                            );
+                                            if (!isNaN(idVal)) {
+                                                idQueries.push(
+                                                    getDocs(query(collection(db, 'heyreach_inbox'), where(field, '==', Number(idVal))))
+                                                        .then(absorbInboxSnap).catch(() => {})
+                                                );
+                                            }
+                                        }
+                                    }
+                                    await Promise.all(idQueries);
+                                    addSCLog(`   🔁 Inbox email lookup found nothing for ${colleague.name || colleague.primaryEmail}; retried by HeyReach account ID (${[...accountIdCandidates].join(', ')}) — ${colleagueInboxByUrl.size} conversation(s) found.`);
+                                } else {
+                                    addSCLog(`   ⚠️ No linkedin_accounts mapping found for ${colleague.name || colleague.primaryEmail} either — can't retry inbox lookup by account ID.`, 'warning');
+                                }
+                            }
 
                             const note = colleague.primaryEmail !== colleagueLinkedInEmail
                                 ? '' : ' (account may be disconnected — tried all email fields)';
