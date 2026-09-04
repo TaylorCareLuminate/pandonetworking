@@ -14289,6 +14289,1070 @@
         // DNC bootstrapping is handled inside onAuthStateChanged (above) to ensure
         // Firestore reads run after authentication is confirmed.
 
+        // ══════════════════════════════════════════════════════════
+        //  BULK ORGANIZATION OUTREACH PURGE
+        //  Removes organizations from ALL outreach — current and upcoming:
+        //    • prospect_organizations docs (incl. hypothesis-group tagged + shared pools) → DELETED
+        //    • prospect_contacts → EXCLUDED (prospect_exclusions record + excludedFromCampaign flag,
+        //      same mechanism as process_exclusions.html)
+        //    • connect_activity in-process pushes → HeyReach cancel + hard delete
+        //      (same flow as sent_messages.html removeAndDeleteQueued)
+        //    • connect_queue pending messages → hard delete
+        //    • connect_reserve_queue messages → soft delete via Railway
+        //      (same endpoint as reserve_queue.html)
+        // ══════════════════════════════════════════════════════════
+
+        const PURGE_API_BASE = RAILWAY_DNC_API; // same Railway host as DNC / HeyReach proxy
+        const PURGE_PUSH_ACTION_TYPES = ['push_to_heyreach', 'auto_push_to_heyreach'];
+
+        let _purgeState = { inputs: [], scope: null, owners: null, results: null, running: false };
+        let _purgeQueryFailures = 0;
+        const _purgeHrKeyCache = new Map(); // bdrEmail (lowercase) -> { success, apiKey?, error? }
+
+        // ── Scope selection ───────────────────────────────────────
+
+        window.purgeOnScopeChange = function() {
+            const scope = document.querySelector('input[name="purgeScope"]:checked')?.value || 'everywhere';
+            document.getElementById('purgeScopeCustomerRow').style.display = scope === 'customer' ? 'block' : 'none';
+            document.getElementById('purgeScopeBDRRow').style.display      = scope === 'bdr'      ? 'block' : 'none';
+        };
+
+        function purgeGetScope() {
+            const scope = document.querySelector('input[name="purgeScope"]:checked')?.value || 'everywhere';
+            if (scope === 'customer') {
+                const sel = document.getElementById('purgeScopeCustomerValue');
+                if (!sel.value) { alert('Please select a company for the Company scope.'); return null; }
+                return { scope, scopeValue: sel.value, scopeLabel: sel.selectedOptions[0]?.textContent || sel.value };
+            }
+            if (scope === 'bdr') {
+                const sel = document.getElementById('purgeScopeBDRValue');
+                if (!sel.value) { alert('Please select a BDR for the BDR scope.'); return null; }
+                return { scope, scopeValue: sel.value, scopeLabel: sel.selectedOptions[0]?.textContent || sel.value };
+            }
+            return { scope: 'everywhere', scopeValue: '', scopeLabel: 'Everywhere' };
+        }
+
+        async function purgePopulateScopeSelects() {
+            const custMap = new Map();
+            try {
+                const custSnap = await getDocs(collection(db, 'customerList'));
+                custSnap.forEach(d => { const x = d.data(); custMap.set(d.id, x.name || x.shortName || d.id); });
+            } catch (_) {}
+
+            const custSelect = document.getElementById('purgeScopeCustomerValue');
+            if (custSelect && custSelect.options.length <= 1) {
+                [...custMap.entries()]
+                    .sort((a, b) => String(a[1]).localeCompare(String(b[1])))
+                    .forEach(([id, name]) => {
+                        const opt = document.createElement('option');
+                        opt.value = id; opt.textContent = name;
+                        custSelect.appendChild(opt);
+                    });
+            }
+
+            const bdrSelect = document.getElementById('purgeScopeBDRValue');
+            if (bdrSelect && bdrSelect.options.length <= 1) {
+                const bdrsSnap = await getDocs(collection(db, 'bdr_leaders'));
+                const byCompany = new Map(); const uncat = [];
+                bdrsSnap.docs.forEach(d => {
+                    const bdr = { id: d.id, ...d.data() };
+                    if (!bdr.primaryEmail) return;
+                    const company = (bdr.customerId && custMap.get(bdr.customerId)) || null;
+                    if (company) { if (!byCompany.has(company)) byCompany.set(company, []); byCompany.get(company).push(bdr); }
+                    else uncat.push(bdr);
+                });
+                const addOpts = (parent, bdrs) => {
+                    bdrs.sort((a, b) => (a.name || '').localeCompare(b.name || '')).forEach(bdr => {
+                        const opt = document.createElement('option');
+                        opt.value = bdr.primaryEmail;
+                        const inactive = bdr.status === 'inactive' ? ' — inactive' : '';
+                        opt.textContent = `${bdr.name || bdr.primaryEmail} (${bdr.primaryEmail})${inactive}`;
+                        parent.appendChild(opt);
+                    });
+                };
+                [...byCompany.keys()].sort().forEach(company => {
+                    const grp = document.createElement('optgroup');
+                    grp.label = company;
+                    addOpts(grp, byCompany.get(company));
+                    bdrSelect.appendChild(grp);
+                });
+                if (uncat.length) {
+                    const grp = document.createElement('optgroup');
+                    grp.label = '── No company ──';
+                    addOpts(grp, uncat);
+                    bdrSelect.appendChild(grp);
+                }
+            }
+        }
+
+        // ── Step 1: AI name variations ────────────────────────────
+
+        window.purgeGenerateVariations = async function(skipAI) {
+            const raw = document.getElementById('purgeOrgNames').value.trim();
+            if (!raw) { alert('Please paste at least one organization name.'); return; }
+            const names = [...new Set(raw.split('\n').map(l => l.trim()).filter(Boolean))];
+            if (!names.length) { alert('No valid names found.'); return; }
+            if (!purgeGetScope()) return;
+            if (!skipAI && !currentUser) { alert('You must be signed in to use AI variations.'); return; }
+
+            const btnA = document.getElementById('btnPurgeVariations');
+            const btnB = document.getElementById('btnPurgeVariationsFast');
+            const statusEl = document.getElementById('purgeStep1Status');
+            btnA.disabled = true; btnB.disabled = true;
+            document.getElementById('purgeResultsBox').style.display = 'none';
+            _purgeState.results = null;
+            _purgeState.inputs = [];
+            try {
+                for (let i = 0; i < names.length; i++) {
+                    const name = names[i];
+                    statusEl.innerHTML = `<i class="fas fa-spinner fa-spin"></i> [${i + 1}/${names.length}] <strong>${escAdminHtml(name)}</strong> — building name variations…`;
+                    let vars = dncBuiltinVariations(name);
+                    if (!skipAI) {
+                        try {
+                            const aiVars = await fetchAdminDNCVariationsFromRailway(name);
+                            vars = [...vars, ...aiVars];
+                        } catch (e) {
+                            console.warn(`Purge: AI variations failed for "${name}":`, e);
+                        }
+                    }
+                    const unique = [...new Set(vars.map(v => (v || '').trim()).filter(v => v && v.toLowerCase() !== name.toLowerCase()))];
+                    _purgeState.inputs.push({ name, variations: unique });
+                }
+                purgeRenderVariations();
+                document.getElementById('purgeVariationsBox').style.display = 'block';
+                statusEl.innerHTML = `✅ Variations ready for ${names.length} organization${names.length !== 1 ? 's' : ''} — review in Step 2, then search.`;
+            } catch (e) {
+                statusEl.textContent = '❌ Error: ' + e.message;
+                console.error('Purge variation error:', e);
+            } finally { btnA.disabled = false; btnB.disabled = false; }
+        };
+
+        function purgeRenderVariations() {
+            const container = document.getElementById('purgeVariationsList');
+            container.innerHTML = _purgeState.inputs.map((inp, i) => `
+                <div style="background:white;border:1px solid #fdba74;border-radius:8px;padding:0.75rem;">
+                    <div style="font-weight:700;font-size:0.9rem;color:#9a3412;margin-bottom:6px;">
+                        <i class="fas fa-building"></i> ${escAdminHtml(inp.name)}
+                        <span style="font-weight:400;color:var(--gray);font-size:0.78rem;">— ${inp.variations.length} variation${inp.variations.length !== 1 ? 's' : ''}</span>
+                    </div>
+                    <textarea id="purgeVars-${i}" rows="${Math.min(6, Math.max(2, inp.variations.length))}"
+                        style="width:100%;padding:8px;border:1px solid #fed7aa;border-radius:6px;font-size:0.85rem;font-family:inherit;resize:vertical;box-sizing:border-box;">${escAdminHtml(inp.variations.join('\n'))}</textarea>
+                </div>`).join('');
+        }
+
+        function purgeCollectVariations() {
+            _purgeState.inputs.forEach((inp, i) => {
+                const ta = document.getElementById(`purgeVars-${i}`);
+                if (!ta) return;
+                inp.variations = [...new Set(ta.value.split('\n').map(l => l.trim()).filter(Boolean))];
+            });
+        }
+
+        // ── Owner enumeration & scope checks ──────────────────────
+
+        async function purgeResolveOwners(scopeSel) {
+            const labels = new Map();       // ownerValue (sentinels as-is, emails lowercased) -> label
+            const emailToBdr = new Map();   // lowercase email -> { customerId }
+            const bdrEmails = [];           // stored-case emails (for query values)
+            const custMap = new Map();
+            try {
+                const custSnap = await getDocs(collection(db, 'customerList'));
+                custSnap.forEach(d => { const x = d.data(); custMap.set(d.id, x.name || x.shortName || d.id); });
+            } catch (_) {}
+
+            const bdrsSnap = await getDocs(collection(db, 'bdr_leaders'));
+            bdrsSnap.docs.forEach(d => {
+                const b = d.data();
+                if (!b.primaryEmail) return;
+                bdrEmails.push(b.primaryEmail);
+                emailToBdr.set(b.primaryEmail.toLowerCase(), { customerId: b.customerId || null });
+                labels.set(b.primaryEmail.toLowerCase(), `BDR: ${b.name || b.primaryEmail}`);
+            });
+
+            const wsSnap = await getDocs(collection(db, 'workspaces'));
+            const wsById = new Map();
+            wsSnap.docs.forEach(d => wsById.set(d.id, { id: d.id, ...d.data() }));
+            const wsSentinels = new Set();
+            const sentinelWs = new Map(); // sentinel -> canonical workspace doc
+            for (const w of wsById.values()) {
+                let canonical = w, hops = 0;
+                while (canonical.mergedInto && wsById.has(canonical.mergedInto) && hops < 24) {
+                    canonical = wsById.get(canonical.mergedInto); hops++;
+                }
+                const ids = new Set([w.id, ...(Array.isArray(w.routingWorkspaceIds) ? w.routingWorkspaceIds : [])]);
+                for (const id of ids) {
+                    const s = WR.WS_PREFIX + id;
+                    wsSentinels.add(s);
+                    if (!sentinelWs.has(s)) sentinelWs.set(s, canonical);
+                    if (!labels.has(s)) labels.set(s, `Workspace: ${canonical.name || id}`);
+                }
+            }
+
+            const hypoSentinels = [];
+            const groupNameById = new Map();
+            try {
+                const gSnap = await getDocs(collection(db, 'hypothesis_groups'));
+                gSnap.docs.forEach(d => {
+                    const g = d.data();
+                    groupNameById.set(d.id, g.name || d.id);
+                    const s = HYPO_SENTINEL_PREFIX + d.id;
+                    hypoSentinels.push(s);
+                    labels.set(s, `Hypothesis pool: ${g.name || d.id}`);
+                });
+            } catch (e) { console.warn('Purge: could not load hypothesis groups:', e); }
+            labels.set('__unassigned__', 'Unassigned pool');
+
+            // Scope restriction (null = everywhere)
+            let scopedEmails = null;        // Set of lowercase emails
+            let scopedEmailValues = null;   // stored-case + lowercase, for query values
+            let scopedWsSentinels = null;   // Set of __ws__: sentinels
+            if (scopeSel.scope === 'bdr') {
+                const email = scopeSel.scopeValue;
+                scopedEmails = new Set([email.toLowerCase()]);
+                scopedEmailValues = [...new Set([email, email.toLowerCase()])];
+                scopedWsSentinels = new Set();
+                for (const [s, ws] of sentinelWs.entries()) {
+                    if ((ws.createdBy || '').toLowerCase() === email.toLowerCase()) scopedWsSentinels.add(s);
+                }
+            } else if (scopeSel.scope === 'customer') {
+                scopedEmails = new Set();
+                scopedEmailValues = [];
+                for (const email of bdrEmails) {
+                    const info = emailToBdr.get(email.toLowerCase());
+                    if (info && info.customerId === scopeSel.scopeValue) {
+                        scopedEmails.add(email.toLowerCase());
+                        scopedEmailValues.push(email, email.toLowerCase());
+                    }
+                }
+                scopedEmailValues = [...new Set(scopedEmailValues)];
+                scopedWsSentinels = new Set();
+                for (const [s, ws] of sentinelWs.entries()) {
+                    const clientIds = Array.isArray(ws.clientIds) ? ws.clientIds : [];
+                    if (clientIds.includes(scopeSel.scopeValue)) scopedWsSentinels.add(s);
+                }
+            }
+
+            return {
+                labels, groupNameById,
+                scoped: !!(scopedEmails || scopedWsSentinels),
+                scopedEmails, scopedWsSentinels,
+                orgOwnerValues: [...new Set([
+                    ...(scopedEmailValues ? scopedEmailValues : bdrEmails),
+                    ...(scopedWsSentinels ? [...scopedWsSentinels] : [...wsSentinels]),
+                    ...hypoSentinels,
+                    '__unassigned__'
+                ])]
+            };
+        }
+
+        function purgeEmailInScope(owners, email) {
+            if (!owners.scopedEmails) return true;
+            return !!email && owners.scopedEmails.has(String(email).toLowerCase());
+        }
+
+        /** Scope check for owner values that may be emails or pool sentinels. */
+        function purgeOwnerValueInScope(owners, value) {
+            if (!value) return false;
+            if (value === '__unassigned__' || value.startsWith(HYPO_SENTINEL_PREFIX)) return true; // shared pools always in scope
+            if (value.startsWith(WR.WS_PREFIX)) return owners.scopedWsSentinels ? owners.scopedWsSentinels.has(value) : true;
+            return purgeEmailInScope(owners, value);
+        }
+
+        function purgeOwnerLabel(owners, value) {
+            if (!value) return '(no owner)';
+            if (value.startsWith(WR.WS_PREFIX) || value.startsWith(HYPO_SENTINEL_PREFIX) || value === '__unassigned__') {
+                return owners.labels.get(value) || value;
+            }
+            return owners.labels.get(String(value).toLowerCase()) || value;
+        }
+
+        // ── Firestore "in"-query helper (chunked, mildly parallel) ─
+
+        async function purgeQueryIn(collName, field, values) {
+            const byId = new Map();
+            const unique = [...new Set((values || [])
+                .map(v => (typeof v === 'string' ? v.trim() : v))
+                .filter(v => v))];
+            if (!unique.length) return byId;
+            const chunks = WR.chunk(unique, WR.MAX_IN);
+            const CONCURRENCY = 4;
+            for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+                const batch = chunks.slice(i, i + CONCURRENCY);
+                const snaps = await Promise.all(batch.map(async ch => {
+                    const q = ch.length === 1
+                        ? query(collection(db, collName), where(field, '==', ch[0]))
+                        : query(collection(db, collName), where(field, 'in', ch));
+                    try {
+                        return getAllDocs
+                            ? await getAllDocs(q, { pageSize: 1000, timeoutMs: 60000, maxRetries: 2 })
+                            : await getDocs(q);
+                    } catch (e) {
+                        _purgeQueryFailures++;
+                        console.warn(`Purge query failed (${collName}.${field}):`, e.message);
+                        return null;
+                    }
+                }));
+                snaps.forEach(snap => {
+                    if (!snap) return;
+                    snap.forEach(d => { if (!byId.has(d.id)) byId.set(d.id, { id: d.id, ...d.data() }); });
+                });
+            }
+            return byId;
+        }
+
+        function purgeMergeMaps(target, source) {
+            source.forEach((v, k) => { if (!target.has(k)) target.set(k, v); });
+        }
+
+        // ── Step 2: search everything ─────────────────────────────
+
+        function purgeSetSearchStatus(html) {
+            document.getElementById('purgeSearchStatus').innerHTML = html;
+        }
+
+        window.purgeRunSearch = async function() {
+            if (_purgeState.running) return;
+            const scopeSel = purgeGetScope();
+            if (!scopeSel) return;
+            purgeCollectVariations();
+            if (!_purgeState.inputs.length) { alert('Generate variations first (Step 1).'); return; }
+
+            const btn = document.getElementById('btnPurgeSearch');
+            _purgeState.running = true;
+            _purgeQueryFailures = 0;
+            btn.disabled = true;
+            document.getElementById('purgeResultsBox').style.display = 'none';
+
+            const spin = (msg) => purgeSetSearchStatus(`<i class="fas fa-spinner fa-spin"></i> ${msg}`);
+
+            try {
+                spin('Resolving BDRs, workspaces &amp; hypothesis groups…');
+                const owners = await purgeResolveOwners(scopeSel);
+                _purgeState.scope = scopeSel;
+                _purgeState.owners = owners;
+
+                // Fuzzy matcher entries — reuse the DNC fuzzy matcher against our inputs
+                const entries = _purgeState.inputs.map((inp, i) => ({
+                    original_name: inp.name, variations: inp.variations, _purgeIdx: i
+                }));
+                const matchInput = (name) => {
+                    const m = isDNCMatch(name || '', entries);
+                    return m ? m._purgeIdx : -1;
+                };
+
+                // ── 1. Organizations (all lists: BDRs, workspaces, hypothesis pools, unassigned)
+                spin(`Loading organizations across ${owners.orgOwnerValues.length} owner value${owners.orgOwnerValues.length !== 1 ? 's' : ''}…`);
+                const orgRows = await WR.queryUnionByField(db, 'prospect_organizations', 'bdrEmail', owners.orgOwnerValues, window.clemailFirestore);
+                const orgs = [];
+                const orgById = new Map();
+                for (const o of orgRows) {
+                    const idx = matchInput(o.company_name);
+                    if (idx < 0) continue;
+                    const hypoIds = Array.isArray(o.hypothesis_group_ids) ? o.hypothesis_group_ids : [];
+                    const rec = {
+                        id: o.id,
+                        name: o.company_name || '(unnamed)',
+                        owner: o.bdrEmail || '',
+                        ownerLabel: purgeOwnerLabel(owners, o.bdrEmail || ''),
+                        linkedinUrl: o.company_linkedin_url || '',
+                        hypoTags: hypoIds.map(gid =>
+                            (o.hypothesis_group_names || {})[gid] || owners.groupNameById.get(gid) || gid),
+                        _inputIdx: idx
+                    };
+                    orgs.push(rec);
+                    orgById.set(o.id, rec);
+                }
+
+                // Candidate name strings for exact-match queries on contacts/messages
+                const nameSet = new Set();
+                entries.forEach(e => [e.original_name, ...e.variations].forEach(n => {
+                    const t = (n || '').trim();
+                    if (t.length >= 2) { nameSet.add(t); nameSet.add(t.toLowerCase()); }
+                }));
+                orgs.forEach(o => { if (o.name && o.name !== '(unnamed)') nameSet.add(o.name); });
+                const nameList = [...nameSet];
+
+                // ── 2. Contacts (matched by company name OR link to a matched org)
+                spin(`Searching contacts (${nameList.length} name variant${nameList.length !== 1 ? 's' : ''})…`);
+                const contactById = new Map();
+                purgeMergeMaps(contactById, await purgeQueryIn('prospect_contacts', 'company', nameList));
+                purgeMergeMaps(contactById, await purgeQueryIn('prospect_contacts', 'searchedOrganizationLinkedInUrl',
+                    orgs.map(o => o.linkedinUrl).filter(Boolean)));
+                purgeMergeMaps(contactById, await purgeQueryIn('prospect_contacts', 'prospect_org_id', orgs.map(o => o.id)));
+
+                const contacts = [];
+                let alreadyExcluded = 0;
+                for (const c of contactById.values()) {
+                    const ownerVals = [c.userEmail, c.bdrEmail, c.linkedInAccountEmail, c.accountEmail].filter(Boolean);
+                    if (owners.scoped && !ownerVals.some(v => purgeOwnerValueInScope(owners, v))) continue;
+                    let idx = matchInput(c.company);
+                    if (idx < 0 && c.prospect_org_id && orgById.has(c.prospect_org_id)) idx = orgById.get(c.prospect_org_id)._inputIdx;
+                    if (idx < 0 && c.searchedOrganizationLinkedInUrl) {
+                        const viaOrg = orgs.find(o => o.linkedinUrl && o.linkedinUrl === c.searchedOrganizationLinkedInUrl);
+                        if (viaOrg) idx = viaOrg._inputIdx;
+                    }
+                    if (idx < 0) continue;
+                    if (c.excludedFromCampaign) { alreadyExcluded++; continue; }
+                    const primaryOwner = c.userEmail || c.bdrEmail || c.linkedInAccountEmail || c.accountEmail || '';
+                    contacts.push({
+                        id: c.id,
+                        name: `${c.firstName || ''} ${c.lastName || ''}`.trim() || '(unknown)',
+                        title: c.title || '',
+                        company: c.company || '',
+                        owner: primaryOwner,
+                        ownerLabel: purgeOwnerLabel(owners, primaryOwner),
+                        linkedInUrl: c.linkedInUrl || '',
+                        _inputIdx: idx
+                    });
+                }
+
+                // Canonical contact URL -> input index (fallback matching for messages)
+                const urlToInputIdx = new Map();
+                contacts.forEach(c => {
+                    const u = canonicalLinkedInUrl(c.linkedInUrl || '');
+                    if (u && !urlToInputIdx.has(u)) urlToInputIdx.set(u, c._inputIdx);
+                });
+
+                // ── 3. HeyReach "already sent" confirmations (keep sent history intact)
+                spin('Loading HeyReach sent confirmations…');
+                const sentUrls = new Set();
+                try {
+                    const sentSnap = await getDocs(query(
+                        collection(db, 'heyreach_activity'),
+                        where('eventType', '==', 'CONNECTION_REQUEST_SENT'),
+                        limitFn(10000)
+                    ));
+                    sentSnap.forEach(d => {
+                        const data = d.data();
+                        const u = canonicalLinkedInUrl(data.leadProfileUrl || data.profileUrl || '');
+                        if (u) sentUrls.add(u);
+                    });
+                } catch (e) { console.warn('Purge: could not load sent confirmations:', e.message); }
+
+                // ── 4. In-process HeyReach pushes (connect_activity)
+                spin('Searching in-process HeyReach pushes…');
+                const actById = new Map();
+                for (const f of ['contactCompany', 'prospectCompany', 'prospect_company', 'company_name']) {
+                    purgeMergeMaps(actById, await purgeQueryIn('connect_activity', f, nameList));
+                }
+                const contactUrls = contacts.map(c => c.linkedInUrl).filter(Boolean);
+                for (const f of ['contactLinkedInUrl', 'prospectUrl']) {
+                    purgeMergeMaps(actById, await purgeQueryIn('connect_activity', f, contactUrls));
+                }
+
+                const activities = [];
+                for (const a of actById.values()) {
+                    const isPush = PURGE_PUSH_ACTION_TYPES.includes(a.actionType)
+                        || (!a.actionType && a.contactLinkedInUrl && a.campaignId);
+                    if (!isPush) continue;
+                    if (owners.scoped && !purgeEmailInScope(owners, a.bdrEmail)) continue;
+                    const profileUrl = a.contactLinkedInUrl || a.prospectUrl || a.prospect_url || a.prospectLinkedInUrl || '';
+                    const canon = canonicalLinkedInUrl(profileUrl);
+                    if (canon && sentUrls.has(canon)) continue; // already sent — keep the history record
+                    const company = a.contactCompany || a.prospectCompany || a.prospect_company || a.company_name || '';
+                    let idx = matchInput(company);
+                    if (idx < 0 && canon && urlToInputIdx.has(canon)) idx = urlToInputIdx.get(canon);
+                    if (idx < 0) continue;
+                    const t = safeUploadedAtDate(a._createTime || a.timestamp || a.createdAt);
+                    activities.push({
+                        id: a.id,
+                        contactName: a.contactName || a.prospectName || a.prospect_name || '(unknown)',
+                        company,
+                        bdrEmail: a.bdrEmail || '',
+                        ownerLabel: purgeOwnerLabel(owners, a.bdrEmail || ''),
+                        profileUrl,
+                        stale: t ? (Date.now() - t.getTime() > STALE_QUEUE_MS) : false,
+                        _inputIdx: idx
+                    });
+                    if (canon && !urlToInputIdx.has(canon)) urlToInputIdx.set(canon, idx);
+                }
+
+                // ── 5. Pending message queue (connect_queue)
+                spin('Searching the message queue…');
+                const queueById = new Map();
+                for (const f of ['prospect_company', 'contactCompany', 'company', 'company_name']) {
+                    purgeMergeMaps(queueById, await purgeQueryIn('connect_queue', f, nameList));
+                }
+                const urlsForQueue = [...new Set([...contactUrls, ...activities.map(a => a.profileUrl)].filter(Boolean))];
+                for (const f of ['linkedin_url', 'prospect_li_url', 'contact_linkedin_url']) {
+                    purgeMergeMaps(queueById, await purgeQueryIn('connect_queue', f, urlsForQueue));
+                }
+
+                const queueDocs = [];
+                for (const qd of queueById.values()) {
+                    if (owners.scoped
+                        && !purgeEmailInScope(owners, qd.account_email)
+                        && !purgeEmailInScope(owners, qd.bdr_auth_email)) continue;
+                    const company = qd.prospect_company || qd.contactCompany || qd.company || qd.company_name || '';
+                    const url = qd.linkedin_url || qd.prospect_li_url || qd.contact_linkedin_url || '';
+                    const canon = canonicalLinkedInUrl(url);
+                    let idx = matchInput(company);
+                    if (idx < 0 && canon && urlToInputIdx.has(canon)) idx = urlToInputIdx.get(canon);
+                    if (idx < 0) continue;
+                    const contactName = [qd.contactFirstName, qd.contactLastName].filter(Boolean).join(' ')
+                        || qd.contactName || qd.prospect_name || '(unknown)';
+                    const owner = qd.account_email || qd.bdr_auth_email || '';
+                    queueDocs.push({
+                        id: qd.id, contactName, company,
+                        owner, ownerLabel: purgeOwnerLabel(owners, owner),
+                        url, _inputIdx: idx
+                    });
+                }
+
+                // ── 6. Reserve queue (connect_reserve_queue, pending only)
+                spin('Searching the reserve queue…');
+                const reserveById = new Map();
+                purgeMergeMaps(reserveById, await purgeQueryIn('connect_reserve_queue', 'contactCompany', nameList));
+                purgeMergeMaps(reserveById, await purgeQueryIn('connect_reserve_queue', 'prospect_li_url', urlsForQueue));
+
+                const reserveDocs = [];
+                for (const r of reserveById.values()) {
+                    if ((r.status || 'pending') !== 'pending') continue;
+                    if (owners.scoped
+                        && !purgeEmailInScope(owners, r.account_email)
+                        && !purgeEmailInScope(owners, r.bdr_auth_email)) continue;
+                    let idx = matchInput(r.contactCompany);
+                    if (idx < 0) {
+                        const canon = canonicalLinkedInUrl(r.prospect_li_url || '');
+                        if (canon && urlToInputIdx.has(canon)) idx = urlToInputIdx.get(canon);
+                    }
+                    if (idx < 0) continue;
+                    const owner = r.account_email || r.bdr_auth_email || '';
+                    reserveDocs.push({
+                        id: r.id,
+                        contactName: [r.contactFirstName, r.contactLastName].filter(Boolean).join(' ') || '(unknown)',
+                        company: r.contactCompany || '',
+                        owner, ownerLabel: purgeOwnerLabel(owners, owner),
+                        _inputIdx: idx
+                    });
+                }
+
+                _purgeState.results = {
+                    orgs, contacts, activities, queue: queueDocs, reserve: reserveDocs,
+                    alreadyExcluded, queryFailures: _purgeQueryFailures
+                };
+
+                purgeSetSearchStatus('');
+                purgeRenderResults();
+                document.getElementById('purgeResultsBox').style.display = 'block';
+                document.getElementById('purgeResultsBox').scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+            } catch (e) {
+                purgeSetSearchStatus('❌ Search error: ' + escAdminHtml(e.message));
+                console.error('Purge search error:', e);
+            } finally {
+                _purgeState.running = false;
+                btn.disabled = false;
+            }
+        };
+
+        // ── Step 3: render results ────────────────────────────────
+
+        function purgeSummaryChip(icon, count, label, color) {
+            return `<div style="background:${color}12;border:1.5px solid ${color};border-radius:8px;padding:0.5rem 0.9rem;display:flex;flex-direction:column;min-width:110px;">
+                <span style="font-size:1.35rem;font-weight:800;color:${color};line-height:1.2;">${count}</span>
+                <span style="font-size:0.72rem;color:var(--gray);text-transform:uppercase;letter-spacing:.04em;"><i class="fas ${icon}"></i> ${label}</span>
+            </div>`;
+        }
+
+        function purgeRow(kind, id, checked, mainHtml, metaHtml) {
+            return `<label style="display:flex;align-items:flex-start;gap:8px;padding:4px 6px;border-radius:5px;cursor:pointer;font-size:0.83rem;line-height:1.4;">
+                <input type="checkbox" class="purge-chk" data-kind="${kind}" data-id="${escAdminHtml(id)}" ${checked ? 'checked' : ''}
+                    onchange="purgeUpdateSummaryCounts()"
+                    style="width:14px;height:14px;margin-top:3px;accent-color:#dc2626;flex-shrink:0;">
+                <span style="flex:1;">${mainHtml}${metaHtml ? ` <span style="color:var(--gray);font-size:0.76rem;">${metaHtml}</span>` : ''}</span>
+            </label>`;
+        }
+
+        function purgeKindBlock(title, icon, color, rowsHtml, count) {
+            if (!count) return '';
+            return `<div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;">
+                <div style="background:${color}10;padding:0.45rem 0.8rem;font-size:0.8rem;font-weight:700;color:${color};">
+                    <i class="fas ${icon}"></i> ${title} (${count})
+                </div>
+                <div style="padding:0.35rem 0.5rem;max-height:260px;overflow-y:auto;">${rowsHtml}</div>
+            </div>`;
+        }
+
+        function purgeRenderResults() {
+            const R = _purgeState.results;
+            if (!R) return;
+            const summaryEl = document.getElementById('purgeSummary');
+            const listEl = document.getElementById('purgeResultsList');
+
+            const hypoOrgCount = R.orgs.filter(o => o.hypoTags.length > 0).length;
+            let summaryHtml =
+                purgeSummaryChip('fa-building', R.orgs.length, 'Organizations', '#b91c1c') +
+                purgeSummaryChip('fa-project-diagram', hypoOrgCount, 'In hypothesis groups', '#7c3aed') +
+                purgeSummaryChip('fa-users', R.contacts.length, 'Contacts to exclude', '#0369a1') +
+                purgeSummaryChip('fa-paper-plane', R.activities.length, 'In-process pushes', '#c2410c') +
+                purgeSummaryChip('fa-inbox', R.queue.length, 'Queued messages', '#0f766e') +
+                purgeSummaryChip('fa-box-archive', R.reserve.length, 'Reserve messages', '#f97316');
+            if (R.alreadyExcluded > 0) {
+                summaryHtml += `<div style="align-self:center;font-size:0.78rem;color:var(--gray);">
+                    (${R.alreadyExcluded} contact${R.alreadyExcluded !== 1 ? 's' : ''} already excluded — skipped)</div>`;
+            }
+            if (R.queryFailures > 0) {
+                summaryHtml += `<div style="align-self:center;font-size:0.78rem;color:#b45309;">
+                    <i class="fas fa-triangle-exclamation"></i> ${R.queryFailures} search quer${R.queryFailures !== 1 ? 'ies' : 'y'} failed —
+                    results may be incomplete (check console, re-run search).</div>`;
+            }
+            summaryEl.innerHTML = summaryHtml;
+
+            const total = R.orgs.length + R.contacts.length + R.activities.length + R.queue.length + R.reserve.length;
+            if (total === 0) {
+                listEl.innerHTML = `<p style="color:var(--gray);font-style:italic;padding:0.5rem;">
+                    Nothing found for these organizations in the selected scope.</p>`;
+                document.getElementById('btnPurgeExecute').disabled = true;
+                return;
+            }
+            document.getElementById('btnPurgeExecute').disabled = false;
+
+            let html = '';
+            _purgeState.inputs.forEach((inp, idx) => {
+                const gOrgs = R.orgs.filter(x => x._inputIdx === idx);
+                const gContacts = R.contacts.filter(x => x._inputIdx === idx);
+                const gActs = R.activities.filter(x => x._inputIdx === idx);
+                const gQueue = R.queue.filter(x => x._inputIdx === idx);
+                const gReserve = R.reserve.filter(x => x._inputIdx === idx);
+                const gTotal = gOrgs.length + gContacts.length + gActs.length + gQueue.length + gReserve.length;
+
+                const counts = `${gOrgs.length} org${gOrgs.length !== 1 ? 's' : ''} · ${gContacts.length} contact${gContacts.length !== 1 ? 's' : ''} · ${gActs.length + gQueue.length + gReserve.length} message${(gActs.length + gQueue.length + gReserve.length) !== 1 ? 's' : ''}`;
+                html += `
+                <div style="border:1.5px solid ${gTotal ? '#fca5a5' : 'var(--border)'};border-radius:10px;overflow:hidden;">
+                    <div style="display:flex;align-items:center;gap:10px;padding:0.65rem 1rem;background:${gTotal ? '#fef2f2' : '#f9fafb'};cursor:pointer;user-select:none;"
+                        onclick="purgeToggleGroup(${idx})">
+                        <i class="fas fa-chevron-down" id="purge-group-chevron-${idx}" style="font-size:0.7rem;color:#6b7280;transition:transform 0.15s;"></i>
+                        <input type="checkbox" class="purge-group-chk" data-group="${idx}" ${gTotal ? 'checked' : 'disabled'}
+                            onclick="event.stopPropagation();purgeGroupSelect(${idx}, this.checked)"
+                            style="width:15px;height:15px;accent-color:#dc2626;">
+                        <span style="font-weight:700;font-size:0.92rem;color:#991b1b;flex:1;">${escAdminHtml(inp.name)}</span>
+                        <span style="font-size:0.78rem;color:var(--gray);">${gTotal ? counts : 'no matches'}</span>
+                    </div>
+                    <div id="purge-group-body-${idx}" style="padding:${gTotal ? '0.65rem 0.85rem' : '0'};display:flex;flex-direction:column;gap:0.6rem;">`;
+
+                if (gTotal) {
+                    html += purgeKindBlock('Organizations to delete', 'fa-building', '#b91c1c',
+                        gOrgs.map(o => purgeRow('org', o.id, true,
+                            `<strong>${escAdminHtml(o.name)}</strong>`,
+                            `${escAdminHtml(o.ownerLabel)}${o.hypoTags.length ? ' · Hypothesis: ' + escAdminHtml(o.hypoTags.join(', ')) : ''}`)).join(''),
+                        gOrgs.length);
+                    html += purgeKindBlock('Contacts to exclude', 'fa-users', '#0369a1',
+                        gContacts.map(c => purgeRow('contact', c.id, true,
+                            `${escAdminHtml(c.name)}${c.title ? ' — ' + escAdminHtml(c.title) : ''}`,
+                            `${escAdminHtml(c.company)} · ${escAdminHtml(c.ownerLabel)}`)).join(''),
+                        gContacts.length);
+                    html += purgeKindBlock('In-process HeyReach pushes to cancel & delete', 'fa-paper-plane', '#c2410c',
+                        gActs.map(a => purgeRow('activity', a.id, true,
+                            `${escAdminHtml(a.contactName)}${a.stale ? ' <span style="color:#b45309;font-size:0.72rem;">(stale &gt;21d)</span>' : ''}`,
+                            `${escAdminHtml(a.company)} · ${escAdminHtml(a.ownerLabel)}`)).join(''),
+                        gActs.length);
+                    html += purgeKindBlock('Queued messages to delete', 'fa-inbox', '#0f766e',
+                        gQueue.map(qd => purgeRow('queue', qd.id, true,
+                            escAdminHtml(qd.contactName),
+                            `${escAdminHtml(qd.company)} · ${escAdminHtml(qd.ownerLabel)}`)).join(''),
+                        gQueue.length);
+                    html += purgeKindBlock('Reserve-queue messages to remove', 'fa-box-archive', '#f97316',
+                        gReserve.map(r => purgeRow('reserve', r.id, true,
+                            escAdminHtml(r.contactName),
+                            `${escAdminHtml(r.company)} · ${escAdminHtml(r.ownerLabel)}`)).join(''),
+                        gReserve.length);
+                }
+
+                html += `</div></div>`;
+            });
+            listEl.innerHTML = html;
+            document.getElementById('purgeSelectAllChk').checked = true;
+            purgeUpdateSummaryCounts();
+        }
+
+        window.purgeToggleGroup = function(idx) {
+            const body = document.getElementById('purge-group-body-' + idx);
+            const chevron = document.getElementById('purge-group-chevron-' + idx);
+            if (!body) return;
+            const collapsed = body.style.display === 'none';
+            body.style.display = collapsed ? 'flex' : 'none';
+            if (chevron) chevron.style.transform = collapsed ? '' : 'rotate(-90deg)';
+        };
+
+        window.purgeGroupSelect = function(idx, checked) {
+            const body = document.getElementById('purge-group-body-' + idx);
+            if (!body) return;
+            body.querySelectorAll('.purge-chk').forEach(c => { c.checked = checked; });
+            purgeUpdateSummaryCounts();
+        };
+
+        window.purgeSelectAll = function(checked) {
+            document.querySelectorAll('#purgeResultsList .purge-chk').forEach(c => { c.checked = checked; });
+            document.querySelectorAll('#purgeResultsList .purge-group-chk').forEach(c => { if (!c.disabled) c.checked = checked; });
+            purgeUpdateSummaryCounts();
+        };
+
+        window.purgeUpdateSummaryCounts = function() {
+            const counts = { org: 0, contact: 0, activity: 0, queue: 0, reserve: 0 };
+            document.querySelectorAll('#purgeResultsList .purge-chk:checked').forEach(c => {
+                counts[c.dataset.kind] = (counts[c.dataset.kind] || 0) + 1;
+            });
+            const total = counts.org + counts.contact + counts.activity + counts.queue + counts.reserve;
+            const btn = document.getElementById('btnPurgeExecute');
+            btn.disabled = total === 0;
+            document.getElementById('purgeExecStatus').textContent = total
+                ? `${counts.org} orgs · ${counts.contact} contacts · ${counts.activity + counts.queue + counts.reserve} messages selected`
+                : 'Nothing selected';
+        };
+
+        // ── Execution log ─────────────────────────────────────────
+
+        function purgeLog(msg, color) {
+            const el = document.getElementById('purgeExecLog');
+            el.style.display = 'block';
+            const line = document.createElement('div');
+            if (color) line.style.color = color;
+            line.innerHTML = msg;
+            el.appendChild(line);
+            el.scrollTop = el.scrollHeight;
+        }
+
+        // ── HeyReach cancellation (same flow as sent_messages.html) ──
+
+        async function purgeGetHeyReachApiKey(bdrEmail) {
+            const key = String(bdrEmail || '').toLowerCase();
+            if (!key) return { success: false, error: 'No BDR email on the activity record' };
+            if (_purgeHrKeyCache.has(key)) return _purgeHrKeyCache.get(key);
+            let result;
+            try {
+                const liSnap = await getDocs(query(collection(db, 'linkedin_accounts'), where('bdrEmail', '==', key)));
+                if (!liSnap || liSnap.empty) {
+                    result = { success: false, error: `No LinkedIn account found for ${key}` };
+                } else {
+                    const customerId = liSnap.docs[0].data().customerId;
+                    if (!customerId) {
+                        result = { success: false, error: `No customer ID on LinkedIn account for ${key}` };
+                    } else {
+                        const custSnap = await getDoc(doc(db, 'customerList', customerId));
+                        const custData = custSnap ? (typeof custSnap.data === 'function' ? custSnap.data() : custSnap) : null;
+                        const apiKey = custData && custData.heyreachApiKey;
+                        result = apiKey
+                            ? { success: true, apiKey }
+                            : { success: false, error: `No HeyReach API key configured for customer of ${key}` };
+                    }
+                }
+            } catch (e) {
+                result = { success: false, error: `API key lookup failed: ${e.message}` };
+            }
+            _purgeHrKeyCache.set(key, result);
+            return result;
+        }
+
+        /**
+         * Cancels a pushed lead in HeyReach — Strategy A (stopleadincampaign by
+         * campaignId + leadUrl), then Strategy B (deleteleads by listId + profileUrl).
+         * Mirrors removeFromHeyReachInternal in sent_messages.html.
+         */
+        async function purgeStopHeyReach(act) {
+            try {
+                const snap = await getDoc(doc(db, 'connect_activity', act.id));
+                if (!snap) return { success: false, error: 'Activity record not found' };
+                const data = typeof snap.data === 'function' ? snap.data() : snap;
+
+                let campaignId = data.heyreachCampaignId || data.campaignId;
+                let listId = data.heyreachListId || data.listId;
+                const internalCampaignId = data.campaignId;
+                const bdrEmail = data.bdrEmail || act.bdrEmail || (currentUser && currentUser.email) || '';
+                const profileUrl = String(act.profileUrl || data.contactLinkedInUrl || data.prospectUrl || '')
+                    .toLowerCase().replace(/\/$/, '');
+                if (!profileUrl) return { success: false, error: 'No LinkedIn profile URL on the activity record' };
+
+                const keyRes = await purgeGetHeyReachApiKey(bdrEmail);
+                if (!keyRes.success) return keyRes;
+
+                // listId from the campaigns collection if missing
+                if (!listId && internalCampaignId) {
+                    try {
+                        const campSnap = await getDoc(doc(db, 'campaigns', internalCampaignId));
+                        const campData = campSnap ? (typeof campSnap.data === 'function' ? campSnap.data() : campSnap) : null;
+                        if (campData) {
+                            listId = campData.heyreachListId || campData.listId;
+                            if (!listId && Array.isArray(campData.heyreachCampaigns) && campData.heyreachCampaigns.length) {
+                                const match = campData.heyreachCampaigns.find(hc =>
+                                    hc.id != null && campaignId != null && String(hc.id) === String(campaignId)
+                                ) || campData.heyreachCampaigns.find(hc =>
+                                    hc.label && hc.label.toLowerCase().includes((bdrEmail.split('@')[0] || '').toLowerCase())
+                                ) || campData.heyreachCampaigns[0];
+                                listId = match && match.listId;
+                            }
+                        }
+                    } catch (_) {}
+                }
+
+                // Strategy A: stop the lead in its campaign (no listId needed)
+                if (campaignId) {
+                    const stopResp = await fetch(`${PURGE_API_BASE}/proxy/heyreach/campaign/stopleadincampaign`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'x-api-key': keyRes.apiKey },
+                        body: JSON.stringify({ campaignId, leadUrl: profileUrl, leadMemberId: null })
+                    });
+                    const stopResult = await stopResp.json().catch(() => ({}));
+                    if (stopResp.ok && stopResult.success !== false) return { success: true };
+                }
+
+                // Resolve listId directly from HeyReach if still missing
+                if (!listId && campaignId) {
+                    try {
+                        const campsResp = await fetch(`${PURGE_API_BASE}/proxy/heyreach/campaigns/getall`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'x-api-key': keyRes.apiKey },
+                            body: JSON.stringify({ offset: 0, limit: 100, keyword: '', status: 'all' })
+                        });
+                        if (campsResp.ok) {
+                            const campsData = await campsResp.json();
+                            const arr = campsData.items || campsData.campaigns || campsData.data
+                                || (Array.isArray(campsData) ? campsData : []);
+                            const match = Array.isArray(arr)
+                                ? arr.find(c => String(c.id || c._id || c.campaign_id) === String(campaignId))
+                                : null;
+                            if (match) listId = match.linkedInUserListId || match.listId || match.LinkedInUserListId;
+                        }
+                    } catch (_) {}
+                }
+
+                if (!listId) {
+                    return { success: false, error: `Could not stop lead (campaignId=${campaignId || 'none'}, no listId)` };
+                }
+
+                // Strategy B: remove from the lead list
+                const delResp = await fetch(`${PURGE_API_BASE}/proxy/heyreach/lists/deleteleads`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': keyRes.apiKey },
+                    body: JSON.stringify({
+                        listId: parseInt(listId), profileUrls: [profileUrl],
+                        campaignId, pauseAndResume: true
+                    })
+                });
+                const delResult = await delResp.json().catch(() => ({}));
+                if (delResp.ok) return { success: true };
+                return { success: false, error: delResult.message || delResult.error || 'HeyReach deleteleads failed' };
+
+            } catch (e) {
+                return { success: false, error: e.message };
+            }
+        }
+
+        // ── Execute ───────────────────────────────────────────────
+
+        window.purgeExecute = async function() {
+            if (_purgeState.running) return;
+            const R = _purgeState.results;
+            if (!R) return;
+
+            const selected = { org: new Set(), contact: new Set(), activity: new Set(), queue: new Set(), reserve: new Set() };
+            document.querySelectorAll('#purgeResultsList .purge-chk:checked').forEach(c => {
+                if (selected[c.dataset.kind]) selected[c.dataset.kind].add(c.dataset.id);
+            });
+            const orgSel = R.orgs.filter(x => selected.org.has(x.id));
+            const contactSel = R.contacts.filter(x => selected.contact.has(x.id));
+            const actSel = R.activities.filter(x => selected.activity.has(x.id));
+            const queueSel = R.queue.filter(x => selected.queue.has(x.id));
+            const reserveSel = R.reserve.filter(x => selected.reserve.has(x.id));
+            const total = orgSel.length + contactSel.length + actSel.length + queueSel.length + reserveSel.length;
+            if (!total) { alert('Nothing selected.'); return; }
+
+            const addToDnc = document.getElementById('purgeAddToDnc').checked;
+            const typed = prompt(
+                `FINAL CONFIRMATION — scope: ${_purgeState.scope.scopeLabel}\n\nThis will:\n` +
+                `• Delete ${orgSel.length} organization(s) from all lists\n` +
+                `• Exclude ${contactSel.length} contact(s) from campaigns\n` +
+                `• Cancel & delete ${actSel.length} in-process HeyReach push(es)\n` +
+                `• Delete ${queueSel.length} queued message(s)\n` +
+                `• Remove ${reserveSel.length} reserve-queue message(s)\n` +
+                (addToDnc ? `• Add ${_purgeState.inputs.length} organization(s) to the DNC list\n` : '') +
+                `\nThis cannot be undone.\n\nType DELETE to proceed:`
+            );
+            if (typed === null) return;
+            if (typed.trim() !== 'DELETE') { alert('Cancelled — you must type DELETE exactly.'); return; }
+
+            const btn = document.getElementById('btnPurgeExecute');
+            _purgeState.running = true;
+            btn.disabled = true;
+            document.getElementById('purgeExecLog').innerHTML = '';
+            const nowIso = () => new Date().toISOString();
+            const inputName = (idx) => (_purgeState.inputs[idx] ? _purgeState.inputs[idx].name : '(unknown)');
+            const stats = { hrOk: 0, hrFail: 0, acts: 0, queue: 0, reserve: 0, contacts: 0, orgs: 0, dnc: 0 };
+            const errors = [];
+            const done = { org: new Set(), contact: new Set(), activity: new Set(), queue: new Set(), reserve: new Set() };
+
+            try {
+                // A. In-process HeyReach pushes: cancel in HeyReach (best effort), then hard-delete
+                if (actSel.length) {
+                    purgeLog(`<strong>[1/5] Cancelling &amp; deleting ${actSel.length} in-process HeyReach push(es)…</strong>`);
+                    for (let i = 0; i < actSel.length; i++) {
+                        const a = actSel[i];
+                        try {
+                            const hr = await purgeStopHeyReach(a);
+                            if (hr.success) stats.hrOk++;
+                            else {
+                                stats.hrFail++;
+                                purgeLog(`&nbsp;&nbsp;⚠️ HeyReach cancel failed for ${escAdminHtml(a.contactName)}: ${escAdminHtml(hr.error || 'unknown')} — deleting record anyway`, '#fbbf24');
+                            }
+                            await deleteDoc(doc(db, 'connect_activity', a.id));
+                            stats.acts++;
+                            done.activity.add(a.id);
+                        } catch (e) {
+                            errors.push(`push ${a.contactName}: ${e.message}`);
+                            purgeLog(`&nbsp;&nbsp;❌ ${escAdminHtml(a.contactName)}: ${escAdminHtml(e.message)}`, '#f87171');
+                        }
+                    }
+                    purgeLog(`&nbsp;&nbsp;✓ ${stats.acts}/${actSel.length} deleted (HeyReach cancelled: ${stats.hrOk}, cancel failures: ${stats.hrFail})`);
+                }
+
+                // B. Queued messages (connect_queue) — hard delete
+                if (queueSel.length) {
+                    purgeLog(`<strong>[2/5] Deleting ${queueSel.length} queued message(s)…</strong>`);
+                    for (const qd of queueSel) {
+                        try {
+                            await deleteDoc(doc(db, 'connect_queue', qd.id));
+                            stats.queue++;
+                            done.queue.add(qd.id);
+                        } catch (e) {
+                            errors.push(`queue ${qd.contactName}: ${e.message}`);
+                            purgeLog(`&nbsp;&nbsp;❌ ${escAdminHtml(qd.contactName)}: ${escAdminHtml(e.message)}`, '#f87171');
+                        }
+                    }
+                    purgeLog(`&nbsp;&nbsp;✓ ${stats.queue}/${queueSel.length} deleted`);
+                }
+
+                // C. Reserve queue — soft delete via Railway (same as reserve_queue.html)
+                if (reserveSel.length) {
+                    purgeLog(`<strong>[3/5] Removing ${reserveSel.length} reserve-queue message(s)…</strong>`);
+                    for (const r of reserveSel) {
+                        try {
+                            const idToken = await currentUser.getIdToken();
+                            const resp = await fetch(`${PURGE_API_BASE}/api/reserve-queue/${r.id}`, {
+                                method: 'DELETE',
+                                headers: { 'Authorization': `Bearer ${idToken}`, 'Content-Type': 'application/json' }
+                            });
+                            const j = await resp.json().catch(() => ({}));
+                            if (!resp.ok || j.success === false) throw new Error(j.error || j.message || `HTTP ${resp.status}`);
+                            stats.reserve++;
+                            done.reserve.add(r.id);
+                        } catch (e) {
+                            errors.push(`reserve ${r.contactName}: ${e.message}`);
+                            purgeLog(`&nbsp;&nbsp;❌ ${escAdminHtml(r.contactName)}: ${escAdminHtml(e.message)}`, '#f87171');
+                        }
+                    }
+                    purgeLog(`&nbsp;&nbsp;✓ ${stats.reserve}/${reserveSel.length} removed`);
+                }
+
+                // D. Contacts — exclude (same mechanism as process_exclusions.html)
+                if (contactSel.length) {
+                    purgeLog(`<strong>[4/5] Excluding ${contactSel.length} contact(s)…</strong>`);
+                    for (const c of contactSel) {
+                        try {
+                            const reason = `Bulk organization outreach purge — organization "${inputName(c._inputIdx)}" removed from outreach`;
+                            await addDoc(collection(db, 'prospect_exclusions'), {
+                                linkedinUrl: c.linkedInUrl || '',
+                                excludedByBdr: (c.owner && !c.owner.startsWith('__')) ? c.owner : '',
+                                excludedBy: (currentUser && currentUser.email) || 'unknown',
+                                excludedAt: nowIso(),
+                                messageType: 'prospect',
+                                prospectName: c.name,
+                                prospectTitle: c.title,
+                                prospectCompany: c.company,
+                                excludedReason: reason,
+                                excludedByTool: 'org_outreach_purge'
+                            });
+                            await updateDoc(doc(db, 'prospect_contacts', c.id), {
+                                excludedFromCampaign: true,
+                                excludedAt: nowIso(),
+                                excludedReason: reason
+                            });
+                            stats.contacts++;
+                            done.contact.add(c.id);
+                        } catch (e) {
+                            errors.push(`contact ${c.name}: ${e.message}`);
+                            purgeLog(`&nbsp;&nbsp;❌ ${escAdminHtml(c.name)}: ${escAdminHtml(e.message)}`, '#f87171');
+                        }
+                    }
+                    purgeLog(`&nbsp;&nbsp;✓ ${stats.contacts}/${contactSel.length} excluded`);
+                }
+
+                // E. Organizations — delete from all lists (incl. hypothesis-group tags, which
+                //    live on the org doc itself, so deleting the doc removes it from every group)
+                if (orgSel.length) {
+                    purgeLog(`<strong>[5/5] Deleting ${orgSel.length} organization(s)…</strong>`);
+                    for (const o of orgSel) {
+                        try {
+                            await deleteDoc(doc(db, 'prospect_organizations', o.id));
+                            stats.orgs++;
+                            done.org.add(o.id);
+                        } catch (e) {
+                            errors.push(`org ${o.name}: ${e.message}`);
+                            purgeLog(`&nbsp;&nbsp;❌ ${escAdminHtml(o.name)}: ${escAdminHtml(e.message)}`, '#f87171');
+                        }
+                    }
+                    purgeLog(`&nbsp;&nbsp;✓ ${stats.orgs}/${orgSel.length} deleted`);
+                }
+
+                // F. Optional: add the organizations to the DNC list (blocks future generation)
+                if (addToDnc) {
+                    purgeLog(`<strong>[+] Adding ${_purgeState.inputs.length} organization(s) to the DNC list…</strong>`);
+                    const s = _purgeState.scope;
+                    const dncScope = s.scope === 'customer'
+                        ? { scope: 'customer', scopeValue: s.scopeValue, scopeLabel: s.scopeLabel }
+                        : s.scope === 'bdr'
+                            ? { scope: 'bdr', scopeValue: s.scopeValue, scopeLabel: s.scopeLabel }
+                            : { scope: 'global', scopeValue: '', scopeLabel: 'Global' };
+                    for (const inp of _purgeState.inputs) {
+                        try {
+                            await addDoc(collection(db, 'dnc_organizations'), {
+                                original_name: inp.name,
+                                variations: inp.variations,
+                                scope: dncScope.scope,
+                                scopeValue: dncScope.scopeValue,
+                                scopeLabel: dncScope.scopeLabel,
+                                added_at: nowIso(),
+                                added_by: (currentUser && currentUser.email) || '',
+                                source: 'org_outreach_purge'
+                            });
+                            stats.dnc++;
+                        } catch (e) {
+                            errors.push(`DNC ${inp.name}: ${e.message}`);
+                            purgeLog(`&nbsp;&nbsp;❌ DNC add ${escAdminHtml(inp.name)}: ${escAdminHtml(e.message)}`, '#f87171');
+                        }
+                    }
+                    purgeLog(`&nbsp;&nbsp;✓ ${stats.dnc}/${_purgeState.inputs.length} DNC entries added`);
+                }
+
+                purgeLog('&nbsp;');
+                purgeLog(`<strong style="color:#4ade80;">DONE — ${stats.orgs} orgs deleted · ${stats.contacts} contacts excluded · ` +
+                    `${stats.acts} pushes cancelled+deleted · ${stats.queue} queued deleted · ${stats.reserve} reserve removed` +
+                    (addToDnc ? ` · ${stats.dnc} DNC entries` : '') + `</strong>`, '#4ade80');
+                if (errors.length) {
+                    purgeLog(`<strong style="color:#f87171;">${errors.length} error(s) — details above &amp; in the console.</strong>`, '#f87171');
+                    console.error('Purge errors:', errors);
+                }
+
+                // Drop executed items from state and re-render what's left
+                R.orgs = R.orgs.filter(x => !done.org.has(x.id));
+                R.contacts = R.contacts.filter(x => !done.contact.has(x.id));
+                R.activities = R.activities.filter(x => !done.activity.has(x.id));
+                R.queue = R.queue.filter(x => !done.queue.has(x.id));
+                R.reserve = R.reserve.filter(x => !done.reserve.has(x.id));
+                purgeRenderResults();
+
+                // Refresh visible org table / stats in the background (best effort)
+                try { loadOrganizationsTable().catch(() => {}); } catch (_) {}
+                try { loadStats().catch(() => {}); } catch (_) {}
+
+            } catch (e) {
+                purgeLog(`❌ Fatal error: ${escAdminHtml(e.message)}`, '#f87171');
+                console.error('Purge execution error:', e);
+            } finally {
+                _purgeState.running = false;
+                btn.disabled = false;
+            }
+        };
+
         // ── Title Keyword Analyzer ─────────────────────────────────────────────
         {
             const TKA_STOP = new Set([
