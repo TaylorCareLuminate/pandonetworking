@@ -460,6 +460,15 @@
       font-size: 0.78em; text-align: center; padding: 4px 8px;
       border-radius: 6px; margin-top: 2px; display: none;
     }
+    .fu-manage-row { display: flex; gap: 8px; margin-top: 8px; }
+    .fu-manage-btn {
+      flex: 1; padding: 6px 12px; border: 1px solid #d1d5db; background: #f9fafb;
+      color: #6b7280; border-radius: 7px; font-size: 0.78em; font-weight: 600;
+      cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .fu-manage-btn:hover { background: #f3f4f6; color: #374151; }
+    .fu-manage-btn.dismiss:hover { background: #fef2f2; border-color: #fecaca; color: #b91c1c; }
     /* Compose modal */
     .fu-compose-overlay {
       position: fixed; inset: 0; background: rgba(0,0,0,0.45);
@@ -1317,6 +1326,17 @@
       </div>
     </div>
     <div class="fu-cards" id="fuCardList"></div>
+  </div>
+</div>
+
+<!-- Dismiss / Snooze modal -->
+<div class="fu-compose-overlay" id="fuActionOverlay" style="display:none;" onclick="if(event.target===this)window.closeFuAction()">
+  <div class="fu-compose-modal" style="max-width:460px;">
+    <div class="fu-compose-head">
+      <h3 id="fuActionTitle"></h3>
+      <button class="fu-compose-close" onclick="window.closeFuAction()">×</button>
+    </div>
+    <div class="fu-compose-body" id="fuActionBody" style="padding:18px 20px;"></div>
   </div>
 </div>
 
@@ -5201,6 +5221,29 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
     }
   }
 
+  // Generic flag patch onto an account's company_comms_scans doc (same full-record
+  // write pattern as fuSetNeverEngaged / fuSetNotApplicable). Used for the user-driven
+  // Dismiss ("no follow-up needed") and Snooze ("push off until date") actions.
+  async function fuUpdateScanFlags(accountId, accountName, patch) {
+    try {
+      await waitForWrapper();
+      const { doc, setDoc } = window.clemailFirestore;
+      const existing = scanState[accountId] || {};
+      const updated  = { ...existing, ...patch };
+      await withTimeout(
+        setDoc(doc(window.clemailDb, 'company_comms_scans', accountId), updated),
+        10000,
+        `Firestore write for ${accountName || accountId}`
+      );
+      scanState[accountId] = updated;
+      return true;
+    } catch (e) {
+      console.warn('fuUpdateScanFlags failed:', e.message);
+      showToast(`Could not save: ${e.message}`, 'error');
+      return false;
+    }
+  }
+
   // ── Main entry ──────────────────────────────────────────────────────────────
   // Uses the already-collected comms scan data (emails + LinkedIn per company)
   // rather than re-scanning BDR inboxes.  One AI call per company.
@@ -5255,14 +5298,41 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
     // below so future scans skip them automatically unless they engage again.
     const neverEngagedAccounts = [];
     const reEngagedAccounts    = [];
+    const snoozedAccounts      = [];
+    const dismissedAccounts    = [];
+    const reactivatedAccounts  = []; // dismissed, but new 1:1 activity has appeared since
     const pool = allAccounts.filter(a => {
       const stage = (a.stage || '').toLowerCase().trim();
       if (SKIP_STAGES.has(stage)) return false;
       const s = scanState[a.id];
       if (!s?.lastScanDate) return false;
       if (s.notApplicable) return false; // not B2B and not benefits — permanently excluded
+
+      // Snoozed — user pushed the follow-up off until a future date
+      if (s.fuSnoozedUntil && new Date(s.fuSnoozedUntil) > new Date()) {
+        snoozedAccounts.push(a);
+        return false;
+      }
+
       const { hex, other } = splitHexEmails(allRealOf(s));
       const li = allLiOf(s);
+
+      // Dismissed as "no follow-up needed" — stays hidden unless a NEW 1:1 email or
+      // LinkedIn message has appeared since the dismissal. HEX group meeting emails
+      // don't count, otherwise the monthly DRI invite would resurface every
+      // dismissed account.
+      if (s.fuDismissed) {
+        const last = lastCommsDate(other, li);
+        const baseline = s.fuDismissedLastComms ? new Date(s.fuDismissedLastComms).getTime()
+                       : s.fuDismissedAt        ? new Date(s.fuDismissedAt).getTime()
+                       : 0;
+        if (!last || last.getTime() <= baseline) {
+          dismissedAccounts.push(a);
+          return false;
+        }
+        reactivatedAccounts.push(a); // something changed — let it back in
+      }
+
       const hexOnly = hex.length > 0 && other.length === 0 && li.length === 0;
       if (hexOnly) return true;
 
@@ -5288,6 +5358,23 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
     const skippedNA = allAccounts.filter(a => scanState[a.id]?.notApplicable);
     if (skippedNA.length) {
       fuLog(`⏭ Skipping ${skippedNA.length} compan${skippedNA.length === 1 ? 'y' : 'ies'} marked "NA" (not B2B, not benefits): ${skippedNA.slice(0, 5).map(a => a.name).join(', ')}${skippedNA.length > 5 ? '…' : ''}`, 'info');
+    }
+    if (snoozedAccounts.length) {
+      const preview = snoozedAccounts.slice(0, 5)
+        .map(a => `${a.name} (until ${fmtDate(scanState[a.id]?.fuSnoozedUntil)})`).join(', ');
+      fuLog(`⏭ Skipping ${snoozedAccounts.length} snoozed compan${snoozedAccounts.length === 1 ? 'y' : 'ies'}: ${preview}${snoozedAccounts.length > 5 ? '…' : ''}`, 'info');
+    }
+    if (dismissedAccounts.length) {
+      fuLog(`⏭ Skipping ${dismissedAccounts.length} dismissed compan${dismissedAccounts.length === 1 ? 'y' : 'ies'} (no follow-up needed, no new messages since): ${dismissedAccounts.slice(0, 5).map(a => a.name).join(', ')}${dismissedAccounts.length > 5 ? '…' : ''}`, 'info');
+    }
+    if (reactivatedAccounts.length) {
+      fuLog(`✅ Re-activating ${reactivatedAccounts.length} dismissed compan${reactivatedAccounts.length === 1 ? 'y' : 'ies'} — new 1:1 messages since dismissal: ${reactivatedAccounts.slice(0, 5).map(a => a.name).join(', ')}${reactivatedAccounts.length > 5 ? '…' : ''}`, 'info');
+      for (const a of reactivatedAccounts) {
+        await fuUpdateScanFlags(a.id, a.name, {
+          fuDismissed: false,
+          fuDismissReactivatedAt: new Date().toISOString(),
+        });
+      }
     }
 
     // Persist "Never Engaged" markers so future scans skip these orgs without
@@ -6132,6 +6219,16 @@ Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needRea
                 <i class="fab fa-linkedin-in"></i> Send LinkedIn
               </button>
             </div>
+            <div class="fu-manage-row">
+              <button class="fu-manage-btn" onclick="window.openFuSnooze(${idx})"
+                title="Push this follow-up off — the account is hidden from scans until the date you pick">
+                <i class="fas fa-clock"></i> Snooze
+              </button>
+              <button class="fu-manage-btn dismiss" onclick="window.openFuDismiss(${idx})"
+                title="Mark as not needing follow-up — hidden from future scans unless new messages arrive">
+                <i class="fas fa-ban"></i> Dismiss
+              </button>
+            </div>
             <div class="fu-send-status" id="fu-status-${idx}"></div>
           </div>
         </div>
@@ -6145,6 +6242,160 @@ Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needRea
         if (el) el.innerHTML = _cardTabSummary(fu);
       });
     });
+  }
+
+  /* ============================================================
+     DISMISS / SNOOZE
+     User actions on an opportunity card:
+       • Dismiss — account needs no follow-up (reason required). Persisted on the
+         company_comms_scans doc; skipped by future scans until a NEW 1:1 email or
+         LinkedIn message appears after the dismissal, then auto-reactivated.
+       • Snooze — push the follow-up off; hidden from scans until the chosen date.
+  ============================================================ */
+
+  let fuActionState = null; // { type: 'dismiss'|'snooze', idx }
+
+  function fuActionBtnStyle(primary) {
+    return primary
+      ? 'padding:7px 16px;background:var(--danger);color:#fff;border:none;border-radius:7px;font-size:0.82em;font-weight:600;cursor:pointer;'
+      : 'padding:7px 16px;background:#f3f4f6;color:#374151;border:none;border-radius:7px;font-size:0.82em;font-weight:600;cursor:pointer;';
+  }
+
+  window.closeFuAction = function () {
+    fuActionState = null;
+    document.getElementById('fuActionOverlay').style.display = 'none';
+  };
+
+  window.openFuDismiss = function (idx) {
+    const fu = fuScanResults[idx];
+    if (!fu) return;
+    fuActionState = { type: 'dismiss', idx };
+    const acctName = fu._accountName || fu.contactCompany || 'this account';
+    document.getElementById('fuActionTitle').innerHTML =
+      `<i class="fas fa-ban" style="color:var(--danger);margin-right:6px;"></i>Dismiss ${escHtml(acctName)}`;
+    document.getElementById('fuActionBody').innerHTML = `
+      <div style="font-size:0.85em;color:#4b5563;line-height:1.55;margin-bottom:12px;">
+        This account will be skipped by future follow-up scans. It only comes back automatically
+        if a <strong>new 1:1 email or LinkedIn message</strong> shows up after today.
+      </div>
+      <label style="font-size:0.78em;font-weight:700;color:#374151;display:block;margin-bottom:5px;">
+        Why is no follow-up needed? <span style="color:var(--danger);">*</span>
+      </label>
+      <textarea id="fuDismissReason" rows="3"
+        style="width:100%;padding:8px 10px;border:1.5px solid #d1d5db;border-radius:8px;font-size:0.85em;font-family:inherit;resize:vertical;box-sizing:border-box;"
+        placeholder="e.g. Not a fit — they handle networking internally / wrong buyer / went with a competitor"></textarea>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;">
+        <button onclick="window.closeFuAction()" style="${fuActionBtnStyle(false)}">Cancel</button>
+        <button onclick="window.confirmFuDismiss()" style="${fuActionBtnStyle(true)}">
+          <i class="fas fa-ban"></i> Dismiss account
+        </button>
+      </div>`;
+    document.getElementById('fuActionOverlay').style.display = 'flex';
+    document.getElementById('fuDismissReason').focus();
+  };
+
+  window.confirmFuDismiss = async function () {
+    if (fuActionState?.type !== 'dismiss') return;
+    const fu = fuScanResults[fuActionState.idx];
+    if (!fu) return;
+    const reason = (document.getElementById('fuDismissReason')?.value || '').trim();
+    if (!reason) { showToast('Please enter a reason — it is saved with the dismissal.', 'warning'); return; }
+
+    // Baseline for "unless something changes": the latest 1:1 (non-HEX) comms date
+    // right now. Any genuine message newer than this reactivates the account.
+    const s = scanState[fu._accountId] || {};
+    const { other } = splitHexEmails((s.emails || []).filter(e => !isNoiseEmail(e)));
+    const last = lastCommsDate(other, s.linkedInMessages || []);
+
+    const ok = await fuUpdateScanFlags(fu._accountId, fu._accountName, {
+      fuDismissed:          true,
+      fuDismissedAt:        new Date().toISOString(),
+      fuDismissedReason:    reason,
+      fuDismissedLastComms: last ? last.toISOString() : null,
+    });
+    if (!ok) return; // toast already shown; keep the card
+    fuRemoveCard(fuActionState.idx, `${fu._accountName || 'Account'} dismissed — will only return if new messages arrive`);
+    window.closeFuAction();
+  };
+
+  window.openFuSnooze = function (idx) {
+    const fu = fuScanResults[idx];
+    if (!fu) return;
+    fuActionState = { type: 'snooze', idx };
+    const acctName = fu._accountName || fu.contactCompany || 'this account';
+    const minDate  = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    const opts = [
+      { days: 7,   label: '1 week'   },
+      { days: 14,  label: '2 weeks'  },
+      { days: 30,  label: '1 month'  },
+      { days: 90,  label: '3 months' },
+    ];
+    document.getElementById('fuActionTitle').innerHTML =
+      `<i class="fas fa-clock" style="color:var(--warning);margin-right:6px;"></i>Snooze ${escHtml(acctName)}`;
+    document.getElementById('fuActionBody').innerHTML = `
+      <div style="font-size:0.85em;color:#4b5563;line-height:1.55;margin-bottom:12px;">
+        Push this follow-up off — the account is hidden from scans until the date you pick, then shows up again automatically.
+      </div>
+      <div style="display:flex;flex-direction:column;gap:7px;">
+        ${opts.map((o, i) => `
+          <label style="display:flex;align-items:center;gap:8px;font-size:0.86em;color:#1f2937;cursor:pointer;">
+            <input type="radio" name="fuSnoozeOpt" value="${o.days}" ${i === 1 ? 'checked' : ''}>
+            ${o.label} <span style="color:#9ca3af;font-size:0.85em;">(until ${fmtDate(new Date(Date.now() + o.days * 86400000).toISOString())})</span>
+          </label>`).join('')}
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.86em;color:#1f2937;cursor:pointer;">
+          <input type="radio" name="fuSnoozeOpt" value="custom">
+          Until date:
+          <input type="date" id="fuSnoozeDate" min="${minDate}"
+            style="padding:4px 8px;border:1.5px solid #d1d5db;border-radius:7px;font-size:0.95em;font-family:inherit;"
+            onfocus="document.querySelector('input[name=fuSnoozeOpt][value=custom]').checked = true;">
+        </label>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+        <button onclick="window.closeFuAction()" style="${fuActionBtnStyle(false)}">Cancel</button>
+        <button onclick="window.confirmFuSnooze()"
+          style="padding:7px 16px;background:var(--primary);color:#fff;border:none;border-radius:7px;font-size:0.82em;font-weight:600;cursor:pointer;">
+          <i class="fas fa-clock"></i> Snooze
+        </button>
+      </div>`;
+    document.getElementById('fuActionOverlay').style.display = 'flex';
+  };
+
+  window.confirmFuSnooze = async function () {
+    if (fuActionState?.type !== 'snooze') return;
+    const fu = fuScanResults[fuActionState.idx];
+    if (!fu) return;
+    const sel = document.querySelector('input[name=fuSnoozeOpt]:checked');
+    if (!sel) { showToast('Pick a snooze duration.', 'warning'); return; }
+
+    let until;
+    if (sel.value === 'custom') {
+      const raw = document.getElementById('fuSnoozeDate')?.value;
+      if (!raw) { showToast('Pick a date to snooze until.', 'warning'); return; }
+      until = new Date(raw + 'T23:59:59');
+      if (isNaN(until.getTime()) || until <= new Date()) {
+        showToast('Snooze date must be in the future.', 'warning'); return;
+      }
+    } else {
+      until = new Date(Date.now() + parseInt(sel.value, 10) * 86400000);
+    }
+
+    const ok = await fuUpdateScanFlags(fu._accountId, fu._accountName, {
+      fuSnoozedUntil: until.toISOString(),
+      fuSnoozedAt:    new Date().toISOString(),
+    });
+    if (!ok) return;
+    fuRemoveCard(fuActionState.idx, `${fu._accountName || 'Account'} snoozed until ${fmtDate(until.toISOString())}`);
+    window.closeFuAction();
+  };
+
+  // Remove a card from the current results, re-render (so card indices stay aligned
+  // with fuScanResults), then persist. Message edits are already synced live via
+  // onFuMessageEdit, so re-rendering before the save is safe.
+  function fuRemoveCard(idx, toastMsg) {
+    fuScanResults.splice(idx, 1);
+    showFollowupResults(fuScanResults, fuSaveMeta.scanned, fuScanResults.length);
+    saveFollowupResults({ scanned: fuSaveMeta.scanned });
+    showToast(toastMsg, 'success');
   }
 
   /* ============================================================
