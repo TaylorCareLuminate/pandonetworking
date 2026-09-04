@@ -3764,6 +3764,42 @@
                     </label>
                     <div class="form-help" style="margin-top:4px;">When enabled, prospects with profile enrichment data are prioritised and sorted by LinkedIn connection count (highest first) before generation begins. Prospects without any stored connection count are processed last. <strong>Always on</strong> for Pull from Workspace (contacts are selected and processed most connections → least).</div>
                 </div>
+
+                <!-- Custom Org Research (client-defined Brave search fed into every message) -->
+                <div class="form-group" style="margin-top:14px; padding:16px; background:#fff7ed; border:1px solid #fdba74; border-radius:8px;">
+                    <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;font-weight:600;margin-bottom:0;">
+                        <input type="checkbox" id="fullAiOrgResearchEnabled"
+                            style="width:16px;height:16px;accent-color:#ea580c;cursor:pointer;flex-shrink:0;"
+                            onchange="toggleFullAiOrgResearchPanel(); saveFullAiOrgResearchSettings();">
+                        <span><i class="fas fa-search-plus" style="color:#ea580c;"></i> <strong>Custom Org Research</strong> — feed a client-defined Brave search into every message</span>
+                    </label>
+                    <div class="form-help" style="margin-top:4px;">Runs a Brave search <strong>once per organization</strong> (e.g. recent or upcoming M&amp;A activity at the health system), distills the findings into a short verified brief, and shares that brief — plus your usage instructions — with <strong>every</strong> message generated for contacts at that organization (Post Reply, About Me, Internet Search, all of them).</div>
+                    <div id="fullAiOrgResearchPanel" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid #fdba74;">
+                        <div class="form-group" style="margin-bottom:12px;">
+                            <label for="fullAiOrgResearchQuery" style="font-size:13px;">Brave Search Query <span style="font-weight:400;color:var(--gray-500);">(use <code>{organization}</code> where the org name should go)</span></label>
+                            <input type="text" id="fullAiOrgResearchQuery"
+                                placeholder="{organization} merger acquisition announcement"
+                                onchange="saveFullAiOrgResearchSettings()" style="width:100%;">
+                            <div class="form-help">Example for M&amp;A: <code>{organization} merger acquisition announcement</code>. If you leave out the placeholder, the organization name is automatically added to the front of the query.</div>
+                        </div>
+                        <div class="form-group" style="margin-bottom:12px;">
+                            <label for="fullAiOrgResearchInstructions" style="font-size:13px;">How should the AI use the findings?</label>
+                            <textarea id="fullAiOrgResearchInstructions" rows="3" style="width:100%;"
+                                placeholder="If the research shows recent or upcoming M&A activity at this health system, mention it naturally in the message."
+                                onchange="saveFullAiOrgResearchSettings()"></textarea>
+                            <div class="form-help">These instructions are passed to the AI along with the research findings for every message. The AI is told to ignore the research when nothing relevant was found, and to never invent facts beyond the findings.</div>
+                        </div>
+                        <div class="form-group" style="margin-bottom:0;">
+                            <label for="fullAiOrgResearchFreshness" style="font-size:13px;">Search Recency</label>
+                            <select id="fullAiOrgResearchFreshness" onchange="saveFullAiOrgResearchSettings()" style="width:220px;">
+                                <option value="py" selected>Past year</option>
+                                <option value="pm">Past month</option>
+                                <option value="pw">Past week</option>
+                            </select>
+                            <div class="form-help">Cost: one Brave search (~$0.003) + one small Llama call per <strong>organization</strong> (not per contact) per run.</div>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <!-- Generate Button -->
@@ -12889,6 +12925,103 @@
         })();
 
         // =====================================================================
+        // CUSTOM ORG RESEARCH (Full AI tab)
+        // Client-defined Brave search whose findings are fed into EVERY message
+        // generated for contacts at an organization. The search runs once per
+        // organization per run (cached below), then the resulting brief +
+        // instructions ride along on every full-ai-generate-single call as
+        // `orgCustomResearch`.
+        // =====================================================================
+
+        /** Show/hide the Custom Org Research config panel. */
+        window.toggleFullAiOrgResearchPanel = function() {
+            const on = document.getElementById('fullAiOrgResearchEnabled')?.checked;
+            const panel = document.getElementById('fullAiOrgResearchPanel');
+            if (panel) panel.style.display = on ? '' : 'none';
+        };
+
+        /** Persists Custom Org Research settings to localStorage. */
+        window.saveFullAiOrgResearchSettings = function() {
+            localStorage.setItem('fullAiOrgResearch', JSON.stringify({
+                enabled: !!document.getElementById('fullAiOrgResearchEnabled')?.checked,
+                query: document.getElementById('fullAiOrgResearchQuery')?.value || '',
+                instructions: document.getElementById('fullAiOrgResearchInstructions')?.value || '',
+                freshness: document.getElementById('fullAiOrgResearchFreshness')?.value || 'py'
+            }));
+        };
+
+        // Restore Custom Org Research settings on page load
+        (function restoreFullAiOrgResearchSettings() {
+            try {
+                const saved = JSON.parse(localStorage.getItem('fullAiOrgResearch') || 'null');
+                if (!saved) return;
+                const cb = document.getElementById('fullAiOrgResearchEnabled');
+                if (cb) cb.checked = !!saved.enabled;
+                const q = document.getElementById('fullAiOrgResearchQuery');
+                if (q && saved.query) q.value = saved.query;
+                const ins = document.getElementById('fullAiOrgResearchInstructions');
+                if (ins && saved.instructions) ins.value = saved.instructions;
+                const fr = document.getElementById('fullAiOrgResearchFreshness');
+                if (fr && saved.freshness) fr.value = saved.freshness;
+                window.toggleFullAiOrgResearchPanel();
+            } catch (_) { /* corrupted localStorage — ignore */ }
+        })();
+
+        /** True when Custom Org Research is enabled AND a query is configured. */
+        function isFullAiOrgResearchEnabled() {
+            return !!document.getElementById('fullAiOrgResearchEnabled')?.checked
+                && !!(document.getElementById('fullAiOrgResearchQuery')?.value || '').trim();
+        }
+
+        // Per-run cache: normalized org name -> orgCustomResearch object (or null when
+        // the search failed / found nothing usable). Reset at the start of each run.
+        let fullAiOrgResearchCache = new Map();
+
+        /**
+         * Fetches (or returns cached) Custom Org Research for one organization.
+         * Returns { organizationName, query, instructions, brief } or null.
+         * Never throws — a research failure must not block message generation.
+         */
+        async function getFullAiOrgCustomResearch(company, bdrEmail, token, addLog) {
+            const orgName = (company || '').trim();
+            if (!orgName) return null;
+            const cacheKey = orgName.toLowerCase();
+            if (fullAiOrgResearchCache.has(cacheKey)) return fullAiOrgResearchCache.get(cacheKey);
+
+            const query = (document.getElementById('fullAiOrgResearchQuery')?.value || '').trim();
+            const instructions = (document.getElementById('fullAiOrgResearchInstructions')?.value || '').trim();
+            const freshness = document.getElementById('fullAiOrgResearchFreshness')?.value || 'py';
+
+            let result = null;
+            try {
+                addLog(`   🔎 Custom Org Research for "${orgName}" (once per organization)...`);
+                const resp = await fetch(`${RAILWAY_API}/api/connect/org-custom-research`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({ bdrEmail, organizationName: orgName, query, instructions, freshness })
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.ok && data.success) {
+                    result = {
+                        organizationName: orgName,
+                        query: data.resolvedQuery || query,
+                        instructions,
+                        brief: data.brief || ''
+                    };
+                    addLog(data.hasFindings
+                        ? `   🔎 Research found: ${(data.brief || '').substring(0, 140)}...`
+                        : `   🔎 Research: nothing relevant found for "${orgName}" — messages will note that (instructions still apply).`, data.hasFindings ? 'success' : 'dim');
+                } else {
+                    addLog(`   ⚠️ Custom Org Research failed (${data.error || `HTTP ${resp.status}`}) — continuing without it.`, 'warning');
+                }
+            } catch (e) {
+                addLog(`   ⚠️ Custom Org Research error: ${e.message} — continuing without it.`, 'warning');
+            }
+            fullAiOrgResearchCache.set(cacheKey, result);
+            return result;
+        }
+
+        // =====================================================================
         // LINKEDIN PROFILE CACHE
         // Collection: linkedin_profile_cache
         // Caches full dev_fusion profile data so repeat API calls are avoided.
@@ -17017,6 +17150,10 @@
 
                 addLog(`🚀 Starting Full AI Smart Generate for ${count} prospects (${bdrEmail})...`);
                 addLog(`🎚️ Formality: ${FORMALITY_LABELS[getFormalityLevel('fullAiFormalitySlider')] || 'Conversational'} (${getFormalityLevel('fullAiFormalitySlider')}/5)`);
+                fullAiOrgResearchCache = new Map(); // Custom Org Research — fresh per-org cache for this run
+                if (isFullAiOrgResearchEnabled()) {
+                    addLog(`🔎 Custom Org Research ON — query: "${(document.getElementById('fullAiOrgResearchQuery')?.value || '').trim()}" (one Brave search per organization, findings fed into every message)`, 'info');
+                }
                 if (workspaceSource) {
                     addLog(`📂 Contact source: Workspace pull`, 'info');
                 } else if (colleagueSource) {
@@ -17657,6 +17794,15 @@
                             }
                         }
 
+                        // Custom Org Research — one Brave search per organization, shared by every
+                        // contact at that org (cached in fullAiOrgResearchCache for this run).
+                        let orgCustomResearch = null;
+                        if (isFullAiOrgResearchEnabled()) {
+                            orgCustomResearch = await getFullAiOrgCustomResearch(
+                                prospect.company || prospect.companyName || '', bdrEmail, token, addLog
+                            );
+                        }
+
                         // Step B: Call the single-prospect endpoint — this is the core Railway call.
                         // Retries once on 401 (token expiry) and once on network failure (transient).
                         const _singleBody = JSON.stringify({
@@ -17667,7 +17813,8 @@
                             connectionFilterEnabled: isConnectionFilterEnabled(),
                             minConnectionCount: getConnectionFilterMin(),
                             existingProfileData,
-                            formality: getFormalityLevel('fullAiFormalitySlider')
+                            formality: getFormalityLevel('fullAiFormalitySlider'),
+                            ...(orgCustomResearch ? { orgCustomResearch } : {})
                         });
                         let singleRes;
                         for (let _attempt = 1; _attempt <= 2; _attempt++) {

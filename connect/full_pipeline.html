@@ -571,6 +571,36 @@
                     <div class="form-help">Off by default. When on, after the Target Contact rules filter, only the top N contacts at each organization (ranked by LinkedIn connection count) move on to message generation for the BDR. The additional good-fit contacts are <strong>not lost</strong> — they stay saved to the BDR in prospect_contacts and are tagged with this hypothesis group so they can be used later. This limits how many contacts at the same organization are messaged at once.</div>
                 </div>
             </div>
+
+            <!-- Custom Org Research (client-defined Brave search fed into every message) -->
+            <div class="form-group" style="margin-top:14px; padding:16px; background:#fff7ed; border:1px solid #fdba74; border-radius:8px;">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                    <input type="checkbox" id="fpOrgResearchEnabled" style="width:auto;" onchange="document.getElementById('fpOrgResearchPanel').style.display = this.checked ? '' : 'none';">
+                    <span><i class="fas fa-search-plus" style="color:#ea580c;"></i> <strong>Custom Org Research</strong> — feed a client-defined Brave search into every message</span>
+                </label>
+                <div class="form-help">Runs a Brave search <strong>once per organization</strong> (e.g. recent or upcoming M&amp;A activity at the health system), distills the findings into a short verified brief, and shares that brief — plus your usage instructions — with <strong>every</strong> message generated for contacts at that organization (Post Reply, About Me, Internet Search, and the Profile Message fallback's parent call).</div>
+                <div id="fpOrgResearchPanel" style="display:none; margin-top:12px; padding-top:12px; border-top:1px solid #fdba74;">
+                    <div class="form-group">
+                        <label for="fpOrgResearchQuery"><i class="fas fa-search"></i> Brave Search Query <span style="font-weight:400; color:var(--gray-500);">(use <code>{organization}</code> where the org name should go)</span></label>
+                        <input type="text" id="fpOrgResearchQuery" placeholder="{organization} merger acquisition announcement" />
+                        <div class="form-help">Example for M&amp;A: <code>{organization} merger acquisition announcement</code>. Without the placeholder, the organization name is automatically added to the front of the query.</div>
+                    </div>
+                    <div class="form-group">
+                        <label for="fpOrgResearchInstructions"><i class="fas fa-comment-dots"></i> How should the AI use the findings?</label>
+                        <textarea id="fpOrgResearchInstructions" rows="3" placeholder="If the research shows recent or upcoming M&A activity at this health system, mention it naturally in the message."></textarea>
+                        <div class="form-help">Passed to the AI along with the research findings for every message. The AI ignores the research when nothing relevant was found, and never invents facts beyond the findings.</div>
+                    </div>
+                    <div class="form-group" style="margin-bottom:0;">
+                        <label for="fpOrgResearchFreshness"><i class="fas fa-clock"></i> Search Recency</label>
+                        <select id="fpOrgResearchFreshness" style="width:220px;">
+                            <option value="py" selected>Past year</option>
+                            <option value="pm">Past month</option>
+                            <option value="pw">Past week</option>
+                        </select>
+                        <div class="form-help">Cost: one Brave search (~$0.003) + one small Llama call per <strong>organization</strong> (not per contact) per run.</div>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- ══════════ STEP 6: Cost guardrails ══════════ -->
@@ -4257,6 +4287,61 @@
             }
         }
 
+        // ── Custom Org Research ──────────────────────────────────────────────
+        // Client-defined Brave search (Step 5 settings) whose findings are fed into
+        // EVERY message generated for contacts at an organization — e.g. "mention
+        // recent or upcoming M&A activity at the health system". Fetched ONCE per
+        // organization per run (cached below), then passed as orgCustomResearch on
+        // every full-ai-generate-single call, where the backend threads it into the
+        // Post Reply, About Me, and Internet Search prompts.
+        let fpOrgResearchCache = null; // Map<orgNameLower, researchObj|null> — reset per run
+
+        function fpIsOrgResearchEnabled() {
+            return !!document.getElementById('fpOrgResearchEnabled')?.checked
+                && !!(document.getElementById('fpOrgResearchQuery')?.value || '').trim();
+        }
+
+        // Returns { organizationName, query, instructions, brief } or null.
+        // Never throws — a research failure must not block message generation.
+        async function fpFetchOrgCustomResearch({ token, bdrEmail, org }) {
+            const orgName = (org.company_name || '').trim();
+            if (!orgName || !fpIsOrgResearchEnabled()) return null;
+            const cacheKey = orgName.toLowerCase();
+            if (fpOrgResearchCache.has(cacheKey)) return fpOrgResearchCache.get(cacheKey);
+
+            const query        = (document.getElementById('fpOrgResearchQuery')?.value || '').trim();
+            const instructions = (document.getElementById('fpOrgResearchInstructions')?.value || '').trim();
+            const freshness    = document.getElementById('fpOrgResearchFreshness')?.value || 'py';
+
+            let result = null;
+            try {
+                addLog(`   🔎 Custom Org Research for ${orgName} (once for the whole organization)…`);
+                const resp = await fetchWithRetry(`${RAILWAY_API}/api/connect/org-custom-research`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({ bdrEmail, organizationName: orgName, query, instructions, freshness })
+                }, { addLog, label: 'Custom org research', retries: 1 });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.ok && data.success) {
+                    result = {
+                        organizationName: orgName,
+                        query: data.resolvedQuery || query,
+                        instructions,
+                        brief: data.brief || ''
+                    };
+                    addLog(data.hasFindings
+                        ? `   🔎 Research found: ${(data.brief || '').substring(0, 140)}…`
+                        : `   🔎 Research: nothing relevant found for ${orgName} — messages proceed normally (instructions still ride along).`, data.hasFindings ? 'success' : 'dim');
+                } else {
+                    addLog(`   ⚠️ Custom Org Research failed (${data.error || `HTTP ${resp.status}`}) — continuing without it.`, 'warning');
+                }
+            } catch (e) {
+                addLog(`   ⚠️ Custom Org Research error: ${e.message} — continuing without it.`, 'warning');
+            }
+            fpOrgResearchCache.set(cacheKey, result);
+            return result;
+        }
+
         // ── Story diversity / reuse cap ──────────────────────────────────────
         // Without this, every contact at an org gets the same #1-rated verified story
         // (step6_generateMessages always uses verifiedItems[0]), so once a BDR gets more
@@ -4673,6 +4758,7 @@
             fpRunPostTypeTally = { regular: 0, quote: 0, repost: 0 };
             fpRunMessageSourceTally = {};
             fpStoryUsageByUrl = new Map();
+            fpOrgResearchCache = new Map();
             window.fpRunNoMsgTally = {};
             fpRenderStats(); // after the tallies above so the live funnel/source-mix reset to their empty state too
             document.getElementById('fpProgressSection').style.display = 'block';
@@ -4703,6 +4789,11 @@
                 settings: {
                     routingMode, connectionFilterEnabled: connFilterOn, minConnectionCount: connFilterMin,
                     opusExcludeMode, crossBdrEnabled, finalReviewEnabled, profileMsgFallback: profileMsgFallbackOn,
+                    orgCustomResearch: fpIsOrgResearchEnabled() ? {
+                        query: (document.getElementById('fpOrgResearchQuery')?.value || '').trim(),
+                        instructions: (document.getElementById('fpOrgResearchInstructions')?.value || '').trim(),
+                        freshness: document.getElementById('fpOrgResearchFreshness')?.value || 'py'
+                    } : null,
                     topContactsCap: { enabled: topContactsEnabled, limit: topContactsLimit },
                     scanCriteria, secondScan: secondScanConfig, orgTypeMode: orgTypeConfig,
                     costGuard: { costPerMessage, enforcesAllInCost: true, minSpendBeforeEnforcing: costMinSpend },
@@ -4749,6 +4840,9 @@
                     : `⏭️ Skipping LinkedIn URL research for ${notFoundUrlCount} organization(s) already researched with no URL found — check "Re-search..." in Step 3 to retry them.`, 'dim');
             }
             addLog(`🧠 Models: build = ${buildModel}, Opus review = ${opusModel}`);
+            if (fpIsOrgResearchEnabled()) {
+                addLog(`🔎 Custom Org Research ON — query: "${(document.getElementById('fpOrgResearchQuery')?.value || '').trim()}" (one Brave search per organization, findings fed into every message)`);
+            }
 
             let token = await auth.currentUser.getIdToken();
             let lastTokenRefreshAt = Date.now();
@@ -5150,6 +5244,10 @@
                             if (newsRefreshedToken) { token = newsRefreshedToken; lastTokenRefreshAt = Date.now(); }
                             orgReport.newsStories = orgNewsItems === null ? null : orgNewsItems.length;
 
+                            // ── 5b. Custom Org Research — ONCE per organization (client-defined
+                            // Brave search, Step 5 settings). Shared with every contact below.
+                            const orgCustomResearch = await fpFetchOrgCustomResearch({ token, bdrEmail, org });
+
                             // ── 6. Full AI init — pass matched contact URLs as the URL filter ──
                             const matchedUrls = contactsForMessaging
                                 .map(c => (c.linkedInUrl || '').toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/+$/, ''))
@@ -5367,6 +5465,7 @@
                                         minConnectionCount: connFilterMin,
                                         existingProfileData,
                                         ...(orgNewsItems !== null ? { orgPreVerifiedItems: assignedStory ? [assignedStory] : [] } : {}),
+                                        ...(orgCustomResearch ? { orgCustomResearch } : {}),
                                         messageModel: buildModel
                                     });
                                     let singleRes;
