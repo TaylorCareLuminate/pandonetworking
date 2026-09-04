@@ -3351,14 +3351,14 @@
             </div>
             <div class="stat-item">
                 <div class="stat-value" id="queueConnect" style="color: var(--primary);">—</div>
-                <div class="stat-label">
+                <div class="stat-label" id="queueConnectLabel" title="Across the full queue for this BDR (no Hypothesis Group filter active).">
                     <i class="fas fa-user-plus" style="font-size: 0.8rem; margin-right: 0.2rem;"></i>
                     Queue Connect
                 </div>
             </div>
             <div class="stat-item">
                 <div class="stat-value" id="queueMessage" style="color: var(--primary);">—</div>
-                <div class="stat-label">
+                <div class="stat-label" id="queueMessageLabel" title="Across the full queue for this BDR (no Hypothesis Group filter active).">
                     <i class="fas fa-envelope" style="font-size: 0.8rem; margin-right: 0.2rem;"></i>
                     Queue Messages
                 </div>
@@ -3579,19 +3579,40 @@
             return m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || m.linkedInUrl || m.li_url || '';
         }
 
+        // Returns true if the given hypothesis group is assigned to the given BDR email. Supports
+        // both bdrEmails[] and legacy bdrEmail. A group with neither field set is treated as
+        // unscoped/shared and matches any BDR. Used to make sure a contact who happens to be
+        // tagged in ANOTHER BDR's hypothesis group never has that other BDR's saved Target
+        // Contact / Message Review Instructions applied here — only groups actually assigned to
+        // the currently selected BDR are eligible to match.
+        function _fcrGroupBelongsToBdr(g, bdrEmail) {
+            if (!bdrEmail) return true;
+            if (Array.isArray(g.bdrEmails) && g.bdrEmails.length) return g.bdrEmails.includes(bdrEmail);
+            if (g.bdrEmail) return g.bdrEmail === bdrEmail;
+            return true;
+        }
+
         // Determines, for every currently loaded message, which hypothesis group (if any) it
         // belongs to — based on matching its LinkedIn URL against each group's tagged URL set.
         // Used so Opus review can apply each group's own instructions instead of one global set.
+        // Only considers hypothesis groups assigned to the currently selected BDR (see
+        // _fcrGroupBelongsToBdr) — a contact can legitimately be tagged in another BDR's group
+        // (e.g. a shared company/contact), but that group's saved instructions belong to a
+        // different BDR and must never override what's typed into the instructions boxes here.
+        // Messages that only match another BDR's group are treated as ungrouped.
         async function computeFcrHypothesisBreakdown() {
             _fcrMsgGroupMap = new Map();
             _fcrNoGroupCount = 0;
             _fcrGroupBreakdown = [];
 
             if (!loadedMessages.length) { renderFcrHypothesisBreakdown(); return; }
-            if (!_hypothesisGroups.length) { _fcrNoGroupCount = loadedMessages.length; renderFcrHypothesisBreakdown(); return; }
+
+            const bdrEmail = bdrSelect?.value || '';
+            const bdrGroups = _hypothesisGroups.filter(g => _fcrGroupBelongsToBdr(g, bdrEmail));
+            if (!bdrGroups.length) { _fcrNoGroupCount = loadedMessages.length; renderFcrHypothesisBreakdown(); return; }
 
             try {
-                await Promise.all(_hypothesisGroups.map(g => fcrGetHypGroupUrls(g.id)));
+                await Promise.all(bdrGroups.map(g => fcrGetHypGroupUrls(g.id)));
             } catch (e) {
                 console.warn('computeFcrHypothesisBreakdown: failed loading one or more group URL sets:', e.message);
             }
@@ -3601,20 +3622,22 @@
             loadedMessages.forEach(m => {
                 // Ground truth first: if the doc was already stamped with a hypothesisGroupId at
                 // generation time (Full Pipeline / Full AI Generate), trust that over re-deriving
-                // the group purely by URL match. A contact's LinkedIn URL can legitimately be
-                // tagged in more than one hypothesis group (e.g. a broad company-wide group plus a
-                // narrower A/B test group) — blind URL-matching would then pick whichever group
-                // happens to come first in _hypothesisGroups, which can silently move the message
-                // to a group with no/different messageVariations and wipe its hypothesisVariationId
-                // when approved (see full_pipeline.html's Data Repair tool for the same root cause
-                // on the generation side). Only fall back to URL-matching when there's no stamp.
+                // the group purely by URL match — but only when that stamped group actually
+                // belongs to the currently selected BDR (bdrGroups). A contact's LinkedIn URL can
+                // legitimately be tagged in more than one hypothesis group (e.g. a broad
+                // company-wide group plus a narrower A/B test group) — blind URL-matching would
+                // then pick whichever group happens to come first in bdrGroups, which can
+                // silently move the message to a group with no/different messageVariations and
+                // wipe its hypothesisVariationId when approved (see full_pipeline.html's Data
+                // Repair tool for the same root cause on the generation side). Only fall back to
+                // URL-matching when there's no stamp (or the stamped group isn't this BDR's).
                 let matchedGroup = m.hypothesisGroupId
-                    ? (_hypothesisGroups.find(g => g.id === m.hypothesisGroupId) || null)
+                    ? (bdrGroups.find(g => g.id === m.hypothesisGroupId) || null)
                     : null;
                 if (!matchedGroup) {
                     const url = _fcrNormalizeUrl(_fcrMsgUrl(m));
                     if (url) {
-                        for (const g of _hypothesisGroups) {
+                        for (const g of bdrGroups) {
                             const urlSet = _fcrHypUrlCache.get(g.id);
                             if (urlSet && urlSet.has(url)) { matchedGroup = g; break; }
                         }
@@ -5976,7 +5999,11 @@
                 });
                 const connectDocs = Array.from(mergedDocsById.values());
 
-                // Compute queue counts from the already-fetched records (no separate unlimited round-trip)
+                // Compute queue counts from the already-fetched records (no separate unlimited round-trip).
+                // IMPORTANT: this must apply the same Hypothesis Group filter as the loadedMessages
+                // computation below — otherwise these badges (and the "Queue 1" hub) show a much bigger
+                // number than what actually renders on the page, which is confusing (e.g. badge says 215
+                // but only 15 cards appear because a hypothesis group filter silently excluded the rest).
                 {
                     const queueCounts = {};
                     mergedDocsById.forEach((docSnap) => {
@@ -5985,6 +6012,10 @@
                         // Include docs without reviewStatus (treated as pending_admin_review)
                         if (rs !== 'pending_admin_review' && data.reviewStatus) return;
                         if (data.deleted) return;
+                        if (fcrHypUrlSet) {
+                            const prospectUrl = data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || '';
+                            if (!prospectUrl || !fcrHypUrlSet.has(_fcrNormalizeUrl(prospectUrl))) return; // excluded by active hypothesis group filter
+                        }
                         const msgType = data.message_type || 'connect';
                         queueCounts[msgType] = (queueCounts[msgType] || 0) + 1;
                     });
@@ -5992,6 +6023,15 @@
                     const queueMessageEl = document.getElementById('queueMessage');
                     if (queueConnectEl) queueConnectEl.textContent = queueCounts['connect'] ?? 0;
                     if (queueMessageEl) queueMessageEl.textContent = queueCounts['message'] ?? 0;
+                    // Make it obvious in the UI when these counts are scoped to a hypothesis group filter,
+                    // so a small number here isn't mistaken for "the whole queue is small."
+                    const queueConnectLabelEl = document.getElementById('queueConnectLabel');
+                    const queueMessageLabelEl = document.getElementById('queueMessageLabel');
+                    const hypScopeTitle = fcrHypUrlSet
+                        ? `Scoped to the active Hypothesis Group filter (${fcrHypUrlSet.size.toLocaleString()} allowed URLs). Clear the Hypothesis Group filter above to see the full queue.`
+                        : 'Across the full queue for this BDR (no Hypothesis Group filter active).';
+                    if (queueConnectLabelEl) queueConnectLabelEl.title = hypScopeTitle;
+                    if (queueMessageLabelEl) queueMessageLabelEl.title = hypScopeTitle;
 
                     // Update Queue 1 hub (top-right)
                     currentQueue1Counts = { connect: queueCounts['connect'] ?? 0, message: queueCounts['message'] ?? 0 };
@@ -6018,6 +6058,7 @@
                 let filteredByDeleted = 0;
                 let filteredByMessageType = 0;
                 let filteredBySourceType = 0;
+                let filteredByHypGroup = 0;
                 let debugItemCount = 0;
                 
                 connectDocs.forEach((docSnap) => {
@@ -6101,6 +6142,7 @@
                                 const prospectUrl = data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || '';
                                 if (!prospectUrl || !fcrHypUrlSet.has(_fcrNormalizeUrl(prospectUrl))) {
                                     // filtered out by hypothesis group
+                                    filteredByHypGroup++;
                                 } else {
                                     loadedMessages.push({
                                         id: docSnap.id,
@@ -6135,7 +6177,7 @@
                     }
                 });
                 
-                console.log(`🔍 Filtering results: Total=${connectDocs.length}, Loaded=${loadedMessages.length}, FilteredByReviewStatus=${filteredByReviewStatus}, FilteredByDeleted=${filteredByDeleted}, FilteredByMessageType=${filteredByMessageType}, FilteredBySourceType=${filteredBySourceType}${fcrHypUrlSet ? `, HypGroupFilter: active (${fcrHypUrlSet.size} allowed URLs)` : ''}`);
+                console.log(`🔍 Filtering results: Total=${connectDocs.length}, Loaded=${loadedMessages.length}, FilteredByReviewStatus=${filteredByReviewStatus}, FilteredByDeleted=${filteredByDeleted}, FilteredByMessageType=${filteredByMessageType}, FilteredBySourceType=${filteredBySourceType}, FilteredByHypGroup=${filteredByHypGroup}${fcrHypUrlSet ? `, HypGroupFilter: active (${fcrHypUrlSet.size} allowed URLs)` : ''}`);
                 
                 // 75-day duplicate filter (avoid repeat connection outreach to same URL).
                 // When "Filter by Source" is Harvest Questions, skip this so harvest follow-ups stay visible.
@@ -11195,7 +11237,12 @@
             // with no custom target/message instructions) so per-message variation instructions
             // still get resolved and applied below.
             const selectedHypGroupId = document.getElementById('fcrHypothesisSelect')?.value || '';
-            const splitByHypGroup = !selectedHypGroupId && _hypothesisGroups.some(g =>
+            // Only groups actually assigned to the currently selected BDR (see
+            // _fcrGroupBelongsToBdr) are eligible to trigger/participate in the split — a group
+            // belonging to a different BDR must never contribute its instructions here, even if
+            // some loaded contact happens to also be tagged in it.
+            const bdrHypGroupsForSplit = _hypothesisGroups.filter(g => _fcrGroupBelongsToBdr(g, bdrSelect?.value || ''));
+            const splitByHypGroup = !selectedHypGroupId && bdrHypGroupsForSplit.some(g =>
                 (g.targetContactInstructions || '').trim() || (g.messageReviewInstructions || '').trim() || (g.messageVariations || []).length > 0
             );
             if (splitByHypGroup) await computeFcrHypothesisBreakdown();
