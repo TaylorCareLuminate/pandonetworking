@@ -3407,7 +3407,7 @@
                 <i class="fas fa-rotate-left"></i>
                 Unmark All Excluded
             </button>
-            <button id="saveAllEditsBtn" class="btn" style="display:none;background:#0891b2;color:white;" title="Overwrite the original message text in Firestore for all messages you have edited in this session" onclick="saveAllEdits()">
+            <button id="saveAllEditsBtn" class="btn" style="display:none;background:#0891b2;color:white;" title="Save your edited message text AND approve/exclude/delete/group-only selections to Firestore so they survive a reload. Does not process/submit anything — use Submit Batch for that." onclick="saveAllEdits()">
                 <i class="fas fa-floppy-disk"></i>
                 Save All Edits (<span id="saveAllEditsCount">0</span>)
             </button>
@@ -3545,6 +3545,11 @@
         let pushedConnectionUrls = new Map(); // normalizedUrl -> { date, activityId } for contacts already pushed as connections
         let currentlyConnectedUrls = new Set(); // normalized LinkedIn URLs of prospects already connected to this BDR
         let messageSelections = new Map(); // id -> { approve, exclude, delete }
+        // id -> action, mirroring the last `pendingSelection` value we successfully wrote to
+        // Firestore via "Save All Edits" (see saveAllEdits/computeDirtySelectionIds below).
+        // Lets us detect which selections have changed since the last save without having to
+        // hook every single messageSelections.set()/delete() call site in the file.
+        let savedPendingSelectionIds = new Map();
         // When Submit First N is in flight, submitBatch / Final AI Review must only
         // touch these IDs — even if remaining selections get written back early.
         let _submitOnlyIds = null;
@@ -5657,6 +5662,52 @@
             });
         }
 
+        // ── Pending-selection persistence (approve/exclude/delete/group-only) ──
+        //
+        // Checkbox selections normally only reach Firestore when "Submit Batch" runs
+        // the full processing pipeline (campaigns, HeyReach pushes, etc.). "Save All
+        // Edits" lets a reviewer save their in-progress work (text + selections)
+        // WITHOUT triggering any of that — it just stamps a lightweight
+        // `pendingSelection` field on the connect_queue doc so the choice survives a
+        // reload. It has no effect on any other page logic; a doc only leaves Queue 1
+        // (and this field's relevance) once Submit Batch actually processes it.
+        const PENDING_SELECTION_ACTIONS = new Set(['approve', 'exclude', 'delete', 'group-only']);
+
+        // Called for every doc as it's loaded into loadedMessages. Seeds messageSelections
+        // (so the checkbox gets checked once rendered — see restoreSelectionsToCards) and
+        // savedPendingSelectionIds (our "last known saved" baseline) from the doc's saved
+        // pendingSelection field, but only if nothing in this session has already set a
+        // selection for this id (don't clobber in-session choices on a same-session reload).
+        function _fcrSeedPendingSelection(id, data) {
+            if (!data.pendingSelection || !PENDING_SELECTION_ACTIONS.has(data.pendingSelection)) return;
+            if (!messageSelections.has(id)) messageSelections.set(id, data.pendingSelection);
+            savedPendingSelectionIds.set(id, data.pendingSelection);
+        }
+
+        // Returns the set of message IDs whose current messageSelections action differs
+        // from what's already saved to Firestore (savedPendingSelectionIds) — i.e. what
+        // "Save All Edits" still needs to write. Computed on demand rather than tracked at
+        // every messageSelections.set()/delete() call site (there are dozens across auto-
+        // delete rules, cascades, org-contact selection, etc.).
+        function computeDirtySelectionIds() {
+            // messageSelections intentionally survives same-session reloads (e.g. re-loading
+            // a different BDR/filter without a full page refresh — see submitBatch's identical
+            // `loadedMessages.find(...)` guard), so it can contain stale IDs from a previous
+            // load. Scope dirty-detection (and therefore what Save All Edits will write) to
+            // only messages that are actually part of the current view.
+            const currentIds = new Set(loadedMessages.map(m => m.id));
+            const dirty = new Set();
+            messageSelections.forEach((action, id) => {
+                if (!currentIds.has(id)) return;
+                if (savedPendingSelectionIds.get(id) !== action) dirty.add(id);
+            });
+            savedPendingSelectionIds.forEach((action, id) => {
+                if (!currentIds.has(id)) return;   // not part of the current view — leave its saved value alone
+                if (!messageSelections.has(id)) dirty.add(id); // selection was saved before, now unchecked
+            });
+            return dirty;
+        }
+
         // Load BDR leaders
         async function loadBDRLeaders() {
             const previousBDR = bdrSelect.value;
@@ -6150,6 +6201,7 @@
                                         reviewStatus: reviewStatus,
                                         message_type: messageType
                                     });
+                                    _fcrSeedPendingSelection(docSnap.id, data);
                                 }
                             } else {
                                 loadedMessages.push({
@@ -6158,6 +6210,7 @@
                                     reviewStatus: reviewStatus,
                                     message_type: messageType // Ensure message_type is set
                                 });
+                                _fcrSeedPendingSelection(docSnap.id, data);
                             }
                         } else {
                             if (!passesMessageTypeFilter) {
@@ -6267,6 +6320,10 @@
                     renderFcrHypothesisBreakdown();
                 } else {
                     await displayMessages();
+                    // Re-check any approve/exclude/delete/group-only boxes that were seeded
+                    // from a previously-saved `pendingSelection` field (see
+                    // _fcrSeedPendingSelection above) so unsubmitted selections survive a reload.
+                    restoreSelectionsToCards();
                     statsBar.style.display = 'flex';
                     batchActions.style.display = 'flex';
                     document.getElementById('bulkDeletePanel').style.display = 'flex';
@@ -9356,24 +9413,35 @@
             syncSaveEditsBtn();
         }
 
-        // ── Save All Edits ────────────────────────────────────────────────
+        // ── Save All Edits (also saves approve/exclude/delete/group-only selections) ──
         function syncSaveEditsBtn() {
             const btn = document.getElementById('saveAllEditsBtn');
             const countEl = document.getElementById('saveAllEditsCount');
             if (!btn) return;
-            const count = editedMessages.size;
+            const count = new Set([...editedMessages.keys(), ...computeDirtySelectionIds()]).size;
             if (countEl) countEl.textContent = count;
             btn.style.display = count > 0 ? '' : 'none';
         }
 
         window.saveAllEdits = async function saveAllEdits() {
-            const count = editedMessages.size;
+            const dirtySelectionIds = computeDirtySelectionIds();
+            const allIds = new Set([...editedMessages.keys(), ...dirtySelectionIds]);
+            const count = allIds.size;
             if (count === 0) {
-                showAlert('No pending edits to save.', 'info');
+                showAlert('No pending edits or selections to save.', 'info');
                 return;
             }
 
-            if (!confirm(`Save ${count} edited message${count !== 1 ? 's' : ''} back to Firestore?\n\nThis will overwrite the original message text with your edited versions.`)) return;
+            const editCount = editedMessages.size;
+            const selectionCount = dirtySelectionIds.size;
+            const parts = [];
+            if (editCount > 0) parts.push(`${editCount} edited message text${editCount !== 1 ? 's' : ''}`);
+            if (selectionCount > 0) parts.push(`${selectionCount} approve/exclude/delete/group-only selection${selectionCount !== 1 ? 's' : ''}`);
+            if (!confirm(
+                `Save ${parts.join(' and ')} to Firestore?\n\n` +
+                `This saves your progress so it survives a reload — it does NOT process approved ` +
+                `messages (no campaigns/sends happen). Use "Submit Batch" for that.`
+            )) return;
 
             const btn = document.getElementById('saveAllEditsBtn');
             if (btn) {
@@ -9384,26 +9452,46 @@
             let saved = 0;
             const failedIds = new Set();
 
-            for (const [msgId, newText] of editedMessages) {
+            for (const msgId of allIds) {
+                const payload = {};
+                const hasTextEdit = editedMessages.has(msgId);
+                const newText = editedMessages.get(msgId);
+                if (hasTextEdit) {
+                    payload.message_to_contact = newText;
+                    payload.lastEditedByAdmin   = currentUser?.email || '';
+                    payload.lastEditedAt        = new Date().toISOString();
+                }
+                const hasSelectionChange = dirtySelectionIds.has(msgId);
+                const selectionAction = messageSelections.get(msgId) ?? null;
+                if (hasSelectionChange) {
+                    // null clears a previously-saved selection that's since been unchecked.
+                    payload.pendingSelection   = selectionAction;
+                    payload.pendingSelectionBy = currentUser?.email || '';
+                    payload.pendingSelectionAt = new Date().toISOString();
+                }
+
                 try {
-                    await updateDoc(doc(emailDB, 'connect_queue', msgId), {
-                        message_to_contact:   newText,
-                        lastEditedByAdmin:    currentUser?.email || '',
-                        lastEditedAt:         new Date().toISOString()
-                    });
+                    await updateDoc(doc(emailDB, 'connect_queue', msgId), payload);
 
-                    // Sync in-memory record
-                    const record = loadedMessages.find(m => m.id === msgId);
-                    if (record) record.message_to_contact = newText;
+                    if (hasTextEdit) {
+                        // Sync in-memory record
+                        const record = loadedMessages.find(m => m.id === msgId);
+                        if (record) record.message_to_contact = newText;
 
-                    // Clear the "Edited" indicator so the textarea treats new text as the baseline
-                    const ta = document.querySelector(`textarea[data-message-id="${msgId}"]`);
-                    if (ta) {
-                        ta.dataset.originalText = newText;
-                        ta.classList.remove('edited');
+                        // Clear the "Edited" indicator so the textarea treats new text as the baseline
+                        const ta = document.querySelector(`textarea[data-message-id="${msgId}"]`);
+                        if (ta) {
+                            ta.dataset.originalText = newText;
+                            ta.classList.remove('edited');
+                        }
+                        const indicator = document.getElementById(`editIndicator_${msgId}`);
+                        if (indicator) indicator.style.display = 'none';
                     }
-                    const indicator = document.getElementById(`editIndicator_${msgId}`);
-                    if (indicator) indicator.style.display = 'none';
+
+                    if (hasSelectionChange) {
+                        if (selectionAction) savedPendingSelectionIds.set(msgId, selectionAction);
+                        else savedPendingSelectionIds.delete(msgId);
+                    }
 
                     saved++;
                 } catch (err) {
@@ -9412,9 +9500,33 @@
                 }
             }
 
-            // Remove successfully saved entries from the map (collect first, then delete)
-            const toRemove = [...editedMessages.keys()].filter(id => !failedIds.has(id));
+            // Remove successfully saved text edits from the map (collect first, then delete)
+            const toRemove = [...editedMessages.keys()].filter(id => allIds.has(id) && !failedIds.has(id));
             toRemove.forEach(id => editedMessages.delete(id));
+
+            // ── Refresh the localStorage "recover unsaved work" snapshot ──
+            // scheduleAutoSave() persists editedMessages/messageSelections to
+            // localStorage (fcr_saved_batch_state) every time something is edited
+            // or checked, so a crash/session-timeout doesn't lose work. Without this
+            // block, that snapshot still contains the *pre-save* text/selections for
+            // everything we just wrote to Firestore. If the page is reloaded later, the
+            // "Unsaved batch work recovered!" banner reappears and clicking
+            // "Restore Selections" would overwrite what we just saved with the stale
+            // copy — making it look like Save All Edits silently failed. Refresh (or
+            // clear) the snapshot now so it can never restore data older than what's
+            // already safely in Firestore.
+            if (editedMessages.size === 0 && computeDirtySelectionIds().size === 0) {
+                clearBatchState();
+                document.getElementById('restoreStateBanner')?.remove();
+            } else {
+                saveBatchState('post-save');
+                // If a stale restore banner is currently showing, refresh it so its
+                // "Restore Selections" button restores the just-updated snapshot
+                // instead of the old pre-save one.
+                if (document.getElementById('restoreStateBanner')) {
+                    showRestoreBanner(getSavedBatchState());
+                }
+            }
 
             if (btn) {
                 btn.disabled = false;
@@ -9423,7 +9535,7 @@
             syncSaveEditsBtn();
 
             if (failedIds.size === 0) {
-                showAlert(`✅ Saved ${saved} edited message${saved !== 1 ? 's' : ''} to Firestore.`, 'success');
+                showAlert(`✅ Saved ${saved} message${saved !== 1 ? 's' : ''} (edits + selections) to Firestore.`, 'success');
             } else {
                 showAlert(`Saved ${saved} message${saved !== 1 ? 's' : ''}, but ${failedIds.size} failed. Check the console for details.`, 'warning');
             }
