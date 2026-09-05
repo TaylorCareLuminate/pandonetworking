@@ -161,11 +161,29 @@
     }
 
     // ── BDR Availability / Slots ────────────────────────────────────────
+    // In-flight request de-duplication: pages like company_review_replies.html
+    // mount one widget per contact card, and many contacts share the same BDR —
+    // so a single render pass can fire dozens of *simultaneous, identical*
+    // GETs for that BDR's availability doc. Share one in-flight promise per
+    // doc id instead of firing them all. This never serves stale data to a
+    // write path (setSlotStatus/saveAvailability always await a fresh call
+    // that starts *after* any prior in-flight request has already resolved
+    // and been cleared below), it only collapses truly-concurrent duplicates.
+    const _inFlightAvailability = new Map();
     async function getAvailabilityDoc(conferenceId, bdrEmail) {
-        const { doc, getDoc } = fx();
         const id = availabilityDocId(conferenceId, bdrEmail);
-        const snap = await getDoc(doc(dbi(), 'conference_availability', id));
-        return snap.exists ? { id: snap.id, ...snap.data() } : null;
+        if (_inFlightAvailability.has(id)) return _inFlightAvailability.get(id);
+        const promise = (async () => {
+            const { doc, getDoc } = fx();
+            const snap = await getDoc(doc(dbi(), 'conference_availability', id));
+            return snap.exists ? { id: snap.id, ...snap.data() } : null;
+        })();
+        _inFlightAvailability.set(id, promise);
+        try {
+            return await promise;
+        } finally {
+            _inFlightAvailability.delete(id);
+        }
     }
 
     async function getAllAvailabilityForConference(conferenceId) {
