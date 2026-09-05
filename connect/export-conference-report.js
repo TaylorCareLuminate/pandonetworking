@@ -7,6 +7,7 @@ window.exportConferenceReportPdf = async function (context) {
     const {
         conference,          // { name, location, startDate, endDate, notes }
         scheduledMeetings,   // [{ date, startTime, endTime, bdrName, contactName, contactTitle, contactCompany, email, phone, notes }]
+        heldMeetings = [],   // same shape as scheduledMeetings, but tentative/unconfirmed
         openInterest,        // [{ bdrName, contactName, contactTitle, contactCompany, email, phone, notes }]
         preparedFor          // optional client name string
     } = context;
@@ -171,12 +172,17 @@ window.exportConferenceReportPdf = async function (context) {
     doc.setFontSize(11);
     doc.setFont(undefined, 'normal');
     const scheduledCount = scheduledMeetings.length;
+    const heldCount = heldMeetings.length;
     const openCount = openInterest.length;
     doc.text(`Confirmed meeting times: ${scheduledCount}`, margin + 2, yPos);
     yPos += 7;
+    if (heldCount > 0) {
+        doc.text(`Tentatively held times (awaiting confirmation): ${heldCount}`, margin + 2, yPos);
+        yPos += 7;
+    }
     doc.text(`Additional contacts wanting to meet (time to be confirmed): ${openCount}`, margin + 2, yPos);
     yPos += 7;
-    const bdrSet = new Set([...scheduledMeetings, ...openInterest].map(m => m.bdrName || m.bdrEmail).filter(Boolean));
+    const bdrSet = new Set([...scheduledMeetings, ...heldMeetings, ...openInterest].map(m => m.bdrName || m.bdrEmail).filter(Boolean));
     doc.text(`Representatives attending: ${[...bdrSet].join(', ') || '—'}`, margin + 2, yPos);
     yPos += 12;
 
@@ -189,18 +195,12 @@ window.exportConferenceReportPdf = async function (context) {
         yPos += 6;
     }
 
-    // === CONFIRMED MEETINGS (grouped by day) ===
-    addSectionHeader('Confirmed Meeting Times', 'Sorted by day and time');
-
-    if (scheduledMeetings.length === 0) {
-        doc.setFontSize(10);
-        doc.setTextColor(...colors.textLight);
-        doc.text('No confirmed meeting times yet.', margin + 2, yPos);
-        doc.setTextColor(...colors.text);
-        yPos += 10;
-    } else {
+    // Renders a "grouped by day" meeting list (used for both confirmed and
+    // tentatively-held sections). `dayBandColor` tints the day-header band and
+    // `tagLabel` (if set) stamps a small tag on each entry (e.g. "HELD").
+    function renderMeetingsByDay(meetings, dayBandColor, tagLabel) {
         const byDay = new Map();
-        scheduledMeetings
+        meetings
             .slice()
             .sort((a, b) => `${a.date}${a.startTime}`.localeCompare(`${b.date}${b.startTime}`))
             .forEach(m => {
@@ -211,7 +211,7 @@ window.exportConferenceReportPdf = async function (context) {
 
         [...byDay.keys()].sort().forEach(dayKey => {
             checkPageBreak(16);
-            doc.setFillColor(...colors.secondary);
+            doc.setFillColor(...dayBandColor);
             doc.rect(margin - 3, yPos - 2, pageWidth - 2 * margin + 6, 8, 'F');
             doc.setTextColor(255, 255, 255);
             doc.setFontSize(10);
@@ -221,12 +221,9 @@ window.exportConferenceReportPdf = async function (context) {
             doc.setFont(undefined, 'normal');
             yPos += 12;
 
-            byDay.get(dayKey).forEach((m, idx) => {
+            byDay.get(dayKey).forEach((m) => {
                 checkPageBreak(26);
                 const boxStartY = yPos - 1;
-                const isEven = idx % 2 === 0;
-                doc.setFillColor(...(isEven ? [255, 255, 255] : colors.rowAlt));
-                // draw box after we know height; placeholder rect drawn later
 
                 doc.setFontSize(10);
                 doc.setFont(undefined, 'bold');
@@ -237,6 +234,17 @@ window.exportConferenceReportPdf = async function (context) {
                 doc.setFont(undefined, 'bold');
                 doc.setTextColor(...colors.text);
                 doc.text(sanitizeText(m.contactName || 'Unknown'), margin + 42, yPos + 4);
+
+                if (tagLabel) {
+                    const tagX = margin + 42 + doc.getTextWidth(sanitizeText(m.contactName || 'Unknown')) + 4;
+                    doc.setFontSize(7);
+                    doc.setFillColor(...colors.warning);
+                    doc.roundedRect(tagX, yPos, 14, 4.2, 1, 1, 'F');
+                    doc.setTextColor(255, 255, 255);
+                    doc.text(tagLabel, tagX + 7, yPos + 3, { align: 'center' });
+                    doc.setTextColor(...colors.text);
+                    doc.setFontSize(10);
+                }
 
                 doc.setFont(undefined, 'normal');
                 doc.setFontSize(9);
@@ -271,6 +279,26 @@ window.exportConferenceReportPdf = async function (context) {
             });
             yPos += 4;
         });
+    }
+
+    // === CONFIRMED MEETINGS (grouped by day) ===
+    addSectionHeader('Confirmed Meeting Times', 'Sorted by day and time');
+
+    if (scheduledMeetings.length === 0) {
+        doc.setFontSize(10);
+        doc.setTextColor(...colors.textLight);
+        doc.text('No confirmed meeting times yet.', margin + 2, yPos);
+        doc.setTextColor(...colors.text);
+        yPos += 10;
+    } else {
+        renderMeetingsByDay(scheduledMeetings, colors.secondary, null);
+    }
+
+    // === TENTATIVELY HELD — AWAITING CONFIRMATION (grouped by day) ===
+    if (heldMeetings.length > 0) {
+        checkPageBreak(24);
+        addSectionHeader('Tentatively Held — Awaiting Confirmation', 'Time mentioned to the contact but not yet locked in');
+        renderMeetingsByDay(heldMeetings, colors.warning, 'HELD');
     }
 
     // === WANTS TO MEET — NO TIME SET ===

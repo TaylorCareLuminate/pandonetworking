@@ -100,11 +100,18 @@
         .slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
         .slot-chip { border-radius: 8px; padding: 8px 10px; font-size: 12px; border: 1.5px solid; position: relative; }
         .slot-chip.open { background: #f0fdf4; border-color: #86efac; color: #15803d; }
+        .slot-chip.held { background: #fffbeb; border-color: #fcd34d; color: #92400e; }
         .slot-chip.booked { background: #fef3f2; border-color: #fca5a5; color: #b91c1c; }
         .slot-chip .slot-time { font-weight: 700; display: block; margin-bottom: 2px; }
         .slot-chip .slot-who { font-size: 11px; opacity: 0.9; display: block; }
         .slot-chip .slot-release { position: absolute; top: 4px; right: 6px; cursor: pointer; opacity: 0.6; font-size: 11px; }
         .slot-chip .slot-release:hover { opacity: 1; }
+        .slot-legend { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; font-size: 12px; color: var(--gray-600); }
+        .slot-legend span { display: inline-flex; align-items: center; gap: 6px; }
+        .slot-legend .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+        .slot-legend .dot.open { background: #86efac; }
+        .slot-legend .dot.held { background: #fcd34d; }
+        .slot-legend .dot.booked { background: #fca5a5; }
         .empty-state { text-align: center; padding: 2.5rem 1rem; color: var(--gray-600); }
         .empty-state i { font-size: 2.4rem; opacity: 0.4; margin-bottom: 10px; display: block; }
 
@@ -120,6 +127,7 @@
         .source-tag.regex { background: #dbeafe; color: #1d4ed8; }
         .source-tag.ai { background: #ede9fe; color: #7c3aed; }
         .source-tag.manual { background: #f3f4f6; color: #6b7280; }
+        .held-pill { display: inline-block; padding: 2px 8px; border-radius: 8px; font-size: 10.5px; font-weight: 700; background: #fef3c7; color: #92400e; text-transform: uppercase; letter-spacing: 0.03em; }
 
         .section-subtitle { font-size: 13px; color: var(--gray-600); margin: 18px 0 8px 0; font-weight: 600; }
         .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
@@ -223,6 +231,10 @@
             <div id="confirmedTableWrap">
                 <div class="loading-inline"><i class="fas fa-spinner fa-spin"></i> Loading…</div>
             </div>
+
+            <div class="section-subtitle"><i class="fas fa-clock" style="color:#b45309;"></i> Tentatively Held — Awaiting Confirmation <span id="heldCount" style="font-weight:400;color:var(--gray-600);"></span></div>
+            <p style="font-size:12px;color:var(--gray-600);margin:-4px 0 8px 0;">A time was mentioned to the contact but not fully reserved yet. Click <strong>Confirm</strong> once they lock it in.</p>
+            <div id="heldTableWrap"></div>
 
             <div class="section-subtitle"><i class="fas fa-handshake"></i> Wants to Meet — No Time Set <span id="openCount" style="font-weight:400;color:var(--gray-600);"></span></div>
             <div id="openTableWrap"></div>
@@ -529,7 +541,12 @@
                 byDay.get(s.date).push(s);
             });
             const days = [...byDay.keys()].sort();
-            container.innerHTML = days.map(day => {
+            const legend = `<div class="slot-legend">
+                <span><span class="dot open"></span> Open</span>
+                <span><span class="dot held"></span> Held (mentioned, not confirmed)</span>
+                <span><span class="dot booked"></span> Booked (confirmed)</span>
+            </div>`;
+            container.innerHTML = legend + days.map(day => {
                 const slots = byDay.get(day).sort((a, b) => a.startTime.localeCompare(b.startTime));
                 const openCt = slots.filter(s => s.status === 'open').length;
                 return `
@@ -539,10 +556,10 @@
                     </div>
                     <div class="slot-grid">
                         ${slots.map(s => `
-                            <div class="slot-chip ${s.status === 'booked' ? 'booked' : 'open'}">
-                                ${s.status === 'booked' ? `<span class="slot-release" title="Release this slot (does not notify anyone)" onclick="releaseSlotManual('${esc(s.id)}')"><i class="fas fa-times"></i></span>` : ''}
+                            <div class="slot-chip ${esc(s.status || 'open')}">
+                                ${s.status !== 'open' ? `<span class="slot-release" title="Release this slot back to open (does not notify anyone)" onclick="releaseSlotManual('${esc(s.id)}')"><i class="fas fa-times"></i></span>` : ''}
                                 <span class="slot-time">${esc(CS.fmtTime12(s.startTime))}–${esc(CS.fmtTime12(s.endTime))}</span>
-                                <span class="slot-who">${s.status === 'booked' ? esc(s.contactName || 'Booked') : 'Open'}</span>
+                                <span class="slot-who">${s.status === 'booked' ? esc(s.contactName || 'Booked') : s.status === 'held' ? `${esc(s.contactName || 'Held')} (held)` : 'Open'}</span>
                             </div>`).join('')}
                     </div>
                 </div>`;
@@ -562,7 +579,7 @@
                 currentAvailability.slots = newSlots;
                 // Downgrade the linked meeting request (if any) to "no time set" rather than deleting it
                 if (slot && slot.meetingRequestId) {
-                    await CS.updateMeetingRequestFields(slot.meetingRequestId, { slotId: null, hasTimeSlot: false, date: null, startTime: null, endTime: null });
+                    await CS.updateMeetingRequestFields(slot.meetingRequestId, { slotId: null, hasTimeSlot: false, slotStatus: null, date: null, startTime: null, endTime: null });
                 }
                 renderSlotGrid();
                 await loadMeetingRequestsForWorkingConference();
@@ -586,22 +603,30 @@
         window.renderReportTables = function () {
             const bdrFilter = document.getElementById('reportBdrFilter').value;
             const filtered = bdrFilter ? meetingRequests.filter(r => r.bdrEmail === bdrFilter) : meetingRequests;
-            const confirmed = filtered.filter(r => r.hasTimeSlot).sort((a, b) => `${a.date}${a.startTime}`.localeCompare(`${b.date}${b.startTime}`));
+            const byTime = (a, b) => `${a.date}${a.startTime}`.localeCompare(`${b.date}${b.startTime}`);
+            const confirmed = filtered.filter(r => r.hasTimeSlot && (r.slotStatus || 'confirmed') !== 'held').sort(byTime);
+            const held = filtered.filter(r => r.hasTimeSlot && r.slotStatus === 'held').sort(byTime);
             const openOnes = filtered.filter(r => !r.hasTimeSlot);
 
             document.getElementById('confirmedCount').textContent = `(${confirmed.length})`;
+            document.getElementById('heldCount').textContent = `(${held.length})`;
             document.getElementById('openCount').textContent = `(${openOnes.length})`;
 
             document.getElementById('confirmedTableWrap').innerHTML = confirmed.length === 0
                 ? `<div class="empty-state" style="padding:1.5rem;"><i class="fas fa-calendar-times"></i>No confirmed meetings yet for this filter.</div>`
-                : buildReportTable(confirmed, true);
+                : buildReportTable(confirmed, 'confirmed');
+
+            document.getElementById('heldTableWrap').innerHTML = held.length === 0
+                ? `<div class="empty-state" style="padding:1.5rem;"><i class="fas fa-clock"></i>No tentatively-held times for this filter.</div>`
+                : buildReportTable(held, 'held');
 
             document.getElementById('openTableWrap').innerHTML = openOnes.length === 0
                 ? `<div class="empty-state" style="padding:1.5rem;"><i class="fas fa-handshake"></i>Nobody in this filter is waiting on a time yet.</div>`
-                : buildReportTable(openOnes, false);
+                : buildReportTable(openOnes, 'open');
         };
 
-        function buildReportTable(rows, showTime) {
+        function buildReportTable(rows, mode) {
+            const showTime = mode !== 'open';
             return `
             <table class="report-table">
                 <thead><tr>
@@ -611,7 +636,7 @@
                 <tbody>
                     ${rows.map(r => `
                         <tr data-req-id="${esc(r.id)}">
-                            ${showTime ? `<td><strong>${esc(CS.fmtDateShort(r.date))}</strong><br>${esc(CS.fmtTime12(r.startTime))}–${esc(CS.fmtTime12(r.endTime))}</td>` : ''}
+                            ${showTime ? `<td><strong>${esc(CS.fmtDateShort(r.date))}</strong><br>${esc(CS.fmtTime12(r.startTime))}–${esc(CS.fmtTime12(r.endTime))}${mode === 'held' ? '<br><span class="held-pill">Held</span>' : ''}</td>` : ''}
                             <td>${esc(r.contactName || 'Unknown')}${r.contactLiUrl ? ` <a href="${esc(r.contactLiUrl)}" target="_blank"><i class="fab fa-linkedin" style="color:#0a66c2;"></i></a>` : ''}</td>
                             <td>${esc(r.contactTitle || '')}${r.contactTitle && r.contactCompany ? ' · ' : ''}${esc(r.contactCompany || '')}</td>
                             <td>${esc(r.bdrName || r.bdrEmail || '')}</td>
@@ -619,6 +644,7 @@
                             <td>${editableCell(r.id, 'phone', r.phone, r.phoneSource)}</td>
                             <td>${editableCell(r.id, 'notes', r.notes, '')}</td>
                             <td style="white-space:nowrap;">
+                                ${mode === 'held' ? `<button class="btn btn-sm btn-gold" title="Confirm this time" onclick="confirmHeldRequest('${esc(r.id)}')"><i class="fas fa-check"></i></button>` : ''}
                                 <button class="btn btn-sm btn-secondary" title="AI-scan LinkedIn conversation for missing info" onclick="scanOneMissingInfo('${esc(r.id)}')"><i class="fas fa-magic"></i></button>
                                 <button class="btn btn-sm btn-danger" title="Remove this meeting request" onclick="cancelRequestFromReport('${esc(r.id)}')"><i class="fas fa-trash"></i></button>
                             </td>
@@ -626,6 +652,19 @@
                 </tbody>
             </table>`;
         }
+
+        window.confirmHeldRequest = async function (reqId) {
+            const req = meetingRequests.find(r => r.id === reqId);
+            if (!req) return;
+            try {
+                const updated = await CS.setMeetingRequestHoldState(reqId, false);
+                Object.assign(req, updated);
+                renderReportTables();
+                showAlert(`Confirmed the meeting time for ${req.contactName || 'this contact'}.`, 'success');
+            } catch (e) {
+                showAlert('Error confirming meeting: ' + e.message, 'error');
+            }
+        };
 
         function editableCell(reqId, field, value, source) {
             const missing = !value;
@@ -725,9 +764,10 @@
             const conference = conferences.find(c => c.id === workingConferenceId);
             const bdrFilter = document.getElementById('reportBdrFilter').value;
             const filtered = bdrFilter ? meetingRequests.filter(r => r.bdrEmail === bdrFilter) : meetingRequests;
-            const scheduledMeetings = filtered.filter(r => r.hasTimeSlot);
+            const scheduledMeetings = filtered.filter(r => r.hasTimeSlot && (r.slotStatus || 'confirmed') !== 'held');
+            const heldMeetings = filtered.filter(r => r.hasTimeSlot && r.slotStatus === 'held');
             const openInterest = filtered.filter(r => !r.hasTimeSlot);
-            if (scheduledMeetings.length === 0 && openInterest.length === 0) {
+            if (scheduledMeetings.length === 0 && heldMeetings.length === 0 && openInterest.length === 0) {
                 alert('No meeting requests to include in the report yet.');
                 return;
             }
@@ -735,6 +775,7 @@
                 await window.exportConferenceReportPdf({
                     conference,
                     scheduledMeetings,
+                    heldMeetings,
                     openInterest,
                     preparedFor: document.getElementById('preparedForInput').value.trim()
                 });

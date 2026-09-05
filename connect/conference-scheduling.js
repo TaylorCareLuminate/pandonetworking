@@ -226,22 +226,40 @@
             .sort((a, b) => `${a.date}${a.startTime}`.localeCompare(`${b.date}${b.startTime}`));
     }
 
-    async function bookSlot(conferenceId, bdrEmail, slotId, info) {
+    /**
+     * Sets a slot to 'open' | 'held' | 'booked' and stamps who it's for.
+     * 'held'   = mentioned/proposed to a contact but not yet confirmed —
+     *            still shows as unavailable to others, but doesn't count as a
+     *            real meeting in the report/PDF.
+     * 'booked' = fully confirmed meeting.
+     * Throws if the slot is already held/booked by a DIFFERENT meeting
+     * request (so two people can't be pitched — or booked into — the same
+     * slot at once).
+     */
+    async function setSlotStatus(conferenceId, bdrEmail, slotId, status, info) {
         const avail = await getAvailabilityDoc(conferenceId, bdrEmail);
         if (!avail) throw new Error('No availability windows are set up for this BDR at this conference yet.');
         let target = null;
         const slots = (avail.slots || []).map(s => {
             if (s.id !== slotId) return s;
-            if (s.status === 'booked' && s.meetingRequestId && s.meetingRequestId !== info.meetingRequestId) {
-                throw new Error('That time slot was just booked by someone else — please pick another.');
+            if ((s.status === 'booked' || s.status === 'held') && s.meetingRequestId && s.meetingRequestId !== info.meetingRequestId) {
+                throw new Error(`That time slot is already ${s.status === 'booked' ? 'booked' : 'on hold'} for someone else — please pick another.`);
             }
-            target = { ...s, status: 'booked', ...info };
+            target = { ...s, status, ...info };
             return target;
         });
         if (!target) throw new Error('Selected time slot no longer exists — please refresh and try again.');
         const { doc, updateDoc } = fx();
         await updateDoc(doc(dbi(), 'conference_availability', avail.id), { slots, updatedAt: new Date() });
         return target;
+    }
+
+    async function bookSlot(conferenceId, bdrEmail, slotId, info) {
+        return setSlotStatus(conferenceId, bdrEmail, slotId, 'booked', info);
+    }
+
+    async function holdSlot(conferenceId, bdrEmail, slotId, info) {
+        return setSlotStatus(conferenceId, bdrEmail, slotId, 'held', info);
     }
 
     async function releaseSlot(conferenceId, bdrEmail, slotId) {
@@ -277,8 +295,10 @@
     }
 
     /**
-     * Create/update a meeting request. Pass slotId to book a specific open slot,
-     * or omit/null it (with wantsToMeet true) to mark "wants to meet, no time yet".
+     * Create/update a meeting request. Pass slotId to book/hold a specific
+     * open slot (add holdOnly: true to soft-hold it — "mentioned to the
+     * contact but not confirmed" — instead of fully booking it), or omit
+     * slotId (with wantsToMeet true) to mark "wants to meet, no time yet".
      */
     async function saveMeetingRequest(ctx) {
         const { doc, getDoc, setDoc } = fx();
@@ -289,15 +309,17 @@
         const existing = existingSnap.exists ? existingSnap.data() : null;
 
         const bdrEmailLower = (ctx.bdrEmail || existing?.bdrEmail || '').toLowerCase().trim();
+        const wantsSlotId = ctx.slotId || null;
+        const wantsHold = !!ctx.holdOnly;
 
-        // Release the previously-booked slot if it's being changed or cleared.
-        if (existing && existing.slotId && existing.slotId !== ctx.slotId) {
+        // Release the previously-held/booked slot if it's being changed or cleared.
+        if (existing && existing.slotId && existing.slotId !== wantsSlotId) {
             await releaseSlot(ctx.conferenceId, bdrEmailLower, existing.slotId);
         }
 
         let slotInfo = null;
-        if (ctx.slotId) {
-            slotInfo = await bookSlot(ctx.conferenceId, bdrEmailLower, ctx.slotId, {
+        if (wantsSlotId) {
+            slotInfo = await setSlotStatus(ctx.conferenceId, bdrEmailLower, wantsSlotId, wantsHold ? 'held' : 'booked', {
                 meetingRequestId: reqId,
                 contactName: ctx.contactName || '',
                 contactCompany: ctx.contactCompany || ''
@@ -316,8 +338,9 @@
             contactCompany: ctx.contactCompany || existing?.contactCompany || '',
             contactTitle: ctx.contactTitle || existing?.contactTitle || '',
             wantsToMeet: ctx.wantsToMeet !== false,
-            hasTimeSlot: !!ctx.slotId,
-            slotId: ctx.slotId || null,
+            hasTimeSlot: !!wantsSlotId,
+            slotStatus: wantsSlotId ? (wantsHold ? 'held' : 'confirmed') : null,
+            slotId: wantsSlotId,
             date: slotInfo ? slotInfo.date : null,
             startTime: slotInfo ? slotInfo.startTime : null,
             endTime: slotInfo ? slotInfo.endTime : null,
@@ -335,6 +358,29 @@
         return { id: reqId, ...data };
     }
 
+    /**
+     * Flips an existing meeting request's slot between 'held' (soft hold —
+     * mentioned but not confirmed) and 'confirmed' (fully booked), without
+     * needing to re-pick the slot. Used by the "Confirm" action in the
+     * report table and the widget's quick-confirm button.
+     */
+    async function setMeetingRequestHoldState(requestId, holdOnly) {
+        const { doc, getDoc, updateDoc } = fx();
+        const reqRef = doc(dbi(), 'conference_meeting_requests', requestId);
+        const snap = await getDoc(reqRef);
+        if (!snap.exists) throw new Error('Meeting request not found.');
+        const existing = snap.data();
+        if (!existing.slotId) throw new Error('This request has no time slot to confirm/hold.');
+        await setSlotStatus(existing.conferenceId, existing.bdrEmail, existing.slotId, holdOnly ? 'held' : 'booked', {
+            meetingRequestId: requestId,
+            contactName: existing.contactName || '',
+            contactCompany: existing.contactCompany || ''
+        });
+        const patch = { slotStatus: holdOnly ? 'held' : 'confirmed', updatedAt: new Date() };
+        await updateDoc(reqRef, patch);
+        return { ...existing, ...patch, id: requestId };
+    }
+
     async function cancelMeetingRequest(conferenceId, ctx) {
         const { doc, getDoc, updateDoc } = fx();
         const key = contactKeyFor(ctx);
@@ -346,7 +392,7 @@
         if (existing.slotId) {
             await releaseSlot(conferenceId, existing.bdrEmail, existing.slotId);
         }
-        await updateDoc(reqRef, { status: 'cancelled', wantsToMeet: false, slotId: null, hasTimeSlot: false, updatedAt: new Date() });
+        await updateDoc(reqRef, { status: 'cancelled', wantsToMeet: false, slotId: null, hasTimeSlot: false, slotStatus: null, updatedAt: new Date() });
     }
 
     async function updateMeetingRequestFields(requestId, patch) {
@@ -478,6 +524,7 @@
                 </div>
                 <div class="cs-widget-row cs-widget-actions">
                     <select class="cs-slot-select"><option value="">Loading time slots…</option></select>
+                    <label class="cs-hold-label" title="Mention this time to the contact without fully reserving it"><input type="checkbox" class="cs-hold-cb"> Hold only — not confirmed</label>
                     <label class="cs-no-time-label"><input type="checkbox" class="cs-no-time-cb"> Wants to meet — no time yet</label>
                     <button type="button" class="cs-save-btn"><i class="fas fa-check"></i> Save</button>
                     <button type="button" class="cs-clear-btn" title="Remove this meeting request"><i class="fas fa-times"></i></button>
@@ -486,6 +533,7 @@
 
         const confSelect = containerEl.querySelector('.cs-conf-select');
         const slotSelect = containerEl.querySelector('.cs-slot-select');
+        const holdCb = containerEl.querySelector('.cs-hold-cb');
         const noTimeCb = containerEl.querySelector('.cs-no-time-cb');
         const statusEl = containerEl.querySelector('.cs-status');
         const saveBtn = containerEl.querySelector('.cs-save-btn');
@@ -499,8 +547,26 @@
                 return;
             }
             if (req.hasTimeSlot && req.date) {
-                statusEl.innerHTML = `<i class="fas fa-calendar-check"></i> ${escapeHtml(fmtDateShort(req.date))} · ${escapeHtml(fmtTime12(req.startTime))}–${escapeHtml(fmtTime12(req.endTime))}`;
-                statusEl.className = 'cs-status cs-status-booked';
+                const isHeld = req.slotStatus === 'held';
+                const whenStr = `${escapeHtml(fmtDateShort(req.date))} · ${escapeHtml(fmtTime12(req.startTime))}–${escapeHtml(fmtTime12(req.endTime))}`;
+                if (isHeld) {
+                    statusEl.innerHTML = `<i class="fas fa-clock"></i> Held: ${whenStr} <button type="button" class="cs-confirm-inline-btn" title="Confirm this time"><i class="fas fa-check"></i> Confirm</button>`;
+                    statusEl.className = 'cs-status cs-status-held';
+                    const confirmBtn = statusEl.querySelector('.cs-confirm-inline-btn');
+                    if (confirmBtn) confirmBtn.addEventListener('click', async () => {
+                        confirmBtn.disabled = true;
+                        try {
+                            state.request = await setMeetingRequestHoldState(req.id, false);
+                            setStatus();
+                            await refreshForConference();
+                        } catch (e) {
+                            alert('Could not confirm: ' + e.message);
+                        }
+                    });
+                } else {
+                    statusEl.innerHTML = `<i class="fas fa-calendar-check"></i> Confirmed: ${whenStr}`;
+                    statusEl.className = 'cs-status cs-status-booked';
+                }
             } else {
                 statusEl.innerHTML = `<i class="fas fa-handshake"></i> Wants to meet — time TBD`;
                 statusEl.className = 'cs-status cs-status-pending';
@@ -519,11 +585,11 @@
             state.request = req;
             state.openSlots = openSlots;
 
-            // If this contact already has a booked slot, make sure it appears in the
-            // dropdown (it's "booked", so getOpenSlots() alone won't include it).
+            // If this contact already has a held/booked slot, make sure it appears
+            // in the dropdown (getOpenSlots() only returns 'open' ones).
             let slotsForDropdown = openSlots.slice();
             if (req && req.hasTimeSlot && req.slotId && !slotsForDropdown.some(s => s.id === req.slotId)) {
-                slotsForDropdown.unshift({ id: req.slotId, date: req.date, startTime: req.startTime, endTime: req.endTime, status: 'booked' });
+                slotsForDropdown.unshift({ id: req.slotId, date: req.date, startTime: req.startTime, endTime: req.endTime, status: req.slotStatus === 'held' ? 'held' : 'booked' });
             }
             slotsForDropdown.sort((a, b) => `${a.date}${a.startTime}`.localeCompare(`${b.date}${b.startTime}`));
 
@@ -537,7 +603,9 @@
             const hasSlot = !!(req && req.hasTimeSlot && req.slotId);
             slotSelect.value = hasSlot ? req.slotId : '';
             noTimeCb.checked = !!(req && req.wantsToMeet && !req.hasTimeSlot);
+            holdCb.checked = !!(req && req.hasTimeSlot && req.slotStatus === 'held');
             slotSelect.disabled = noTimeCb.checked;
+            holdCb.disabled = noTimeCb.checked;
             saveBtn.disabled = false;
 
             setStatus();
@@ -549,7 +617,8 @@
 
         noTimeCb.addEventListener('change', () => {
             slotSelect.disabled = noTimeCb.checked;
-            if (noTimeCb.checked) slotSelect.value = '';
+            holdCb.disabled = noTimeCb.checked;
+            if (noTimeCb.checked) { slotSelect.value = ''; holdCb.checked = false; }
         });
 
         saveBtn.addEventListener('click', async () => {
@@ -559,6 +628,7 @@
             }
             const wantsNoTime = noTimeCb.checked;
             const slotId = wantsNoTime ? null : (slotSelect.value || null);
+            const holdOnly = !wantsNoTime && holdCb.checked;
             if (!wantsNoTime && !slotId) {
                 alert('Pick a time slot, or check "Wants to meet — no time yet".');
                 return;
@@ -580,6 +650,7 @@
                     contactTitle: ctx.contactTitle || '',
                     wantsToMeet: true,
                     slotId,
+                    holdOnly,
                     source: ctx.source || 'manual'
                 });
                 state.request = saved;
@@ -627,17 +698,22 @@
             .cs-widget-row:last-child { margin-bottom: 0; }
             .cs-widget-label { font-weight: 700; font-size: 0.8rem; color: #92400e; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
             .cs-conf-select, .cs-slot-select { padding: 0.3rem 0.5rem; border: 1.5px solid #e5e7eb; border-radius: 6px; font-size: 0.78rem; font-family: inherit; max-width: 220px; }
-            .cs-no-time-label { display: inline-flex; align-items: center; gap: 5px; font-size: 0.76rem; color: #4b5563; cursor: pointer; white-space: nowrap; }
+            .cs-no-time-label, .cs-hold-label { display: inline-flex; align-items: center; gap: 5px; font-size: 0.76rem; color: #4b5563; cursor: pointer; white-space: nowrap; }
+            .cs-hold-label { color: #92400e; }
+            .cs-hold-label input:disabled, .cs-no-time-label input:disabled { cursor: not-allowed; }
             .cs-save-btn, .cs-clear-btn { border: none; border-radius: 6px; font-size: 0.76rem; font-weight: 600; cursor: pointer; padding: 0.32rem 0.65rem; display: inline-flex; align-items: center; gap: 4px; }
             .cs-save-btn { background: #12314C; color: white; }
             .cs-save-btn:hover { background: #0e2438; }
             .cs-save-btn:disabled { opacity: 0.6; cursor: not-allowed; }
             .cs-clear-btn { background: #fee2e2; color: #dc2626; }
             .cs-clear-btn:hover { background: #fecaca; }
-            .cs-status { font-size: 0.76rem; font-weight: 600; }
+            .cs-status { font-size: 0.76rem; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
             .cs-status-booked { color: #0f766e; }
+            .cs-status-held { color: #b45309; }
             .cs-status-pending { color: #b45309; }
             .cs-status-error { color: #dc2626; }
+            .cs-confirm-inline-btn { border: none; background: #fde68a; color: #92400e; border-radius: 5px; font-size: 0.68rem; font-weight: 700; padding: 2px 7px; cursor: pointer; display: inline-flex; align-items: center; gap: 3px; }
+            .cs-confirm-inline-btn:hover { background: #fcd34d; }
         `;
         document.head.appendChild(style);
     }
@@ -648,9 +724,10 @@
         loadConferences, loadAllConferences, createConference, updateConference, deleteConference,
         // Availability / slots
         getAvailabilityDoc, getAllAvailabilityForConference, saveAvailability, getOpenSlots, generateSlots,
+        setSlotStatus, bookSlot, holdSlot, releaseSlot,
         // Meeting requests
         getMeetingRequest, getMeetingRequestsForConference, getAllMeetingRequests,
-        saveMeetingRequest, cancelMeetingRequest, updateMeetingRequestFields,
+        saveMeetingRequest, cancelMeetingRequest, updateMeetingRequestFields, setMeetingRequestHoldState,
         // Scanning
         regexScan, aiScan, scanContactInfo, findConversationTextForContact,
         // Widget
