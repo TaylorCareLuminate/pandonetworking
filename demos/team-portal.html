@@ -631,9 +631,6 @@
           <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
             <select id="meetingBookingsHostFilter" onchange="loadMeetingBookings()" style="display:none;padding:0.45rem 0.6rem;border:1.5px solid var(--border);border-radius:8px;font-size:0.82rem;font-family:inherit;color:var(--navy);">
               <option value="">All team members</option>
-              <option value="taylor">Taylor Davis</option>
-              <option value="joe">Joe Annoreno</option>
-              <option value="sam">Sam Ellsworth</option>
             </select>
             <button class="btn btn-outline btn-sm" onclick="loadMeetingBookings()"><i class="fas fa-rotate"></i> Refresh</button>
           </div>
@@ -1140,20 +1137,38 @@
     // Microsoft calendar connection status, and all bookings — mirroring
     // ../calendar/index.html's Overview + Bookings tabs.
     const SCHEDULE_BASE_URL = 'https://pandonetworking.com';
-    const MEETING_TEAM = {
-      taylor: { name: 'Taylor Davis',  email: 'taylordavis@pandonetworking.com',  color: '#12314C', initials: 'TD' },
-      joe:    { name: 'Joe Annoreno',  email: 'joeannoreno@pandonetworking.com',  color: '#94AD82', initials: 'JA' },
-      sam:    { name: 'Sam Ellsworth', email: 'samellsworth@pandonetworking.com', color: '#4E6E4A', initials: 'SE' },
-    };
     const MEETING_INDIVIDUAL_DURATIONS = [15, 30, 60];
-    const MEETING_JOINT_TYPES = [
-      { key: 'taylor-joe-30', label: '30 min', hosts: ['taylor','joe'], hostLabel: 'Taylor & Joe' },
-      { key: 'taylor-joe-60', label: '60 min', hosts: ['taylor','joe'], hostLabel: 'Taylor & Joe' },
-      { key: 'taylor-sam-30', label: '30 min', hosts: ['taylor','sam'], hostLabel: 'Taylor & Sam' },
-      { key: 'taylor-sam-60', label: '60 min', hosts: ['taylor','sam'], hostLabel: 'Taylor & Sam' },
-    ];
 
+    // MEETING_TEAM / MEETING_JOINT_TYPES are no longer hardcoded — they're loaded
+    // from GET /api/calendar/types, which returns the 3 curated leaders (with their
+    // joint links) PLUS every OTHER internal Microsoft mailbox connected via OAuth,
+    // whether that happened through the org-wide central admin-consent sign-up or
+    // someone's own individual "Connect Accounts" login. This is what makes every
+    // centrally-connected team member show up here, not just whoever signed in
+    // with their own OAuth.
+    let MEETING_TEAM = {};
+    let MEETING_JOINT_TYPES = [];
+    let meetingTeamDataLoaded = false;
     let myMeetingHostKey = null; // which MEETING_TEAM key (if any) matches the logged-in user
+
+    async function loadMeetingTeamData(force = false) {
+      if (meetingTeamDataLoaded && !force) return;
+      try {
+        const data = await apiFetch('/api/calendar/types');
+        MEETING_TEAM = data.team || {};
+        MEETING_JOINT_TYPES = (data.types || [])
+          .filter(t => !t.anyAvailable && Array.isArray(t.hosts) && t.hosts.length > 1)
+          .map(t => ({
+            key: t.key,
+            label: `${t.duration} min`,
+            hosts: t.hosts.map(h => h.key),
+            hostLabel: t.hosts.map(h => h.name).join(' & '),
+          }));
+        meetingTeamDataLoaded = true;
+      } catch (err) {
+        console.error('Failed to load meeting team data:', err);
+      }
+    }
 
     function meetingBookingUrl(type) {
       return `${SCHEDULE_BASE_URL}/public/schedule/book.html?type=${type}`;
@@ -1234,8 +1249,22 @@
       if (isAdminUser) {
         indivTitle.textContent = 'Team Meeting Links';
         indivDesc.textContent  = "Every team member's individual scheduling links — share whichever fits.";
-        indivGrid.innerHTML = Object.keys(MEETING_TEAM).map(buildIndividualHostCard).join('');
-        jointGrid.innerHTML = buildJointLinksHtml(Object.keys(MEETING_TEAM));
+        const allHostKeys = Object.keys(MEETING_TEAM);
+        if (!allHostKeys.length) {
+          indivGrid.innerHTML = `<div class="empty-state"><i class="fas fa-triangle-exclamation"></i> Could not load team meeting links — try refreshing.</div>`;
+        } else {
+          indivGrid.innerHTML = allHostKeys.map(buildIndividualHostCard).join('');
+        }
+        jointGrid.innerHTML = buildJointLinksHtml(allHostKeys);
+
+        // Keep the "Team Bookings" host filter in sync with everyone currently
+        // connected (curated leaders + org-wide/central sign-up members), not
+        // just the 3 original hardcoded names.
+        const prevValue = hostFilter.value;
+        hostFilter.innerHTML = '<option value="">All team members</option>' +
+          allHostKeys.map(k => `<option value="${k}">${escapeHtml(MEETING_TEAM[k].name || k)}</option>`).join('');
+        if (allHostKeys.includes(prevValue)) hostFilter.value = prevValue;
+
         bookingsTitle.textContent = 'Team Bookings';
         bookingsDesc.textContent  = 'Every call scheduled across the team.';
         hostFilter.style.display = 'inline-block';
@@ -1275,9 +1304,12 @@
           else if (!h.connected)                                 { label = 'Token inactive';        color = 'var(--warning)'; }
           else if (!h.hasCalWrite)                                { label = 'Missing calendar scope'; color = 'var(--warning)'; }
           else                                                    { label = 'Connected';             color = 'var(--success)'; }
+          const orgWideBadge = h.authType === 'application'
+            ? ' <span class="status-badge" style="background:#12314C22;color:#12314C;font-size:0.7rem;">Org-wide</span>'
+            : '';
           return `<tr>
             <td class="company-cell">${escapeHtml(h.name || key)}<br><span style="color:var(--gray);font-weight:400;font-size:0.8rem;">${escapeHtml(h.email || '')}</span></td>
-            <td><span class="status-badge" style="background:${color}22;color:${color};"><i class="fas fa-circle" style="font-size:0.55rem;"></i> ${label}</span></td>
+            <td><span class="status-badge" style="background:${color}22;color:${color};"><i class="fas fa-circle" style="font-size:0.55rem;"></i> ${label}</span>${orgWideBadge}</td>
           </tr>`;
         }).join('');
         body.innerHTML = rows
@@ -1334,10 +1366,19 @@
     }
     window.loadMeetingBookings = loadMeetingBookings;
 
-    function initMeetingLinksTab() {
+    async function initMeetingLinksTab() {
+      const indivGrid = document.getElementById('meetingIndividualGrid');
+      indivGrid.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-spin"></i> Loading meeting links...</div>';
+
+      // Always refetch (not just once per session) so a team member who was
+      // just connected via the org-wide central sign-up shows up here without
+      // requiring a full page reload — the backend itself caches this for a
+      // couple of minutes, so this stays cheap.
+      await loadMeetingTeamData(true);
+
       if (!myMeetingHostKey) {
         const email = (window.auth.currentUser.email || '').toLowerCase();
-        myMeetingHostKey = Object.keys(MEETING_TEAM).find(k => MEETING_TEAM[k].email.toLowerCase() === email) || null;
+        myMeetingHostKey = Object.keys(MEETING_TEAM).find(k => (MEETING_TEAM[k].email || '').toLowerCase() === email) || null;
       }
       renderMeetingLinksTab();
     }

@@ -5589,16 +5589,59 @@ HealthLuminate
      *   [{ key, label, ok, detail, canFix, fixed }]
      * With apply=false it only reports; with apply=true it fixes what it can.
      */
+    // HeyReach sender-account lookups cached per customer for 5 minutes so the
+    // bulk scanner doesn't hit the HeyReach API once per BDR.
+    const _heyreachSendersCache = new Map();
+    async function fetchHeyReachSendersCached(customer) {
+      const cached = _heyreachSendersCache.get(customer.id);
+      if (cached && Date.now() - cached.ts < 5 * 60 * 1000) return cached.senders;
+      const senders = await window.HeyReachCampaigns.fetchLinkedInSenders({
+        railwayUrl: window.railwayApiUrl, apiKey: customer.heyreachApiKey
+      });
+      _heyreachSendersCache.set(customer.id, { ts: Date.now(), senders });
+      return senders;
+    }
+
+    // Default review settings seeded onto bdr_leaders docs — must mirror what
+    // connect/bdr_review_settings.html shows for a BDR with no saved settings.
+    function bdrReviewSettingsDefaults(primaryEmail) {
+      return {
+        reviewMode: 'manual',
+        reviewHours: 48,
+        targetDailyConnections: 10,
+        targetMonthlyConnections: 20,
+        targetMonthlyReplies: 10,
+        targetMonthlyMeetings: 5,
+        showStartupChecklist: false,
+        targetContact: '',
+        currentStrategy: '',
+        responseStrategy: '',
+        dailyEmailEnabled: false,
+        dailyEmailRecipient: primaryEmail || '',
+        dailyEmailBcc: '',
+        dailyEmailTime: '09:00',
+        dailyEmailFromAccountId: '',
+        inProcessEmailEnabled: false,
+        inProcessEmailRecipient: '',
+        toneReviewEnabled: false,
+        toneReviewPrompt: '',
+        viewerEmails: []
+      };
+    }
+
     async function auditAndFixBDR(bdr, {
       apply = false,
       onLog = () => {},
       linkedInUrlHint = '',
       preferredHeyreachAccountId = null,
       skipCampaigns = false,
-      sequenceDelay = '3h'
+      sequenceDelay = '3h',
+      skipHeyReachMatch = false,   // true = don't try to find a HeyReach account (not connected yet)
+      onlyKeys = null              // array of check keys → only fix those (bulk scanner "Fix Selected")
     } = {}) {
       const lib = window.HeyReachCampaigns;
       const checks = [];
+      const applyFor = (key) => apply && (!onlyKeys || onlyKeys.includes(key));
       const add = (key, label, ok, detail = '', canFix = false, fixed = false) => {
         checks.push({ key, label, ok, detail, canFix, fixed });
         onLog(`${fixed ? '🔧' : ok ? '✔' : '✘'} ${label}${detail ? ' — ' + detail : ''}`, fixed || ok ? 'ok' : 'err');
@@ -5621,18 +5664,71 @@ HealthLuminate
       add('heyreach_enabled', 'Customer has HeyReach enabled + API key', heyreachReady,
         heyreachReady ? '' : 'Enable HeyReach and set the API key on the customer record (Customer Management)');
 
-      if (!primaryEmail || !customer || !heyreachReady) {
+      // ── 2. /connect page access (users.html → Allowed Individual Emails) ───
+      if (primaryEmail) {
+        try {
+          const { doc: mDoc, getDoc: mGetDoc, setDoc: mSetDoc } =
+            await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
+          const folderRef = mDoc(window.db, 'folderPermissions', 'connect');
+          const folderSnap = await mGetDoc(folderRef);
+          const folderData = folderSnap.exists() ? folderSnap.data() : {};
+          const allowedEmails = (folderData.allowedEmails || []).map(e => String(e).toLowerCase());
+          const allowedDomains = folderData.allowedDomains || [];
+          const domain = primaryEmail.split('@')[1] || '';
+          const hasAccess = allowedEmails.includes(primaryEmail)
+            || allowedDomains.includes('*') || allowedDomains.includes(domain);
+          if (hasAccess) {
+            add('folder_access', 'Email allowed on /connect pages (users.html)', true,
+              allowedEmails.includes(primaryEmail) ? primaryEmail : `whole domain ${domain} is allowed`, true);
+          } else if (applyFor('folder_access')) {
+            await mSetDoc(folderRef, {
+              allowedEmails: [...(folderData.allowedEmails || []), primaryEmail]
+            }, { merge: true });
+            add('folder_access', 'Email allowed on /connect pages (users.html)', true,
+              `added ${primaryEmail} to the connect folder's Allowed Individual Emails`, true, true);
+          } else {
+            add('folder_access', 'Email allowed on /connect pages (users.html)', false,
+              `${primaryEmail} is not in the connect folder's Allowed Individual Emails — they can't open About Me / review pages`, true);
+          }
+        } catch (err) {
+          add('folder_access', 'Email allowed on /connect pages (users.html)', false,
+            `Could not check folderPermissions: ${err.message}`);
+        }
+      }
+
+      // ── 3. BDR review settings (connect/bdr_review_settings.html) ──────────
+      const reviewDefaults = bdrReviewSettingsDefaults(primaryEmail);
+      const missingReviewKeys = Object.keys(reviewDefaults).filter(k => bdr[k] === undefined);
+      if (missingReviewKeys.length === 0) {
+        add('review_settings', 'BDR review settings configured', true,
+          `mode: ${bdr.reviewMode}, ${bdr.reviewHours}h review window`, true);
+      } else if (applyFor('review_settings')) {
+        const seed = {};
+        missingReviewKeys.forEach(k => { seed[k] = reviewDefaults[k]; });
+        seed.reviewSettingsUpdatedAt = new Date().toISOString();
+        seed.reviewSettingsUpdatedBy = window.currentUser?.email || 'easy_enroll';
+        await setDoc(doc(window.emailDB, 'bdr_leaders', bdr.id), seed, { merge: true });
+        Object.assign(bdr, seed);
+        add('review_settings', 'BDR review settings configured', true,
+          `seeded defaults for: ${missingReviewKeys.join(', ')}`, true, true);
+      } else {
+        add('review_settings', 'BDR review settings configured', false,
+          `not set (defaults will be seeded): ${missingReviewKeys.join(', ')}`, true);
+      }
+
+      if (!primaryEmail || !customer) {
         onLog('Cannot continue — fix the items above first.', 'err');
         return checks;
       }
 
-      // ── 2. Resolve the HeyReach LinkedIn account ───────────────────────────
+      // ── 4. Resolve the HeyReach LinkedIn account ───────────────────────────
       let senders = [];
-      try {
-        senders = await lib.fetchLinkedInSenders({ railwayUrl: window.railwayApiUrl, apiKey: customer.heyreachApiKey });
-      } catch (err) {
-        add('heyreach_api', 'HeyReach API reachable', false, err.message);
-        return checks;
+      if (heyreachReady && !skipHeyReachMatch) {
+        try {
+          senders = await fetchHeyReachSendersCached(customer);
+        } catch (err) {
+          add('heyreach_api', 'HeyReach API reachable', false, err.message);
+        }
       }
 
       let liDoc = findLinkedInAccountForBDR(bdr);
@@ -5656,25 +5752,33 @@ HealthLuminate
         }
       }
 
+      let hrMissingDetail;
+      if (skipHeyReachMatch) {
+        hrMissingDetail = 'Skipped — HeyReach not connected yet. BDR + LinkedIn records are still set up so About Me works; re-run Audit & Fix once HeyReach is connected.';
+      } else if (!heyreachReady) {
+        hrMissingDetail = 'Customer has no HeyReach configuration — records are still set up so About Me works.';
+      } else {
+        hrMissingDetail = `No confident match for "${bdr.name}" among ${senders.length} HeyReach account(s). Records are still set up so About Me works; use Easy Enroll to pick the account manually later.`;
+      }
       add('heyreach_account', 'HeyReach LinkedIn account found', !!hrAccount,
         hrAccount
           ? `${hrAccount.firstName} ${hrAccount.lastName} (ID ${hrAccount.id}) — ${hrHow}`
-          : `No confident match for "${bdr.name}" among ${senders.length} HeyReach account(s). Use Easy Enroll to pick manually.`);
+          : hrMissingDetail);
 
-      if (!hrAccount) return checks;
-
-      // ── 3. linkedin_accounts record ────────────────────────────────────────
+      // ── 5. linkedin_accounts record ────────────────────────────────────────
+      // Created even without a HeyReach account (placeholder heyreachAccountId)
+      // so about_me.html and bdr_review_settings.html can find the BDR.
       if (!liDoc) {
-        if (apply) {
+        if (applyFor('linkedin_record')) {
           const docId = `linkedin_${Date.now()}`;
-          const profileUrl = linkedInUrlHint || hrAccount.profileUrl || '';
+          const profileUrl = linkedInUrlHint || hrAccount?.profileUrl || '';
           const liData = {
             accountName: `${bdr.name} - LinkedIn`,
             customerId: bdr.customerId,
             bdrLeaderId: bdr.id,
             linkedInProfileUrl: profileUrl,
             bdrEmail: primaryEmail,
-            heyreachAccountId: String(hrAccount.id),
+            heyreachAccountId: hrAccount ? String(hrAccount.id) : '',
             linkedInUrl: profileUrl,
             phantomBusterCookie: '',
             cookieStatus: 'unknown',
@@ -5690,7 +5794,8 @@ HealthLuminate
           await setDoc(doc(window.emailDB, 'linkedin_accounts', docId), liData);
           liDoc = { id: docId, ...liData };
           if (Array.isArray(window.linkedInAccounts)) window.linkedInAccounts.push(liDoc);
-          add('linkedin_record', 'LinkedIn account record exists', true, `created ${docId}`, true, true);
+          add('linkedin_record', 'LinkedIn account record exists', true,
+            `created ${docId}${hrAccount ? '' : ' (HeyReach ID left blank — link later)'}`, true, true);
         } else {
           add('linkedin_record', 'LinkedIn account record exists', false,
             'No linkedin_accounts record for this BDR', true);
@@ -5698,17 +5803,17 @@ HealthLuminate
       } else {
         // Record exists — make sure the key fields are filled in
         const updates = {};
-        if (!liDoc.heyreachAccountId) updates.heyreachAccountId = String(hrAccount.id);
+        if (!liDoc.heyreachAccountId && hrAccount) updates.heyreachAccountId = String(hrAccount.id);
         if (!liDoc.bdrLeaderId) updates.bdrLeaderId = bdr.id;
         if (!liDoc.bdrEmail) updates.bdrEmail = primaryEmail;
-        if (!liDoc.linkedInProfileUrl && (linkedInUrlHint || hrAccount.profileUrl)) {
+        if (!liDoc.linkedInProfileUrl && (linkedInUrlHint || hrAccount?.profileUrl)) {
           updates.linkedInProfileUrl = linkedInUrlHint || hrAccount.profileUrl;
         }
         if (!liDoc.linkedInUrl && (liDoc.linkedInProfileUrl || updates.linkedInProfileUrl)) {
           updates.linkedInUrl = liDoc.linkedInProfileUrl || updates.linkedInProfileUrl;
         }
         const needsUpdate = Object.keys(updates).length > 0;
-        if (needsUpdate && apply) {
+        if (needsUpdate && applyFor('linkedin_record')) {
           updates.updatedAt = new Date();
           await updateDoc(doc(window.emailDB, 'linkedin_accounts', liDoc.id), updates);
           Object.assign(liDoc, updates);
@@ -5720,9 +5825,9 @@ HealthLuminate
         }
       }
 
-      // ── 4. BDR → LinkedIn account link ─────────────────────────────────────
+      // ── 6. BDR → LinkedIn account link ─────────────────────────────────────
       const linked = !!liDoc && bdr.linkedInAccountId === liDoc.id;
-      if (!linked && liDoc && apply) {
+      if (!linked && liDoc && applyFor('bdr_link')) {
         await setDoc(doc(window.emailDB, 'bdr_leaders', bdr.id), {
           linkedInAccountId: liDoc.id, updatedAt: new Date()
         }, { merge: true });
@@ -5733,11 +5838,11 @@ HealthLuminate
           linked ? liDoc.id : 'bdr_leaders.linkedInAccountId not set', true);
       }
 
-      // ── 5. LinkedIn email association (used by @connect) ───────────────────
-      const wantedLiEmail = (hrAccount.email || '').toLowerCase();
+      // ── 7. LinkedIn email association (used by @connect) ───────────────────
+      const wantedLiEmail = (hrAccount?.email || '').toLowerCase();
       const currentAssoc = (window.linkedInEmailAssociations.get(bdr.primaryEmail) || '').toLowerCase();
       const assocOk = !!currentAssoc;
-      if (!assocOk && wantedLiEmail && apply) {
+      if (!assocOk && wantedLiEmail && applyFor('li_email')) {
         await setDoc(doc(window.emailDB, 'linkedin_email_associations', bdr.primaryEmail), {
           authEmail: bdr.primaryEmail,
           linkedInEmail: wantedLiEmail,
@@ -5748,19 +5853,33 @@ HealthLuminate
         add('li_email', 'LinkedIn email association set', true, wantedLiEmail, true, true);
       } else if (!assocOk && !wantedLiEmail) {
         add('li_email', 'LinkedIn email association set', false,
-          'HeyReach account has no email address — set it manually on the BDR card', false);
+          hrAccount
+            ? 'HeyReach account has no email address — set it manually on the BDR card'
+            : 'Waiting on HeyReach — will be set once their HeyReach account is linked', false);
       } else {
         add('li_email', 'LinkedIn email association set', assocOk, currentAssoc || wantedLiEmail, true);
       }
 
-      // ── 6. HeyReach account cache doc ──────────────────────────────────────
+      // Without a HeyReach account the remaining steps can't run — the records
+      // above are enough for About Me + review settings; finish here.
+      if (!hrAccount) {
+        add('hr_cache', 'HeyReach account cached in Firebase', false,
+          'Waiting on HeyReach account — re-run Audit & Fix after connecting it', false);
+        if (!skipCampaigns) {
+          add('campaigns', 'Standard campaigns associated (Connect / Message / Quick Message)', false,
+            'Waiting on HeyReach account — re-run Audit & Fix after connecting it', false);
+        }
+        return checks;
+      }
+
+      // ── 8. HeyReach account cache doc ──────────────────────────────────────
       const cacheId = `${bdr.customerId}_${hrAccount.id}`;
       let cacheOk = false;
       try {
         const cacheSnap = await getDoc(doc(window.emailDB, 'heyreach_linkedin_accounts', cacheId));
         cacheOk = cacheSnap && (typeof cacheSnap.exists === 'function' ? cacheSnap.exists() : cacheSnap.exists);
       } catch (_) { cacheOk = false; }
-      if (!cacheOk && apply) {
+      if (!cacheOk && applyFor('hr_cache')) {
         await setDoc(doc(window.emailDB, 'heyreach_linkedin_accounts', cacheId), {
           id: hrAccount.id,
           name: `${hrAccount.firstName} ${hrAccount.lastName}`.trim(),
@@ -5776,13 +5895,13 @@ HealthLuminate
         add('hr_cache', 'HeyReach account cached in Firebase', cacheOk, cacheId, true);
       }
 
-      // ── 7. Standard campaign set ───────────────────────────────────────────
+      // ── 9. Standard campaign set ───────────────────────────────────────────
       if (!skipCampaigns) {
         const missing = bdrMissingCampaignTypes(bdr);
         if (missing.length === 0) {
           add('campaigns', 'Standard campaigns associated (Connect / Message / Quick Message)', true,
             `${(bdr.heyreachCampaigns || []).length} campaign(s) on record`);
-        } else if (!apply) {
+        } else if (!applyFor('campaigns')) {
           add('campaigns', 'Standard campaigns associated (Connect / Message / Quick Message)', false,
             `missing: ${missing.join(', ')} — will be created and launched`, true);
         } else {
@@ -5917,8 +6036,9 @@ HealthLuminate
           </button>
           <button onclick="closeBDRAuditModal()" class="btn btn-secondary">Close</button>
           <small style="flex-basis: 100%; color: #666;">
-            Fixing will create/link any missing records and build + launch any missing campaigns
-            (with the standard sequences, starter contacts, and every-day 12:00–21:00 Denver schedule).
+            Fixing will create/link any missing records, grant /connect page access, seed default review
+            settings, and build + launch any missing campaigns (with the standard sequences, starter
+            contacts, and every-day 12:00–21:00 Denver schedule).
           </small>`;
       } else {
         actions.innerHTML = `<button onclick="closeBDRAuditModal()" class="btn btn-secondary">Close</button>`;
@@ -5983,7 +6103,8 @@ HealthLuminate
             <div style="padding: 1.5rem 2rem;">
               <p style="margin-top: 0; color: #666; font-size: 0.9rem;">
                 Enter the new BDR's details. The system finds their HeyReach account, links the LinkedIn
-                account record, sets the email association, and builds + launches their standard campaigns.
+                account record, sets the email association, grants them access to the /connect pages
+                (About Me, reviews), seeds default review settings, and builds + launches their standard campaigns.
               </p>
 
               <div id="enroll-step-1">
@@ -6105,10 +6226,11 @@ HealthLuminate
         let html;
         if (rows.length === 0) {
           html = `<div style="color:#991b1b; padding: 0.5rem 0;">
-            No LinkedIn accounts found in this HeyReach workspace. Connect the account in HeyReach first,
-            then enroll again. You can still enroll now — HeyReach linking will be skipped.</div>
+            No LinkedIn accounts found in this HeyReach workspace yet. You can still enroll now —
+            the BDR + LinkedIn records, /connect access, and review settings are all set up so you can
+            run through About Me with them. Link HeyReach later with Audit &amp; Fix.</div>
             <label class="enroll-candidate"><input type="radio" name="enroll-account" value="" checked>
-              <div><strong>Skip HeyReach linking for now</strong></div></label>`;
+              <div><strong>Enroll without HeyReach for now</strong></div></label>`;
         } else {
           html = rows.map(r => `
             <label class="enroll-candidate ${r.checked ? 'best' : ''}">
@@ -6122,7 +6244,8 @@ HealthLuminate
             </label>`).join('') +
             `<label class="enroll-candidate">
               <input type="radio" name="enroll-account" value="">
-              <div><strong>None of these</strong> — skip HeyReach linking for now</div>
+              <div><strong>None of these / no HeyReach account yet</strong> — still set up the BDR + LinkedIn
+                records, /connect access, and review settings (link HeyReach later with Audit &amp; Fix)</div>
             </label>`;
           if (matches.length === 0) {
             html = `<div style="color:#854d0e; background:#fef9c3; border:1px solid #fde68a; border-radius:6px; padding:0.5rem 0.75rem; margin-bottom:0.5rem; font-size:0.85rem;">
@@ -6206,6 +6329,7 @@ HealthLuminate
           onLog: log,
           linkedInUrlHint: st.linkedInUrl,
           preferredHeyreachAccountId: selectedAccountId || null,
+          skipHeyReachMatch: !selectedAccountId,
           skipCampaigns: !createCampaigns || !selectedAccountId,
           sequenceDelay: delayChoice
         });
@@ -6230,6 +6354,162 @@ HealthLuminate
           `<button onclick="closeEasyEnrollModal()" class="btn btn-secondary">Close</button>`;
         showAlert(`Enrollment failed: ${err.message}`, 'error');
       }
+    };
+
+    // ── BDR Setup Scanner (bulk audit across all BDRs, bottom of page) ───────
+    window._bdrScanResults = null;
+
+    window.runBDRSetupScan = async () => {
+      const btn = document.getElementById('bdr-scan-btn');
+      const status = document.getElementById('bdr-scan-status');
+      const resultsEl = document.getElementById('bdr-scan-results');
+      const logEl = document.getElementById('bdr-scan-log');
+      btn.disabled = true;
+      resultsEl.innerHTML = '';
+      logEl.style.display = 'none';
+      logEl.innerHTML = '';
+
+      try {
+        if (window.bdrLeaders === null) await loadBDRLeaders();
+        if (window.linkedInAccounts === null) await loadLinkedInAccounts();
+        if (window.linkedInEmailAssociations.size === 0) await loadLinkedInEmailAssociations();
+
+        let bdrs = window.bdrLeaders || [];
+        if (window.selectedCustomer !== 'all') {
+          bdrs = bdrs.filter(b => b.customerId === window.selectedCustomer);
+        }
+
+        window._bdrScanResults = [];
+        let i = 0;
+        for (const bdr of bdrs) {
+          i++;
+          status.textContent = `Scanning ${i}/${bdrs.length}: ${bdr.name || bdr.id}...`;
+          try {
+            const checks = await auditAndFixBDR(bdr, { apply: false });
+            window._bdrScanResults.push({ bdr, checks, error: null });
+          } catch (err) {
+            window._bdrScanResults.push({ bdr, checks: [], error: err.message });
+          }
+        }
+        status.textContent = `Scanned ${bdrs.length} BDR(s).`;
+        renderBDRScanResults();
+      } catch (err) {
+        status.textContent = '';
+        resultsEl.innerHTML = `<div style="color:#991b1b;"><i class="fas fa-times-circle"></i> Scan failed: ${err.message}</div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    function renderBDRScanResults() {
+      const resultsEl = document.getElementById('bdr-scan-results');
+      const results = window._bdrScanResults || [];
+      const withIssues = results.filter(r => r.error || r.checks.some(c => !c.ok));
+      const clean = results.length - withIssues.length;
+
+      if (results.length === 0) {
+        resultsEl.innerHTML = '<div style="color:#666;">No BDRs to scan — check the customer filter at the top of the page.</div>';
+        return;
+      }
+      if (withIssues.length === 0) {
+        resultsEl.innerHTML = `<div class="audit-headline ok"><i class="fas fa-check-circle"></i>
+          All ${results.length} BDR(s) passed every check.</div>`;
+        return;
+      }
+
+      let anyFixable = false;
+      const cards = withIssues.map(r => {
+        if (r.error) {
+          return `<div class="scan-bdr-card">
+            <div class="scan-bdr-head"><strong>${r.bdr.name || r.bdr.id}</strong>
+              <span style="color:#666; font-size:0.8rem;">${r.bdr.primaryEmail || ''}</span></div>
+            <div style="color:#991b1b; font-size:0.85rem; padding:0.25rem 0;">Scan error: ${r.error}</div>
+          </div>`;
+        }
+        const failures = r.checks.filter(c => !c.ok);
+        const rows = failures.map(c => {
+          if (c.canFix) anyFixable = true;
+          return `
+            <label class="scan-issue-row">
+              ${c.canFix
+                ? `<input type="checkbox" class="scan-fix-box" data-bdr-id="${r.bdr.id}" data-check-key="${c.key}" checked>`
+                : `<span class="scan-no-fix" title="Cannot be fixed automatically — see detail"><i class="fas fa-hand-paper"></i></span>`}
+              <div>
+                <div class="audit-check-label">${c.label}</div>
+                ${c.detail ? `<div class="audit-check-detail">${c.detail}</div>` : ''}
+              </div>
+            </label>`;
+        }).join('');
+        return `<div class="scan-bdr-card">
+          <div class="scan-bdr-head">
+            <strong>${r.bdr.name || r.bdr.id}</strong>
+            <span style="color:#666; font-size:0.8rem;">${r.bdr.primaryEmail || ''}</span>
+            <span class="scan-issue-count">${failures.length} issue(s)</span>
+          </div>
+          ${rows}
+        </div>`;
+      }).join('');
+
+      resultsEl.innerHTML = `
+        <div class="audit-headline fail"><i class="fas fa-exclamation-triangle"></i>
+          ${withIssues.length} of ${results.length} BDR(s) have setup issues${clean > 0 ? ` (${clean} clean)` : ''}.
+          Checked items will be fixed — uncheck anything you want to leave alone.</div>
+        ${cards}
+        ${anyFixable ? `
+        <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap; margin-top:1rem;">
+          <label style="display:flex; align-items:center; gap:8px; font-size:0.9rem; font-weight:600;">
+            Connect / Message delay after liking the post:
+            <select id="scan-delay-choice" style="padding:4px 8px; border:1px solid #ccc; border-radius:4px;">
+              <option value="3h" selected>3 hours</option>
+              <option value="2d">2 days</option>
+            </select>
+          </label>
+          <button onclick="runBDRScanFixes()" class="btn btn-success" id="scan-fix-btn">
+            <i class="fas fa-wrench"></i> Fix Selected Issues
+          </button>
+          <small style="color:#666;">(delay only matters if campaigns will be built)</small>
+        </div>` : ''}`;
+    }
+
+    window.runBDRScanFixes = async () => {
+      const boxes = [...document.querySelectorAll('.scan-fix-box:checked')];
+      if (boxes.length === 0) { showAlert('No fixes selected — check at least one issue.', 'warning'); return; }
+
+      // Group the selected check keys by BDR
+      const byBdr = new Map();
+      boxes.forEach(b => {
+        if (!byBdr.has(b.dataset.bdrId)) byBdr.set(b.dataset.bdrId, []);
+        byBdr.get(b.dataset.bdrId).push(b.dataset.checkKey);
+      });
+
+      const sequenceDelay = document.getElementById('scan-delay-choice')?.value || '3h';
+      const fixBtn = document.getElementById('scan-fix-btn');
+      if (fixBtn) fixBtn.disabled = true;
+      const status = document.getElementById('bdr-scan-status');
+      const log = (msg, level) => appendAuditLog('bdr-scan-log', msg, level);
+
+      let done = 0;
+      for (const [bdrId, keys] of byBdr) {
+        const entry = (window._bdrScanResults || []).find(r => r.bdr.id === bdrId);
+        if (!entry) continue;
+        done++;
+        status.textContent = `Fixing ${done}/${byBdr.size}: ${entry.bdr.name || bdrId}...`;
+        log(`━━━ ${entry.bdr.name || bdrId} — fixing: ${keys.join(', ')} ━━━`, 'head');
+        try {
+          entry.checks = await auditAndFixBDR(entry.bdr, {
+            apply: true, onlyKeys: keys, sequenceDelay, onLog: log
+          });
+          entry.error = null;
+        } catch (err) {
+          entry.error = err.message;
+          log(`FAILED: ${err.message}`, 'err');
+        }
+      }
+
+      status.textContent = `Fixes applied for ${byBdr.size} BDR(s) — updated results below.`;
+      renderBDRScanResults();
+      await loadBDRLeaders();
+      showAlert('Selected BDR fixes applied — review the scan results and log.', 'success');
     };
 
     // ======= LINKEDIN ACCOUNTS MANAGEMENT =======
@@ -10143,6 +10423,45 @@ HealthLuminate
       vertical-align: middle;
     }
     .enroll-match-tag.weak { background: #f59e0b; }
+
+    /* BDR Setup Scanner (bulk audit section) */
+    .scan-bdr-card {
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px 14px;
+      margin-bottom: 10px;
+    }
+    .scan-bdr-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding-bottom: 6px;
+      margin-bottom: 6px;
+      border-bottom: 1px solid #f1f5f9;
+    }
+    .scan-issue-count {
+      margin-left: auto;
+      background: #fee2e2;
+      color: #991b1b;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+    .scan-issue-row {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 5px 0;
+      cursor: pointer;
+    }
+    .scan-issue-row input[type="checkbox"] { margin-top: 3px; }
+    .scan-no-fix {
+      color: #94a3b8;
+      font-size: 0.85rem;
+      margin-top: 2px;
+    }
   </style>
   <link rel="icon" type="image/png" href="../images/HealthLuminate-Bright.png">
 </head>
@@ -10393,6 +10712,28 @@ HealthLuminate
         </div>
         <div class="card-section-body">
           <div id="email-accounts-list"></div>
+        </div>
+      </div>
+
+      <!-- BDR Setup Scanner -->
+      <div class="admin-card collapsible-card" id="card-bdr-scanner">
+        <div class="card-section-header" onclick="toggleAdminCard('bdr-scanner')">
+          <div class="header-text">
+            <h3><i class="fas fa-clipboard-check"></i> BDR Setup Scanner</h3>
+            <p>Scan every BDR for setup problems — records, links, /connect access, review settings, and
+              campaigns — then pick which issues to fix. Respects the customer filter at the top of the page.</p>
+          </div>
+          <span class="card-toggle-chevron"><i class="fas fa-chevron-right"></i></span>
+        </div>
+        <div class="card-section-body">
+          <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem;">
+            <button onclick="runBDRSetupScan()" class="btn btn-primary" id="bdr-scan-btn">
+              <i class="fas fa-search"></i> Scan All BDRs
+            </button>
+            <span id="bdr-scan-status" style="color: #666; font-size: 0.9rem;"></span>
+          </div>
+          <div id="bdr-scan-results"></div>
+          <div id="bdr-scan-log" class="audit-log" style="display: none;"></div>
         </div>
       </div>
     </div>
