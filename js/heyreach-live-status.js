@@ -71,6 +71,26 @@ export function hrLooksAlreadySent(val) {
     return HR_ALREADY_SENT_PATTERNS.some(p => val.includes(p));
 }
 
+// Builds a short, human-readable explanation of why HeyReach considers a lead
+// terminally dead, from whichever status/error fields are actually populated.
+// This is what lets a report answer "150 pushed, only 75 show up in HeyReach —
+// where are the other 75?" without anyone having to dig through raw API
+// responses by hand: every terminal lead gets a plain-English reason attached.
+export function describeHrTerminalReason({ campaignStatus, connectionStatus, messageStatus, errCode, lead } = {}) {
+    const parts = [];
+    if (errCode != null && errCode !== 0 && String(errCode) !== '0' && String(errCode).toUpperCase() !== 'NONE') {
+        parts.push(`error code ${errCode}`);
+    }
+    if (campaignStatus && campaignStatus !== 'NONE') parts.push(`campaign status: ${campaignStatus}`);
+    if (connectionStatus && connectionStatus !== 'NONE') parts.push(`connection status: ${connectionStatus}`);
+    if (messageStatus && messageStatus !== 'NONE') parts.push(`message status: ${messageStatus}`);
+    if (lead && lead.failedTime) {
+        const d = new Date(lead.failedTime);
+        if (!isNaN(d.getTime())) parts.push(`failed ${d.toLocaleString()}`);
+    }
+    return parts.length ? parts.join(' · ') : 'HeyReach marked this lead terminal (no further detail returned by the API)';
+}
+
 // Classifies one HeyReach lead object (from /lead/GetLead, /lead/GetAll, or
 // /campaign/GetLeadsFromCampaign — all three share this field shape).
 export function classifyHrLead(lead) {
@@ -83,7 +103,10 @@ export function classifyHrLead(lead) {
         || HR_TERMINAL_STATUSES.has(campaignStatus)
         || (errCode != null && errCode !== 0 && String(errCode) !== '0' && String(errCode).toUpperCase() !== 'NONE');
     const isAlreadySent = hrLooksAlreadySent(connectionStatus) || hrLooksAlreadySent(messageStatus);
-    return { isAlreadySent, isTerminal };
+    const reason = isTerminal
+        ? describeHrTerminalReason({ campaignStatus, connectionStatus, messageStatus, errCode, lead })
+        : '';
+    return { isAlreadySent, isTerminal, reason };
 }
 
 // Pulls the LinkedIn profile URL out of a HeyReach lead object, regardless of
