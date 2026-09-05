@@ -3375,9 +3375,10 @@
                     </div>
                     <p style="margin:0.6rem 0 0;font-size:0.78rem;color:#9f1239;">
                         <i class="fas fa-info-circle"></i> This scope is used both for the DNC entries (if you add them)
-                        and for the optional outreach search below. Shared pools (hypothesis-group pools and the
-                        unassigned pool) are always searched regardless of scope — every match shows its owner so
-                        you can uncheck anything.
+                        and for the optional outreach search below. When scoped to a <strong>BDR</strong> or
+                        <strong>Company</strong>, only hypothesis-group pools tied to that BDR/Company are searched,
+                        and the shared Unassigned pool is skipped. Choose <strong>Everywhere</strong> to sweep every
+                        hypothesis pool and the Unassigned pool too. Every match shows its owner so you can uncheck anything.
                     </p>
                 </div>
 
@@ -14601,16 +14602,15 @@
                 }
             }
 
-            const hypoSentinels = [];
+            const hypoGroupsRaw = []; // [{ id, ...groupData }] — full docs, filtered into scope further down
             const groupNameById = new Map();
             try {
                 const gSnap = await getDocs(collection(db, 'hypothesis_groups'));
                 gSnap.docs.forEach(d => {
                     const g = d.data();
                     groupNameById.set(d.id, g.name || d.id);
-                    const s = HYPO_SENTINEL_PREFIX + d.id;
-                    hypoSentinels.push(s);
-                    labels.set(s, `Hypothesis pool: ${g.name || d.id}`);
+                    labels.set(HYPO_SENTINEL_PREFIX + d.id, `Hypothesis pool: ${g.name || d.id}`);
+                    hypoGroupsRaw.push({ id: d.id, ...g });
                 });
             } catch (e) { console.warn('Purge: could not load hypothesis groups:', e); }
             labels.set('__unassigned__', 'Unassigned pool');
@@ -14619,6 +14619,7 @@
             let scopedEmails = null;        // Set of lowercase emails
             let scopedEmailValues = null;   // stored-case + lowercase, for query values
             let scopedWsSentinels = null;   // Set of __ws__: sentinels
+            let scopedWsRawIds = null;      // Set of raw workspace doc ids (no __ws__: prefix)
             if (scopeSel.scope === 'bdr') {
                 const email = scopeSel.scopeValue;
                 scopedEmails = new Set([email.toLowerCase()]);
@@ -14644,16 +14645,42 @@
                     if (clientIds.includes(scopeSel.scopeValue)) scopedWsSentinels.add(s);
                 }
             }
+            if (scopedWsSentinels) {
+                scopedWsRawIds = new Set([...scopedWsSentinels].map(s => WR.parseIdFromSentinel(s)).filter(Boolean));
+            }
+
+            // Hypothesis pools + the Unassigned pool are shared across BDRs/companies, so a
+            // narrower scope (one BDR / one Company) only sweeps the pools actually tied to
+            // that BDR/Company (via the group's assigned BDR emails or linked workspace) and
+            // skips the Unassigned pool entirely. "Everywhere" sweeps all of them.
+            const isScoped = !!(scopedEmails || scopedWsSentinels);
+            let hypoSentinels, includeUnassigned;
+            if (!isScoped) {
+                hypoSentinels = hypoGroupsRaw.map(g => HYPO_SENTINEL_PREFIX + g.id);
+                includeUnassigned = true;
+            } else {
+                hypoSentinels = hypoGroupsRaw
+                    .filter(g => {
+                        const emails = hypoGroupEmails(g).map(e => (e || '').toLowerCase());
+                        if (emails.some(e => scopedEmails && scopedEmails.has(e))) return true;
+                        if (g.workspaceId && scopedWsRawIds && scopedWsRawIds.has(g.workspaceId)) return true;
+                        return false;
+                    })
+                    .map(g => HYPO_SENTINEL_PREFIX + g.id);
+                includeUnassigned = false;
+            }
 
             return {
                 labels, groupNameById,
-                scoped: !!(scopedEmails || scopedWsSentinels),
+                scoped: isScoped,
                 scopedEmails, scopedWsSentinels,
+                scopedHypoSentinels: new Set(hypoSentinels),
+                scopedUnassigned: includeUnassigned,
                 orgOwnerValues: [...new Set([
                     ...(scopedEmailValues ? scopedEmailValues : bdrEmails),
                     ...(scopedWsSentinels ? [...scopedWsSentinels] : [...wsSentinels]),
                     ...hypoSentinels,
-                    '__unassigned__'
+                    ...(includeUnassigned ? ['__unassigned__'] : [])
                 ])]
             };
         }
@@ -14666,7 +14693,8 @@
         /** Scope check for owner values that may be emails or pool sentinels. */
         function purgeOwnerValueInScope(owners, value) {
             if (!value) return false;
-            if (value === '__unassigned__' || value.startsWith(HYPO_SENTINEL_PREFIX)) return true; // shared pools always in scope
+            if (value === '__unassigned__') return owners.scopedUnassigned !== false;
+            if (value.startsWith(HYPO_SENTINEL_PREFIX)) return owners.scopedHypoSentinels ? owners.scopedHypoSentinels.has(value) : true;
             if (value.startsWith(WR.WS_PREFIX)) return owners.scopedWsSentinels ? owners.scopedWsSentinels.has(value) : true;
             return purgeEmailInScope(owners, value);
         }
@@ -14754,7 +14782,13 @@
                 };
 
                 // ── 1. Organizations (all lists: BDRs, workspaces, hypothesis pools, unassigned)
-                spin(`Loading organizations across ${owners.orgOwnerValues.length} owner value${owners.orgOwnerValues.length !== 1 ? 's' : ''}…`);
+                {
+                    const hypoCount = owners.scopedHypoSentinels ? owners.scopedHypoSentinels.size : 0;
+                    const breakdown = owners.scoped
+                        ? ` (${scopeSel.scopeLabel} + ${hypoCount} related hypothesis pool${hypoCount !== 1 ? 's' : ''}${owners.scopedUnassigned ? ' + unassigned pool' : ''})`
+                        : ' (everywhere)';
+                    spin(`Loading organizations across ${owners.orgOwnerValues.length} owner value${owners.orgOwnerValues.length !== 1 ? 's' : ''}${breakdown}…`);
+                }
                 const orgRows = await WR.queryUnionByField(db, 'prospect_organizations', 'bdrEmail', owners.orgOwnerValues, window.clemailFirestore);
                 const orgs = [];
                 const orgById = new Map();
