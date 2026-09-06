@@ -3581,12 +3581,22 @@
         // ── Per-message hypothesis group breakdown (for the currently loaded batch) ──
         // messageId -> hypothesis group id (only present when a match was found)
         let _fcrMsgGroupMap = new Map();
-        let _fcrGroupBreakdown = []; // [{ id, name, count }] sorted by count desc, groups with >0 matches only
+        let _fcrGroupBreakdown = []; // [{ id, name, count, variationCounts }] sorted by count desc, groups with >0 matches only
         let _fcrNoGroupCount = 0;
+        // How many loaded messages belong to a group that defines variations but ended up with
+        // none assigned (should normally be 0 — see computeFcrHypothesisBreakdown). Surfaced as a
+        // warning chip in the hypothesis breakdown bar.
+        let _fcrNoVariationAssignedCount = 0;
         // Message variation assignment (which hypothesis-group message variation a reviewer picked
         // for a given loaded message). messageId -> variationId. Only meaningful for messages whose
         // hypothesis group (per _fcrMsgGroupMap) actually defines messageVariations[].
         let _fcrMsgVariationMap = new Map();
+        // Why each entry in _fcrMsgVariationMap got set — surfaced on the message card so
+        // reviewers can tell an auto-assigned round-robin pick apart from a deliberate one.
+        // messageId -> 'stamped' (kept from generation) | 'auto' (round-robin default) |
+        // 'manual' (reviewer picked on the card, or via the top Message Variation dropdown) |
+        // 'bulk' (set via the Bulk Assign panel).
+        let _fcrMsgVariationSourceMap = new Map();
 
         function _fcrMsgUrl(m) {
             return m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || m.linkedInUrl || m.li_url || '';
@@ -3617,6 +3627,7 @@
             _fcrMsgGroupMap = new Map();
             _fcrNoGroupCount = 0;
             _fcrGroupBreakdown = [];
+            _fcrNoVariationAssignedCount = 0;
 
             if (!loadedMessages.length) { renderFcrHypothesisBreakdown(); return; }
 
@@ -3670,9 +3681,11 @@
                     if (!_fcrMsgVariationMap.has(m.id) && variations.length) {
                         if (m.hypothesisVariationId && variations.some(v => v.id === m.hypothesisVariationId)) {
                             _fcrMsgVariationMap.set(m.id, m.hypothesisVariationId);
+                            _fcrMsgVariationSourceMap.set(m.id, 'stamped');
                         } else {
                             const idx = perGroupRotationIdx.get(matchedGroup.id) || 0;
                             _fcrMsgVariationMap.set(m.id, variations[idx % variations.length].id);
+                            _fcrMsgVariationSourceMap.set(m.id, 'auto');
                             perGroupRotationIdx.set(matchedGroup.id, idx + 1);
                         }
                     }
@@ -3681,9 +3694,35 @@
                 }
             });
 
+            // Tally, per group that defines variations, how many loaded messages ended up on
+            // each variation (and how many have none at all) — surfaced as a chip/tooltip in the
+            // breakdown bar so a reviewer can sanity-check the round-robin/auto-assignment split
+            // across the whole batch without having to open every single card.
+            const perGroupVariationCounts = new Map(); // groupId -> Map(variationLabel -> count)
+            _fcrNoVariationAssignedCount = 0;
+            loadedMessages.forEach(m => {
+                const groupId = _fcrMsgGroupMap.get(m.id);
+                if (!groupId) return;
+                const group = bdrGroups.find(g => g.id === groupId);
+                const variations = group?.messageVariations || [];
+                if (!variations.length) return;
+                const variationId = _fcrMsgVariationMap.get(m.id) || '';
+                const variation = variations.find(v => v.id === variationId) || null;
+                if (!variation) _fcrNoVariationAssignedCount++;
+                const label = variation ? (variation.label || variation.id) : '⚠️ No variation';
+                if (!perGroupVariationCounts.has(groupId)) perGroupVariationCounts.set(groupId, new Map());
+                const counts = perGroupVariationCounts.get(groupId);
+                counts.set(label, (counts.get(label) || 0) + 1);
+            });
+
             _fcrGroupBreakdown = _hypothesisGroups
                 .filter(g => perGroupCount.has(g.id))
-                .map(g => ({ id: g.id, name: g.name || g.id, count: perGroupCount.get(g.id) }))
+                .map(g => ({
+                    id: g.id,
+                    name: g.name || g.id,
+                    count: perGroupCount.get(g.id),
+                    variationCounts: perGroupVariationCounts.get(g.id) || null
+                }))
                 .sort((a, b) => b.count - a.count);
 
             renderFcrHypothesisBreakdown();
@@ -3694,6 +3733,16 @@
         // ── Message Variation assignment (per hypothesis group) ──
         // Fills in the per-message "Hypothesis Variation" dropdown placeholder for every loaded
         // message whose matched hypothesis group (via _fcrMsgGroupMap) has messageVariations[] defined.
+        // Badge styling/labels for each way a message's variation could have been set — shown
+        // directly on the card so reviewers can tell at a glance whether the system picked it
+        // for them (auto/round-robin/stamped) or a human explicitly chose it (manual/bulk).
+        const FCR_VARIATION_SOURCE_META = {
+            stamped: { bg: '#dbeafe', fg: '#1e3a8a', icon: 'fa-tag',           label: 'from generation' },
+            auto:    { bg: '#ffedd5', fg: '#9a3412', icon: 'fa-shuffle',      label: 'auto-assigned · round-robin' },
+            manual:  { bg: '#dcfce7', fg: '#166534', icon: 'fa-hand-pointer', label: 'manually set' },
+            bulk:    { bg: '#cffafe', fg: '#155e75', icon: 'fa-layer-group', label: 'bulk-assigned' }
+        };
+
         function renderHypVariationSelectors() {
             loadedMessages.forEach(m => {
                 const wrap = document.getElementById('hypVariationWrap_' + m.id);
@@ -3703,11 +3752,29 @@
                 const variations = group?.messageVariations || [];
                 if (!variations.length) { wrap.innerHTML = ''; return; }
                 const selectedId = _fcrMsgVariationMap.get(m.id) || '';
+                const selectedVariation = variations.find(v => v.id === selectedId) || null;
+                const source = _fcrMsgVariationSourceMap.get(m.id) || null;
+                const meta = source ? FCR_VARIATION_SOURCE_META[source] : null;
+
+                // Always render a clearly visible, color-coded badge — never leave this silent.
+                // Red = nothing assigned at all (shouldn't normally happen once a group defines
+                // variations, since computeFcrHypothesisBreakdown auto-fills one; if you see this,
+                // something's off and Opus will run with NO variation-specific instructions for
+                // this message).
+                const badge = selectedVariation
+                    ? `<span style="display:inline-flex;align-items:center;gap:5px;background:${meta ? meta.bg : '#f3e8ff'};color:${meta ? meta.fg : '#6b21a8'};padding:2px 9px;border-radius:10px;font-size:0.74rem;font-weight:700;white-space:nowrap;" title="${meta ? escapeHtml(meta.label) : ''}">
+                            <i class="fas ${meta ? meta.icon : 'fa-vial'}"></i> ${escapeHtml(selectedVariation.label || selectedVariation.id)}
+                            ${meta ? `<span style="font-weight:600;opacity:0.75;font-size:0.68rem;">— ${escapeHtml(meta.label)}</span>` : ''}
+                        </span>`
+                    : `<span style="display:inline-flex;align-items:center;gap:5px;background:#fee2e2;color:#991b1b;padding:2px 9px;border-radius:10px;font-size:0.74rem;font-weight:700;white-space:nowrap;" title="This message's hypothesis group defines variations but none is assigned — Opus will review it with NO variation-specific instructions.">
+                            <i class="fas fa-triangle-exclamation"></i> No variation assigned
+                        </span>`;
+
                 wrap.innerHTML = `
                     <div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-                        <i class="fas fa-vial" style="color:#ea580c;font-size:0.75rem;" title="Message variation for ${escapeHtml(group.name || '')}"></i>
-                        <select style="font-size:0.78rem;padding:0.25rem 0.5rem;border:1.5px solid #fdba74;border-radius:6px;background:#fff7ed;color:#9a3412;font-weight:600;max-width:220px;"
-                            onchange="window.setMsgVariation('${m.id}', this.value)" title="Which message variation was used for this contact?">
+                        ${badge}
+                        <select style="font-size:0.78rem;padding:0.25rem 0.5rem;border:1.5px solid #fdba74;border-radius:6px;background:#fff7ed;color:#9a3412;font-weight:600;max-width:200px;"
+                            onchange="window.setMsgVariation('${m.id}', this.value)" title="Override which message variation this contact is reviewed/counted against">
                             <option value="">— No variation —</option>
                             ${variations.map(v => `<option value="${v.id}" ${v.id === selectedId ? 'selected' : ''}>${escapeHtml(v.label || v.id)}</option>`).join('')}
                         </select>
@@ -3717,8 +3784,13 @@
         window.renderHypVariationSelectors = renderHypVariationSelectors;
 
         window.setMsgVariation = function(messageId, variationId) {
-            if (variationId) _fcrMsgVariationMap.set(messageId, variationId);
-            else _fcrMsgVariationMap.delete(messageId);
+            if (variationId) {
+                _fcrMsgVariationMap.set(messageId, variationId);
+                _fcrMsgVariationSourceMap.set(messageId, 'manual');
+            } else {
+                _fcrMsgVariationMap.delete(messageId);
+                _fcrMsgVariationSourceMap.delete(messageId);
+            }
         };
 
         // Returns the Firestore fields to stamp onto a connect_queue doc at approval/send time so
@@ -3796,6 +3868,7 @@
             loadedMessages.forEach(m => {
                 if (_fcrMsgGroupMap.get(m.id) === groupId) {
                     _fcrMsgVariationMap.set(m.id, variationId);
+                    _fcrMsgVariationSourceMap.set(m.id, 'bulk');
                     count++;
                 }
             });
@@ -3820,10 +3893,19 @@
             const chip = (label, count, bg, fg, title) =>
                 `<span title="${escapeHtml(title || '')}" style="display:inline-flex;align-items:center;gap:4px;background:${bg};color:${fg};padding:0.15rem 0.55rem;border-radius:10px;font-weight:600;white-space:nowrap;">${label}: ${count.toLocaleString()}</span>`;
 
-            const chips = _fcrGroupBreakdown.map(g =>
-                chip(`🔬 ${escapeHtml(g.name)}`, g.count, '#ede9fe', '#8A6B2E', `Reviewed with "${g.name}"'s own Target Contact / Exclude Rules + Message Review Instructions`)
-            );
+            const chips = _fcrGroupBreakdown.map(g => {
+                let title = `Reviewed with "${g.name}"'s own Target Contact / Exclude Rules + Message Review Instructions`;
+                if (g.variationCounts && g.variationCounts.size) {
+                    const parts = [...g.variationCounts.entries()].map(([label, count]) => `${label}: ${count}`);
+                    title += `\n\nMessage variation split (auto-assigned round-robin unless manually/bulk overridden):\n${parts.join('\n')}`;
+                }
+                return chip(`🔬 ${escapeHtml(g.name)}`, g.count, '#ede9fe', '#8A6B2E', title);
+            });
             chips.push(chip('🚫 No hypothesis group', _fcrNoGroupCount, '#f3f4f6', '#4b5563', 'Reviewed using the default Target Contact / Exclude Rules and Message Review Instructions shown below'));
+            if (_fcrNoVariationAssignedCount > 0) {
+                chips.push(chip('⚠️ Missing variation', _fcrNoVariationAssignedCount, '#fee2e2', '#991b1b',
+                    'These messages belong to a hypothesis group that defines variations, but none got assigned — check the "No variation assigned" badge on their cards. Opus will review them with NO variation-specific instructions.'));
+            }
 
             const note = filterActive
                 ? `Filtering to one hypothesis group — all loaded messages will use the instructions above.`
@@ -3992,7 +4074,10 @@
 
             if (groupId && _fcrSelectedVariationId && loadedMessages?.length) {
                 loadedMessages.forEach(m => {
-                    if (_fcrMsgGroupMap.get(m.id) === groupId) _fcrMsgVariationMap.set(m.id, _fcrSelectedVariationId);
+                    if (_fcrMsgGroupMap.get(m.id) === groupId) {
+                        _fcrMsgVariationMap.set(m.id, _fcrSelectedVariationId);
+                        _fcrMsgVariationSourceMap.set(m.id, 'manual');
+                    }
                 });
                 renderHypVariationSelectors();
             }
@@ -6016,6 +6101,7 @@
                 messageVariations.clear();
                 // Reset hypothesis message-variation assignments from the previous batch
                 _fcrMsgVariationMap.clear();
+                _fcrMsgVariationSourceMap.clear();
                 
                 // Reset approval timing
                 approvalTimestamps.clear();
@@ -10026,6 +10112,7 @@
             staleStoryUserKept.clear();
             messageVariations.clear();
             _fcrMsgVariationMap.clear();
+            _fcrMsgVariationSourceMap.clear();
             
             document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
                 cb.checked = false;
