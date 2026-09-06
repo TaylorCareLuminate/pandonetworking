@@ -3592,11 +3592,24 @@
         // hypothesis group (per _fcrMsgGroupMap) actually defines messageVariations[].
         let _fcrMsgVariationMap = new Map();
         // Why each entry in _fcrMsgVariationMap got set — surfaced on the message card so
-        // reviewers can tell an auto-assigned round-robin pick apart from a deliberate one.
-        // messageId -> 'stamped' (kept from generation) | 'auto' (round-robin default) |
-        // 'manual' (reviewer picked on the card, or via the top Message Variation dropdown) |
-        // 'bulk' (set via the Bulk Assign panel).
+        // reviewers can tell an auto-assigned pick apart from a deliberate one.
+        // messageId -> 'stamped' (kept from generation) | 'ai' (AI Selection Criteria via Grok —
+        // see FCR_VARIATION_AI_MODEL below) | 'weighted' (random by Random Selection Share %) |
+        // 'auto' (round-robin fallback when nothing else applies) | 'manual' (reviewer picked on
+        // the card, or via the top Message Variation dropdown) | 'bulk' (set via the Bulk Assign
+        // panel).
         let _fcrMsgVariationSourceMap = new Map();
+        // For 'ai'-sourced picks only: messageId -> the AI's one-sentence reason, surfaced in the
+        // badge tooltip so reviewers can sanity-check the AI's judgment against the AI Selection
+        // Criteria without having to open connect_hypothesis_documentation.html.
+        let _fcrMsgVariationReasonMap = new Map();
+        // Which AI model decides a message's variation when its hypothesis group defines "AI
+        // Selection Criteria" (connect_hypothesis_documentation.html's Message Variations tab).
+        // Deliberately NOT one of the Opus Review models above — variation SELECTION (which
+        // angle fits this contact) is a separate, cheaper classification task from message
+        // REVIEW/EDITING, and Grok is the app's standard choice for this kind of criteria-based
+        // classification (see prospect_organizations_admin.html / organization_finder.html).
+        const FCR_VARIATION_AI_MODEL = 'x-ai/grok-4.3';
 
         function _fcrMsgUrl(m) {
             return m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || m.linkedInUrl || m.li_url || '';
@@ -3613,6 +3626,72 @@
             if (Array.isArray(g.bdrEmails) && g.bdrEmails.length) return g.bdrEmails.includes(bdrEmail);
             if (g.bdrEmail) return g.bdrEmail === bdrEmail;
             return true;
+        }
+
+        // Picks a variation at random, weighted by each variation's "Random Selection Share %"
+        // (connect_hypothesis_documentation.html). Mirrors full_pipeline.html's
+        // fpWeightedRandomVariation exactly. Returns null (caller falls back to round-robin) if
+        // no variation has a positive share set — unlike full_pipeline, we deliberately do NOT
+        // fall back to a uniform random pick here, so round-robin (which spreads messages evenly
+        // and is easy to reason about) remains the final fallback for groups that never
+        // configured shares at all.
+        function _fcrWeightedRandomVariation(variations) {
+            const weights = variations.map(v => Math.max(0, parseFloat(v.sharePercent) || 0));
+            const total = weights.reduce((s, w) => s + w, 0);
+            if (total <= 0) return null;
+            let r = Math.random() * total;
+            for (let i = 0; i < variations.length; i++) {
+                r -= weights[i];
+                if (r <= 0) return variations[i];
+            }
+            return variations[variations.length - 1];
+        }
+
+        // Builds the minimal contact-profile object sent to the AI variation selector — mirrors
+        // full_pipeline.html's fpContactInfoForVariation, sourced from whatever's already been
+        // resolved for this message's card (_profileDataCache, populated by displayMessages/
+        // createMessageCard) plus whatever the queue doc itself carries.
+        function _fcrContactInfoForVariation(m) {
+            const pd = _profileDataCache.get(m.id) || {};
+            return {
+                name:     m.contactName || m.prospect_name || '',
+                title:    m.contactTitle || m.prospect_title || m.contact_title || m.prospect_position || m.title || '',
+                company:  pd.company || m.contactCompany || m.prospect_company || m.company_name || '',
+                location: m.location || m.contactLocation || m.prospect_location || '',
+                headline: pd.headline || '',
+                about:    pd.about || ''
+            };
+        }
+
+        // Asks the shared /api/connect/select-message-variation endpoint (same one
+        // full_pipeline.html's "AI decides by criteria" mode uses) which of this group's
+        // variations best fits one contact, based on each variation's AI Selection Criteria.
+        // Deliberately uses FCR_VARIATION_AI_MODEL (Grok) rather than whatever model Opus Review
+        // is set to — variation SELECTION is a separate, cheap classification task from message
+        // review/editing and should never be tied to the (often premium/expensive) review model.
+        // Returns { variation, reason } on a confident pick, or null (caller falls back to
+        // weighted/round-robin) on any failure or "no confident match".
+        async function _fcrSelectVariationWithAI(contactInfo, variations) {
+            try {
+                const token = await auth.currentUser.getIdToken();
+                const resp = await fetch(`${RAILWAY_BASE}/api/connect/select-message-variation`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({
+                        contact: contactInfo,
+                        variations: variations.map(v => ({ id: v.id, label: v.label, criteria: v.aiCriteria || '' })),
+                        model: FCR_VARIATION_AI_MODEL
+                    })
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (resp.ok && data.success && data.variationId) {
+                    const chosen = variations.find(v => v.id === data.variationId);
+                    if (chosen) return { variation: chosen, reason: data.reason || '' };
+                }
+            } catch (e) {
+                console.warn('[HypVariation] AI selection failed:', e.message);
+            }
+            return null;
         }
 
         // Determines, for every currently loaded message, which hypothesis group (if any) it
@@ -3643,6 +3722,10 @@
 
             const perGroupCount = new Map(); // groupId -> count
             const perGroupRotationIdx = new Map(); // groupId -> next round-robin index for un-stamped messages
+            // Messages whose group defines at least one variation with AI Selection Criteria —
+            // resolved via Grok in a second, parallel pass below instead of inline here, since
+            // the AI call is async. { m, group, variations }[]
+            const aiSelectionQueue = [];
             loadedMessages.forEach(m => {
                 // Ground truth first: if the doc was already stamped with a hypothesisGroupId at
                 // generation time (Full Pipeline / Full AI Generate), trust that over re-deriving
@@ -3671,28 +3754,75 @@
                     _fcrMsgGroupMap.set(m.id, matchedGroup.id);
                     perGroupCount.set(matchedGroup.id, (perGroupCount.get(matchedGroup.id) || 0) + 1);
                     // Default every message in a group that defines variations to actually USE one —
-                    // never leave it at "No variation" just because nothing was picked yet. Prefer
-                    // whichever variation this message was actually generated with (stamped by Full
-                    // Pipeline as hypothesisVariationId); if it has no stamp (e.g. older messages,
-                    // or generated before variations existed), fall back to rotating evenly across
-                    // the group's variations round-robin. Only pre-fill when the reviewer hasn't
-                    // already made their own pick for this message.
+                    // never leave it at "No variation" just because nothing was picked yet. Priority:
+                    //   1. Whichever variation this message was actually generated with (stamped by
+                    //      Full Pipeline as hypothesisVariationId) — ground truth, always wins.
+                    //   2. If the group defines AI Selection Criteria on any variation, queue it for
+                    //      AI (Grok) selection below — matches must be judged against each contact's
+                    //      profile, which needs an async call, so it can't happen inline here.
+                    //   3. Random Selection Share % — weighted random pick.
+                    //   4. Round-robin — final fallback so a message is never left with no variation
+                    //      just because the group didn't configure criteria or shares.
+                    // Only pre-fill when the reviewer hasn't already made their own pick.
                     const variations = matchedGroup.messageVariations || [];
                     if (!_fcrMsgVariationMap.has(m.id) && variations.length) {
                         if (m.hypothesisVariationId && variations.some(v => v.id === m.hypothesisVariationId)) {
                             _fcrMsgVariationMap.set(m.id, m.hypothesisVariationId);
                             _fcrMsgVariationSourceMap.set(m.id, 'stamped');
+                        } else if (variations.some(v => (v.aiCriteria || '').trim())) {
+                            aiSelectionQueue.push({ m, variations });
                         } else {
-                            const idx = perGroupRotationIdx.get(matchedGroup.id) || 0;
-                            _fcrMsgVariationMap.set(m.id, variations[idx % variations.length].id);
-                            _fcrMsgVariationSourceMap.set(m.id, 'auto');
-                            perGroupRotationIdx.set(matchedGroup.id, idx + 1);
+                            const weighted = _fcrWeightedRandomVariation(variations);
+                            if (weighted) {
+                                _fcrMsgVariationMap.set(m.id, weighted.id);
+                                _fcrMsgVariationSourceMap.set(m.id, 'weighted');
+                            } else {
+                                const idx = perGroupRotationIdx.get(matchedGroup.id) || 0;
+                                _fcrMsgVariationMap.set(m.id, variations[idx % variations.length].id);
+                                _fcrMsgVariationSourceMap.set(m.id, 'auto');
+                                perGroupRotationIdx.set(matchedGroup.id, idx + 1);
+                            }
                         }
                     }
                 } else {
                     _fcrNoGroupCount++;
                 }
             });
+
+            // ── Resolve AI-criteria-based picks (Grok) ──────────────────────────────────────
+            // Run in parallel across every queued message — same fully-parallel-Promise.all
+            // pattern already used elsewhere on this page for per-message async work (see the
+            // createMessageCard re-render loop above). Each call is independent; a failure/no-
+            // match on one message never blocks the others, and always falls back to weighted
+            // random (or round-robin) so no message is left without a variation.
+            if (aiSelectionQueue.length) {
+                console.log(`[HypVariation] Resolving ${aiSelectionQueue.length} message(s) via AI Selection Criteria (${FCR_VARIATION_AI_MODEL})…`);
+                let _aiPicked = 0, _aiFellBack = 0;
+                await Promise.all(aiSelectionQueue.map(async ({ m, variations }) => {
+                    const contactInfo = _fcrContactInfoForVariation(m);
+                    const picked = await _fcrSelectVariationWithAI(contactInfo, variations);
+                    if (picked) {
+                        _fcrMsgVariationMap.set(m.id, picked.variation.id);
+                        _fcrMsgVariationSourceMap.set(m.id, 'ai');
+                        if (picked.reason) _fcrMsgVariationReasonMap.set(m.id, picked.reason);
+                        _aiPicked++;
+                        return;
+                    }
+                    _aiFellBack++;
+                    const groupId = _fcrMsgGroupMap.get(m.id);
+                    const weighted = _fcrWeightedRandomVariation(variations);
+                    if (weighted) {
+                        _fcrMsgVariationMap.set(m.id, weighted.id);
+                        _fcrMsgVariationSourceMap.set(m.id, 'weighted');
+                    } else {
+                        const idx = perGroupRotationIdx.get(groupId) || 0;
+                        _fcrMsgVariationMap.set(m.id, variations[idx % variations.length].id);
+                        _fcrMsgVariationSourceMap.set(m.id, 'auto');
+                        perGroupRotationIdx.set(groupId, idx + 1);
+                    }
+                }));
+                console.log(`[HypVariation] AI selection done — ${_aiPicked} picked by Grok, ${_aiFellBack} fell back to weighted/round-robin (call failed or no confident match).`);
+            }
 
             // Tally, per group that defines variations, how many loaded messages ended up on
             // each variation (and how many have none at all) — surfaced as a chip/tooltip in the
@@ -3737,10 +3867,12 @@
         // directly on the card so reviewers can tell at a glance whether the system picked it
         // for them (auto/round-robin/stamped) or a human explicitly chose it (manual/bulk).
         const FCR_VARIATION_SOURCE_META = {
-            stamped: { bg: '#dbeafe', fg: '#1e3a8a', icon: 'fa-tag',           label: 'from generation' },
-            auto:    { bg: '#ffedd5', fg: '#9a3412', icon: 'fa-shuffle',      label: 'auto-assigned · round-robin' },
-            manual:  { bg: '#dcfce7', fg: '#166534', icon: 'fa-hand-pointer', label: 'manually set' },
-            bulk:    { bg: '#cffafe', fg: '#155e75', icon: 'fa-layer-group', label: 'bulk-assigned' }
+            stamped:  { bg: '#dbeafe', fg: '#1e3a8a', icon: 'fa-tag',           label: 'from generation' },
+            ai:       { bg: '#ede9fe', fg: '#5b21b6', icon: 'fa-robot',        label: 'AI-selected by criteria (Grok)' },
+            weighted: { bg: '#fef9c3', fg: '#854d0e', icon: 'fa-dice',         label: 'random by Share %' },
+            auto:     { bg: '#ffedd5', fg: '#9a3412', icon: 'fa-shuffle',      label: 'auto-assigned · round-robin' },
+            manual:   { bg: '#dcfce7', fg: '#166534', icon: 'fa-hand-pointer', label: 'manually set' },
+            bulk:     { bg: '#cffafe', fg: '#155e75', icon: 'fa-layer-group', label: 'bulk-assigned' }
         };
 
         function renderHypVariationSelectors() {
@@ -3755,6 +3887,8 @@
                 const selectedVariation = variations.find(v => v.id === selectedId) || null;
                 const source = _fcrMsgVariationSourceMap.get(m.id) || null;
                 const meta = source ? FCR_VARIATION_SOURCE_META[source] : null;
+                const aiReason = source === 'ai' ? (_fcrMsgVariationReasonMap.get(m.id) || '') : '';
+                const badgeTitle = [meta ? meta.label : '', aiReason ? `Grok: "${aiReason}"` : ''].filter(Boolean).join(' — ');
 
                 // Always render a clearly visible, color-coded badge — never leave this silent.
                 // Red = nothing assigned at all (shouldn't normally happen once a group defines
@@ -3762,7 +3896,7 @@
                 // something's off and Opus will run with NO variation-specific instructions for
                 // this message).
                 const badge = selectedVariation
-                    ? `<span style="display:inline-flex;align-items:center;gap:5px;background:${meta ? meta.bg : '#f3e8ff'};color:${meta ? meta.fg : '#6b21a8'};padding:2px 9px;border-radius:10px;font-size:0.74rem;font-weight:700;white-space:nowrap;" title="${meta ? escapeHtml(meta.label) : ''}">
+                    ? `<span style="display:inline-flex;align-items:center;gap:5px;background:${meta ? meta.bg : '#f3e8ff'};color:${meta ? meta.fg : '#6b21a8'};padding:2px 9px;border-radius:10px;font-size:0.74rem;font-weight:700;white-space:nowrap;" title="${escapeHtml(badgeTitle)}">
                             <i class="fas ${meta ? meta.icon : 'fa-vial'}"></i> ${escapeHtml(selectedVariation.label || selectedVariation.id)}
                             ${meta ? `<span style="font-weight:600;opacity:0.75;font-size:0.68rem;">— ${escapeHtml(meta.label)}</span>` : ''}
                         </span>`
@@ -3791,6 +3925,7 @@
                 _fcrMsgVariationMap.delete(messageId);
                 _fcrMsgVariationSourceMap.delete(messageId);
             }
+            _fcrMsgVariationReasonMap.delete(messageId); // stale AI reason no longer applies once overridden
         };
 
         // Returns the Firestore fields to stamp onto a connect_queue doc at approval/send time so
@@ -3869,6 +4004,7 @@
                 if (_fcrMsgGroupMap.get(m.id) === groupId) {
                     _fcrMsgVariationMap.set(m.id, variationId);
                     _fcrMsgVariationSourceMap.set(m.id, 'bulk');
+                    _fcrMsgVariationReasonMap.delete(m.id);
                     count++;
                 }
             });
@@ -4077,6 +4213,7 @@
                     if (_fcrMsgGroupMap.get(m.id) === groupId) {
                         _fcrMsgVariationMap.set(m.id, _fcrSelectedVariationId);
                         _fcrMsgVariationSourceMap.set(m.id, 'manual');
+                        _fcrMsgVariationReasonMap.delete(m.id);
                     }
                 });
                 renderHypVariationSelectors();
@@ -6102,6 +6239,7 @@
                 // Reset hypothesis message-variation assignments from the previous batch
                 _fcrMsgVariationMap.clear();
                 _fcrMsgVariationSourceMap.clear();
+                _fcrMsgVariationReasonMap.clear();
                 
                 // Reset approval timing
                 approvalTimestamps.clear();
@@ -10113,6 +10251,7 @@
             messageVariations.clear();
             _fcrMsgVariationMap.clear();
             _fcrMsgVariationSourceMap.clear();
+            _fcrMsgVariationReasonMap.clear();
             
             document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
                 cb.checked = false;
@@ -11714,7 +11853,7 @@
                 const anyMsgHasVariation = toReview.some(m => !!_fcrMsgVariationMap.get(m.id));
                 const batches = [];
                 if (splitByHypGroup || anyMsgHasVariation) {
-                    const buckets = new Map(); // bucketKey -> { label, prompt, messages: [] }
+                    const buckets = new Map(); // bucketKey -> { label, prompt, messages: [], sourceCounts }
                     toReview.forEach(m => {
                         const groupId = splitByHypGroup ? (_fcrMsgGroupMap.get(m.id) || null) : (selectedHypGroupId || null);
                         const group = groupId ? _hypothesisGroups.find(g => g.id === groupId) : null;
@@ -11727,9 +11866,20 @@
                             const bucketPrompt = splitByHypGroup
                                 ? (group ? buildGroupOpusPrompt(group, variation) : prompt)
                                 : (variation ? buildOpusPrompt({ targetInstr, messageInstr, variation }) : prompt);
-                            buckets.set(bucketKey, { label, prompt: bucketPrompt, messages: [] });
+                            buckets.set(bucketKey, { label, prompt: bucketPrompt, messages: [], sourceCounts: {} });
                         }
-                        buckets.get(bucketKey).messages.push(m);
+                        const bucket = buckets.get(bucketKey);
+                        bucket.messages.push(m);
+                        // Track WHY each message landed in this variation bucket (stamped from
+                        // generation / auto round-robin / manually picked / bulk-assigned / none)
+                        // — if an entire hypothesis group's batch is "stamped" to a single
+                        // variation, that's not a review-side bug: it means every message in
+                        // that batch was generated against that one variation already (no
+                        // diversity to rotate across at review time). Surfacing this distinction
+                        // here avoids mistaking "generation only used one variation" for
+                        // "variation instructions aren't reaching Opus".
+                        const src = variationId ? (_fcrMsgVariationSourceMap.get(m.id) || 'unknown') : 'none';
+                        bucket.sourceCounts[src] = (bucket.sourceCounts[src] || 0) + 1;
                     });
                     buckets.forEach(bucket => {
                         for (let i = 0; i < bucket.messages.length; i += OPUS_BATCH_SIZE) {
@@ -11748,9 +11898,19 @@
                     // variation's instructions when the hypothesis group had no group-level
                     // target/message instructions of its own. This makes that failure mode
                     // visible in the console instead of only discoverable by reading source.
+                    // Also prints WHY the bucket ended up on this variation (see sourceCounts
+                    // above) and the actual variation instruction text Opus will receive, so you
+                    // can eyeball whether it's meaningfully different across buckets/groups
+                    // instead of just trusting a boolean.
                     [...buckets.values()].forEach(b => {
-                        const included = b.prompt.includes('MESSAGE VARIATION INSTRUCTIONS');
-                        console.log(`[OpusReview]   → bucket "${b.label || 'default'}" (${b.messages.length} msgs): variation instructions ${included ? '✅ included in prompt' : '❌ NOT included'}`);
+                        const match = b.prompt.match(/MESSAGE VARIATION INSTRUCTIONS[\s\S]*?:\n([\s\S]*?)(?:\n\nBDR-SPECIFIC INSTRUCTIONS|\n\nADDITIONAL INSTRUCTIONS|\n\nTEXT EDITING DISABLED|$)/);
+                        const included = !!match;
+                        const sourceSummary = Object.entries(b.sourceCounts).map(([k, v]) => `${k}: ${v}`).join(', ');
+                        console.log(`[OpusReview]   → bucket "${b.label || 'default'}" (${b.messages.length} msgs, source: ${sourceSummary}): variation instructions ${included ? '✅ included in prompt' : '❌ NOT included'}`);
+                        if (included) {
+                            const text = match[1].trim();
+                            console.log(`[OpusReview]      text sent to Opus: "${text.slice(0, 300)}${text.length > 300 ? '…' : ''}"`);
+                        }
                     });
                 } else {
                     for (let i = 0; i < toReview.length; i += OPUS_BATCH_SIZE) {
