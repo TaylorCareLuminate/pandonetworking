@@ -7382,7 +7382,17 @@
         // "Show all BDRs" is on / the viewer isn't one of the recognized team
         // members.
         async function applyTeamScopeToAlerts(alerts) {
-            if (getShowAllBdrsOverride() || !getViewerTeamMemberId()) return alerts;
+            if (getShowAllBdrsOverride()) return alerts;
+            // Wait for auth.js to actually finish resolving the signed-in user before
+            // deciding the viewer is "unrecognized" — without this, a call that lands
+            // before Firebase auth has initialized (e.g. the very first _liLoadAlerts()
+            // at page load, which fires long before auth.js's async init completes)
+            // sees getViewerTeamMemberId() as null and "fails open", briefly showing
+            // every BDR's alerts instead of just the viewer's own, until a later
+            // re-scope call corrects it. See the "Auto-load on page ready" block below
+            // for the full explanation of why window.auth isn't ready yet at parse time.
+            try { if (window.firebaseReady) await window.firebaseReady; } catch (e) { /* proceed anyway */ }
+            if (!getViewerTeamMemberId()) return alerts;
             const assignMap = await getBdrAssignmentMap();
             return alerts.filter(a => {
                 const email = (_liAlertCanonicalEmail.get(a.id) || a.bdrEmail || '').toLowerCase().trim();
@@ -10837,9 +10847,36 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         };
 
         // Auto-load on page ready (after auth)
-        const auth = window.auth;
-        if (auth) {
-            import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js').then(({ onAuthStateChanged }) => {
+        //
+        // NOTE: `window.auth` is set asynchronously by auth.js (only after its
+        // Firebase init finishes — which, on pages like this one with no auth UI
+        // elements, is deliberately delayed ~5s while auth.js polls for header
+        // elements it will never find). This inline <script type="module"> block
+        // runs synchronously during initial HTML parsing, long before that, so a
+        // plain `if (window.auth)` check here ALWAYS evaluates false and this
+        // used to permanently skip attaching a real onAuthStateChanged listener
+        // — falling back to a single blind 1.5s timer instead. If that timer (or
+        // the initial _liLoadAlerts() call at the bottom of this script) resolved
+        // team-scoping before the real signed-in user was known, getViewerTeamMemberId()
+        // returned null and the "fail open" branches in applyTeamScopeToAlerts()/
+        // isBdrAssignmentVisibleToViewer() would briefly show every BDR's reply
+        // alerts (not just the viewer's own) until something else happened to
+        // re-run the scope check — which is exactly the "shows a few, then a bit
+        // later shows all of them" symptom reported for the LinkedIn Replies panel.
+        //
+        // Fix: wait on auth.js's own `window.firebaseReady` promise (resolved
+        // once Firebase is truly initialized, regardless of how long that takes)
+        // instead of racing a synchronous window.auth check, so the listener
+        // always attaches and reply-alert scoping always waits for the real viewer.
+        (async () => {
+            try {
+                if (window.firebaseReady) await window.firebaseReady;
+            } catch (err) {
+                console.warn('[Auto-load] firebaseReady rejected, proceeding anyway:', err?.message);
+            }
+            const auth = window.auth;
+            if (auth) {
+                const { onAuthStateChanged } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
                 onAuthStateChanged(auth, user => {
                     if (user) {
                         loadBdrDashboard();
@@ -10852,17 +10889,21 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                         _liRefreshTeamScopedAlerts();
                     }
                 });
-            });
-        } else {
-            setTimeout(() => {
-                loadBdrDashboard();
-                window.loadClientDashboard();
-                populateHeyreachQueueReportBdrs();
-                populateLiFilterBdrs();
-                updateViewerScopeBadges();
-                _liRefreshTeamScopedAlerts();
-            }, 1500);
-        }
+            } else {
+                // window.auth still isn't set even after firebaseReady resolved
+                // (e.g. firebaseReady itself doesn't exist on some older auth.js
+                // version) — fall back to the old blind-timer behavior rather
+                // than silently doing nothing.
+                setTimeout(() => {
+                    loadBdrDashboard();
+                    window.loadClientDashboard();
+                    populateHeyreachQueueReportBdrs();
+                    populateLiFilterBdrs();
+                    updateViewerScopeBadges();
+                    _liRefreshTeamScopedAlerts();
+                }, 1500);
+            }
+        })();
     </script>
 
     <!-- ===== Customization + Platform Updates Module ===== -->
@@ -11430,6 +11471,13 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
 
         // ── Auth Integration ──────────────────────────────────────────────────
 
+        // Wait for auth.js to finish initializing before reading window.auth —
+        // this script block runs at page-parse time, well before auth.js's async
+        // Firebase init completes, so a plain `window.auth` check here would
+        // (almost) always be null and silently skip attaching the real
+        // onAuthStateChanged listener. See the LinkedIn Reply Alerts "Auto-load
+        // on page ready" block above for the full writeup of this race.
+        try { if (window.firebaseReady) await window.firebaseReady; } catch (e) { /* proceed anyway */ }
         const authInst = window.auth;
         if (authInst) {
             const { onAuthStateChanged } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
