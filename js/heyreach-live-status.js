@@ -99,9 +99,25 @@ export function classifyHrLead(lead) {
     const messageStatus    = String(lead.leadMessageStatus || '').toUpperCase().replace(/[\s_-]/g, '_');
     const errCode          = lead.errorCode;
     const hasFailed        = !!lead.failedTime;
-    const isTerminal = hasFailed || campaignStatus === 'FAILED' || campaignStatus === 'FINISHED'
-        || HR_TERMINAL_STATUSES.has(campaignStatus)
-        || (errCode != null && errCode !== 0 && String(errCode) !== '0' && String(errCode).toUpperCase() !== 'NONE');
+
+    // A lead HeyReach never actually attempted to send anything for (both
+    // leadConnectionStatus AND leadMessageStatus are still "None"/empty) is NOT
+    // terminal just because leadCampaignStatus says "Failed" or an errorCode is
+    // present (commonly errorCode "FailedToCheckIfConversationExists" — HeyReach
+    // failing its own pre-send existence check, not a send that failed). Without
+    // this guard, leads that are genuinely still queued and have never been
+    // touched were excluded from "pending" entirely — they'd never fire a
+    // CONNECTION_REQUEST_SENT webhook (nothing was sent) AND they'd be wrongly
+    // classified isTerminal=true here, so no code path ever counted them.
+    // Mirrors ./services/heyreachClassify.js (backend twin) — keep in sync.
+    const neverAttempted = (connectionStatus === '' || connectionStatus === 'NONE')
+        && (messageStatus === '' || messageStatus === 'NONE');
+
+    const isTerminal = hasFailed
+        || (campaignStatus === 'FAILED' && !neverAttempted)
+        || campaignStatus === 'FINISHED'
+        || (HR_TERMINAL_STATUSES.has(campaignStatus) && !neverAttempted)
+        || (errCode != null && errCode !== 0 && String(errCode) !== '0' && String(errCode).toUpperCase() !== 'NONE' && !neverAttempted);
     const isAlreadySent = hrLooksAlreadySent(connectionStatus) || hrLooksAlreadySent(messageStatus);
     const reason = isTerminal
         ? describeHrTerminalReason({ campaignStatus, connectionStatus, messageStatus, errCode, lead })

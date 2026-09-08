@@ -9158,281 +9158,31 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         }
 
         /**
-         * Mirrors loadInProcessForBdr() in edit_in_process_messages.html: same queue
-         * filters + dedup, then the same strict eligibility pass (prospect lead list
-         * + live HeyReach lookup) via /api/connect-queue/in-process-refine-eligibility.
-         * Also cross-checks each row against HeyReach's live per-lead status (see
-         * getLiveHrStatusMapForBdr above) to catch already-sent/finished/failed leads
-         * that webhook-based tracking alone would miss.
+         * Calls the exact same server-side pipeline connect/in_processes_today.html
+         * uses for its "Total In Process" number (computeInProcessLeads() via
+         * GET /api/bdr/in-process-leads) instead of maintaining a second,
+         * independently-written queue/webhook/live-status calculation here.
+         * That second copy is what let this dashboard's "Pending" disagree with
+         * (and sometimes land at 0 while) in_processes_today.html's real count —
+         * this makes the two numbers the same by construction, not by keeping two
+         * implementations in sync by hand.
+         *
+         * The `ctx` param is accepted for call-site compatibility but unused.
          */
         async function computeStrictInProcessPending(bdrAuthEmail, ctx) {
-            const { collection, query, where, getDocs, limit: fsLimit } = window.clemailFirestore;
-            const emailDB = window.clemailDb;
-            const lower = bdrAuthEmail.toLowerCase();
-            const linkedInEmail = ctx.authToLinkedIn.get(lower) || null;
-            const emailsToQuery = [...new Set([lower, linkedInEmail].filter(Boolean))];
-            const emailSet = new Set(emailsToQuery);
-
-            const bdrAccountIds = new Set();
-            emailSet.forEach(em => (ctx.emailToAccountIds.get(em) || new Set()).forEach(id => bdrAccountIds.add(id)));
-
-            // Same fallback order as edit_in_process_messages.html: prefer bdr_leaders.heyreachAccountId,
-            // then fall back to the account ID nested inside heyreachCampaigns. Missing this fallback
-            // was under-matching CONNECTION_REQUEST_SENT events for BDRs whose account ID only lives on
-            // a campaign entry, which made old already-sent leads look like they were still pending.
-            const bdrLeaderInfo = ctx.bdrLeaderInfoByEmail.get(lower) || {};
-            let bdrLeaderAccountId = bdrLeaderInfo.heyreachAccountId ? String(bdrLeaderInfo.heyreachAccountId) : '';
-            if (!bdrLeaderAccountId && bdrLeaderInfo.heyreachCampaigns && bdrLeaderInfo.heyreachCampaigns.length) {
-                const firstWithAcct = bdrLeaderInfo.heyreachCampaigns.find(c => c.accountId || c.heyreachAccountId);
-                if (firstWithAcct) bdrLeaderAccountId = String(firstWithAcct.accountId || firstWithAcct.heyreachAccountId);
+            const token = await getRailwayToken();
+            const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+            const resp = await fetch(`${RAILWAY_BASE}/api/bdr/in-process-leads?bdrEmail=${encodeURIComponent(bdrAuthEmail)}`, { headers });
+            const json = await resp.json().catch(() => ({}));
+            if (!resp.ok || !json.success) {
+                throw new Error((json && json.error) || `HTTP ${resp.status}`);
             }
-            const sentMatchAccountIds = bdrLeaderAccountId ? new Set([bdrLeaderAccountId]) : bdrAccountIds;
-
-            let sentUrlsForBdr;
-            let sentMessageUrlsForBdr = new Set();
-            if (ctx.sentEventsOk) {
-                sentUrlsForBdr = new Set();
-                for (const ev of ctx.allSentEvents) {
-                    let matched = false;
-                    if (ev.accountEmail && emailSet.has(String(ev.accountEmail).toLowerCase())) {
-                        matched = true;
-                    } else if (ev.linkedInAccountId) {
-                        const id = String(ev.linkedInAccountId);
-                        if (sentMatchAccountIds.has(id)) matched = true;
-                        else {
-                            const mapped = ctx.idToBdr.get(id);
-                            if (mapped && emailSet.has(mapped)) matched = true;
-                        }
-                    }
-                    if (!matched) continue;
-                    const url = normalizeHrQueueUrl(ev.leadProfileUrl || '');
-                    if (url) sentUrlsForBdr.add(url);
-                }
-            } else {
-                sentUrlsForBdr = await loadSentUrlsFirestoreFallback(emailDB, emailSet, ctx.idToBdr, sentMatchAccountIds, ctx.REPORT_DAYS);
-            }
-
-            if (ctx.messageSentEventsOk && Array.isArray(ctx.allMessageSentEvents)) {
-                for (const ev of ctx.allMessageSentEvents) {
-                    let matched = false;
-                    if (ev.accountEmail && emailSet.has(String(ev.accountEmail).toLowerCase())) {
-                        matched = true;
-                    } else if (ev.linkedInAccountId) {
-                        const id = String(ev.linkedInAccountId);
-                        if (sentMatchAccountIds.has(id)) matched = true;
-                        else {
-                            const mapped = ctx.idToBdr.get(id);
-                            if (mapped && emailSet.has(mapped)) matched = true;
-                        }
-                    }
-                    if (!matched) continue;
-                    const url = normalizeHrQueueUrl(ev.leadProfileUrl || '');
-                    if (url) sentMessageUrlsForBdr.add(url);
-                }
-            }
-
-            const cutoff = Date.now() - ctx.REPORT_DAYS * 24 * 60 * 60 * 1000;
-            const seenIds = new Set();
-            const queueRows = [];
-            for (const em of emailsToQuery) {
-                const q = query(collection(emailDB, 'connect_queue'), where('account_email', '==', em), fsLimit(8000));
-                const snap = await getDocs(q);
-                snap.forEach(d => {
-                    if (seenIds.has(d.id)) return;
-                    seenIds.add(d.id);
-                    queueRows.push({ id: d.id, ...d.data() });
-                });
-            }
-
-            const inProcess = [];
-            for (const row of queueRows) {
-                const rowEmail = (row.account_email || '').toLowerCase().trim();
-                if (rowEmail && !emailSet.has(rowEmail)) continue;
-                const mt = (row.message_type || '').toLowerCase();
-                const isConnect = mt === 'connect' || mt === 'connection';
-                const isMessage = mt === 'message';
-                if (!isConnect && !isMessage) continue;
-                if (!row.pushed_to_heyreach) continue;
-                const pushTs = new Date(row.heyreach_push_date || row.pushed_date || 0).getTime();
-                if (pushTs > 0 && pushTs < cutoff) continue;
-                const url = normalizeHrQueueUrl(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
-                if (!url) continue;
-                if (isConnect && sentUrlsForBdr.has(url)) continue;
-                if (isMessage && sentMessageUrlsForBdr.has(url)) continue;
-                inProcess.push({ ...row, _kind: isConnect ? 'connect' : 'message' });
-            }
-
-            inProcess.sort((a, b) => {
-                const ta = new Date(a.heyreach_push_date || a.pushed_date || 0).getTime();
-                const tb = new Date(b.heyreach_push_date || b.pushed_date || 0).getTime();
-                return tb - ta;
-            });
-            const seenKeys = new Set();
-            let deduplicated = [];
-            for (const row of inProcess) {
-                const url = normalizeHrQueueUrl(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
-                const key = `${row._kind}::${url}`;
-                if (url && seenKeys.has(key)) continue;
-                if (url) seenKeys.add(key);
-                deduplicated.push(row);
-            }
-
-            const emptyResult = (extra = {}) => ({
-                pending: 0, pendingConnect: 0, pendingMessage: 0,
-                verified: true, preEligibilityCount: 0, excludedByLiveStatus: 0, ...extra,
-            });
-
-            if (!deduplicated.length) {
-                return emptyResult();
-            }
-
-            // ── Live HeyReach status cross-check ──────────────────────────────
-            // sentUrlsForBdr above only reflects CONNECTION_REQUEST_SENT *webhooks*,
-            // which can under-count. Pull HeyReach's own live per-lead status for this
-            // BDR's campaigns and drop anything it says is already sent/finished/failed
-            // — same fix already applied in in_processes_today.html.
-            let excludedByLiveStatus = 0;
-            try {
-                const liveStatusMap = await getLiveHrStatusMapForBdr(bdrAuthEmail, ctx);
-                if (liveStatusMap.size > 0) {
-                    const before = deduplicated.length;
-                    deduplicated = deduplicated.filter(row => {
-                        const url = normalizeUrlForHrLiveMatch(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
-                        const verdict = url ? liveStatusMap.get(url) : null;
-                        return !(verdict && verdict.alreadySent);
-                    });
-                    excludedByLiveStatus = before - deduplicated.length;
-                    if (excludedByLiveStatus > 0) {
-                        console.log(`[bdr-dashboard] ${bdrAuthEmail}: live HeyReach status excluded ${excludedByLiveStatus} already-sent/finished/failed lead(s) that webhook tracking missed.`);
-                    }
-                }
-            } catch (e) {
-                console.warn(`[bdr-dashboard] Live HeyReach status cross-check failed for ${bdrAuthEmail}:`, e.message);
-            }
-
-            if (!deduplicated.length) {
-                return emptyResult({ excludedByLiveStatus });
-            }
-
-            // ── Trust the live campaign lead list over the fragile single-lead check ──
-            // The old eligibility pass below calls HeyReach's single-lead /lead/GetLead
-            // per row to confirm it still exists — but that call is prone to the exact
-            // URL-format mismatches we spent a while chasing down for in_processes_today.html.
-            // If a row's URL was already found in the bulk /leads/getall campaign pull above
-            // (liveStatusMap) and it's NOT flagged already-sent/terminal, that's direct proof
-            // from HeyReach itself that the lead is present and still pending — no need to
-            // risk a second, less reliable existence check dropping it incorrectly. Only rows
-            // we couldn't confirm that way go through the old prospect-list + GetLead pass.
-            let liveStatusMapForSplit = new Map();
-            try { liveStatusMapForSplit = await getLiveHrStatusMapForBdr(bdrAuthEmail, ctx); } catch (_) { /* already logged above */ }
-            const confirmedPresentRows = [];
-            const needsEligibilityCheck = [];
-            for (const row of deduplicated) {
-                const url = normalizeUrlForHrLiveMatch(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
-                const verdict = url ? liveStatusMapForSplit.get(url) : null;
-                if (verdict && !verdict.alreadySent) confirmedPresentRows.push(row);
-                else needsEligibilityCheck.push(row);
-            }
-            if (confirmedPresentRows.length > 0) {
-                console.log(`[bdr-dashboard] ${bdrAuthEmail}: ${confirmedPresentRows.length} row(s) confirmed present+pending directly via live HeyReach campaign data (skipping single-lead check); ${needsEligibilityCheck.length} still need the prospect-list/GetLead check.`);
-            }
-
-            const splitCounts = (rows) => {
-                let pendingConnect = 0, pendingMessage = 0;
-                for (const r of rows) {
-                    if (r._kind === 'message') pendingMessage++;
-                    else pendingConnect++;
-                }
-                return {
-                    pending: pendingConnect + pendingMessage,
-                    pendingConnect,
-                    pendingMessage,
-                };
-            };
-
-            if (!needsEligibilityCheck.length) {
-                return {
-                    ...splitCounts(confirmedPresentRows),
-                    verified: true,
-                    preEligibilityCount: deduplicated.length,
-                    confirmedViaLiveApi: confirmedPresentRows.length,
-                    excludedByLiveStatus,
-                };
-            }
-
-            // The eligibility endpoint does a *live* HeyReach lookup per lead (concurrency 8
-            // server-side). Sending a BDR's entire backlog in one request (e.g. Greg Miller's
-            // ~150 stale rows) can take long enough that Railway's proxy kills it with a 502
-            // before it finishes. Batching keeps each request comfortably under that timeout,
-            // and a failed batch fails open (keeps its rows) instead of losing the whole BDR.
-            const ELIGIBILITY_BATCH_SIZE = 25;
-            const allIds = needsEligibilityCheck.map(r => r.id);
-            let keepIds = [];
-            const summary = { not_on_prospect_lead_list: 0, not_in_heyreach_list: 0, not_in_heyreach: 0 };
-            let prospectLeadUrlCount = null;
-            let anyBatchOk = false;
-            let lastError = null;
-
-            for (let i = 0; i < allIds.length; i += ELIGIBILITY_BATCH_SIZE) {
-                const batch = allIds.slice(i, i + ELIGIBILITY_BATCH_SIZE);
-                try {
-                    const refResp = await fetch(`${RAILWAY_BASE}/api/connect-queue/in-process-refine-eligibility`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ bdrAuthEmail: lower, queueIds: batch })
-                    });
-                    const refJson = await refResp.json().catch(() => ({}));
-                    if (refResp.ok && refJson.success && Array.isArray(refJson.keepIds)) {
-                        anyBatchOk = true;
-                        keepIds = keepIds.concat(refJson.keepIds);
-                        const s = refJson.summary || {};
-                        summary.not_on_prospect_lead_list += s.not_on_prospect_lead_list || 0;
-                        summary.not_in_heyreach_list      += s.not_in_heyreach_list || 0;
-                        summary.not_in_heyreach           += s.not_in_heyreach || 0;
-                        if (prospectLeadUrlCount == null) prospectLeadUrlCount = refJson.prospectLeadUrlCount ?? null;
-                    } else {
-                        lastError = (refJson && refJson.error) || `HTTP ${refResp.status}`;
-                        keepIds = keepIds.concat(batch); // fail open for this batch
-                    }
-                } catch (e) {
-                    lastError = e.message;
-                    keepIds = keepIds.concat(batch); // fail open for this batch
-                }
-            }
-
-            console.log(`[bdr-dashboard] ${bdrAuthEmail}: eligibility summary for the ${allIds.length} unconfirmed row(s) —`, summary, `prospectLeadUrlCount=${prospectLeadUrlCount}`);
-
-            if (!anyBatchOk) {
-                const failOpen = confirmedPresentRows.concat(needsEligibilityCheck);
-                return {
-                    ...splitCounts(failOpen),
-                    verified: false,
-                    preEligibilityCount: deduplicated.length,
-                    confirmedViaLiveApi: confirmedPresentRows.length,
-                    excludedByLiveStatus,
-                    error: lastError || 'eligibility check failed',
-                };
-            }
-
-            // Same safety valve as edit_in_process_messages.html: an empty prospect lead list
-            // means the data is missing, not that everyone is ineligible — skip the filter
-            // rather than zero everyone out.
-            const prospectListEmpty = prospectLeadUrlCount === 0 && summary.not_on_prospect_lead_list > 0;
-            const keepSet = new Set(keepIds);
-            const keptNeeds = prospectListEmpty
-                ? needsEligibilityCheck
-                : needsEligibilityCheck.filter(r => keepSet.has(r.id));
-            const finalRows = confirmedPresentRows.concat(keptNeeds);
             return {
-                ...splitCounts(finalRows),
+                pending: json.pending ?? 0,
+                pendingConnect: json.pendingConnect ?? json.pending ?? 0,
+                pendingMessage: json.pendingMessage ?? 0,
                 verified: true,
-                preEligibilityCount: deduplicated.length,
-                confirmedViaLiveApi: confirmedPresentRows.length,
-                excludedNotOnList: prospectListEmpty ? 0 : summary.not_on_prospect_lead_list,
-                excludedNotInHeyreach: prospectListEmpty ? 0 : (summary.not_in_heyreach_list + summary.not_in_heyreach),
-                excludedByLiveStatus,
-                prospectListEmpty,
-                partial: lastError != null,
+                excludedByLiveStatus: (json.diagnostics && json.diagnostics.erroredCount) || 0,
             };
         }
 
@@ -9560,8 +9310,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             const originalBtnHtml = btn.innerHTML;
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
             try {
-                const ctx = await getDashboardEligibilityContext();
-                const result = await computeStrictInProcessPending(primaryEmail, ctx);
+                const result = await computeStrictInProcessPending(primaryEmail, null);
                 applyRefinedPendingToRow(primaryEmail, result);
                 persistVerifiedPending(primaryEmail, result);
             } catch (e) {
