@@ -2956,7 +2956,8 @@
     <!-- CLEmail Secure API Wrapper -->
     <script src="../js/clemail-firestore-wrapper.js"></script>
     <!-- Conference Scheduling (shared data layer + embeddable widget) -->
-    <script src="conference-scheduling.js"></script>
+    <!-- Versioned to avoid stale-cache issues after conference-scheduling.js changes -->
+    <script src="conference-scheduling.js?v=1.1"></script>
     <!-- Load PandoConnect common header -->
     <script src="healthconnect-header.js?v=3.3"></script>
     <!-- jsPDF for PDF generation -->
@@ -10420,8 +10421,8 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer �
             console.log('🔍 Conversation keys:', Object.keys(conversation));
 
             // Extract required data
-            const conversationIdClean = conversation.conversationId || conversation.rawData?.conversationId || conversationId;
-            const linkedInAccountId = conversation.linkedInAccountId || conversation.rawData?.linkedInAccount?.id;
+            let conversationIdClean = conversation.conversationId || conversation.rawData?.conversationId || conversationId;
+            let linkedInAccountId = conversation.linkedInAccountId || conversation.rawData?.linkedInAccount?.id;
             const customerId = conversation.customerId || conversation.rawData?.customerId;
 
             console.log('🔍 Extracted values:', {
@@ -10448,6 +10449,42 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer �
                 alert('❌ Customer ID not found');
                 console.error('Missing customerId', conversation);
                 return;
+            }
+
+            // A conversation that only exists here because a HeyReach webhook fired a
+            // moment ago (source === 'webhook') never carries HeyReach's real
+            // conversationId — the webhook payload doesn't include one (see
+            // extractDataFromHeyReachPayload in heyreach_webhook_service.js). The real
+            // ID only gets filled in once the 30-min heyreach_inbox sync (or a manual
+            // "Check HeyReach Now") pulls the full conversation from HeyReach's API.
+            // Until then, conversationIdClean above silently fell back to our own
+            // synthetic local `conversationId`, which HeyReach's SendMessage API
+            // doesn't recognize and rejects with a 404 "This conversation does not
+            // exist". Detect that case and resolve the real ID on the spot instead of
+            // letting the send fail with a confusing error.
+            const conversationIdLooksUnresolved = !conversation.conversationId && !conversation.rawData?.conversationId;
+            if (conversationIdLooksUnresolved && conversation.leadProfileUrl) {
+                console.log('🔄 Conversation ID looks unresolved (webhook-only) — checking HeyReach directly before sending...');
+                try {
+                    const checkResp = await fetch(`${RAILWAY_URL}/heyreach/inbox/check-conversation`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ customerId, leadProfileUrl: conversation.leadProfileUrl, linkedInAccountId })
+                    });
+                    const checkResult = await checkResp.json();
+
+                    if (checkResult.success && checkResult.found && checkResult.conversationId) {
+                        console.log(`✅ Resolved real HeyReach conversationId: ${checkResult.conversationId}`);
+                        conversationIdClean = checkResult.conversationId;
+                        linkedInAccountId = checkResult.linkedInAccountId || linkedInAccountId;
+                        conversation.conversationId = checkResult.conversationId; // cache so a retry doesn't re-check
+                    } else {
+                        alert('⏳ HeyReach hasn\'t finished syncing this conversation yet (it just came in a moment ago), so a reply can\'t be sent quite yet. Please wait a minute or two and try again — or use "Check HeyReach Now" on this conversation.');
+                        return;
+                    }
+                } catch (checkError) {
+                    console.warn('⚠️ Could not pre-check HeyReach conversation, will attempt send as-is:', checkError);
+                }
             }
 
             // Get button and disable it
