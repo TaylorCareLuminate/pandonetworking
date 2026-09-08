@@ -5846,6 +5846,21 @@
         // here can land on a different document than about_me.html / company_review_replies.html
         // use, silently splitting a BDR's Quick Text Inserts across two documents.
         let _liAliasToCanonicalEmail = null;
+        // In-flight load promise for the map above — MUST be cached (not just the map
+        // itself) because _liPreloadBdrProfiles resolves every alert's canonical email
+        // concurrently via Promise.all. Without this, the first concurrent call sets
+        // _liAliasToCanonicalEmail to a (still-empty) `new Map()` synchronously before
+        // its fetch even starts, so every OTHER concurrent call sees that truthy-but-empty
+        // Map and returns immediately with no data — silently falling back to each alert's
+        // raw (often alias) bdrEmail instead of its canonical primary email. Since
+        // applyTeamScopeToAlerts() matches BDR-assignment scoping against the *primary*
+        // email, alerts resolved to an alias on that first pass don't match the viewer's
+        // assignment and get hidden — until 5 minutes later when the poll timer calls
+        // _liLoadAlerts() again and finds the map already fully populated from the first
+        // run, correctly resolving (and now correctly showing) every alert. This is what
+        // caused "I only see a few of my messages, then a few minutes later I see all of
+        // them" even after fixing the separate firebaseReady race.
+        let _liAliasToCanonicalEmailPromise = null;
         // Lazily-loaded map of HeyReach linkedInAccountId (string) -> canonical BDR email,
         // sourced from linkedin_accounts (heyreachAccountId -> bdrEmail). This is the SAME
         // account-ownership record the rest of this dashboard already treats as authoritative
@@ -5860,42 +5875,60 @@
         let _liAccountIdToCanonicalEmail = null;
         async function _liGetAliasToCanonicalEmailMap() {
             if (_liAliasToCanonicalEmail) return _liAliasToCanonicalEmail;
-            _liAliasToCanonicalEmail = new Map();
-            _liAccountIdToCanonicalEmail = new Map();
-            if (!window.clemailFirestore || !window.clemailDb) return _liAliasToCanonicalEmail;
+            if (_liAliasToCanonicalEmailPromise) return _liAliasToCanonicalEmailPromise;
+            _liAliasToCanonicalEmailPromise = (async () => {
+                const aliasMap = new Map();
+                const accountIdMap = new Map();
+                if (!window.clemailFirestore || !window.clemailDb) {
+                    _liAliasToCanonicalEmail = aliasMap;
+                    _liAccountIdToCanonicalEmail = accountIdMap;
+                    return aliasMap;
+                }
+                try {
+                    const { collection, getDocs } = window.clemailFirestore;
+                    const emailDB = window.clemailDb;
+                    const [bdrSnap, assocSnap, accountsSnap] = await Promise.all([
+                        getDocs(collection(emailDB, 'bdr_leaders')),
+                        getDocs(collection(emailDB, 'linkedin_email_associations')),
+                        getDocs(collection(emailDB, 'linkedin_accounts'))
+                    ]);
+                    bdrSnap.forEach(d => {
+                        const data = d.data();
+                        const primary = (data.primaryEmail || '').toLowerCase();
+                        if (!primary) return;
+                        if (data.linkedInEmail) {
+                            aliasMap.set(data.linkedInEmail.toLowerCase(), primary);
+                        }
+                    });
+                    assocSnap.forEach(d => {
+                        const data = d.data();
+                        const authEmail = (data.authEmail || d.id || '').toLowerCase();
+                        if (authEmail && data.linkedInEmail) {
+                            aliasMap.set(data.linkedInEmail.toLowerCase(), authEmail);
+                        }
+                    });
+                    accountsSnap.forEach(d => {
+                        const data = d.data();
+                        if (data.heyreachAccountId && data.bdrEmail) {
+                            accountIdMap.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
+                        }
+                    });
+                } catch (err) {
+                    console.warn('[LiAlerts] Could not load alias->canonical email map:', err.message);
+                }
+                // Only publish to the module-level caches once fully populated, so a
+                // concurrent caller that arrives after this point gets the complete map
+                // via the fast `if (_liAliasToCanonicalEmail) return ...` path above,
+                // instead of racing the fetch again.
+                _liAliasToCanonicalEmail = aliasMap;
+                _liAccountIdToCanonicalEmail = accountIdMap;
+                return aliasMap;
+            })();
             try {
-                const { collection, getDocs } = window.clemailFirestore;
-                const emailDB = window.clemailDb;
-                const [bdrSnap, assocSnap, accountsSnap] = await Promise.all([
-                    getDocs(collection(emailDB, 'bdr_leaders')),
-                    getDocs(collection(emailDB, 'linkedin_email_associations')),
-                    getDocs(collection(emailDB, 'linkedin_accounts'))
-                ]);
-                bdrSnap.forEach(d => {
-                    const data = d.data();
-                    const primary = (data.primaryEmail || '').toLowerCase();
-                    if (!primary) return;
-                    if (data.linkedInEmail) {
-                        _liAliasToCanonicalEmail.set(data.linkedInEmail.toLowerCase(), primary);
-                    }
-                });
-                assocSnap.forEach(d => {
-                    const data = d.data();
-                    const authEmail = (data.authEmail || d.id || '').toLowerCase();
-                    if (authEmail && data.linkedInEmail) {
-                        _liAliasToCanonicalEmail.set(data.linkedInEmail.toLowerCase(), authEmail);
-                    }
-                });
-                accountsSnap.forEach(d => {
-                    const data = d.data();
-                    if (data.heyreachAccountId && data.bdrEmail) {
-                        _liAccountIdToCanonicalEmail.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
-                    }
-                });
-            } catch (err) {
-                console.warn('[LiAlerts] Could not load alias->canonical email map:', err.message);
+                return await _liAliasToCanonicalEmailPromise;
+            } finally {
+                _liAliasToCanonicalEmailPromise = null;
             }
-            return _liAliasToCanonicalEmail;
         }
         async function _liResolveCanonicalBdrEmail(email) {
             if (!email) return email;
