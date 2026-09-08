@@ -192,6 +192,50 @@
         return snap.docs.map(d => ({ id: d.id, ...d.data() }));
     }
 
+    /**
+     * Which conferences a given BDR actually has time set up for (i.e. has at
+     * least one generated slot under conference_availability), regardless of
+     * whether any of those slots are still open. Used by mountWidget() to hide
+     * conferences from a contact's "Conference Meeting" picker that this BDR
+     * isn't attending — showing every conference in the system there just adds
+     * noise and makes it easy to pick one that will only ever say "no open
+     * slots for this BDR".
+     *
+     * Cached + in-flight-deduped per bdrEmail (same reasoning as
+     * getAvailabilityDoc above): review pages mount one widget per contact
+     * card, and most contacts share just a handful of BDRs, so without this a
+     * single render pass would fire one of these queries per card.
+     */
+    const _bdrConferenceIdsCache = new Map(); // bdrEmail -> { ids, at }
+    const _inFlightBdrConferenceIds = new Map();
+    const BDR_CONFERENCE_IDS_TTL_MS = 60000;
+    async function getBdrConferenceIdsWithAvailability(bdrEmail) {
+        if (!bdrEmail) return new Set();
+        const lower = bdrEmail.toLowerCase().trim();
+        const cached = _bdrConferenceIdsCache.get(lower);
+        if (cached && (Date.now() - cached.at) < BDR_CONFERENCE_IDS_TTL_MS) return cached.ids;
+        if (_inFlightBdrConferenceIds.has(lower)) return _inFlightBdrConferenceIds.get(lower);
+        const promise = (async () => {
+            const ids = new Set();
+            const { collection, getDocs, query, where } = fx();
+            const snap = await getDocs(query(collection(dbi(), 'conference_availability'), where('bdrEmail', '==', lower)));
+            snap.docs.forEach(d => {
+                const data = d.data();
+                if (Array.isArray(data.slots) && data.slots.length > 0 && data.conferenceId) {
+                    ids.add(data.conferenceId);
+                }
+            });
+            _bdrConferenceIdsCache.set(lower, { ids, at: Date.now() });
+            return ids;
+        })();
+        _inFlightBdrConferenceIds.set(lower, promise);
+        try {
+            return await promise;
+        } finally {
+            _inFlightBdrConferenceIds.delete(lower);
+        }
+    }
+
     function generateSlots(windows, slotDurationMinutes, existingSlots) {
         const dur = Math.max(5, parseInt(slotDurationMinutes, 10) || 30);
         const byKey = new Map((existingSlots || []).map(s => [`${s.date}_${s.startTime}`, s]));
@@ -233,6 +277,7 @@
             updatedAt: new Date()
         };
         await setDoc(doc(dbi(), 'conference_availability', id), data);
+        _bdrConferenceIdsCache.delete(data.bdrEmail);
         return { id, ...data };
     }
 
@@ -504,24 +549,43 @@
     // for a single contact/BDR pair, and wires up all its own event handlers.
     async function mountWidget(containerEl, ctx) {
         if (!containerEl) return;
+        // A page-level wrapper (e.g. company_review_replies.html's
+        // .conference-scheduling-section, which also carries its own header)
+        // gets hidden/shown alongside the widget itself — see below.
+        const sectionEl = containerEl.closest('.conference-scheduling-section');
+        if (sectionEl) sectionEl.style.display = '';
+        containerEl.style.display = '';
         containerEl.innerHTML = `<div class="cs-widget-loading"><i class="fas fa-spinner fa-spin"></i> Loading conference options…</div>`;
 
         let conferences = [];
+        let bdrConferenceIds = null;
         try {
-            conferences = await loadConferences();
+            [conferences, bdrConferenceIds] = await Promise.all([
+                loadConferences(),
+                ctx.bdrEmail ? getBdrConferenceIdsWithAvailability(ctx.bdrEmail) : Promise.resolve(null)
+            ]);
         } catch (e) {
             containerEl.innerHTML = `<div class="cs-widget-error">Could not load conferences: ${escapeHtml(e.message)}</div>`;
             return;
         }
 
+        // Only offer conferences this BDR actually has availability set up for —
+        // one they aren't attending would just show "no open slots" and add
+        // noise to the picker. If a contact already has a request tied to a
+        // conference (even one that's since sold out / had its slot removed),
+        // that conference's availability doc still exists with that slot in it,
+        // so it isn't filtered out here.
+        if (bdrConferenceIds) {
+            conferences = conferences.filter(c => bdrConferenceIds.has(c.id));
+        }
+
         if (conferences.length === 0) {
-            containerEl.innerHTML = `
-                <div class="cs-widget">
-                    <div class="cs-widget-empty">
-                        <i class="fas fa-calendar-star"></i> No conferences set up yet —
-                        <a href="conference_scheduling.html" target="_blank">create one</a>.
-                    </div>
-                </div>`;
+            // Nothing this BDR can do here yet — hide the whole thing (including
+            // the host page's "Conference Meeting Scheduling" header, if any)
+            // rather than showing an always-empty widget.
+            if (sectionEl) sectionEl.style.display = 'none';
+            else containerEl.style.display = 'none';
+            containerEl.innerHTML = '';
             return;
         }
 
@@ -547,6 +611,10 @@
                     <button type="button" class="cs-save-btn"><i class="fas fa-check"></i> Save</button>
                     <button type="button" class="cs-clear-btn" title="Remove this meeting request"><i class="fas fa-times"></i></button>
                 </div>
+                <div class="cs-widget-row cs-reserved-row" style="display:none;">
+                    <span class="cs-reserved-label"><i class="fas fa-lock"></i> Already taken (this BDR):</span>
+                    <span class="cs-reserved-chips"></span>
+                </div>
             </div>`;
 
         const confSelect = containerEl.querySelector('.cs-conf-select');
@@ -556,6 +624,27 @@
         const statusEl = containerEl.querySelector('.cs-status');
         const saveBtn = containerEl.querySelector('.cs-save-btn');
         const clearBtn = containerEl.querySelector('.cs-clear-btn');
+        const reservedRow = containerEl.querySelector('.cs-reserved-row');
+        const reservedChipsEl = containerEl.querySelector('.cs-reserved-chips');
+
+        // Read-only list of this BDR's held/booked times for OTHER contacts at
+        // the selected conference — so a reviewer can see at a glance what's
+        // already spoken for instead of only inferring it from a shortened
+        // dropdown (and can't accidentally re-propose a time that's taken).
+        function renderReservedSlots(reservedSlots) {
+            if (!reservedSlots.length) {
+                reservedRow.style.display = 'none';
+                reservedChipsEl.innerHTML = '';
+                return;
+            }
+            reservedRow.style.display = 'flex';
+            reservedChipsEl.innerHTML = reservedSlots.map(s => {
+                const isHeld = s.status === 'held';
+                const who = escapeHtml(s.contactName || (isHeld ? 'Held' : 'Booked'));
+                const when = `${escapeHtml(fmtDateShort(s.date))} ${escapeHtml(fmtTime12(s.startTime))}`;
+                return `<span class="cs-reserved-chip ${isHeld ? 'cs-reserved-chip-held' : 'cs-reserved-chip-booked'}" title="${isHeld ? 'Tentatively held' : 'Confirmed'}">${when} — ${who}</span>`;
+            }).join('');
+        }
 
         function setStatus() {
             const req = state.request;
@@ -596,15 +685,26 @@
             slotSelect.innerHTML = `<option value="">Loading time slots…</option>`;
             saveBtn.disabled = true;
 
-            const [req, openSlots] = await Promise.all([
+            const [req, avail] = await Promise.all([
                 getMeetingRequest(state.conferenceId, ctx).catch(() => null),
-                ctx.bdrEmail ? getOpenSlots(state.conferenceId, ctx.bdrEmail).catch(() => []) : Promise.resolve([])
+                ctx.bdrEmail ? getAvailabilityDoc(state.conferenceId, ctx.bdrEmail).catch(() => null) : Promise.resolve(null)
             ]);
             state.request = req;
+            const allSlots = (avail && avail.slots) || [];
+            const openSlots = allSlots
+                .filter(s => s.status === 'open')
+                .sort((a, b) => `${a.date}${a.startTime}`.localeCompare(`${b.date}${b.startTime}`));
             state.openSlots = openSlots;
 
+            // Held/booked slots belonging to a DIFFERENT meeting request — shown
+            // read-only below the picker (see renderReservedSlots above).
+            const reservedSlots = allSlots
+                .filter(s => (s.status === 'held' || s.status === 'booked') && s.meetingRequestId !== (req && req.id))
+                .sort((a, b) => `${a.date}${a.startTime}`.localeCompare(`${b.date}${b.startTime}`));
+            renderReservedSlots(reservedSlots);
+
             // If this contact already has a held/booked slot, make sure it appears
-            // in the dropdown (getOpenSlots() only returns 'open' ones).
+            // in the dropdown (openSlots only contains 'open' ones).
             let slotsForDropdown = openSlots.slice();
             if (req && req.hasTimeSlot && req.slotId && !slotsForDropdown.some(s => s.id === req.slotId)) {
                 slotsForDropdown.unshift({ id: req.slotId, date: req.date, startTime: req.startTime, endTime: req.endTime, status: req.slotStatus === 'held' ? 'held' : 'booked' });
@@ -732,6 +832,12 @@
             .cs-status-error { color: #dc2626; }
             .cs-confirm-inline-btn { border: none; background: #fde68a; color: #92400e; border-radius: 5px; font-size: 0.68rem; font-weight: 700; padding: 2px 7px; cursor: pointer; display: inline-flex; align-items: center; gap: 3px; }
             .cs-confirm-inline-btn:hover { background: #fcd34d; }
+            .cs-reserved-row { align-items: flex-start !important; padding-top: 0.35rem; border-top: 1px dashed #e9d9b8; }
+            .cs-reserved-label { font-size: 0.72rem; font-weight: 700; color: #6b7280; white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
+            .cs-reserved-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+            .cs-reserved-chip { font-size: 0.7rem; font-weight: 600; padding: 1px 7px; border-radius: 8px; white-space: nowrap; }
+            .cs-reserved-chip-held { background: #fef3c7; color: #92400e; }
+            .cs-reserved-chip-booked { background: #fee2e2; color: #b91c1c; }
         `;
         document.head.appendChild(style);
     }
@@ -741,7 +847,8 @@
         // Conferences
         loadConferences, loadAllConferences, createConference, updateConference, deleteConference,
         // Availability / slots
-        getAvailabilityDoc, getAllAvailabilityForConference, saveAvailability, getOpenSlots, generateSlots,
+        getAvailabilityDoc, getAllAvailabilityForConference, getBdrConferenceIdsWithAvailability,
+        saveAvailability, getOpenSlots, generateSlots,
         setSlotStatus, bookSlot, holdSlot, releaseSlot,
         // Meeting requests
         getMeetingRequest, getMeetingRequestsForConference, getAllMeetingRequests,
