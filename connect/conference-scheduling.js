@@ -336,6 +336,56 @@
         await updateDoc(doc(dbi(), 'conference_availability', avail.id), { slots, updatedAt: new Date() });
     }
 
+    // ── Cross-widget live refresh ────────────────────────────────────────
+    // company_review_replies.html / index_admin.html mount one widget per
+    // contact card, and many cards share the same BDR. Each widget instance
+    // only re-fetches its own availability on its own actions, so holding a
+    // time on one contact's card used to leave every OTHER already-mounted
+    // card for that same BDR silently showing stale "open"/"already taken"
+    // data until the whole list happened to re-render. This is a tiny pub/sub
+    // keyed by the same conferenceId+bdrEmail doc id: mountWidget() subscribes
+    // whenever it settles on a conference, and any widget that changes a
+    // slot's status notifies the others so they refresh in place.
+    const _widgetSubscriptions = new Map(); // availabilityDocId -> Set<{ containerEl, refresh }>
+
+    function _subscribeWidgetRefresh(conferenceId, bdrEmail, containerEl, refresh) {
+        if (!bdrEmail) return null;
+        const key = availabilityDocId(conferenceId, bdrEmail);
+        if (!_widgetSubscriptions.has(key)) _widgetSubscriptions.set(key, new Set());
+        const set = _widgetSubscriptions.get(key);
+        // Pages like company_review_replies.html fully re-render (and thus
+        // re-mount) every visible card's widget on every refresh/poll, with no
+        // explicit "unmount" — prune this key's dead entries on each new
+        // subscribe so the Set can't grow unbounded across a long session.
+        set.forEach(entry => { if (!entry.containerEl.isConnected) set.delete(entry); });
+        const entry = { containerEl, refresh };
+        set.add(entry);
+        return { key, entry };
+    }
+
+    function _unsubscribeWidgetRefresh(sub) {
+        if (!sub) return;
+        const set = _widgetSubscriptions.get(sub.key);
+        if (set) {
+            set.delete(sub.entry);
+            if (set.size === 0) _widgetSubscriptions.delete(sub.key);
+        }
+    }
+
+    function _notifyAvailabilityChanged(conferenceId, bdrEmail, skipContainerEl) {
+        if (!bdrEmail) return;
+        const key = availabilityDocId(conferenceId, bdrEmail);
+        const set = _widgetSubscriptions.get(key);
+        if (!set) return;
+        // Snapshot before iterating — a refresh can synchronously trigger a
+        // re-subscribe (delete + add) on the same Set.
+        Array.from(set).forEach(entry => {
+            if (entry.containerEl === skipContainerEl) return;
+            if (!entry.containerEl.isConnected) { set.delete(entry); return; } // stale card from a prior render — prune it
+            try { entry.refresh(); } catch (e) { /* best-effort */ }
+        });
+    }
+
     // ── Meeting Requests ────────────────────────────────────────────────
     async function getMeetingRequest(conferenceId, ctx) {
         const { doc, getDoc } = fx();
@@ -666,6 +716,7 @@
                             state.request = await setMeetingRequestHoldState(req.id, false);
                             setStatus();
                             await refreshForConference();
+                            _notifyAvailabilityChanged(state.conferenceId, ctx.bdrEmail, containerEl);
                         } catch (e) {
                             alert('Could not confirm: ' + e.message);
                         }
@@ -679,6 +730,8 @@
                 statusEl.className = 'cs-status cs-status-pending';
             }
         }
+
+        let currentSub = null; // this widget's active cross-widget refresh subscription (see below)
 
         async function refreshForConference() {
             state.conferenceId = confSelect.value;
@@ -727,6 +780,16 @@
             saveBtn.disabled = false;
 
             setStatus();
+
+            // Keep this widget subscribed to live updates for whichever
+            // conference it's currently showing, so if a DIFFERENT contact's
+            // card holds/books/releases a slot for this same BDR+conference,
+            // this card refreshes in place instead of showing stale data
+            // until the whole list happens to re-render.
+            if (currentSub === null || currentSub.key !== availabilityDocId(state.conferenceId, ctx.bdrEmail)) {
+                _unsubscribeWidgetRefresh(currentSub);
+                currentSub = _subscribeWidgetRefresh(state.conferenceId, ctx.bdrEmail, containerEl, () => refreshForConference().catch(() => {}));
+            }
         }
 
         confSelect.addEventListener('change', () => refreshForConference().catch(e => {
@@ -774,6 +837,11 @@
                 state.request = saved;
                 setStatus();
                 await refreshForConference();
+                // Let any other already-mounted card for this same BDR+conference
+                // (e.g. a different contact scrolled into view earlier) know a
+                // slot just changed status, so it doesn't keep showing it as open
+                // or omit it from "Already taken" until the list next re-renders.
+                _notifyAvailabilityChanged(state.conferenceId, ctx.bdrEmail, containerEl);
             } catch (e) {
                 alert('Could not save meeting request: ' + e.message);
             } finally {
@@ -792,6 +860,7 @@
                 slotSelect.value = '';
                 slotSelect.disabled = false;
                 await refreshForConference();
+                _notifyAvailabilityChanged(state.conferenceId, ctx.bdrEmail, containerEl);
             } catch (e) {
                 alert('Could not remove meeting request: ' + e.message);
             } finally {
