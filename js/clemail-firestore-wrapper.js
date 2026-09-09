@@ -520,7 +520,16 @@ class Query {
     const hasLimit = this._constraints.some(c => c.type === 'limit');
     const hasStartAfter = this._constraints.some(c => c.type === 'startAfter');
     if (!hasLimit && !hasStartAfter && !options.singleRequest) {
-      const result = await getAllDocs(this, { timeoutMs: options.timeoutMs });
+      // Forward ALL pagination tuning knobs (pageSize, maxRetries, maxDocs,
+      // onPage) to getAllDocs, not just timeoutMs. Previously only timeoutMs
+      // made it through, so callers loading a known-heavy collection (each doc
+      // embedding a company's full email/LinkedIn history, e.g.
+      // company_comms_scans) had no way to request smaller pages — they always
+      // got getAllDocs' 5000-doc default page, which for a collection with
+      // large-but-few documents (~700 docs, sometimes 60s+ to read/serialize
+      // as ONE request) times out even though pagination code already existed.
+      const { singleRequest, _skipOutdatedFilter, ...pageOptions } = options;
+      const result = await getAllDocs(this, pageOptions);
       return new QuerySnapshot(result.docs);
     }
 

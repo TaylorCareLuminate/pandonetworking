@@ -82,6 +82,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Quick Outreach', href: 'quick_outreach.html', icon: 'fa-bolt-lightning' },
                 { label: 'Fast Batch Review', href: 'fast_connect_review.html', icon: 'fa-bolt' },
                 { label: 'Elion Batch Review', href: 'elion_batch_review.html', icon: 'fa-file-import' },
+                { label: 'Repurpose Messages for New BDR', href: 'repurpose_messages.html', icon: 'fa-people-arrows' },
                 { label: 'Reserve Queue', href: 'reserve_queue.html', icon: 'fa-boxes-stacked' },
                 { label: 'Mass Messages to Group', href: 'fast_prospect_message.html', icon: 'fa-users-between-lines' },
                 { label: 'Mass Messages to Connections', href: 'mass_messages_to_connections.html', icon: 'fa-paper-plane' },
