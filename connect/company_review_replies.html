@@ -2957,7 +2957,7 @@
     <script src="../js/clemail-firestore-wrapper.js"></script>
     <!-- Conference Scheduling (shared data layer + embeddable widget) -->
     <!-- Versioned to avoid stale-cache issues after conference-scheduling.js changes -->
-    <script src="conference-scheduling.js?v=1.3"></script>
+    <script src="conference-scheduling.js?v=1.4"></script>
     <!-- Load PandoConnect common header -->
     <script src="healthconnect-header.js?v=3.3"></script>
     <!-- jsPDF for PDF generation -->
@@ -3921,23 +3921,55 @@
             return new Date(Date.now() - days * 24 * 60 * 60 * 1000);
         }
 
+        // DB cutoff used by inbox/activity loaders. Finite windows (24h / 48h / 7d / 14d)
+        // must scope the query itself — a hard 5000-doc cap on 90 days of platform-wide
+        // heyreach_activity only covers ~2 days once every company is writing events.
+        function resolveDbLoadCutoff() {
+            if (_dbLoadCutoffDate) return _dbLoadCutoffDate;
+            if (typeof timeWindowDays === 'number' && timeWindowDays > 0 && timeWindowDays < 9999) {
+                return computeCutoffDate(timeWindowDays);
+            }
+            return null;
+        }
+
+        const EMPTY_QUERY_SNAPSHOT = { size: 0, empty: true, docs: [], forEach() {} };
+
+        // Run query thunks in small waves so All-BDR views (50+ emails × 4 fields)
+        // don't fire 200+ Railway requests at once and time the backend out.
+        async function runQueryFnsInBatches(queryFns, batchSize = 12) {
+            const results = [];
+            for (let i = 0; i < queryFns.length; i += batchSize) {
+                const chunk = queryFns.slice(i, i + batchSize);
+                const settled = await Promise.allSettled(chunk.map(fn => fn()));
+                settled.forEach((result, idx) => {
+                    if (result.status === 'fulfilled') {
+                        results.push(result.value);
+                    } else {
+                        console.error(`❌ Batched query ${i + idx + 1}/${queryFns.length} failed:`, result.reason?.message || result.reason);
+                        results.push(EMPTY_QUERY_SNAPSHOT);
+                    }
+                });
+            }
+            return results;
+        }
+
         // Attempts a Firestore query with an optional lastMessageAt timestamp filter.
         // Falls back to the unfiltered query if the filtered one fails (e.g. missing composite index).
-        async function tryFilteredCollectionQuery(collRef, fieldName, email, cutoffTimestamp) {
+        async function tryFilteredCollectionQuery(collRef, fieldName, email, cutoffTimestamp, timeoutMs) {
+            const opts = timeoutMs ? { timeoutMs } : {};
             if (cutoffTimestamp) {
                 try {
                     const q = query(collRef, where(fieldName, '==', email), where('lastMessageAt', '>=', cutoffTimestamp), limit(5000));
-                    return await getDocs(q);
+                    return await getDocs(q, opts);
                 } catch (err) {
                     console.warn(`⚠️ Filtered query failed (missing index?), falling back to unfiltered for ${fieldName}=${email}:`, err.message);
                 }
             }
-            return getDocs(query(collRef, where(fieldName, '==', email), limit(5000)));
+            return getDocs(query(collRef, where(fieldName, '==', email), limit(5000)), opts);
         }
 
         window.setTimeFilter = function(days) {
-            const wasShortFilter = (_prevTimeWindowDays === 1 || _prevTimeWindowDays === 2);
-            const isShortFilter  = (days === 1 || days === 2);
+            const previousCutoff = _dbLoadCutoffDate;
 
             _prevTimeWindowDays = timeWindowDays;
             timeWindowDays = days;
@@ -3957,30 +3989,34 @@
 
             console.log(`⏰ Time filter set to ${days === 1 ? '24h' : days === 2 ? '48h' : days + ' days'}`);
 
-            if (isShortFilter) {
-                // Set DB-level cutoff and reload so Firestore only returns recent documents
-                _dbLoadCutoffDate = computeCutoffDate(days);
+            // Finite windows scope the DB read. All-time clears the cutoff.
+            _dbLoadCutoffDate = days < 9999 ? computeCutoffDate(days) : null;
+
+            const widening = !!(previousCutoff && (
+                !_dbLoadCutoffDate || _dbLoadCutoffDate.getTime() < previousCutoff.getTime()
+            ));
+            // Reload when applying a finite window for the first time IF we already have
+            // data on screen (or a company / All-BDR scope). Don't kick off a load just
+            // because an admin clicked "7 days" before picking a company.
+            const firstScopedLoad = days < 9999 && !previousCutoff && (
+                allConversations.length > 0 || (selectedCompanyBDREmails && selectedCompanyBDREmails.length > 0)
+            );
+            const needsReload = days === 1 || days === 2 || widening || firstScopedLoad;
+
+            if (needsReload) {
+                const scopedLabel = days === 1 ? '24-hour' : days === 2 ? '48-hour' : days === 9999 ? 'full' : `${days}-day`;
                 document.getElementById('timeFilterInfo').innerHTML =
-                    `<i class="fas fa-sync fa-spin"></i> Reloading with server-side ${days === 1 ? '24-hour' : '48-hour'} filter…`;
+                    `<i class="fas fa-sync fa-spin"></i> Reloading with ${scopedLabel} conversation window…`;
                 loadConversations().then(() => {
-                    document.getElementById('timeFilterInfo').innerHTML = `<i class="fas fa-database" style="color:#059669"></i> ${infoText} <span style="font-size:0.8em;color:#059669;font-weight:600;">(server-side filtered)</span>`;
+                    const serverFiltered = days < 9999;
+                    document.getElementById('timeFilterInfo').innerHTML = serverFiltered
+                        ? `<i class="fas fa-database" style="color:#059669"></i> ${infoText} <span style="font-size:0.8em;color:#059669;font-weight:600;">(server-side filtered)</span>`
+                        : `<i class="fas fa-info-circle"></i> ${infoText}`;
                 });
             } else {
-                if (wasShortFilter) {
-                    // Coming back from a short filter — need a full reload to restore all conversations
-                    _dbLoadCutoffDate = null;
-                    document.getElementById('timeFilterInfo').innerHTML =
-                        `<i class="fas fa-sync fa-spin"></i> Reloading full conversation history…`;
-                    loadConversations().then(() => {
-                        document.getElementById('timeFilterInfo').innerHTML = `<i class="fas fa-info-circle"></i> ${infoText}`;
-                    });
-                } else {
-                    // Just in-memory filter change — no DB round-trip needed
-                    _dbLoadCutoffDate = null;
-                    document.getElementById('timeFilterInfo').innerHTML = `<i class="fas fa-info-circle"></i> ${infoText}`;
-                    updateCategoryGrid();
-                    applyAllFilters();
-                }
+                document.getElementById('timeFilterInfo').innerHTML = `<i class="fas fa-info-circle"></i> ${infoText}`;
+                updateCategoryGrid();
+                applyAllFilters();
             }
         };
 
@@ -6206,13 +6242,14 @@
                 const emailsForConnectQueue = selectedCompanyBDREmails && selectedCompanyBDREmails.length > 0
                     ? selectedCompanyBDREmails
                     : [accountEmail];
-                await loadConnectQueueContacts(emailsForConnectQueue);
-                
-                // Load from ALL THREE sources in parallel
+                // Load inbox / CSV / webhooks / connect_queue together. connect_queue used
+                // to run first and could burn the 60s timeout on All-BDR batches, starving
+                // the conversation queries that actually populate the page.
                 const [heyreachConversations, linkedinMessages, webhookReplies] = await Promise.all([
                     loadHeyreachInbox(accountEmail),
                     loadLinkedInMessages(accountEmail),
-                    loadHeyreachActivity(accountEmail, viewingBdrEmail)
+                    loadHeyreachActivity(accountEmail, viewingBdrEmail),
+                    loadConnectQueueContacts(emailsForConnectQueue)
                 ]);
                 
                 console.log(`📊 Found ${heyreachConversations.length} HeyReach conversations`);
@@ -6222,7 +6259,8 @@
                 // Combine all three sources
                 allConversations = [...heyreachConversations, ...linkedinMessages, ...webhookReplies];
                 
-                // Smart deduplication: Group by LinkedIn URL + BDR, keep the one with most messages.
+                // Smart deduplication: Group by LinkedIn URL + BDR, merge replyable
+                // metadata with the richest message thread.
                 // Including the BDR email in the key ensures that two BDRs who both connected with
                 // the same person each appear as a separate entry.
                 //
@@ -6260,11 +6298,33 @@
                     return emailToCanonicalBdrId.get(normalized) || normalized;
                 };
 
-                // Score a conversation record: records that can reply (have linkedInAccountId)
-                // are always preferred; secondarily prefer more messages.
-                const convScore = (conv) => {
-                    const replyable = !!(conv.linkedInAccountId || conv.rawData?.linkedInAccount?.id) ? 1000000 : 0;
-                    return replyable + (conv.messages?.length || 0);
+                // Merge duplicates instead of picking a winner. Webhook snapshots are
+                // replyable (have linkedInAccountId) but often miss later BDR replies
+                // that only exist on the heyreach_inbox thread.
+                const convMessages = (conv) => conv.messages || conv.rawData?.messages || [];
+                const laterTimestamp = (a, b) => {
+                    const aT = safeToDate(a)?.getTime() || 0;
+                    const bT = safeToDate(b)?.getTime() || 0;
+                    return aT >= bT ? a : b;
+                };
+                const mergeDuplicateConversations = (existing, incoming) => {
+                    const existingMsgs = convMessages(existing);
+                    const incomingMsgs = convMessages(incoming);
+                    const incomingRicher = incomingMsgs.length > existingMsgs.length
+                        || (incomingMsgs.length === existingMsgs.length
+                            && (safeToDate(incoming.lastMessageAt)?.getTime() || 0) > (safeToDate(existing.lastMessageAt)?.getTime() || 0));
+                    const richer = incomingRicher ? incoming : existing;
+                    const other = incomingRicher ? existing : incoming;
+                    const mergedMsgs = incomingRicher ? incomingMsgs : existingMsgs;
+                    const merged = { ...other, ...richer };
+                    merged.linkedInAccountId = existing.linkedInAccountId || incoming.linkedInAccountId
+                        || existing.rawData?.linkedInAccount?.id || incoming.rawData?.linkedInAccount?.id
+                        || merged.linkedInAccountId || null;
+                    merged.customerId = existing.customerId || incoming.customerId || merged.customerId || '';
+                    merged.lastMessageAt = laterTimestamp(existing.lastMessageAt, incoming.lastMessageAt);
+                    merged.messages = mergedMsgs;
+                    merged.rawData = { ...(other.rawData || {}), ...(richer.rawData || {}), messages: mergedMsgs };
+                    return merged;
                 };
 
                 const conversationsByUrl = new Map();
@@ -6290,15 +6350,7 @@
                     if (!existing) {
                         conversationsByUrl.set(key, conv);
                     } else {
-                        // Prefer the record that can reply (has linkedInAccountId), then most messages.
-                        const existingScore = convScore(existing);
-                        const newScore = convScore(conv);
-                        if (newScore > existingScore) {
-                            console.log(`   🔄 Replacing duplicate (${key.substring(0, 40)}): score ${existingScore} → ${newScore}`);
-                            conversationsByUrl.set(key, conv);
-                        } else {
-                            console.log(`   ℹ️ Skipping duplicate (${key.substring(0, 40)}): keeping score ${existingScore} over ${newScore}`);
-                        }
+                        conversationsByUrl.set(key, mergeDuplicateConversations(existing, conv));
                     }
                 });
                 
@@ -6711,20 +6763,28 @@
             console.log(`📧 Will query for ${emailsToQuery.length} email(s)`);
             
             // For each email, query all FOUR fields (like connect_review.html)
-            // When a short-window DB cutoff is active, attempt a server-side timestamp filter to reduce reads
-            const cutoffTs = _dbLoadCutoffDate ? Timestamp.fromDate(_dbLoadCutoffDate) : null;
-            if (cutoffTs) console.log(`🕐 Filtering heyreach_inbox with server-side cutoff: ${_dbLoadCutoffDate.toLocaleString()}`);
+            // Scope inbox reads to the active time window (7 days, 24h, …). Without
+            // this, All-BDR loads fire unscoped queries for every email × 4 fields
+            // and the 60s timeout wipes the entire inbox result set.
+            const inboxCutoffDate = resolveDbLoadCutoff();
+            const cutoffTs = inboxCutoffDate ? Timestamp.fromDate(inboxCutoffDate) : null;
+            if (cutoffTs) console.log(`🕐 Filtering heyreach_inbox with server-side cutoff: ${inboxCutoffDate.toLocaleString()}`);
 
             const inboxColl = collection(emailDB, 'heyreach_inbox');
-            const queries = [];
+            const inboxTimeoutMs = emailsToQuery.length > 8 ? 90000 : 60000;
+            const queryFns = [];
             emailsToQuery.forEach(email => {
-                queries.push(tryFilteredCollectionQuery(inboxColl, 'accountEmail',         email, cutoffTs));
-                queries.push(tryFilteredCollectionQuery(inboxColl, 'bdrEmail',             email, cutoffTs));
-                queries.push(tryFilteredCollectionQuery(inboxColl, 'linkedInAccountEmail', email, cutoffTs));
-                queries.push(tryFilteredCollectionQuery(inboxColl, 'uploadedByEmail',      email, cutoffTs));
+                queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'accountEmail',         email, cutoffTs, inboxTimeoutMs));
+                queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'bdrEmail',             email, cutoffTs, inboxTimeoutMs));
+                queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'linkedInAccountEmail', email, cutoffTs, inboxTimeoutMs));
+                queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'uploadedByEmail',      email, cutoffTs, inboxTimeoutMs));
             });
             
-            const results = await Promise.all(queries);
+            const results = await runQueryFnsInBatches(queryFns, emailsToQuery.length > 8 ? 12 : 16);
+            const inboxFailed = results.filter(s => s === EMPTY_QUERY_SNAPSHOT).length;
+            if (inboxFailed > 0) {
+                console.warn(`⚠️ ${inboxFailed}/${results.length} heyreach_inbox queries failed or timed out — some threads may be incomplete`);
+            }
             
             // Combine results and deduplicate by document ID
             const seenIds = new Set();
@@ -6840,8 +6900,9 @@
                 const possibleFields = ['accountEmail', 'bdrEmail', 'account_email', 'email', 'user_email'];
                 let allConversations = [];
                 
-                const liCutoffTs = _dbLoadCutoffDate ? Timestamp.fromDate(_dbLoadCutoffDate) : null;
-                if (liCutoffTs) console.log(`🕐 Filtering linkedinMessages with server-side cutoff: ${_dbLoadCutoffDate.toLocaleString()}`);
+                const liCutoffDate = resolveDbLoadCutoff();
+                const liCutoffTs = liCutoffDate ? Timestamp.fromDate(liCutoffDate) : null;
+                if (liCutoffTs) console.log(`🕐 Filtering linkedinMessages with server-side cutoff: ${liCutoffDate.toLocaleString()}`);
 
                 for (const fieldName of possibleFields) {
                     try {
@@ -7172,7 +7233,7 @@
                         collection(emailDB, 'connect_queue'),
                         where('account_email', 'in', batch),
                         limit(10000)
-                    )))
+                    ), { timeoutMs: 120000 }))
                 );
 
                 batchResults.forEach((result, idx) => {
@@ -7345,19 +7406,37 @@
             try {
                 console.log('🔍 Loading HeyReach activity (webhooks) for:', accountEmail);
                 
-                // Use the active DB cutoff if a short-window filter is set; otherwise default to 90 days
-                const activityCutoff = _dbLoadCutoffDate || computeCutoffDate(90);
+                // Finite UI windows (7d / 14d / 24h) must scope this query. The old
+                // 90-day + limit(5000) path is platform-wide (not BDR-scoped), so other
+                // companies' recent events filled the cap and we only ever saw ~2 days.
+                // Omit limit() so clemail-firestore-wrapper paginates via getAllDocs().
+                const REPLY_EVENT_TYPES = ['MESSAGE_REPLY_RECEIVED', 'INMAIL_REPLY_RECEIVED', 'EVERY_MESSAGE_REPLY_RECEIVED'];
+                const activityCutoff = resolveDbLoadCutoff() || computeCutoffDate(90);
+                const cutoffTs = Timestamp.fromDate(activityCutoff);
                 console.log(`🕐 Loading heyreach_activity since: ${activityCutoff.toLocaleString()}`);
 
-                const webhookQuery = query(
-                    collection(emailDB, 'heyreach_activity'),
-                    where('timestamp', '>=', Timestamp.fromDate(activityCutoff)),
-                    orderBy('timestamp', 'desc'),
-                    limit(5000)
-                );
-                
-                const snapshot = await getDocs(webhookQuery);
+                let snapshot;
+                try {
+                    snapshot = await getDocs(query(
+                        collection(emailDB, 'heyreach_activity'),
+                        where('eventType', 'in', REPLY_EVENT_TYPES),
+                        where('timestamp', '>=', cutoffTs),
+                        orderBy('timestamp', 'desc')
+                    ), { timeoutMs: 90000 });
+                } catch (filteredErr) {
+                    console.warn('⚠️ Reply-event activity query failed (missing index?), falling back to timestamp-only pagination:', filteredErr.message);
+                    snapshot = await getDocs(query(
+                        collection(emailDB, 'heyreach_activity'),
+                        where('timestamp', '>=', cutoffTs),
+                        orderBy('timestamp', 'desc')
+                    ), { timeoutMs: 90000 });
+                }
                 console.log(`📊 Found ${snapshot.size} webhook activities`);
+                if (snapshot.size > 0) {
+                    const oldest = safeToDate(snapshot.docs[snapshot.docs.length - 1]?.data()?.timestamp);
+                    const newest = safeToDate(snapshot.docs[0]?.data()?.timestamp);
+                    console.log(`   📅 Activity date range: ${oldest?.toLocaleString() || '?'} → ${newest?.toLocaleString() || '?'}`);
+                }
                 
                 const conversations = [];
                 const processedConversationIds = new Set();
@@ -7463,8 +7542,11 @@
                         }));
                     }
                     
-                    // If no messages found in webhook, try to find full conversation for this lead
-                    if (messages.length === 0 && (leadProfileUrl || leadName !== 'Unknown')) {
+                    // If no messages found in webhook, try to find full conversation for this lead.
+                    // Skip per-lead lookups on All-BDR / large-company loads — they stampede
+                    // Railway, and loadHeyreachInbox already fetches the full threads.
+                    const skipPerLeadLookup = (selectedCompanyBDREmails?.length || 0) > 3;
+                    if (!skipPerLeadLookup && messages.length === 0 && (leadProfileUrl || leadName !== 'Unknown')) {
                         console.log(`   🔍 Looking up full conversation for: ${leadName}`);
                         const fullConversationMessages = await findConversationForLead(leadProfileUrl, data.leadFirstName, data.leadLastName);
                         if (fullConversationMessages.length > 0) {

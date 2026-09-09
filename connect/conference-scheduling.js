@@ -26,7 +26,12 @@
  *       email, phone, emailSource, phoneSource, notes,
  *       status:'active'|'cancelled', source, createdAt, updatedAt }
  *
- * @version 1.0.0
+ * @version 1.4.0 — cross-widget slot-status sync: holding/booking/releasing a
+ *   slot from any mounted widget now notifies every other widget showing the
+ *   same BDR+conference (via setSlotStatus/releaseSlot centrally, not each
+ *   caller) so a held/booked time disappears from their pickers immediately;
+ *   each widget also self-polls every 20s as a fallback for cross-tab/page
+ *   changes the in-page pub/sub can't reach.
  */
 (function () {
     'use strict';
@@ -314,6 +319,12 @@
         if (!target) throw new Error('Selected time slot no longer exists — please refresh and try again.');
         const { doc, updateDoc } = fx();
         await updateDoc(doc(dbi(), 'conference_availability', avail.id), { slots, updatedAt: new Date() });
+        // Centralized here (rather than at each UI call site) so EVERY caller —
+        // the widget's Save/Confirm buttons, the admin scheduling page, future
+        // call sites — reliably pushes a live refresh to any other already-
+        // mounted widget card showing this same BDR+conference, instead of
+        // relying on each caller to remember to notify.
+        _notifyAvailabilityChanged(conferenceId, bdrEmail);
         return target;
     }
 
@@ -334,6 +345,7 @@
             : s);
         const { doc, updateDoc } = fx();
         await updateDoc(doc(dbi(), 'conference_availability', avail.id), { slots, updatedAt: new Date() });
+        _notifyAvailabilityChanged(conferenceId, bdrEmail);
     }
 
     // ── Cross-widget live refresh ────────────────────────────────────────
@@ -716,7 +728,6 @@
                             state.request = await setMeetingRequestHoldState(req.id, false);
                             setStatus();
                             await refreshForConference();
-                            _notifyAvailabilityChanged(state.conferenceId, ctx.bdrEmail, containerEl);
                         } catch (e) {
                             alert('Could not confirm: ' + e.message);
                         }
@@ -836,12 +847,10 @@
                 });
                 state.request = saved;
                 setStatus();
+                // saveMeetingRequest() already notifies any other mounted card
+                // for this same BDR+conference (see setSlotStatus/releaseSlot),
+                // so it won't keep showing this slot as open once we refresh.
                 await refreshForConference();
-                // Let any other already-mounted card for this same BDR+conference
-                // (e.g. a different contact scrolled into view earlier) know a
-                // slot just changed status, so it doesn't keep showing it as open
-                // or omit it from "Already taken" until the list next re-renders.
-                _notifyAvailabilityChanged(state.conferenceId, ctx.bdrEmail, containerEl);
             } catch (e) {
                 alert('Could not save meeting request: ' + e.message);
             } finally {
@@ -860,7 +869,6 @@
                 slotSelect.value = '';
                 slotSelect.disabled = false;
                 await refreshForConference();
-                _notifyAvailabilityChanged(state.conferenceId, ctx.bdrEmail, containerEl);
             } catch (e) {
                 alert('Could not remove meeting request: ' + e.message);
             } finally {
@@ -869,6 +877,20 @@
         });
 
         await refreshForConference();
+
+        // Belt-and-suspenders: the pub/sub notify above covers same-page,
+        // same-BDR cards changing each other's slots instantly, but it can't
+        // reach a widget on a *different* tab/page (e.g. the admin scheduling
+        // page holding a slot while this review page is open elsewhere), and
+        // it depends on the notifying widget's bdrEmail resolving to the exact
+        // same value as this one's. Poll this widget's own availability
+        // periodically as a fallback so a slot someone else holds/books never
+        // stays stuck showing as open here for more than ~20s. Stops itself
+        // once this card's DOM is gone (re-rendered away or removed).
+        const pollTimer = setInterval(() => {
+            if (!containerEl.isConnected) { clearInterval(pollTimer); return; }
+            refreshForConference().catch(() => {});
+        }, 20000);
     }
 
     // Inject shared minimal CSS once per page (kept intentionally small/scoped —
