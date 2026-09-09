@@ -508,6 +508,7 @@ function classifyStep(rawStep, likedPostUrls, isConnUrls, profileUrl) {
 
 // ── State ──────────────────────────────────────────────────────────────────
 let _leads      = [];
+let _diagnostics = null;   // backend pipeline diagnostics from the last load (incl. hiddenShortfall)
 let _scope      = 'all';   // Default: show all currently active leads, not just today
 let _bdrCache   = null;
 let _noreplAccount = null; // internalEmailAccounts noreply SMTP config
@@ -801,7 +802,14 @@ window.runLoad = async function() {
             : rawLeads.filter(l => !l.addedAt || (l.addedAt >= since && l.addedAt < until));
 
         console.log('[InProcess] Loaded from /api/bdr/in-process-leads — diagnostics:', apiJson.diagnostics);
-        log(`  Backend pipeline: ${apiJson.diagnostics.totalRaw} raw leads → ${apiJson.diagnostics.totalVisible} visible (excluded ${apiJson.diagnostics.garbledCount} unresolvable, ${apiJson.diagnostics.erroredCount} errored/terminal, ${apiJson.diagnostics.staleCount} >3wk stale)`, 'ok');
+        _diagnostics = apiJson.diagnostics;
+        const dg = apiJson.diagnostics;
+        log(`  Backend pipeline: ${dg.totalRaw} raw leads → ${dg.totalVisible} visible (excluded ${dg.garbledCount} unresolvable, ${dg.erroredCount} sent/finished/failed, ${(dg.cappedCount || 0) + (dg.staleCount || 0)} no longer in HeyReach's queue)`, 'ok');
+        if (dg.statsAvailable) {
+            log(`  HeyReach campaign stats: ${dg.statsPendingTotal} lead(s) in the not-yet-started pool`, 'info');
+        } else {
+            log(`  ⚠️ HeyReach campaign stats unavailable — fell back to the age-based staleness heuristic`, 'warn');
+        }
         if (apiJson.diagnostics.timedOut) {
             log(`  ⚠️ Backend hit its ${Math.round(apiJson.diagnostics.elapsedMs/1000)}s time budget refreshing live HeyReach status for this many campaigns/leads — some statuses below may be a bit stale. Data from connect_queue/heyreach_leads is always complete either way.`, 'warn');
         }
@@ -824,10 +832,14 @@ window.runLoad = async function() {
 
         {
             const { rows: visibleRows, garbled, errored, stale } = getVisibleLeads();
+            const shortfall = (_diagnostics && _diagnostics.hiddenShortfall) || 0;
             const excludedNote = (garbled.length || errored.length || stale.length)
-                ? ` (${_leads.length} raw minus ${garbled.length} unresolvable, ${errored.length} errored/terminal, ${stale.length} >3wk stale)`
+                ? ` (${_leads.length} raw minus ${garbled.length} unresolvable, ${errored.length} sent/finished/failed, ${stale.length} no longer in HeyReach's queue)`
                 : '';
-            log(`✅ Done. ${visibleRows.length} in-process contacts found${excludedNote}.`, 'ok');
+            log(`✅ Done. ${visibleRows.length + shortfall} in-process contacts${excludedNote}.`, 'ok');
+            if (shortfall > 0) {
+                log(`  ℹ️ ${shortfall} of these are in HeyReach's not-yet-started pool without a matching queue row — counted in the total but not listable by name below.`, 'info');
+            }
         }
 
         // Automatically hydrate live message content from HeyReach's leads list,
@@ -870,37 +882,23 @@ function isErrored(l) {
 }
 
 // ── Always-on filters (shared by the summary strip AND the table) ──────────
-// _leads (built from leadMap) includes every URL we found ANY evidence for —
-// including ones HeyReach's own API already told us are errored/terminal, ones
-// with unresolvable/garbled LinkedIn slugs, and ones stuck pending for >3 weeks.
-// applyFilter() below always strips these before rendering the table, but
-// renderSummary() used to count against the raw, unfiltered _leads — so the
-// "In Process" number in the summary strip (e.g. "515") disagreed with the
-// table's own count (e.g. "498") right below it, and with the BDR dashboard's
-// live-verified "Still in HeyReach Queue" number. Centralizing the filter here
-// so both the strip and the table agree on the exact same set of leads.
-const STALE_QUEUE_MS = 45 * 24 * 60 * 60 * 1000;
-// "Stale" only applies to a lead that ALSO shows zero recorded HeyReach
-// activity ever (no profile visit/like/connect/message in heyreach_activity)
-// — age alone used to hide entire backlogs for BDRs whose queue is deeper
-// than the cutoff's worth of throughput, even though those leads are still
-// genuinely queued, not abandoned. Mirrors services/in_process_leads_service.js
-// (backend twin) — keep in sync.
-function isStaleLead(l) {
-    return !!l.addedAt && l.addedAt.getTime() < (Date.now() - STALE_QUEUE_MS) && !(l._eventTypes && l._eventTypes.length > 0);
-}
+// The backend pipeline (computeInProcessLeads in RailwayCLemail/services/
+// in_process_leads_service.js) now annotates every lead with `_excluded`
+// ('garbled' | 'errored' | 'stale' | 'capped' | null) — HeyReach's own
+// campaign stats and per-lead statuses decide visibility server-side, and
+// this page simply partitions on that flag instead of re-deriving the rules
+// (which is exactly the kind of duplicated logic that made this page and the
+// BDR dashboard drift apart in the past).
+//   'errored' — HeyReach says terminal/failed/paused OR already sent
+//   'capped'  — connect_queue row HeyReach no longer knows about (beyond the
+//               campaign's real "not started" pool size)
+//   'stale'   — legacy age-based fallback, only used when HeyReach campaign
+//               stats couldn't be fetched
 function getVisibleLeads() {
-    let rows = [..._leads];
-
-    const garbled = rows.filter(l => isGarbledSlug(l.url));
-    rows = rows.filter(l => !isGarbledSlug(l.url));
-
-    const errored = rows.filter(isErrored);
-    rows = rows.filter(l => !isErrored(l));
-
-    const stale = rows.filter(isStaleLead);
-    rows = rows.filter(l => !isStaleLead(l));
-
+    const rows    = _leads.filter(l => !l._excluded);
+    const garbled = _leads.filter(l => l._excluded === 'garbled');
+    const errored = _leads.filter(l => l._excluded === 'errored');
+    const stale   = _leads.filter(l => l._excluded === 'stale' || l._excluded === 'capped');
     return { rows, garbled, errored, stale };
 }
 
@@ -909,8 +907,13 @@ function renderSummary() {
     const { rows } = getVisibleLeads();
     const counts = { start: 0, like: 0, isconn: 0, unknown: 0 };
     rows.forEach(l => { counts[l._step] = (counts[l._step]||0) + 1; });
-    document.getElementById('sTotal').textContent   = rows.length;
-    document.getElementById('sStart').textContent   = counts.start;
+    // hiddenShortfall = leads HeyReach reports in its not-yet-started pool that
+    // have no matching connect_queue row to list by name. They're real and will
+    // be sent, so the total (which the BDR dashboard mirrors exactly) includes
+    // them; they also belong under "At Start" since none of their steps have run.
+    const shortfall = (_diagnostics && _diagnostics.hiddenShortfall) || 0;
+    document.getElementById('sTotal').textContent   = rows.length + shortfall;
+    document.getElementById('sStart').textContent   = counts.start + shortfall;
     document.getElementById('sLike').textContent    = counts.like;
     document.getElementById('sIsconn').textContent  = counts.isconn;
     document.getElementById('sBlocked').textContent = counts.unknown;
@@ -1473,9 +1476,7 @@ window.exportCsv = function() {
 
     const esc = v => `"${String(v || '').replace(/"/g, '""')}"`;
     const rows = _leads
-        .filter(l => !isGarbledSlug(l.url))
-        .filter(l => !isErrored(l))
-        .filter(l => !isStaleLead(l))
+        .filter(l => !l._excluded)
         .map(l => {
             const name = [l.firstName, l.lastName].filter(Boolean).join(' ') || l.prospect_name || nameFrom('https://www.linkedin.com/' + l.url) || '';
             const liUrl = l.rawUrl.startsWith('http') ? l.rawUrl : `https://www.linkedin.com/${l.rawUrl}`;
