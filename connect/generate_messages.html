@@ -15209,7 +15209,28 @@
         //     at a time, right after it comes back.
         // Returns the review result ({ exclude, excludeReason, improvedMessage, rating,
         // ratingReason }) or null on failure — non-fatal, the caller just logs and moves on.
-        async function runFullAiOpusReviewSingle({ token, bdrEmail, hypothesisGroupId, docId, targetContactInstructions, messageReviewInstructions, bdrOpusInstructions, excludeMode, addLog }) {
+        // Converts processProfileData()'s output (headline/about/experienceParagraph/
+        // educationParagraph) into the { headline, about, experience: [...], education: [...] }
+        // shape the Opus Review endpoint understands (same shape Fast Connect Review's own
+        // Opus Review sends — see buildFullAiOpusPayloadItem on the backend). Without this,
+        // full-ai-opus-review-single only ever saw title/company text, so exclude rules that
+        // check the headline or experience section (e.g. "make sure their headline reflects
+        // their title") had nothing to actually check against.
+        function buildOpusProfilePayload(pd) {
+            if (!pd) return null;
+            const profile = {};
+            if (pd.headline) profile.headline = pd.headline;
+            if (pd.about)    profile.about    = String(pd.about);
+            if (pd.experienceParagraph) {
+                profile.experience = String(pd.experienceParagraph).split('\n').map(s => s.trim()).filter(Boolean);
+            }
+            if (pd.educationParagraph) {
+                profile.education = String(pd.educationParagraph).split('\n').map(s => s.trim()).filter(Boolean);
+            }
+            return Object.keys(profile).length ? profile : null;
+        }
+
+        async function runFullAiOpusReviewSingle({ token, bdrEmail, hypothesisGroupId, docId, targetContactInstructions, messageReviewInstructions, bdrOpusInstructions, excludeMode, profile, addLog }) {
             try {
                 const res = await fetchWithRetry('https://railwayclemail-production.up.railway.app/api/connect/full-ai-opus-review-single', {
                     method: 'POST',
@@ -15219,7 +15240,7 @@
                     // opusModel is explicit so this goes to real Claude Opus 5 instead of the
                     // backend's legacy 'claude-opus' slug (which resolves to Sonnet 5) or its
                     // no-model-passed fallback (Kimi K3).
-                    body: JSON.stringify({ bdrEmail, hypothesisGroupId, docId, targetContactInstructions, messageReviewInstructions, bdrOpusInstructions, excludeMode, opusModel: 'anthropic/claude-opus-5' })
+                    body: JSON.stringify({ bdrEmail, hypothesisGroupId, docId, targetContactInstructions, messageReviewInstructions, bdrOpusInstructions, excludeMode, opusModel: 'anthropic/claude-opus-5', profile })
                 }, { addLog, label: 'Opus Review' });
                 const data = await res.json().catch(() => ({}));
                 if (!res.ok || !data.success) {
@@ -17444,7 +17465,7 @@
                 // loop below. Reviews that one message with Opus and writes opusReview* fields
                 // straight onto its connect_queue doc — Fast Connect Review picks them up the
                 // next time it loads, no batching or extra step needed.
-                async function reviewMessageWithOpusIfEnabled(docId, variation) {
+                async function reviewMessageWithOpusIfEnabled(docId, variation, pd) {
                     if (!opusReviewEnabled || !docId) return;
                     addLog('   🔬 Running Opus Review on this message...', 'info');
                     const r = await runFullAiOpusReviewSingle({
@@ -17453,6 +17474,7 @@
                         messageReviewInstructions: fullAiReviewInstrFor(variation),
                         bdrOpusInstructions: opusBdrInstr,
                         excludeMode: opusExcludeMode,
+                        profile: buildOpusProfilePayload(pd),
                         addLog
                     });
                     if (r) {
@@ -18019,7 +18041,7 @@
                                         });
                                         fullAiCreatedDocIds.push(msgIdPM);
                                         addLog(`   ✅ [Profile Message] saved to queue${shouldRouteToReserve ? ' → Reserve Queue' : ''}`, 'success');
-                                        await reviewMessageWithOpusIfEnabled(msgIdPM, variationPM);
+                                        await reviewMessageWithOpusIfEnabled(msgIdPM, variationPM, pProfile);
                                         await reviewMessageWithFinalAiIfEnabled(msgIdPM, buildFullAiFinalReviewContext({
                                             msgText: pmResult.message,
                                             src: 'Profile Message',
@@ -18133,7 +18155,7 @@
                             });
                             savedCount++;
                             fullAiCreatedDocIds.push(msgId);
-                            await reviewMessageWithOpusIfEnabled(msgId, variation);
+                            await reviewMessageWithOpusIfEnabled(msgId, variation, pd);
                             await reviewMessageWithFinalAiIfEnabled(msgId, buildFullAiFinalReviewContext({
                                 msgText, src, sourceData, prospect, pd,
                                 bdrEmail, bdrContext,
