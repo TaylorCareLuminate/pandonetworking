@@ -2975,6 +2975,35 @@
             modalFailureDetails.style.display = 'block';
         }
 
+        // Polls GET /api/connect-queue/auto-push-job/:jobId until the background push
+        // finishes. Needed because large queues can take longer than Railway's ~120s proxy
+        // timeout — the POST /auto-push call above responds early with stillRunning:true in
+        // that case (instead of letting the proxy drop the connection, which the browser
+        // would otherwise report as a misleading "blocked by CORS policy" / "Failed to
+        // fetch" error) while the push keeps running server-side. This polls for the real
+        // outcome so the modal still ends up showing accurate pushed/failed counts.
+        async function pollAutoPushJob(jobId) {
+            const POLL_INTERVAL_MS = 4000;
+            const MAX_WAIT_MS = 10 * 60 * 1000; // 10 minutes
+            const deadline = Date.now() + MAX_WAIT_MS;
+
+            while (Date.now() < deadline) {
+                await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+                try {
+                    const pollResp = await fetch(`${RAILWAY_API_BASE}/api/connect-queue/auto-push-job/${jobId}`);
+                    const pollData = await pollResp.json();
+                    if (pollData.status === 'completed') {
+                        return { success: pollData.results?.success !== false, results: pollData.results, message: pollData.results?.error };
+                    }
+                    // else still running — keep polling
+                    modalSubtitle.textContent = 'Still pushing — this queue is larger than usual, hang tight...';
+                } catch (pollErr) {
+                    console.warn('[Push Now] Poll error, will retry:', pollErr.message);
+                }
+            }
+            throw new Error('Push is still running in the background after 10 minutes. Check Push History shortly for the final results.');
+        }
+
         async function handlePushNow() {
             // Phase 1: AI Review via Railway
             modalIcon.className = 'modal-icon loading';
@@ -3049,7 +3078,17 @@
                     }
                 });
                 
-                const data = await response.json();
+                let data = await response.json();
+
+                // Large queues can take longer than Railway's ~120s proxy timeout. The server
+                // responds early with stillRunning:true in that case instead of letting the
+                // proxy drop the connection (which shows up in the browser as a misleading
+                // CORS/"Failed to fetch" error). Poll for the real outcome instead of treating
+                // this as a failure.
+                if (data.success && data.stillRunning && data.jobId) {
+                    console.log(`[Push Now] Push still running server-side (jobId=${data.jobId}) — polling for completion...`);
+                    data = await pollAutoPushJob(data.jobId);
+                }
                 
                 if (data.success) {
                     const totalPushed = (data.results?.pushed?.connect || 0) + (data.results?.pushed?.message || 0);

@@ -8434,9 +8434,30 @@
             return top30;
         }
 
+        // Different BDRs — even at completely different client companies — often
+        // target overlapping people (e.g. the same healthcare exec shows up on
+        // multiple customers' prospect lists), so a hypothesis group's
+        // contactLinkedInUrls array can legitimately contain a URL that has
+        // nothing to do with THIS BDR's outreach. Every hypothesis_groups doc
+        // carries bdrEmail/bdrEmails identifying which BDR(s) it actually
+        // belongs to — a group must never be used unless the BDR on this alert
+        // is one of them, regardless of which lookup path found it.
+        function _liGroupBelongsToBdr(groupData, bdrEmailVariants) {
+            if (!groupData || !bdrEmailVariants || !bdrEmailVariants.length) return false;
+            const groupEmails = new Set();
+            if (groupData.bdrEmail) groupEmails.add(String(groupData.bdrEmail).toLowerCase().trim());
+            if (Array.isArray(groupData.bdrEmails)) {
+                groupData.bdrEmails.forEach(e => { if (e) groupEmails.add(String(e).toLowerCase().trim()); });
+            }
+            return bdrEmailVariants.some(e => groupEmails.has(e));
+        }
+
         // Everything we can find about this contact: prospect_contacts enrichment,
         // original connect_queue outreach, the hypothesis group, and CRM notes.
-        async function _liGetContactContext(alertObj) {
+        // `bdrEmailVariants` (lowercased canonical + alias emails for the alert's
+        // BDR) gates which hypothesis group — if any — is allowed to be used;
+        // see _liGroupBelongsToBdr.
+        async function _liGetContactContext(alertObj, bdrEmailVariants = []) {
             if (_liContactContextCache.has(alertObj.id)) return _liContactContextCache.get(alertObj.id);
             const ctx = { prospectDocs: [], queueDocs: [], hypothesisGroup: null, crmNotes: [] };
             try {
@@ -8480,27 +8501,36 @@
 
                 // Hypothesis group: prefer the stamp on connect_queue, then fall back
                 // to hypothesis_groups.contactLinkedInUrls array-contains lookups.
+                // Either path can surface a group that some OTHER BDR's contact
+                // happens to share this LinkedIn URL with — only accept a match
+                // once _liGroupBelongsToBdr confirms this BDR is actually on it.
                 let groupData = null;
-                const stampedId = ctx.queueDocs.map(q => q.hypothesisGroupId).find(Boolean);
-                if (stampedId) {
+                const stampedIds = [...new Set(ctx.queueDocs.map(q => q.hypothesisGroupId).filter(Boolean))];
+                for (const stampedId of stampedIds) {
                     try {
                         const snap = await getDoc(doc(db, 'hypothesis_groups', stampedId));
-                        if (snap && snap.exists) groupData = { id: stampedId, ...snap.data() };
+                        if (snap && snap.exists) {
+                            const candidate = { id: stampedId, ...snap.data() };
+                            if (_liGroupBelongsToBdr(candidate, bdrEmailVariants)) { groupData = candidate; break; }
+                            console.warn(`[LiAlerts][AI] Ignoring hypothesis group "${candidate.name || stampedId}" stamped on connect_queue for alert ${alertObj.id} — this BDR isn't listed on it`);
+                        }
                     } catch (_) { /* fall through to URL lookup */ }
                 }
-                if (!groupData && alertObj.leadProfileUrl) {
+                if (!groupData && alertObj.leadProfileUrl && bdrEmailVariants.length) {
                     const raw = alertObj.leadProfileUrl.trim();
                     const tryUrls = [...new Set([
                         _liNormalizeLinkedInUrl(raw), raw, raw.replace(/\/$/, '')
                     ])].filter(Boolean).slice(0, 3);
                     for (const u of tryUrls) {
                         try {
-                            const snap = await getDocs(query(collection(db, 'hypothesis_groups'), where('contactLinkedInUrls', 'array-contains', u), limit(1)));
-                            if (snap.size > 0) {
-                                const d = snap.docs[0];
-                                groupData = { id: d.id, ...d.data() };
-                                break;
-                            }
+                            // Over-fetch (not limit(1)) since multiple unrelated BDRs'
+                            // groups can share this URL — we need to scan past the
+                            // ones that don't belong to this BDR to find one that does.
+                            const snap = await getDocs(query(collection(db, 'hypothesis_groups'), where('contactLinkedInUrls', 'array-contains', u), limit(20)));
+                            const match = snap.docs
+                                .map(d => ({ id: d.id, ...d.data() }))
+                                .find(candidate => _liGroupBelongsToBdr(candidate, bdrEmailVariants));
+                            if (match) { groupData = match; break; }
                         } catch (_) { /* try next variant */ }
                     }
                 }
@@ -8716,11 +8746,12 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 const canonicalEmail = _liCanonicalEmailForCard(id, alertObj.bdrEmail);
                 const profile = _liBdrProfileCache.get(canonicalEmail) || { linkedInUrl: '', calendarLink: '', textInserts: [] };
                 const emails = [...new Set([canonicalEmail, (alertObj.bdrEmail || '').toLowerCase(), alertObj.bdrEmail].filter(Boolean))];
+                const bdrEmailVariants = [...new Set(emails.map(e => e.toLowerCase()))];
 
                 if (force) _liContactContextCache.delete(id);
                 const [recentReplies, ctx] = await Promise.all([
                     _liGetRecentBdrReplies(emails),
-                    _liGetContactContext(alertObj)
+                    _liGetContactContext(alertObj, bdrEmailVariants)
                 ]);
 
                 const prompt = _liBuildDraftPrompt(alertObj, canonicalEmail, profile, recentReplies, ctx);

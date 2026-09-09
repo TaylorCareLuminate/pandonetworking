@@ -11107,6 +11107,25 @@
                 }
             }
 
+            // Source LinkedIn post the message replies to — CRITICAL for reposts: post_type
+            // 'repost'/'quote' means the prospect merely SHARED someone else's content, and
+            // the reviewer must never treat the reshared author's first-person statements
+            // (job search, new role, award) as the prospect's own. The server's
+            // buildMessageBlock renders this with an explicit repost warning.
+            let sourcePost = null;
+            const spText     = m.post_text || m.postText || '';
+            const spReshared = m.reshared_post_text || m.resharedPostText || '';
+            if (spText || spReshared || m.post_url) {
+                sourcePost = {
+                    text: String(spText).slice(0, 1500),
+                    type: m.post_type || m.postType || 'regular',
+                    date: m.post_date || m.postedAt || null,
+                    url:  m.post_url || null,
+                    resharedText: spReshared ? String(spReshared).slice(0, 1500) : null,
+                    resharedAuthor: [m.resharedAuthorFirstName, m.resharedAuthorLastName].filter(Boolean).join(' ') || null
+                };
+            }
+
             return {
                 id: m.id,
                 message_to_contact: currentText,
@@ -11117,7 +11136,8 @@
                 ...(location ? { location } : {}),
                 orgContacts,
                 ...(profilePayload ? { profile: profilePayload } : {}),
-                ...(conversationHistory ? { conversationHistory } : {})
+                ...(conversationHistory ? { conversationHistory } : {}),
+                ...(sourcePost ? { sourcePost } : {})
             };
         }
 
@@ -15729,6 +15749,16 @@ Rules:
             }
         }
 
+        // Repost banner baked directly INTO {{post_text}} — review rules aren't guaranteed
+        // to reference {{post_type}}, so the label must travel with the text itself.
+        // Without this, a reviewer AI reading only {{post_text}} sees a reshared post
+        // (e.g. someone ELSE's "exploring my next opportunity" post) as if the prospect
+        // wrote it — the exact failure that produced a message asking a prospect about a
+        // job search that wasn't his.
+        if ((ctx.post_type === 'repost' || ctx.post_type === 'quote') && ctx.post_text && !String(ctx.post_text).startsWith('[⚠️')) {
+            ctx.post_text = `[⚠️ ${ctx.post_type === 'quote' ? 'QUOTE-REPOST' : 'REPOST'} — the prospect SHARED someone else's post${ctx.reshared_post_author ? ` (original author: ${ctx.reshared_post_author})` : ''}. The prospect did NOT write this content; first-person statements in it are the original author's, NOT the prospect's.]\n${ctx.post_text}`;
+        }
+
         if (wantsFullArchive && window.MessageDataArchive) {
             // Prefer the real archive bundle (untrimmed, exact shape formatForReview expects).
             // If it's missing or aged out, fall back to whatever the trimmed field-collection
@@ -15791,7 +15821,14 @@ Rules:
             '{{profile_about}}':    ctx.profile_about        || '(not available)',
             '{{profile_experience}}': Array.isArray(ctx.profile_experience) ? ctx.profile_experience.join(' | ') : (ctx.profile_experience || '(not available)'),
             '{{profile_education}}':  Array.isArray(ctx.profile_education)  ? ctx.profile_education.join(' | ')  : (ctx.profile_education  || '(not available)'),
-            '{{recent_posts}}':        Array.isArray(ctx.recent_posts) ? ctx.recent_posts.map(p => typeof p === 'string' ? p : (p?.text || '')).filter(Boolean).join(' | ') : '(not available)',
+            '{{recent_posts}}':        Array.isArray(ctx.recent_posts) ? ctx.recent_posts.map(p => {
+                if (typeof p === 'string') return p;
+                const t = p?.text || '';
+                if (!t) return '';
+                // Tag reshares so the reviewer never mistakes someone else's words for the prospect's
+                const isReshare = p?.postType === 'repost' || p?.postType === 'quote';
+                return isReshare ? `[RESHARED — the prospect shared this, it was written by ${p.resharedAuthor || 'someone else'}, NOT the prospect] ${t}` : t;
+            }).filter(Boolean).join(' | ') : '(not available)',
             '{{about_me_findings}}': ctx.about_me_findings ? JSON.stringify(ctx.about_me_findings).slice(0, 4000) : '(not available)',
             '{{bdr_profile}}':      ctx.bdr_profile          || '(not available)',
             '{{bdr_name}}':         ctx.bdr_name             || '',
