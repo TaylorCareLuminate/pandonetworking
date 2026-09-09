@@ -1299,7 +1299,14 @@
 
         const postsBlock = (ctx.posts || []).map((post, i) => {
             const dateStr = post.date ? new Date(post.date).toLocaleDateString('en-US') : 'unknown date';
-            return `[PROSPECT POST ${i + 1} | ${dateStr} | authored by the PROSPECT, not the sender]\n${post.text || ''}`;
+            // Reposts/quotes are someone ELSE's content the prospect merely shared — label
+            // them explicitly so the attribution AI never treats the original author's
+            // first-person statements (job search, new role, award) as the prospect's own.
+            const isReshare = post.postType === 'repost' || post.postType === 'quote';
+            const authorLabel = isReshare
+                ? `⚠️ RESHARED by the prospect — this is a ${post.postType === 'quote' ? 'QUOTE-REPOST' : 'REPOST'} of someone else's post${post.resharedAuthor ? ` (original author: ${post.resharedAuthor})` : ''}. The PROSPECT did NOT write this content; first-person statements in it belong to the original author, NOT the prospect`
+                : 'authored by the PROSPECT, not the sender';
+            return `[PROSPECT POST ${i + 1} | ${dateStr} | ${authorLabel}]\n${post.text || ''}`;
         }).join('\n\n') || '(no prospect posts retrieved)';
 
         const newsBlock = (ctx.news || []).map((n, i) => {
@@ -1328,12 +1335,20 @@
             .filter(d => d.about_me_findings || d.news_data || d.ai_company_news || d.message_to_contact)
             .slice(0, 5)
             .map((d, i) => {
+                // Stored source post — label reposts loudly so the attribution AI can see
+                // when the message was built on someone ELSE's content the prospect shared.
+                const qPostType = d.post_type || d.postType || 'regular';
+                const qIsReshare = qPostType === 'repost' || qPostType === 'quote';
+                const qReshareAuthor = [d.resharedAuthorFirstName, d.resharedAuthorLastName].filter(Boolean).join(' ');
                 const bits = [
                     `[QUEUE RECORD ${i + 1}]`,
                     `message_source_label: ${d.source || d.generated_via || 'unknown'}`,
                     `sender_bdr_name: ${d.bdr_name || '(n/a)'}`,
                     `sender_bdr_email: ${d.bdr_primary_email || d.bdr_auth_email || d.account_email || '(n/a)'}`,
                     d.message_to_contact ? `stored_outbound_message: ${d.message_to_contact}` : '',
+                    d.post_text ? `stored_source_post_type: ${qPostType}${qIsReshare ? ` — ⚠️ RESHARED: the prospect only SHARED this post; it was written by ${qReshareAuthor || 'someone else'}, NOT the prospect. First-person statements in it are the original author's.` : ' (written by the prospect)'}` : '',
+                    d.post_text ? `stored_source_post_text (the LinkedIn post this message replies to): ${String(d.post_text).slice(0, 2000)}` : '',
+                    d.reshared_post_text && d.reshared_post_text !== d.post_text ? `stored_reshared_content (someone else's words the prospect shared): ${String(d.reshared_post_text).slice(0, 2000)}` : '',
                     d.about_me_findings ? `stored_about_me_findings_json: ${JSON.stringify(d.about_me_findings)}` : '',
                     d.news_data ? `stored_news_data: ${JSON.stringify(d.news_data).slice(0, 2000)}` : '',
                     d.ai_company_news ? `stored_ai_company_news: ${JSON.stringify(d.ai_company_news).slice(0, 1500)}` : '',
@@ -1347,6 +1362,7 @@ CRITICAL ROLE LABELS — READ BEFORE ANALYZING
 - PROSPECT / RECIPIENT = the person who received the message (${prospectName} / ${prospectUrl}).
 - "About Me" statements belong ONLY to the SENDER. They are first-person facts about the sender (hobbies, education, career, company). They are NEVER facts about the prospect.
 - Prospect profile + prospect posts + prospect company news are about the RECIPIENT only.
+- REPOSTS: any post in A2 or C1 marked "⚠️ RESHARED" is someone ELSE's content that the prospect merely shared. First-person statements inside reshared content (job searching, starting a new role, awards) belong to the ORIGINAL AUTHOR — never attribute them to the prospect, and flag any message claim that does.
 - About Me Connect messages often claim a SHARED interest ("fellow golfer"). That usually means: (a) the hobby appears in SENDER About Me, and (b) the system believed the prospect also had that interest from prospect profile/posts. Always say which side each piece came from.
 
 ════════════════════════════════════════════════════════════
@@ -1419,10 +1435,15 @@ ${queueFindings}
                 const dateStr = p.date ? new Date(p.date).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) : '';
                 const pid = `${idPrefix}-${p.index ?? idx}`;
                 const shortText = (p.text || '').length > 280;
+                const isReshare = p.postType === 'repost' || p.postType === 'quote';
+                const reshareBadge = isReshare
+                    ? `<span style="background:#fef3c7;color:#92400e;border:1px solid #fcd34d;border-radius:4px;padding:0.05rem 0.4rem;font-size:0.68rem;font-weight:700;"><i class="fas fa-retweet"></i> ${p.postType === 'quote' ? 'QUOTE-REPOST' : 'REPOST'} — written by ${esc(p.resharedAuthor || 'someone else')}, NOT the prospect</span>`
+                    : '';
                 return `<div class="post-item">
                     <div class="post-item-header">
                         <span><i class="fas fa-hashtag"></i> Post ${esc(String(p.index != null ? p.index : idx + 1))}</span>
                         ${dateStr ? `<span><i class="fas fa-calendar"></i> ${esc(dateStr)}</span>` : ''}
+                        ${reshareBadge}
                         ${p.postUrl ? `<a href="${esc(p.postUrl)}" target="_blank" style="color:#0F2D4D;text-decoration:none;margin-left:auto;"><i class="fab fa-linkedin"></i> View</a>` : ''}
                     </div>
                     <div id="${pid}" class="post-item-text">${esc(p.text || '')}</div>
@@ -1480,8 +1501,12 @@ ${queueFindings}
         const newsItems = [];
         if (archive.news?.newsData) newsItems.push(archive.news.newsData);
         if (archive.post?.text || archive.post?.url) {
+            const apIsReshare = archive.post.type === 'repost' || archive.post.type === 'quote';
+            const apAuthor = [archive.post.resharedAuthorFirstName, archive.post.resharedAuthorLastName].filter(Boolean).join(' ');
             newsItems.push({
-                headline: archive.post.type && archive.post.type !== 'regular' ? `Reshared/${archive.post.type} post` : 'LinkedIn post used for this message',
+                headline: apIsReshare
+                    ? `⚠️ ${archive.post.type === 'quote' ? 'QUOTE-REPOST' : 'REPOST'} used for this message — the prospect SHARED someone else's post${apAuthor ? ` (original author: ${apAuthor})` : ''}; the prospect did NOT write this content`
+                    : 'LinkedIn post used for this message (written by the prospect)',
                 url: archive.post.url,
                 date: archive.post.date,
                 content: archive.post.resharedText || archive.post.text

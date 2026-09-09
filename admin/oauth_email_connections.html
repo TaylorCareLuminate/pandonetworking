@@ -829,6 +829,39 @@
         </div>
       </div>
 
+      <!-- Org-Wide Connect (Microsoft admin consent) -->
+      <div class="section-card">
+        <div class="section-header">
+          <div>
+            <h2><i class="fas fa-building-shield" style="color:var(--dark-blue)"></i> Connect Entire Organization (Microsoft)</h2>
+            <p class="section-desc">One-click org-wide access via admin consent — registers every Microsoft 365 mailbox in the tenant without individual team-member logins</p>
+          </div>
+        </div>
+        <div class="section-body">
+          <div class="info-box" style="margin-bottom:1rem">
+            <strong>How this works:</strong> Instead of each team member logging in through OAuth, the Microsoft admin grants the app
+            <em>application permissions</em> once in Microsoft Entra ID (admin consent). The backend then accesses every mailbox and
+            calendar in the tenant directly — connections never expire and new hires are picked up by re-running this.
+            <ul>
+              <li>One-time Entra setup required first: add <strong>application</strong> permissions
+                (<code>Mail.ReadWrite</code>, <code>Mail.Send</code>, <code>Calendars.ReadWrite</code>, <code>User.Read.All</code>)
+                to the app registration and click <strong>"Grant admin consent"</strong></li>
+              <li>The backend's <code>MICROSOFT_ORG_TENANT_ID</code> env var must be set to your directory (tenant) ID — not "common"</li>
+              <li>Existing individually-connected (delegated) accounts are left untouched</li>
+            </ul>
+          </div>
+          <div style="display:flex; gap:0.75rem; flex-wrap:wrap; align-items:center;">
+            <label for="org-domain-input" style="font-size:0.85rem; font-weight:600;">Limit to domain:</label>
+            <input id="org-domain-input" type="text" value="pandonetworking.com" placeholder="e.g. pandonetworking.com (empty = all)"
+                   style="padding:0.5rem 0.75rem; border:1px solid var(--border); border-radius:6px; font-size:0.85rem; min-width:240px;" />
+            <button id="org-connect-btn" class="btn-connect btn-microsoft" style="width:auto; padding:0.6rem 1.2rem;" onclick="connectOrganization()">
+              <i class="fas fa-building-shield"></i> Connect Whole Organization
+            </button>
+          </div>
+          <div id="org-connect-result" style="display:none; margin-top:1rem;"></div>
+        </div>
+      </div>
+
       <!-- Connected Accounts -->
       <div class="section-card">
         <div class="section-header">
@@ -1252,6 +1285,61 @@
       await startOAuthFlow('microsoft', '', '', includeCalendar);
     }
 
+    // ─── ORG-WIDE CONNECT (admin consent / app-only) ──────────────
+    // Registers every Microsoft 365 mailbox in the tenant at once. Requires
+    // the one-time Entra admin-consent setup described in the info box.
+    async function connectOrganization() {
+      const btn = document.getElementById('org-connect-btn');
+      const resultEl = document.getElementById('org-connect-result');
+      const domain = document.getElementById('org-domain-input').value.trim();
+
+      if (!confirm(
+        `Connect every Microsoft 365 mailbox${domain ? ' on @' + domain : ' in the tenant'} for email + calendar access?\n\n` +
+        'This uses org-wide admin consent — team members will NOT need to log in individually.'
+      )) return;
+
+      const originalHtml = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Connecting organization...';
+      resultEl.style.display = 'none';
+
+      try {
+        const headers = await getAuthHeaders();
+        const res = await fetch(`${RAILWAY_URL}/oauth/microsoft/connect-organization`, {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ domain: domain || undefined }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || data.message || 'Org connect failed');
+
+        const rows = (data.connected || []).map(a =>
+          `<li><strong>${esc(a.email)}</strong> — ${a.wasNew ? 'newly connected' : 'refreshed'}` +
+          `${a.subscription && a.subscription !== 'created' ? ` <span style="color:var(--warning)">(inbox watch: ${esc(a.subscription)})</span>` : ''}</li>`
+        ).join('');
+        const skippedRows = (data.skipped || []).map(s =>
+          `<li style="color:var(--gray)">${esc(s.email || '?')} — ${esc(s.reason)}</li>`
+        ).join('');
+
+        resultEl.innerHTML =
+          `<div class="status-banner banner-success" style="display:flex"><i class="fas fa-check-circle"></i> ${esc(data.message)}</div>` +
+          (rows ? `<ul style="margin:0.75rem 0 0 1.25rem; font-size:0.85rem;">${rows}</ul>` : '') +
+          (skippedRows ? `<details style="margin-top:0.5rem; font-size:0.82rem;"><summary>Skipped (${data.skipped.length})</summary><ul style="margin:0.5rem 0 0 1.25rem;">${skippedRows}</ul></details>` : '');
+        resultEl.style.display = 'block';
+        showToast('Organization connected', 'success');
+        loadAccounts();
+      } catch (err) {
+        console.error('Org connect error:', err);
+        resultEl.innerHTML =
+          `<div class="status-banner banner-error" style="display:flex"><i class="fas fa-exclamation-circle"></i> <strong>Org connect failed:</strong>&nbsp;${esc(err.message)}</div>` +
+          `<p style="font-size:0.82rem; color:var(--gray); margin-top:0.5rem;">Most common causes: application permissions not granted with admin consent in Entra ID yet, or <code>MICROSOFT_ORG_TENANT_ID</code> not set on the backend.</p>`;
+        resultEl.style.display = 'block';
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = originalHtml;
+      }
+    }
+
     async function startOAuthFlow(provider, hint = '', claims = '', includeCalendar = false) {
       try {
         const userId = window.auth?.currentUser?.uid || 'admin';
@@ -1404,7 +1492,11 @@
             <i class="fab fa-${isGoogle ? 'google' : 'microsoft'}"></i>
           </div>
           <div class="account-info">
-            <div class="account-email">${esc(account.email)}</div>
+            <div class="account-email">${esc(account.email)}
+              ${account.authType === 'application'
+                ? '<span title="Connected org-wide via admin consent (application permissions) — no user login, never expires" style="background:#e7f1ff;color:#1a4d8f;border:1px solid #b8d4f5;border-radius:10px;padding:0.1rem 0.5rem;font-size:0.68rem;font-weight:700;vertical-align:middle;margin-left:0.35rem"><i class="fas fa-building-shield"></i> Org-wide</span>'
+                : ''}
+            </div>
             <div style="font-size:0.72rem;color:var(--gray);margin-bottom:0.15rem;font-family:monospace" title="Internal account ID used to identify this connection">
               ID: <span style="user-select:all">${esc(account.accountId)}</span>
             </div>
@@ -1412,7 +1504,7 @@
               <span><i class="fas fa-calendar-plus"></i> Connected ${connectedDate}</span>
               <span><i class="fas fa-sync"></i> Refreshed ${refreshedDate}</span>
               ${watchHtml}
-              ${account.scopes && (isGoogle ? account.scopes.includes('calendar') : account.scopes.toLowerCase().includes('calendars'))
+              ${account.authType === 'application' || (account.scopes && (isGoogle ? account.scopes.includes('calendar') : account.scopes.toLowerCase().includes('calendars')))
                 ? '<span title="Calendar access was granted for this account" style="color:#2D6B83"><i class="fas fa-calendar-check"></i> Calendar</span>'
                 : '<span title="No calendar access — reconnect with Calendar toggle on to enable scheduling" style="color:#aaa"><i class="fas fa-calendar-times"></i> No calendar</span>'
               }

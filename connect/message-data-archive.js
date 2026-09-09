@@ -152,21 +152,40 @@
         }
 
         if (Array.isArray(posts) && posts.length) {
-            const lines = [`=== PROSPECT'S RECENT LINKEDIN POSTS (${posts.length}) ===`];
+            const lines = [`=== PROSPECT'S RECENT LINKEDIN POSTS (${posts.length}) ===`,
+                'NOTE: posts marked [RESHARED] were only SHARED by the prospect — someone else wrote them. First-person statements in a [RESHARED] post belong to the original author, NOT the prospect.'];
             posts.forEach((p, i) => {
-                lines.push(`--- Post ${p.index != null ? p.index : i + 1}${p.date ? ` (${p.date})` : ''} ---`);
+                const isReshare = p.postType === 'repost' || p.postType === 'quote';
+                const reshareAuthor = p.resharedAuthor || [p.resharedAuthorFirstName, p.resharedAuthorLastName].filter(Boolean).join(' ');
+                const reshareTag = isReshare
+                    ? ` [RESHARED — ${p.postType === 'quote' ? 'quote-repost' : 'repost'} of someone else's post${reshareAuthor ? ` by ${reshareAuthor}` : ''}; the prospect did NOT write this]`
+                    : '';
+                lines.push(`--- Post ${p.index != null ? p.index : i + 1}${p.date ? ` (${p.date})` : ''}${reshareTag} ---`);
                 lines.push(p.text || '(no text)');
+                if (isReshare && p.resharedPostText && p.resharedPostText !== p.text) {
+                    lines.push(`Reshared content (someone else's words): ${p.resharedPostText}`);
+                }
             });
             sections.push(lines.join('\n'));
         }
 
         if (post && (post.text || post.url)) {
+            const isReshare = post.type === 'repost' || post.type === 'quote';
+            const resharedAuthor = [post.resharedAuthorFirstName, post.resharedAuthorLastName].filter(Boolean).join(' ');
             const lines = ['=== SPECIFIC LINKEDIN POST THIS MESSAGE REPLIES TO ==='];
-            if (post.type && post.type !== 'regular') lines.push(`Type: ${post.type}`);
+            if (isReshare) {
+                lines.push(`⚠️ POST TYPE: ${post.type === 'quote' ? 'QUOTE-REPOST' : 'REPOST/RESHARE'} — the prospect only SHARED this content${resharedAuthor ? `; it was originally written by ${resharedAuthor}` : '; it was written by someone else'}. The prospect did NOT write it. First-person statements below (job search, new role, hiring, awards) are the ORIGINAL AUTHOR's, NOT the prospect's. The outreach message must say "you shared a post", never "your post", and must not attribute the original author's situation to the prospect.`);
+            } else if (post.type && post.type !== 'regular') {
+                lines.push(`Type: ${post.type}`);
+            }
             if (post.date) lines.push(`Date: ${post.date}`);
             if (post.url)  lines.push(`URL: ${post.url}`);
-            lines.push(post.resharedText || post.text || '');
-            const resharedAuthor = [post.resharedAuthorFirstName, post.resharedAuthorLastName].filter(Boolean).join(' ');
+            if (isReshare && post.text && post.resharedText && post.text !== post.resharedText) {
+                lines.push(`Prospect's own commentary: ${post.text}`);
+                lines.push(`Reshared content (someone else's words): ${post.resharedText}`);
+            } else {
+                lines.push(post.resharedText || post.text || '');
+            }
             if (resharedAuthor) lines.push(`Original post author (reshared/quoted): ${resharedAuthor}`);
             sections.push(lines.join('\n'));
         }

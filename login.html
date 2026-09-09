@@ -109,7 +109,7 @@
   </script>
 
   <!-- Use centralized auth system -->
-  <script src="js/auth.js?v=1.1.1"></script>
+  <script src="js/auth.js?v=1.5.1"></script>
   
   <style>
     :root {
@@ -1025,7 +1025,7 @@
     }
 
     async function redirectAfterLogin(userEmail = null) {
-      const url = await getReturnUrl(userEmail);
+      const url = sanitizeRedirectUrl(await getReturnUrl(userEmail)) || 'index.html';
       sessionStorage.removeItem('returnUrl');
       if (url.startsWith('/') || url.match(/^[a-zA-Z0-9.-]+\.html/) || url.includes('/')) {
         window.location.href = url;
@@ -1034,11 +1034,62 @@
       }
     }
 
+    // Headers and dashboards historically linked to account-settings.html,
+    // but the real file is account-setting.html — rewrite so a stale
+    // returnUrl or forwarding rule cannot 404 a just-signed-in user.
+    function sanitizeRedirectUrl(url) {
+      if (!url) return null;
+      try {
+        const rewritten = String(url).replace(/account-settings\.html/gi, 'account-setting.html');
+        const parsed = /^https?:/i.test(rewritten) ? new URL(rewritten) : new URL(rewritten, window.location.origin);
+        const path = parsed.pathname.toLowerCase();
+        if (path.endsWith('/login.html') || path.endsWith('/auth-action.html') || path.endsWith('/sso-bridge.html')) {
+          return null;
+        }
+        return rewritten;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Firebase appends mode=signIn to the continue URL. If we already put
+    // mode=emailLogin on that URL, URLSearchParams.get('mode') returns
+    // emailLogin and isSignInWithEmailLink() fails — the client never
+    // actually signs in. Normalize to a single mode=signIn.
+    function getEmailSignInHref() {
+      try {
+        const url = new URL(window.location.href);
+        const modes = url.searchParams.getAll('mode');
+        if (url.searchParams.has('oobCode') && modes.includes('signIn') && url.searchParams.get('mode') !== 'signIn') {
+          url.searchParams.set('mode', 'signIn');
+        }
+        return url.toString();
+      } catch (e) {
+        return window.location.href;
+      }
+    }
+
+    function looksLikeEmailSignInLink(href) {
+      try {
+        if (isSignInWithEmailLink(auth, href)) return true;
+        const url = new URL(href);
+        return url.searchParams.has('oobCode') && url.searchParams.getAll('mode').includes('signIn');
+      } catch (e) {
+        return false;
+      }
+    }
+
     // Only an explicitly requested return URL, ignoring the referrer and
     // forwarding-rule fallbacks, so a deliberate visit here is never hijacked.
     function getPendingReturnUrl() {
       const param = new URLSearchParams(window.location.search).get('returnUrl');
-      return param || sessionStorage.getItem('returnUrl');
+      return sanitizeRedirectUrl(param || sessionStorage.getItem('returnUrl'));
+    }
+
+    function userHasPasswordProvider(user) {
+      return !!(user && user.providerData && user.providerData.some(function(p) {
+        return p.providerId === 'password';
+      }));
     }
 
     // A protected page that keeps bouncing a signed-in user back here would
@@ -1133,8 +1184,10 @@
 
     // ─── Initialize ───────────────────────────────────────────────
     waitForAuth().then(() => {
+      // Do not put mode= on this URL. Firebase appends mode=signIn; a
+      // second mode= emailLogin makes isSignInWithEmailLink() return false.
       const actionCodeSettings = {
-        url: window.location.origin + '/login.html?mode=emailLogin',
+        url: window.location.origin + '/login.html',
         handleCodeInApp: true,
       };
 
@@ -1154,9 +1207,11 @@
         window.history.replaceState({}, '', cleanUrl);
       }
 
-      // Handle email link sign-in
-      if (isSignInWithEmailLink(auth, window.location.href)) {
-        handleEmailLinkSignIn();
+      // Handle email link sign-in (including links that still have the
+      // legacy mode=emailLogin continue URL from older emails).
+      const emailLinkHref = getEmailSignInHref();
+      if (looksLikeEmailSignInLink(emailLinkHref)) {
+        handleEmailLinkSignIn(emailLinkHref);
       }
 
       // Auth state observer — if already logged in, surface account tab
@@ -1339,6 +1394,8 @@
       });
 
       // ── Email Link form ───────────────────────────────────────
+      let pendingEmailLinkHref = null;
+
       document.getElementById('email-login-form').addEventListener('submit', async function(e) {
         e.preventDefault();
         const email = document.getElementById('email-login-email').value.trim();
@@ -1346,6 +1403,10 @@
         setLoading('send-email-btn', 'email-spinner', true);
         clearAlert();
         try {
+          if (pendingEmailLinkHref) {
+            await completeEmailLinkSignIn(email, pendingEmailLinkHref);
+            return;
+          }
           await sendSignInLinkToEmail(auth, email, actionCodeSettings);
           window.localStorage.setItem('emailForSignIn', email);
           document.getElementById('sent-to-email').textContent = email;
@@ -1359,18 +1420,42 @@
       });
 
       // ── Email Link sign-in handler ────────────────────────────
-      async function handleEmailLinkSignIn() {
+      async function handleEmailLinkSignIn(linkHref) {
+        const href = linkHref || getEmailSignInHref();
         let email = window.localStorage.getItem('emailForSignIn');
         if (!email) {
-          email = window.prompt('Please confirm your email address to complete sign-in:');
-          if (!email) { showAlert('Email is required to complete sign-in.', 'error'); return; }
+          pendingEmailLinkHref = href;
+          showTab('emailLogin');
+          const btn = document.getElementById('send-email-btn');
+          if (btn) {
+            const spinner = document.getElementById('email-spinner');
+            btn.innerHTML = '';
+            if (spinner) btn.appendChild(spinner);
+            btn.appendChild(document.createTextNode(' Finish Sign In'));
+          }
+          showAlert('Confirm the email address this login link was sent to so we can finish signing you in. You do not need to sign up again.', 'info', 'alertContainer', false);
+          const input = document.getElementById('email-login-email');
+          if (input) input.focus();
+          return;
         }
+        await completeEmailLinkSignIn(email, href);
+      }
+
+      async function completeEmailLinkSignIn(email, href) {
         showAlert('Signing you in...', 'info');
         try {
-          const { user } = await signInWithEmailLink(auth, email, window.location.href);
+          const { user } = await signInWithEmailLink(auth, email, href);
           window.localStorage.removeItem('emailForSignIn');
+          pendingEmailLinkHref = null;
           try {
-            await setDoc(doc(db, 'users', user.uid), { lastLogin: new Date(), emailVerified: user.emailVerified }, { merge: true });
+            await setDoc(doc(db, 'users', user.uid), {
+              lastLogin: new Date(),
+              emailVerified: true,
+              email: user.email,
+              uid: user.uid,
+              domain: getDomainFromEmail(user.email),
+              displayName: user.displayName || user.email.split('@')[0]
+            }, { merge: true });
           } catch (e) { /* non-critical */ }
           showAlert(`Welcome${user.displayName ? ', ' + user.displayName : ''}! Redirecting...`, 'success');
           setTimeout(() => redirectAfterLogin(user.email), 1800);
@@ -1442,11 +1527,13 @@
         const user = auth.currentUser;
         if (!user) { showAlert('You must be signed in to change your password.', 'error'); return; }
         clearAlert();
-        try {
-          await requireReauth();
-        } catch (err) {
-          if (err.message !== 'cancelled') showAlert(friendlyFirebaseError(err), 'error');
-          return;
+        if (userHasPasswordProvider(user)) {
+          try {
+            await requireReauth();
+          } catch (err) {
+            if (err.message !== 'cancelled') showAlert(friendlyFirebaseError(err), 'error');
+            return;
+          }
         }
         setLoading('password-btn', 'password-spinner', true);
         try {

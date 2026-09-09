@@ -1863,7 +1863,6 @@
             display: flex;
             align-items: center;
             gap: 12px;
-            margin-top: 6px;
             flex-wrap: wrap;
         }
 
@@ -3308,8 +3307,14 @@
             /* ── Find a Dismissed Reply ──────────────────────────────────── */
             .li-find-dismissed-bar {
                 display: flex;
-                justify-content: flex-end;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                flex-wrap: wrap;
                 margin-bottom: 16px;
+            }
+            .li-scope-toggle-light {
+                color: #475569;
             }
             .btn-li-find-dismissed {
                 background: white;
@@ -3489,11 +3494,20 @@
             .btn-li-restore:disabled { opacity: 0.6; cursor: not-allowed; }
         </style>
 
-        <!-- Find a Dismissed Reply: search + restore alerts you've already dismissed.
-             Lives above #liReplyAlertsBanner (rather than after the card list) so
-             it's immediately visible without scrolling — and stays visible even
-             when there are zero active alerts (banner is display:none in that case). -->
+        <!-- Find a Dismissed Reply + "Show all BDRs" scope toggle: both live above
+             #liReplyAlertsBanner (rather than inside it) so they're immediately
+             visible without scrolling — and stay visible even when there are zero
+             active alerts (banner is display:none in that case). The scope toggle
+             used to live inside the banner, which meant it disappeared whenever
+             there were no new replies to show. -->
         <div class="li-find-dismissed-bar">
+            <div class="li-viewer-scope-row">
+                <label class="li-scope-toggle li-scope-toggle-light" title="Temporarily see every team member's BDRs, not just yours">
+                    <input type="checkbox" id="liShowAllBdrsToggle" onchange="window.toggleShowAllBdrs(this.checked)">
+                    Show all BDRs
+                </label>
+                <span class="viewer-scope-badge viewer-scope-badge-light" id="liViewerScopeBadge"></span>
+            </div>
             <button type="button" class="btn-li-find-dismissed" onclick="window.liOpenDismissedSearch()">
                 <i class="fas fa-clock-rotate-left"></i> Find a Dismissed Reply
             </button>
@@ -3528,13 +3542,6 @@
                             <span class="li-alerts-badge" id="liAlertsBadge">0</span>
                         </div>
                         <div class="li-alerts-subtitle" id="liAlertsMeta">Checking for new replies…</div>
-                        <div class="li-viewer-scope-row">
-                            <span class="viewer-scope-badge" id="liViewerScopeBadge"></span>
-                            <label class="li-scope-toggle" title="Temporarily see every team member's BDRs, not just yours">
-                                <input type="checkbox" id="liShowAllBdrsToggle" onchange="window.toggleShowAllBdrs(this.checked)">
-                                Show all BDRs
-                            </label>
-                        </div>
                     </div>
                 </div>
                 <div class="li-alerts-header-right">
@@ -4498,6 +4505,18 @@
                     </div>
                     <p class="page-card-description">
                         AI analysis of prospects who have expressed interest in meeting. Score and rank leads by intent signals to prioritize follow-up conversations.
+                    </p>
+                </a>
+
+                <a href="conference_scheduling.html" class="page-card">
+                    <div class="page-card-header">
+                        <div class="page-card-icon" style="background: linear-gradient(135deg, #C9973D 0%, #12314C 100%);">
+                            <i class="fas fa-calendar-star"></i>
+                        </div>
+                        <h3 class="page-card-title">Conference Scheduling</h3>
+                    </div>
+                    <p class="page-card-description">
+                        Set each BDR's open meeting windows at a conference, pick times right from the reply alerts and message review pages, then build a branded PDF meeting schedule to hand to clients.
                     </p>
                 </a>
             </div>
@@ -5664,6 +5683,8 @@
     <script src="../js/clemail-firestore-wrapper.js"></script>
     <!-- html2canvas for LinkedIn reply alert conversation snapshots -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <!-- Conference Scheduling (widget embedded in each reply alert card) -->
+    <script src="conference-scheduling.js?v=1.4"></script>
 
     <script type="module">
         import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
@@ -5832,6 +5853,21 @@
         // here can land on a different document than about_me.html / company_review_replies.html
         // use, silently splitting a BDR's Quick Text Inserts across two documents.
         let _liAliasToCanonicalEmail = null;
+        // In-flight load promise for the map above — MUST be cached (not just the map
+        // itself) because _liPreloadBdrProfiles resolves every alert's canonical email
+        // concurrently via Promise.all. Without this, the first concurrent call sets
+        // _liAliasToCanonicalEmail to a (still-empty) `new Map()` synchronously before
+        // its fetch even starts, so every OTHER concurrent call sees that truthy-but-empty
+        // Map and returns immediately with no data — silently falling back to each alert's
+        // raw (often alias) bdrEmail instead of its canonical primary email. Since
+        // applyTeamScopeToAlerts() matches BDR-assignment scoping against the *primary*
+        // email, alerts resolved to an alias on that first pass don't match the viewer's
+        // assignment and get hidden — until 5 minutes later when the poll timer calls
+        // _liLoadAlerts() again and finds the map already fully populated from the first
+        // run, correctly resolving (and now correctly showing) every alert. This is what
+        // caused "I only see a few of my messages, then a few minutes later I see all of
+        // them" even after fixing the separate firebaseReady race.
+        let _liAliasToCanonicalEmailPromise = null;
         // Lazily-loaded map of HeyReach linkedInAccountId (string) -> canonical BDR email,
         // sourced from linkedin_accounts (heyreachAccountId -> bdrEmail). This is the SAME
         // account-ownership record the rest of this dashboard already treats as authoritative
@@ -5846,42 +5882,60 @@
         let _liAccountIdToCanonicalEmail = null;
         async function _liGetAliasToCanonicalEmailMap() {
             if (_liAliasToCanonicalEmail) return _liAliasToCanonicalEmail;
-            _liAliasToCanonicalEmail = new Map();
-            _liAccountIdToCanonicalEmail = new Map();
-            if (!window.clemailFirestore || !window.clemailDb) return _liAliasToCanonicalEmail;
+            if (_liAliasToCanonicalEmailPromise) return _liAliasToCanonicalEmailPromise;
+            _liAliasToCanonicalEmailPromise = (async () => {
+                const aliasMap = new Map();
+                const accountIdMap = new Map();
+                if (!window.clemailFirestore || !window.clemailDb) {
+                    _liAliasToCanonicalEmail = aliasMap;
+                    _liAccountIdToCanonicalEmail = accountIdMap;
+                    return aliasMap;
+                }
+                try {
+                    const { collection, getDocs } = window.clemailFirestore;
+                    const emailDB = window.clemailDb;
+                    const [bdrSnap, assocSnap, accountsSnap] = await Promise.all([
+                        getDocs(collection(emailDB, 'bdr_leaders')),
+                        getDocs(collection(emailDB, 'linkedin_email_associations')),
+                        getDocs(collection(emailDB, 'linkedin_accounts'))
+                    ]);
+                    bdrSnap.forEach(d => {
+                        const data = d.data();
+                        const primary = (data.primaryEmail || '').toLowerCase();
+                        if (!primary) return;
+                        if (data.linkedInEmail) {
+                            aliasMap.set(data.linkedInEmail.toLowerCase(), primary);
+                        }
+                    });
+                    assocSnap.forEach(d => {
+                        const data = d.data();
+                        const authEmail = (data.authEmail || d.id || '').toLowerCase();
+                        if (authEmail && data.linkedInEmail) {
+                            aliasMap.set(data.linkedInEmail.toLowerCase(), authEmail);
+                        }
+                    });
+                    accountsSnap.forEach(d => {
+                        const data = d.data();
+                        if (data.heyreachAccountId && data.bdrEmail) {
+                            accountIdMap.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
+                        }
+                    });
+                } catch (err) {
+                    console.warn('[LiAlerts] Could not load alias->canonical email map:', err.message);
+                }
+                // Only publish to the module-level caches once fully populated, so a
+                // concurrent caller that arrives after this point gets the complete map
+                // via the fast `if (_liAliasToCanonicalEmail) return ...` path above,
+                // instead of racing the fetch again.
+                _liAliasToCanonicalEmail = aliasMap;
+                _liAccountIdToCanonicalEmail = accountIdMap;
+                return aliasMap;
+            })();
             try {
-                const { collection, getDocs } = window.clemailFirestore;
-                const emailDB = window.clemailDb;
-                const [bdrSnap, assocSnap, accountsSnap] = await Promise.all([
-                    getDocs(collection(emailDB, 'bdr_leaders')),
-                    getDocs(collection(emailDB, 'linkedin_email_associations')),
-                    getDocs(collection(emailDB, 'linkedin_accounts'))
-                ]);
-                bdrSnap.forEach(d => {
-                    const data = d.data();
-                    const primary = (data.primaryEmail || '').toLowerCase();
-                    if (!primary) return;
-                    if (data.linkedInEmail) {
-                        _liAliasToCanonicalEmail.set(data.linkedInEmail.toLowerCase(), primary);
-                    }
-                });
-                assocSnap.forEach(d => {
-                    const data = d.data();
-                    const authEmail = (data.authEmail || d.id || '').toLowerCase();
-                    if (authEmail && data.linkedInEmail) {
-                        _liAliasToCanonicalEmail.set(data.linkedInEmail.toLowerCase(), authEmail);
-                    }
-                });
-                accountsSnap.forEach(d => {
-                    const data = d.data();
-                    if (data.heyreachAccountId && data.bdrEmail) {
-                        _liAccountIdToCanonicalEmail.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
-                    }
-                });
-            } catch (err) {
-                console.warn('[LiAlerts] Could not load alias->canonical email map:', err.message);
+                return await _liAliasToCanonicalEmailPromise;
+            } finally {
+                _liAliasToCanonicalEmailPromise = null;
             }
-            return _liAliasToCanonicalEmail;
         }
         async function _liResolveCanonicalBdrEmail(email) {
             if (!email) return email;
@@ -6153,6 +6207,9 @@
                             </div>
                         </div>
                     </div>
+
+                    <!-- Conference Meeting Scheduling -->
+                    <div id="li-conf-widget-${_liEscHtml(id)}"></div>
                 </div>
             </div>`;
         }
@@ -7365,7 +7422,17 @@
         // "Show all BDRs" is on / the viewer isn't one of the recognized team
         // members.
         async function applyTeamScopeToAlerts(alerts) {
-            if (getShowAllBdrsOverride() || !getViewerTeamMemberId()) return alerts;
+            if (getShowAllBdrsOverride()) return alerts;
+            // Wait for auth.js to actually finish resolving the signed-in user before
+            // deciding the viewer is "unrecognized" — without this, a call that lands
+            // before Firebase auth has initialized (e.g. the very first _liLoadAlerts()
+            // at page load, which fires long before auth.js's async init completes)
+            // sees getViewerTeamMemberId() as null and "fails open", briefly showing
+            // every BDR's alerts instead of just the viewer's own, until a later
+            // re-scope call corrects it. See the "Auto-load on page ready" block below
+            // for the full explanation of why window.auth isn't ready yet at parse time.
+            try { if (window.firebaseReady) await window.firebaseReady; } catch (e) { /* proceed anyway */ }
+            if (!getViewerTeamMemberId()) return alerts;
             const assignMap = await getBdrAssignmentMap();
             return alerts.filter(a => {
                 const email = (_liAlertCanonicalEmail.get(a.id) || a.bdrEmail || '').toLowerCase().trim();
@@ -7768,6 +7835,34 @@
 
             // Load CRM notes for each alert
             _liAlerts.forEach(a => _liLoadNotesHistory(a.id));
+
+            // Mount the Conference Meeting Scheduling widget for each alert card
+            if (window.ConferenceScheduling) {
+                _liAlerts.forEach(async a => {
+                    const wrap = document.getElementById(`li-conf-widget-${a.id}`);
+                    if (!wrap) return;
+                    const leadName = a.leadName || [a.leadFirstName, a.leadLastName].filter(Boolean).join(' ') || 'Unknown';
+                    // a.bdrEmail is the LinkedIn account's own login email (see
+                    // _liResolveCanonicalBdrEmailForAlert's comment above), which usually
+                    // differs from the BDR's canonical/primary email that
+                    // conference_availability docs are keyed by. Passing the raw alias
+                    // through made the widget always show "No open slots" / silently fail
+                    // to hold times, even when the BDR had real availability set up —
+                    // resolve to the canonical email first, same as company_review_replies.html.
+                    const canonicalBdrEmail = await _liResolveCanonicalBdrEmailForAlert(a);
+                    window.ConferenceScheduling.mountWidget(wrap, {
+                        bdrEmail: canonicalBdrEmail || '',
+                        bdrName: canonicalBdrEmail || '',
+                        contactLiUrl: a.leadProfileUrl || '',
+                        contactName: leadName,
+                        contactFirstName: a.leadFirstName || '',
+                        contactLastName: a.leadLastName || '',
+                        contactCompany: a.leadCompany || '',
+                        contactTitle: a.leadPosition || '',
+                        source: 'index_admin'
+                    }).catch(err => console.warn('[ConferenceScheduling] mount failed for', a.id, err));
+                });
+            }
 
             // Re-apply any active BDR/name filter so a refresh (poll or manual scan)
             // doesn't blow away a search someone is in the middle of using.
@@ -8339,9 +8434,30 @@
             return top30;
         }
 
+        // Different BDRs — even at completely different client companies — often
+        // target overlapping people (e.g. the same healthcare exec shows up on
+        // multiple customers' prospect lists), so a hypothesis group's
+        // contactLinkedInUrls array can legitimately contain a URL that has
+        // nothing to do with THIS BDR's outreach. Every hypothesis_groups doc
+        // carries bdrEmail/bdrEmails identifying which BDR(s) it actually
+        // belongs to — a group must never be used unless the BDR on this alert
+        // is one of them, regardless of which lookup path found it.
+        function _liGroupBelongsToBdr(groupData, bdrEmailVariants) {
+            if (!groupData || !bdrEmailVariants || !bdrEmailVariants.length) return false;
+            const groupEmails = new Set();
+            if (groupData.bdrEmail) groupEmails.add(String(groupData.bdrEmail).toLowerCase().trim());
+            if (Array.isArray(groupData.bdrEmails)) {
+                groupData.bdrEmails.forEach(e => { if (e) groupEmails.add(String(e).toLowerCase().trim()); });
+            }
+            return bdrEmailVariants.some(e => groupEmails.has(e));
+        }
+
         // Everything we can find about this contact: prospect_contacts enrichment,
         // original connect_queue outreach, the hypothesis group, and CRM notes.
-        async function _liGetContactContext(alertObj) {
+        // `bdrEmailVariants` (lowercased canonical + alias emails for the alert's
+        // BDR) gates which hypothesis group — if any — is allowed to be used;
+        // see _liGroupBelongsToBdr.
+        async function _liGetContactContext(alertObj, bdrEmailVariants = []) {
             if (_liContactContextCache.has(alertObj.id)) return _liContactContextCache.get(alertObj.id);
             const ctx = { prospectDocs: [], queueDocs: [], hypothesisGroup: null, crmNotes: [] };
             try {
@@ -8385,27 +8501,36 @@
 
                 // Hypothesis group: prefer the stamp on connect_queue, then fall back
                 // to hypothesis_groups.contactLinkedInUrls array-contains lookups.
+                // Either path can surface a group that some OTHER BDR's contact
+                // happens to share this LinkedIn URL with — only accept a match
+                // once _liGroupBelongsToBdr confirms this BDR is actually on it.
                 let groupData = null;
-                const stampedId = ctx.queueDocs.map(q => q.hypothesisGroupId).find(Boolean);
-                if (stampedId) {
+                const stampedIds = [...new Set(ctx.queueDocs.map(q => q.hypothesisGroupId).filter(Boolean))];
+                for (const stampedId of stampedIds) {
                     try {
                         const snap = await getDoc(doc(db, 'hypothesis_groups', stampedId));
-                        if (snap && snap.exists) groupData = { id: stampedId, ...snap.data() };
+                        if (snap && snap.exists) {
+                            const candidate = { id: stampedId, ...snap.data() };
+                            if (_liGroupBelongsToBdr(candidate, bdrEmailVariants)) { groupData = candidate; break; }
+                            console.warn(`[LiAlerts][AI] Ignoring hypothesis group "${candidate.name || stampedId}" stamped on connect_queue for alert ${alertObj.id} — this BDR isn't listed on it`);
+                        }
                     } catch (_) { /* fall through to URL lookup */ }
                 }
-                if (!groupData && alertObj.leadProfileUrl) {
+                if (!groupData && alertObj.leadProfileUrl && bdrEmailVariants.length) {
                     const raw = alertObj.leadProfileUrl.trim();
                     const tryUrls = [...new Set([
                         _liNormalizeLinkedInUrl(raw), raw, raw.replace(/\/$/, '')
                     ])].filter(Boolean).slice(0, 3);
                     for (const u of tryUrls) {
                         try {
-                            const snap = await getDocs(query(collection(db, 'hypothesis_groups'), where('contactLinkedInUrls', 'array-contains', u), limit(1)));
-                            if (snap.size > 0) {
-                                const d = snap.docs[0];
-                                groupData = { id: d.id, ...d.data() };
-                                break;
-                            }
+                            // Over-fetch (not limit(1)) since multiple unrelated BDRs'
+                            // groups can share this URL — we need to scan past the
+                            // ones that don't belong to this BDR to find one that does.
+                            const snap = await getDocs(query(collection(db, 'hypothesis_groups'), where('contactLinkedInUrls', 'array-contains', u), limit(20)));
+                            const match = snap.docs
+                                .map(d => ({ id: d.id, ...d.data() }))
+                                .find(candidate => _liGroupBelongsToBdr(candidate, bdrEmailVariants));
+                            if (match) { groupData = match; break; }
                         } catch (_) { /* try next variant */ }
                     }
                 }
@@ -8621,11 +8746,12 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 const canonicalEmail = _liCanonicalEmailForCard(id, alertObj.bdrEmail);
                 const profile = _liBdrProfileCache.get(canonicalEmail) || { linkedInUrl: '', calendarLink: '', textInserts: [] };
                 const emails = [...new Set([canonicalEmail, (alertObj.bdrEmail || '').toLowerCase(), alertObj.bdrEmail].filter(Boolean))];
+                const bdrEmailVariants = [...new Set(emails.map(e => e.toLowerCase()))];
 
                 if (force) _liContactContextCache.delete(id);
                 const [recentReplies, ctx] = await Promise.all([
                     _liGetRecentBdrReplies(emails),
-                    _liGetContactContext(alertObj)
+                    _liGetContactContext(alertObj, bdrEmailVariants)
                 ]);
 
                 const prompt = _liBuildDraftPrompt(alertObj, canonicalEmail, profile, recentReplies, ctx);
@@ -9078,281 +9204,31 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         }
 
         /**
-         * Mirrors loadInProcessForBdr() in edit_in_process_messages.html: same queue
-         * filters + dedup, then the same strict eligibility pass (prospect lead list
-         * + live HeyReach lookup) via /api/connect-queue/in-process-refine-eligibility.
-         * Also cross-checks each row against HeyReach's live per-lead status (see
-         * getLiveHrStatusMapForBdr above) to catch already-sent/finished/failed leads
-         * that webhook-based tracking alone would miss.
+         * Calls the exact same server-side pipeline connect/in_processes_today.html
+         * uses for its "Total In Process" number (computeInProcessLeads() via
+         * GET /api/bdr/in-process-leads) instead of maintaining a second,
+         * independently-written queue/webhook/live-status calculation here.
+         * That second copy is what let this dashboard's "Pending" disagree with
+         * (and sometimes land at 0 while) in_processes_today.html's real count —
+         * this makes the two numbers the same by construction, not by keeping two
+         * implementations in sync by hand.
+         *
+         * The `ctx` param is accepted for call-site compatibility but unused.
          */
         async function computeStrictInProcessPending(bdrAuthEmail, ctx) {
-            const { collection, query, where, getDocs, limit: fsLimit } = window.clemailFirestore;
-            const emailDB = window.clemailDb;
-            const lower = bdrAuthEmail.toLowerCase();
-            const linkedInEmail = ctx.authToLinkedIn.get(lower) || null;
-            const emailsToQuery = [...new Set([lower, linkedInEmail].filter(Boolean))];
-            const emailSet = new Set(emailsToQuery);
-
-            const bdrAccountIds = new Set();
-            emailSet.forEach(em => (ctx.emailToAccountIds.get(em) || new Set()).forEach(id => bdrAccountIds.add(id)));
-
-            // Same fallback order as edit_in_process_messages.html: prefer bdr_leaders.heyreachAccountId,
-            // then fall back to the account ID nested inside heyreachCampaigns. Missing this fallback
-            // was under-matching CONNECTION_REQUEST_SENT events for BDRs whose account ID only lives on
-            // a campaign entry, which made old already-sent leads look like they were still pending.
-            const bdrLeaderInfo = ctx.bdrLeaderInfoByEmail.get(lower) || {};
-            let bdrLeaderAccountId = bdrLeaderInfo.heyreachAccountId ? String(bdrLeaderInfo.heyreachAccountId) : '';
-            if (!bdrLeaderAccountId && bdrLeaderInfo.heyreachCampaigns && bdrLeaderInfo.heyreachCampaigns.length) {
-                const firstWithAcct = bdrLeaderInfo.heyreachCampaigns.find(c => c.accountId || c.heyreachAccountId);
-                if (firstWithAcct) bdrLeaderAccountId = String(firstWithAcct.accountId || firstWithAcct.heyreachAccountId);
+            const token = await getRailwayToken();
+            const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+            const resp = await fetch(`${RAILWAY_BASE}/api/bdr/in-process-leads?bdrEmail=${encodeURIComponent(bdrAuthEmail)}`, { headers });
+            const json = await resp.json().catch(() => ({}));
+            if (!resp.ok || !json.success) {
+                throw new Error((json && json.error) || `HTTP ${resp.status}`);
             }
-            const sentMatchAccountIds = bdrLeaderAccountId ? new Set([bdrLeaderAccountId]) : bdrAccountIds;
-
-            let sentUrlsForBdr;
-            let sentMessageUrlsForBdr = new Set();
-            if (ctx.sentEventsOk) {
-                sentUrlsForBdr = new Set();
-                for (const ev of ctx.allSentEvents) {
-                    let matched = false;
-                    if (ev.accountEmail && emailSet.has(String(ev.accountEmail).toLowerCase())) {
-                        matched = true;
-                    } else if (ev.linkedInAccountId) {
-                        const id = String(ev.linkedInAccountId);
-                        if (sentMatchAccountIds.has(id)) matched = true;
-                        else {
-                            const mapped = ctx.idToBdr.get(id);
-                            if (mapped && emailSet.has(mapped)) matched = true;
-                        }
-                    }
-                    if (!matched) continue;
-                    const url = normalizeHrQueueUrl(ev.leadProfileUrl || '');
-                    if (url) sentUrlsForBdr.add(url);
-                }
-            } else {
-                sentUrlsForBdr = await loadSentUrlsFirestoreFallback(emailDB, emailSet, ctx.idToBdr, sentMatchAccountIds, ctx.REPORT_DAYS);
-            }
-
-            if (ctx.messageSentEventsOk && Array.isArray(ctx.allMessageSentEvents)) {
-                for (const ev of ctx.allMessageSentEvents) {
-                    let matched = false;
-                    if (ev.accountEmail && emailSet.has(String(ev.accountEmail).toLowerCase())) {
-                        matched = true;
-                    } else if (ev.linkedInAccountId) {
-                        const id = String(ev.linkedInAccountId);
-                        if (sentMatchAccountIds.has(id)) matched = true;
-                        else {
-                            const mapped = ctx.idToBdr.get(id);
-                            if (mapped && emailSet.has(mapped)) matched = true;
-                        }
-                    }
-                    if (!matched) continue;
-                    const url = normalizeHrQueueUrl(ev.leadProfileUrl || '');
-                    if (url) sentMessageUrlsForBdr.add(url);
-                }
-            }
-
-            const cutoff = Date.now() - ctx.REPORT_DAYS * 24 * 60 * 60 * 1000;
-            const seenIds = new Set();
-            const queueRows = [];
-            for (const em of emailsToQuery) {
-                const q = query(collection(emailDB, 'connect_queue'), where('account_email', '==', em), fsLimit(8000));
-                const snap = await getDocs(q);
-                snap.forEach(d => {
-                    if (seenIds.has(d.id)) return;
-                    seenIds.add(d.id);
-                    queueRows.push({ id: d.id, ...d.data() });
-                });
-            }
-
-            const inProcess = [];
-            for (const row of queueRows) {
-                const rowEmail = (row.account_email || '').toLowerCase().trim();
-                if (rowEmail && !emailSet.has(rowEmail)) continue;
-                const mt = (row.message_type || '').toLowerCase();
-                const isConnect = mt === 'connect' || mt === 'connection';
-                const isMessage = mt === 'message';
-                if (!isConnect && !isMessage) continue;
-                if (!row.pushed_to_heyreach) continue;
-                const pushTs = new Date(row.heyreach_push_date || row.pushed_date || 0).getTime();
-                if (pushTs > 0 && pushTs < cutoff) continue;
-                const url = normalizeHrQueueUrl(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
-                if (!url) continue;
-                if (isConnect && sentUrlsForBdr.has(url)) continue;
-                if (isMessage && sentMessageUrlsForBdr.has(url)) continue;
-                inProcess.push({ ...row, _kind: isConnect ? 'connect' : 'message' });
-            }
-
-            inProcess.sort((a, b) => {
-                const ta = new Date(a.heyreach_push_date || a.pushed_date || 0).getTime();
-                const tb = new Date(b.heyreach_push_date || b.pushed_date || 0).getTime();
-                return tb - ta;
-            });
-            const seenKeys = new Set();
-            let deduplicated = [];
-            for (const row of inProcess) {
-                const url = normalizeHrQueueUrl(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
-                const key = `${row._kind}::${url}`;
-                if (url && seenKeys.has(key)) continue;
-                if (url) seenKeys.add(key);
-                deduplicated.push(row);
-            }
-
-            const emptyResult = (extra = {}) => ({
-                pending: 0, pendingConnect: 0, pendingMessage: 0,
-                verified: true, preEligibilityCount: 0, excludedByLiveStatus: 0, ...extra,
-            });
-
-            if (!deduplicated.length) {
-                return emptyResult();
-            }
-
-            // ── Live HeyReach status cross-check ──────────────────────────────
-            // sentUrlsForBdr above only reflects CONNECTION_REQUEST_SENT *webhooks*,
-            // which can under-count. Pull HeyReach's own live per-lead status for this
-            // BDR's campaigns and drop anything it says is already sent/finished/failed
-            // — same fix already applied in in_processes_today.html.
-            let excludedByLiveStatus = 0;
-            try {
-                const liveStatusMap = await getLiveHrStatusMapForBdr(bdrAuthEmail, ctx);
-                if (liveStatusMap.size > 0) {
-                    const before = deduplicated.length;
-                    deduplicated = deduplicated.filter(row => {
-                        const url = normalizeUrlForHrLiveMatch(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
-                        const verdict = url ? liveStatusMap.get(url) : null;
-                        return !(verdict && verdict.alreadySent);
-                    });
-                    excludedByLiveStatus = before - deduplicated.length;
-                    if (excludedByLiveStatus > 0) {
-                        console.log(`[bdr-dashboard] ${bdrAuthEmail}: live HeyReach status excluded ${excludedByLiveStatus} already-sent/finished/failed lead(s) that webhook tracking missed.`);
-                    }
-                }
-            } catch (e) {
-                console.warn(`[bdr-dashboard] Live HeyReach status cross-check failed for ${bdrAuthEmail}:`, e.message);
-            }
-
-            if (!deduplicated.length) {
-                return emptyResult({ excludedByLiveStatus });
-            }
-
-            // ── Trust the live campaign lead list over the fragile single-lead check ──
-            // The old eligibility pass below calls HeyReach's single-lead /lead/GetLead
-            // per row to confirm it still exists — but that call is prone to the exact
-            // URL-format mismatches we spent a while chasing down for in_processes_today.html.
-            // If a row's URL was already found in the bulk /leads/getall campaign pull above
-            // (liveStatusMap) and it's NOT flagged already-sent/terminal, that's direct proof
-            // from HeyReach itself that the lead is present and still pending — no need to
-            // risk a second, less reliable existence check dropping it incorrectly. Only rows
-            // we couldn't confirm that way go through the old prospect-list + GetLead pass.
-            let liveStatusMapForSplit = new Map();
-            try { liveStatusMapForSplit = await getLiveHrStatusMapForBdr(bdrAuthEmail, ctx); } catch (_) { /* already logged above */ }
-            const confirmedPresentRows = [];
-            const needsEligibilityCheck = [];
-            for (const row of deduplicated) {
-                const url = normalizeUrlForHrLiveMatch(row.prospect_li_url || row.contact_linkedin_url || row.linkedin_url || '');
-                const verdict = url ? liveStatusMapForSplit.get(url) : null;
-                if (verdict && !verdict.alreadySent) confirmedPresentRows.push(row);
-                else needsEligibilityCheck.push(row);
-            }
-            if (confirmedPresentRows.length > 0) {
-                console.log(`[bdr-dashboard] ${bdrAuthEmail}: ${confirmedPresentRows.length} row(s) confirmed present+pending directly via live HeyReach campaign data (skipping single-lead check); ${needsEligibilityCheck.length} still need the prospect-list/GetLead check.`);
-            }
-
-            const splitCounts = (rows) => {
-                let pendingConnect = 0, pendingMessage = 0;
-                for (const r of rows) {
-                    if (r._kind === 'message') pendingMessage++;
-                    else pendingConnect++;
-                }
-                return {
-                    pending: pendingConnect + pendingMessage,
-                    pendingConnect,
-                    pendingMessage,
-                };
-            };
-
-            if (!needsEligibilityCheck.length) {
-                return {
-                    ...splitCounts(confirmedPresentRows),
-                    verified: true,
-                    preEligibilityCount: deduplicated.length,
-                    confirmedViaLiveApi: confirmedPresentRows.length,
-                    excludedByLiveStatus,
-                };
-            }
-
-            // The eligibility endpoint does a *live* HeyReach lookup per lead (concurrency 8
-            // server-side). Sending a BDR's entire backlog in one request (e.g. Greg Miller's
-            // ~150 stale rows) can take long enough that Railway's proxy kills it with a 502
-            // before it finishes. Batching keeps each request comfortably under that timeout,
-            // and a failed batch fails open (keeps its rows) instead of losing the whole BDR.
-            const ELIGIBILITY_BATCH_SIZE = 25;
-            const allIds = needsEligibilityCheck.map(r => r.id);
-            let keepIds = [];
-            const summary = { not_on_prospect_lead_list: 0, not_in_heyreach_list: 0, not_in_heyreach: 0 };
-            let prospectLeadUrlCount = null;
-            let anyBatchOk = false;
-            let lastError = null;
-
-            for (let i = 0; i < allIds.length; i += ELIGIBILITY_BATCH_SIZE) {
-                const batch = allIds.slice(i, i + ELIGIBILITY_BATCH_SIZE);
-                try {
-                    const refResp = await fetch(`${RAILWAY_BASE}/api/connect-queue/in-process-refine-eligibility`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ bdrAuthEmail: lower, queueIds: batch })
-                    });
-                    const refJson = await refResp.json().catch(() => ({}));
-                    if (refResp.ok && refJson.success && Array.isArray(refJson.keepIds)) {
-                        anyBatchOk = true;
-                        keepIds = keepIds.concat(refJson.keepIds);
-                        const s = refJson.summary || {};
-                        summary.not_on_prospect_lead_list += s.not_on_prospect_lead_list || 0;
-                        summary.not_in_heyreach_list      += s.not_in_heyreach_list || 0;
-                        summary.not_in_heyreach           += s.not_in_heyreach || 0;
-                        if (prospectLeadUrlCount == null) prospectLeadUrlCount = refJson.prospectLeadUrlCount ?? null;
-                    } else {
-                        lastError = (refJson && refJson.error) || `HTTP ${refResp.status}`;
-                        keepIds = keepIds.concat(batch); // fail open for this batch
-                    }
-                } catch (e) {
-                    lastError = e.message;
-                    keepIds = keepIds.concat(batch); // fail open for this batch
-                }
-            }
-
-            console.log(`[bdr-dashboard] ${bdrAuthEmail}: eligibility summary for the ${allIds.length} unconfirmed row(s) —`, summary, `prospectLeadUrlCount=${prospectLeadUrlCount}`);
-
-            if (!anyBatchOk) {
-                const failOpen = confirmedPresentRows.concat(needsEligibilityCheck);
-                return {
-                    ...splitCounts(failOpen),
-                    verified: false,
-                    preEligibilityCount: deduplicated.length,
-                    confirmedViaLiveApi: confirmedPresentRows.length,
-                    excludedByLiveStatus,
-                    error: lastError || 'eligibility check failed',
-                };
-            }
-
-            // Same safety valve as edit_in_process_messages.html: an empty prospect lead list
-            // means the data is missing, not that everyone is ineligible — skip the filter
-            // rather than zero everyone out.
-            const prospectListEmpty = prospectLeadUrlCount === 0 && summary.not_on_prospect_lead_list > 0;
-            const keepSet = new Set(keepIds);
-            const keptNeeds = prospectListEmpty
-                ? needsEligibilityCheck
-                : needsEligibilityCheck.filter(r => keepSet.has(r.id));
-            const finalRows = confirmedPresentRows.concat(keptNeeds);
             return {
-                ...splitCounts(finalRows),
+                pending: json.pending ?? 0,
+                pendingConnect: json.pendingConnect ?? json.pending ?? 0,
+                pendingMessage: json.pendingMessage ?? 0,
                 verified: true,
-                preEligibilityCount: deduplicated.length,
-                confirmedViaLiveApi: confirmedPresentRows.length,
-                excludedNotOnList: prospectListEmpty ? 0 : summary.not_on_prospect_lead_list,
-                excludedNotInHeyreach: prospectListEmpty ? 0 : (summary.not_in_heyreach_list + summary.not_in_heyreach),
-                excludedByLiveStatus,
-                prospectListEmpty,
-                partial: lastError != null,
+                excludedByLiveStatus: (json.diagnostics && json.diagnostics.erroredCount) || 0,
             };
         }
 
@@ -9480,8 +9356,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             const originalBtnHtml = btn.innerHTML;
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
             try {
-                const ctx = await getDashboardEligibilityContext();
-                const result = await computeStrictInProcessPending(primaryEmail, ctx);
+                const result = await computeStrictInProcessPending(primaryEmail, null);
                 applyRefinedPendingToRow(primaryEmail, result);
                 persistVerifiedPending(primaryEmail, result);
             } catch (e) {
@@ -10800,9 +10675,36 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         };
 
         // Auto-load on page ready (after auth)
-        const auth = window.auth;
-        if (auth) {
-            import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js').then(({ onAuthStateChanged }) => {
+        //
+        // NOTE: `window.auth` is set asynchronously by auth.js (only after its
+        // Firebase init finishes — which, on pages like this one with no auth UI
+        // elements, is deliberately delayed ~5s while auth.js polls for header
+        // elements it will never find). This inline <script type="module"> block
+        // runs synchronously during initial HTML parsing, long before that, so a
+        // plain `if (window.auth)` check here ALWAYS evaluates false and this
+        // used to permanently skip attaching a real onAuthStateChanged listener
+        // — falling back to a single blind 1.5s timer instead. If that timer (or
+        // the initial _liLoadAlerts() call at the bottom of this script) resolved
+        // team-scoping before the real signed-in user was known, getViewerTeamMemberId()
+        // returned null and the "fail open" branches in applyTeamScopeToAlerts()/
+        // isBdrAssignmentVisibleToViewer() would briefly show every BDR's reply
+        // alerts (not just the viewer's own) until something else happened to
+        // re-run the scope check — which is exactly the "shows a few, then a bit
+        // later shows all of them" symptom reported for the LinkedIn Replies panel.
+        //
+        // Fix: wait on auth.js's own `window.firebaseReady` promise (resolved
+        // once Firebase is truly initialized, regardless of how long that takes)
+        // instead of racing a synchronous window.auth check, so the listener
+        // always attaches and reply-alert scoping always waits for the real viewer.
+        (async () => {
+            try {
+                if (window.firebaseReady) await window.firebaseReady;
+            } catch (err) {
+                console.warn('[Auto-load] firebaseReady rejected, proceeding anyway:', err?.message);
+            }
+            const auth = window.auth;
+            if (auth) {
+                const { onAuthStateChanged } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
                 onAuthStateChanged(auth, user => {
                     if (user) {
                         loadBdrDashboard();
@@ -10815,17 +10717,21 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                         _liRefreshTeamScopedAlerts();
                     }
                 });
-            });
-        } else {
-            setTimeout(() => {
-                loadBdrDashboard();
-                window.loadClientDashboard();
-                populateHeyreachQueueReportBdrs();
-                populateLiFilterBdrs();
-                updateViewerScopeBadges();
-                _liRefreshTeamScopedAlerts();
-            }, 1500);
-        }
+            } else {
+                // window.auth still isn't set even after firebaseReady resolved
+                // (e.g. firebaseReady itself doesn't exist on some older auth.js
+                // version) — fall back to the old blind-timer behavior rather
+                // than silently doing nothing.
+                setTimeout(() => {
+                    loadBdrDashboard();
+                    window.loadClientDashboard();
+                    populateHeyreachQueueReportBdrs();
+                    populateLiFilterBdrs();
+                    updateViewerScopeBadges();
+                    _liRefreshTeamScopedAlerts();
+                }, 1500);
+            }
+        })();
     </script>
 
     <!-- ===== Customization + Platform Updates Module ===== -->
@@ -11393,6 +11299,13 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
 
         // ── Auth Integration ──────────────────────────────────────────────────
 
+        // Wait for auth.js to finish initializing before reading window.auth —
+        // this script block runs at page-parse time, well before auth.js's async
+        // Firebase init completes, so a plain `window.auth` check here would
+        // (almost) always be null and silently skip attaching the real
+        // onAuthStateChanged listener. See the LinkedIn Reply Alerts "Auto-load
+        // on page ready" block above for the full writeup of this race.
+        try { if (window.firebaseReady) await window.firebaseReady; } catch (e) { /* proceed anyway */ }
         const authInst = window.auth;
         if (authInst) {
             const { onAuthStateChanged } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
@@ -11779,6 +11692,15 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 section: 'Admin',
                 description: 'AI analysis of prospects who have expressed interest in meeting — score and rank leads by intent signals to prioritize follow-up.',
                 keywords: ['meeting','interest','intent','score','rank','leads','interested to meet','follow up','analysis']
+            },
+            {
+                title: 'Conference Scheduling',
+                href: 'conference_scheduling.html',
+                icon: 'fa-calendar-star',
+                color: ['#C9973D','#12314C'],
+                section: 'Admin',
+                description: 'Set each BDR\'s open meeting windows at a conference, pick times from reply alerts and message review, then build a branded PDF meeting schedule for clients.',
+                keywords: ['conference','scheduling','schedule','time slots','availability','open windows','meet','meetup','event','trade show','HLTH','HIMSS','PDF','report','client report','BDR calendar','book meeting']
             },
             {
                 title: 'Scheduled Meetings Calendar',

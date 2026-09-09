@@ -4971,6 +4971,13 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
   const FU_SAVE_LS_KEY = 'company_comms_followup_results';
   const FU_SAVE_COLL   = 'company_comms_followups';
   const FU_SAVE_DOC    = 'latest';
+  // Firestore's hard per-document cap is 1,048,576 bytes. Leave headroom for the
+  // rest of the payload (savedAt/scanned/etc.) and Firestore's own field overhead.
+  const FU_SAVE_MAX_BYTES = 950000;
+
+  function fuByteSize(obj) {
+    return new TextEncoder().encode(JSON.stringify(obj)).length;
+  }
 
   function fuSlimForSave(fu) {
     const {
@@ -5072,14 +5079,45 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
     try {
       await waitForWrapper();
       const { doc, setDoc } = window.clemailFirestore;
+      const fsPayload = fuFitPayloadToFirestoreLimit(payload);
       await withTimeout(
-        setDoc(doc(window.clemailDb, FU_SAVE_COLL, FU_SAVE_DOC), payload),
+        setDoc(doc(window.clemailDb, FU_SAVE_COLL, FU_SAVE_DOC), fsPayload),
         15000,
         'Save follow-up opportunities'
       );
     } catch (e) {
       console.warn('Firestore follow-up save failed:', e.message);
+      fuLog(`  ⚠ Cloud save failed (${e.message}) — results are still safe in this browser's local cache.`, 'warning');
     }
+  }
+
+  // Firestore documents cap out at 1MB. A full scan of a few hundred companies
+  // (each carrying a transcript + drafted message + summary) can blow past that
+  // — which previously made the ENTIRE save silently fail with INVALID_ARGUMENT,
+  // leaving Firestore holding a stale/older result set. Progressively shed the
+  // least-essential, most-verbose fields (transcript, then summary) before
+  // falling back to keeping only the highest-priority opportunities (results are
+  // already sorted by urgency/need before this is called), so the save always
+  // succeeds with as much real data as fits.
+  function fuFitPayloadToFirestoreLimit(payload) {
+    if (fuByteSize(payload) <= FU_SAVE_MAX_BYTES) return payload;
+
+    let results = payload.results.map(r => ({ ...r, transcript: (r.transcript || '').slice(0, 300) }));
+    let candidate = { ...payload, results };
+    if (fuByteSize(candidate) <= FU_SAVE_MAX_BYTES) return candidate;
+
+    results = results.map(r => ({ ...r, aiSummary: (r.aiSummary || '').slice(0, 200) }));
+    candidate = { ...payload, results };
+    if (fuByteSize(candidate) <= FU_SAVE_MAX_BYTES) return candidate;
+
+    // Still too big — keep trimming the (already-sorted, most-urgent-first)
+    // results list down to whatever fits rather than failing outright.
+    while (results.length > 1 && fuByteSize({ ...payload, results }) > FU_SAVE_MAX_BYTES) {
+      results = results.slice(0, Math.max(1, Math.floor(results.length * 0.8)));
+    }
+    console.warn(`saveFollowupResults: trimmed ${payload.results.length - results.length} lowest-priority result(s) to fit Firestore's 1MB doc limit`);
+    fuLog(`  ⚠ Cloud save trimmed to the top ${results.length} of ${payload.results.length} opportunities to fit Firestore's 1MB size limit (full list is still in this browser's local cache).`, 'warning');
+    return { ...payload, results, truncatedForSave: true };
   }
 
   let _fuSaveTimer = null;
@@ -5620,6 +5658,55 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
   // so re-scans don't repeat the same search/AI call.
   const fuClassifyCache = new Map(); // accountId → { isB2B, isBenefits, reason, unverified }
 
+  // Shared helper for the lighter-weight AI calls (classification + need-rating).
+  // Retries transient failures (HTTP 500s, timeouts, 429s) with backoff so a
+  // brief backend/OpenRouter hiccup doesn't silently fall back to the same
+  // default for every single company in the scan — which is what made every
+  // "AI Follow-up Opportunity" look identically rated when /api/ai-profile-eval
+  // was returning 500 for a stretch of the run. fuAnalyzeCompany has its own
+  // (longer, 4-attempt) retry loop for the same reason; this mirrors it for the
+  // two calls that previously gave up after a single try.
+  async function fuAiEvalCall(prompt, { temperature = 0.1, maxTokens = 200, timeoutMs = 25000, maxRetries = 3, label = 'AI call' } = {}) {
+    let lastErr;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const res = await fetchWithTimeout(`${RAILWAY_URL}/api/ai-profile-eval`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider:    'openrouter',
+            model:       getSelectedAiModel(),
+            prompt,
+            temperature,
+            max_tokens:  maxTokens,
+          }),
+        }, timeoutMs);
+        if (res.status === 429) {
+          const retryAfterSec = parseInt(res.headers.get('Retry-After') || '0', 10);
+          const waitMs = retryAfterSec > 0
+            ? retryAfterSec * 1000
+            : Math.min(2000 * Math.pow(2, attempt - 1), 20000);
+          await sleep(waitMs);
+          continue;
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data    = await res.json();
+        const raw     = (data.message || data.response || '').trim();
+        const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        const match   = cleaned.match(/\{[\s\S]*\}/);
+        if (!match) throw new Error('No JSON in AI response');
+        return JSON.parse(match[0]);
+      } catch (e) {
+        lastErr = e;
+        if (attempt === maxRetries) break;
+        const waitMs = 750 * attempt;
+        console.warn(`${label} error (attempt ${attempt}/${maxRetries}): ${e.message} — retrying in ${waitMs}ms`);
+        await sleep(waitMs);
+      }
+    }
+    throw lastErr || new Error('AI call failed');
+  }
+
   async function fuClassifyCompany(account) {
     if (fuClassifyCache.has(account.id)) return fuClassifyCache.get(account.id);
 
@@ -5673,24 +5760,13 @@ TASK: Based ONLY on the search results above, answer two questions about this co
 Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_false, "isBenefits": true_or_false, "reason": "one concise sentence covering both answers"}`;
 
     try {
-      const res = await fetchWithTimeout(`${RAILWAY_URL}/api/ai-profile-eval`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider:    'openrouter',
-          model:       getSelectedAiModel(),
-          prompt,
-          temperature: 0.1,
-          max_tokens:  200,
-        }),
-      }, 25000);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data    = await res.json();
-      const raw     = (data.message || data.response || '').trim();
-      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-      const match   = cleaned.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error('No JSON in AI response');
-      const parsed = JSON.parse(match[0]);
+      const parsed = await fuAiEvalCall(prompt, {
+        temperature: 0.1,
+        maxTokens:   200,
+        timeoutMs:   25000,
+        maxRetries:  3,
+        label:       `fuClassifyCompany for ${account.name}`,
+      });
       const result = {
         isB2B:      parsed.isB2B !== false,
         isBenefits: parsed.isBenefits === true,
@@ -5700,7 +5776,7 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
       return result;
     } catch (e) {
       console.warn('fuClassifyCompany: classification failed for', account.name, e.message);
-      fuLog(`  ⚠ AI classification failed/timed out for ${account.name}: ${e.message}`, 'warning');
+      fuLog(`  ⚠ AI classification failed after retries for ${account.name}: ${e.message}`, 'warning');
       const result = { isB2B: true, isBenefits: false, reason: 'Classification call failed.', unverified: true };
       fuClassifyCache.set(account.id, result);
       return result;
@@ -5958,30 +6034,20 @@ ${liLines || '  (none)'}
 Respond ONLY with valid JSON (no markdown): {"needScore":integer_1_to_5,"needReason":"one short phrase matching the rubric"}`;
 
     try {
-      const res = await fetchWithTimeout(`${RAILWAY_URL}/api/ai-profile-eval`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider:    'openrouter',
-          model:       getSelectedAiModel(),
-          prompt,
-          temperature: 0.1,
-          max_tokens:  120,
-        }),
-      }, 20000);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data    = await res.json();
-      const raw     = (data.message || data.response || '').trim();
-      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-      const match   = cleaned.match(/\{[\s\S]*\}/);
-      if (!match) return null;
-      const parsed = JSON.parse(match[0]);
+      const parsed = await fuAiEvalCall(prompt, {
+        temperature: 0.1,
+        maxTokens:   120,
+        timeoutMs:   20000,
+        maxRetries:  3,
+        label:       `fuRateNeed for ${account.name}`,
+      });
       return {
         needScore:  clampNeedScore(parsed.needScore),
         needReason: parsed.needReason || '',
       };
     } catch (e) {
       console.warn('fuRateNeed failed for', account.name, e.message);
+      fuLog(`  ⚠ Need-rating failed after retries for ${account.name} — this opportunity will show no Need badge.`, 'warning');
       return null;
     }
   }

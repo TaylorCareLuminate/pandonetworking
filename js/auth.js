@@ -1466,6 +1466,17 @@ console.log('📋 Auth script loaded, waiting for initialization...');
     return;
   }
 
+  // Never steal the tab while a Firebase email-link (magic link) is being
+  // completed. Redirecting to sso-bridge.html would drop or race the oobCode
+  // and leave the client looking signed-out.
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('oobCode') || params.getAll('mode').includes('signIn')) {
+      console.log('ℹ️ [SSO Bridge] Email-link sign-in in progress, skipping');
+      return;
+    }
+  } catch (e) { /* continue */ }
+
   // Uses a real top-level (same-tab) redirect through healthluminate.com and
   // back, rather than a hidden iframe. A hidden iframe can't reliably read
   // another site's login session in modern browsers — Safari ITP, Firefox
