@@ -5485,15 +5485,22 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
     const results = [];
     let analyzed  = 0;
 
-    for (let i = 0; i < targetAccounts.length; i++) {
-      if (fuShouldStop) {
-        fuLog(`⏹ Stopped by user after ${analyzed} of ${targetAccounts.length} companies.`, 'warning');
-        break;
-      }
+    function fuUpdateProgress() {
+      const pct = Math.round((analyzed / targetAccounts.length) * 90);
+      fuSetStatus(`Analyzing… (${analyzed}/${targetAccounts.length} analyzed)`, pct);
+      document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
+    }
 
-      const account = targetAccounts[i];
-      const scan    = scanState[account.id];
-      if (!scan) continue;
+    // Companies are independent of each other, so instead of awaiting one Brave
+    // search + up to two AI calls per company in strict sequence (which is what
+    // made large scans take many minutes), a small pool of lanes processes
+    // several companies concurrently.
+    const CONCURRENCY = Math.min(4, targetAccounts.length);
+    fuLog(`Running ${CONCURRENCY} compan${CONCURRENCY === 1 ? 'y' : 'ies'} at a time…`);
+
+    async function processAccount(account) {
+      const scan = scanState[account.id];
+      if (!scan) return;
 
       const emails = realEmailsOf(scan);
       const liMsgs = liMsgsOf(scan);
@@ -5515,8 +5522,6 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
       // and the hard urgency/need caps applied after the AI answers.
       const facts = fuCommsFacts(otherAll, allLi);
 
-      const pct = Math.round((i / targetAccounts.length) * 90);
-      fuSetStatus(`Analyzing ${account.name}… (${i + 1}/${targetAccounts.length})`, pct);
       if (hexOnly) {
         fuLog(`[${account.name}] HEX-only connection (${hexAll.length} DRI Monthly meeting email${hexAll.length === 1 ? '' : 's'}) — using HEX intro`);
       } else if (staleReconnect) {
@@ -5533,9 +5538,8 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
           && facts.daysSinceOutbound != null && facts.daysSinceOutbound < minDaysSince) {
         fuLog(`  ⏭ Skipped — we messaged them ${facts.daysSinceOutbound}d ago (< ${minDaysSince}d min) with no reply yet`, 'info');
         analyzed++;
-        document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
-        if (i < targetAccounts.length - 1 && !fuShouldStop) await sleep(150);
-        continue;
+        fuUpdateProgress();
+        return;
       }
 
       // Classification gate — verify via live Brave search + AI whether this is a
@@ -5549,9 +5553,8 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
         fuLog(`  ⛔ Marked NA — not a B2B company and not in employee benefits (Brave search): ${classification.reason || 'no reason given'}`, 'warning');
         await fuSetNotApplicable(account, classification.reason || '');
         analyzed++;
-        document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
-        if (i < targetAccounts.length - 1 && !fuShouldStop) await sleep(400);
-        continue;
+        fuUpdateProgress();
+        return;
       }
       if (classification.unverified) {
         fuLog(`  ⚠ Could not verify B2B/benefits status via Brave search — proceeding anyway.`, 'warning');
@@ -5593,11 +5596,11 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
       fuApplyRecencyGuard(analysis, facts);
 
       analyzed++;
-      document.getElementById('fuJobCount').textContent = `${analyzed} / ${targetAccounts.length} analyzed`;
+      fuUpdateProgress();
 
       if (!analysis) {
         fuLog(`  ⚠ AI call failed — skipped`, 'warning');
-        continue;
+        return;
       }
 
       if (hexOnly || staleReconnect || benefitsPath || (analysis.shouldFollowUp && (analysis.fitScore || 0) >= fitThreshold)) {
@@ -5755,6 +5758,18 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
   async function fuClassifyCompany(account) {
     if (fuClassifyCache.has(account.id)) return fuClassifyCache.get(account.id);
 
+    // Persisted from a previous scan (see fuSaveClassification below) — a
+    // company's B2B/benefits classification essentially never changes, so skip
+    // the Brave search + AI call entirely once we have a verified answer on file.
+    // This is the main cost saver on re-scans, which previously re-ran a Brave
+    // search + AI classification call for every single eligible company, every time.
+    const saved = scanState[account.id]?.fuClassification;
+    if (saved && !saved.unverified) {
+      const result = { isB2B: saved.isB2B, isBenefits: saved.isBenefits, reason: saved.reason || '' };
+      fuClassifyCache.set(account.id, result);
+      return result;
+    }
+
     const query = `${account.name}${account.domain ? ' ' + account.domain : ''} company what they do`;
     let snippetText = '';
     try {
@@ -5777,7 +5792,8 @@ The time windows refer to the PROSPECT'S most recent message TO US (see KEY DATE
     }
 
     // No search context available — don't block outreach on a network hiccup,
-    // but flag it as unverified so the log makes that clear.
+    // but flag it as unverified so the log makes that clear (and so it's never
+    // persisted — we want a real classification attempt next time, not this default).
     if (!snippetText) {
       const result = { isB2B: true, isBenefits: false, reason: 'Brave search returned no results.', unverified: true };
       fuClassifyCache.set(account.id, result);
@@ -5818,6 +5834,7 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
         reason:     parsed.reason || '',
       };
       fuClassifyCache.set(account.id, result);
+      fuSaveClassification(account, result); // fire-and-forget persist for future scans
       return result;
     } catch (e) {
       console.warn('fuClassifyCompany: classification failed for', account.name, e.message);
@@ -5825,6 +5842,36 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"isB2B": true_or_fa
       const result = { isB2B: true, isBenefits: false, reason: 'Classification call failed.', unverified: true };
       fuClassifyCache.set(account.id, result);
       return result;
+    }
+  }
+
+  // Persists a verified B2B/benefits classification onto the account's
+  // company_comms_scans doc (same full-record write pattern as fuSetNotApplicable)
+  // so future scans skip the Brave search + AI classification call entirely for
+  // this company. Fire-and-forget: a save failure just means the next scan
+  // re-classifies, which is safe and cheap, so this never blocks or fails the scan.
+  async function fuSaveClassification(account, result) {
+    try {
+      await waitForWrapper();
+      const { doc, setDoc } = window.clemailFirestore;
+      const existing = scanState[account.id] || {};
+      const updated = {
+        ...existing,
+        fuClassification: {
+          isB2B:        result.isB2B,
+          isBenefits:   result.isBenefits,
+          reason:       result.reason || '',
+          classifiedAt: new Date().toISOString(),
+        },
+      };
+      await withTimeout(
+        setDoc(doc(window.clemailDb, 'company_comms_scans', account.id), updated),
+        10000,
+        `Firestore write for ${account.name || account.id}`
+      );
+      scanState[account.id] = updated;
+    } catch (e) {
+      console.warn('fuSaveClassification: save failed for', account.name || account.id, e.message);
     }
   }
 
