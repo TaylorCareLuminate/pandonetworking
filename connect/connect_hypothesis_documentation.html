@@ -10391,17 +10391,21 @@
             // the owner is a customer workspace sentinel — these are real, fully
             // enriched records that just need to be claimed, not recreated.
             const bdrByEmail = new Map(allBdrs.map(b => [(b.primaryEmail || b.id || '').toLowerCase(), b]));
-            const keyOwner   = new Map(); // canonicalKey → { bdrEmail, bdrName, company, docId }
+            const keyOwner   = new Map(); // canonicalKey → { bdrEmail, bdrName, company, docId, name, title, org }
             const keyUnowned = new Map(); // canonicalKey → { docId, ownerType, workspaceName, name, title, org, hasEnrichment }
 
             scanResults.prospectContacts.forEach(row => {
                 if (row.ownerType === 'bdr') {
                     const bdr = bdrByEmail.get(row.ownerEmail);
+                    // The server already reads name/title/company straight off the
+                    // prospect_contacts doc for every hit (owned or not) — surface it
+                    // here too so "Found & Owned" rows aren't left blank in the report.
                     keyOwner.set(row.key, {
                         bdrEmail: row.ownerEmail,
                         bdrName:  bdr?.name || row.ownerEmail,
                         company:  bdr?._company || (bdr ? 'Other' : 'Unrecognized owner'),
-                        docId:    row.docId
+                        docId:    row.docId,
+                        name:     row.name || '', title: row.title || '', org: row.company || ''
                     });
                 } else {
                     keyUnowned.set(row.key, {
@@ -10455,18 +10459,38 @@
             // a name/title/company preview pulled straight from the cached profile — not
             // just an aggregate count, so this bucket is a named list, not a mystery number.
             const missingKeys2 = uniqueKeys.filter(k => !keyOwner.has(k) && !keyUnowned.has(k) && !keyHeyreach.has(k) && !keyQueueProfile.has(k));
+
+            // Also sweep the cache for any key that WAS found/recovered but is still
+            // missing a name, title, or organization from its own record (e.g. it was
+            // tagged onto this group as a bare URL with no metadata captured, and its
+            // prospect_contacts/heyreach/queue record itself never got enriched) — not
+            // just the fully-missing bucket. This is what lets "Found & Owned" rows
+            // that came up blank get backfilled from the enrichment cache too.
+            const _preIdentity = (key) => ({
+                name:  keyOwner.get(key)?.name  || keyUnowned.get(key)?.name  || keyHeyreach.get(key)?.name  || keyQueueProfile.get(key)?.name  || keyToTagged.get(key)?.name  || '',
+                title: keyOwner.get(key)?.title || keyUnowned.get(key)?.title || keyHeyreach.get(key)?.title || keyQueueProfile.get(key)?.title || keyToTagged.get(key)?.title || '',
+                org:   keyOwner.get(key)?.org   || keyUnowned.get(key)?.org   || keyHeyreach.get(key)?.org   || keyQueueProfile.get(key)?.org   || keyToTagged.get(key)?.org   || '',
+            });
+            const missingKeySet = new Set(missingKeys2);
+            const partialGapKeys = uniqueKeys.filter(k => {
+                if (missingKeySet.has(k)) return false; // already covered below
+                const id = _preIdentity(k);
+                return !id.name || !id.title || !id.org;
+            });
+            const enrichKeys = [...missingKeys2, ...partialGapKeys];
+
             const keyApifyCache = new Map(); // canonicalKey → { name, title, company, cachedAt }
-            if (missingKeys2.length) {
+            if (enrichKeys.length) {
                 document.getElementById('locateContent').innerHTML =
-                    `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Checking the Apify profile cache for the remaining ${missingKeys2.length.toLocaleString()}…</div>`;
+                    `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Checking the enrichment cache for ${enrichKeys.length.toLocaleString()} contact${enrichKeys.length !== 1 ? 's' : ''} missing a name, title, or organization…</div>`;
                 try {
                     const cacheResp = await fetch(`${RAILWAY_BASE}/api/ai-profile-cleanup/cache-coverage`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        // ignoreExpiry: these contacts have been missing for a while, so any
-                        // historical cache hit is useful for recovery even past the normal
-                        // 30-day freshness window used elsewhere for re-scrape decisions.
-                        body: JSON.stringify({ urls: missingKeys2.map(k => keyToUrl.get(k)), ignoreExpiry: true, includeDetails: true })
+                        // ignoreExpiry: these contacts have been missing enrichment for a
+                        // while, so any historical cache hit is useful even past the
+                        // normal 30-day freshness window used elsewhere for re-scrape decisions.
+                        body: JSON.stringify({ urls: enrichKeys.map(k => keyToUrl.get(k)), ignoreExpiry: true, includeDetails: true })
                     });
                     if (cacheResp.ok) {
                         const cacheData = await cacheResp.json();
@@ -10477,7 +10501,13 @@
                     }
                 } catch(e) { console.warn('[openLocateModal] cache-coverage check failed:', e.message); }
             }
-            const apifyCachedCount = keyApifyCache.size;
+            // Scoped strictly to the fully-missing bucket — keeps the "Recoverable
+            // (Apify Cache)" / "Truly Gone" stats meaning "recreatable from nothing"
+            // rather than counting the (separate) partial name/title/org backfills below.
+            const apifyCachedCount = missingKeys2.filter(k => keyApifyCache.has(k)).length;
+            // How many already-found/recovered contacts got a name/title/org gap
+            // filled in from the cache, purely for an informational note in the UI.
+            const partialBackfilledCount = partialGapKeys.filter(k => keyApifyCache.has(k)).length;
 
             // 6. Summarize + render
             const foundCount       = keyOwner.size;
@@ -10536,9 +10566,13 @@
                     bdrName:     src.bdrName  || '',
                     bdrEmail:    src.bdrEmail || '',
                     company:     src.company  || (unowned?.ownerType === 'workspace' ? `Workspace: ${unowned.workspaceName || 'Unknown'}` : (unowned ? 'Unowned' : '')),
-                    name:        unowned?.name  || recov?.name  || recovQ?.name  || cached?.name  || tag?.name  || '',
-                    title:       unowned?.title || recov?.title || recovQ?.title || cached?.title || tag?.title || '',
-                    org:         unowned?.org   || recov?.org   || recovQ?.org   || cached?.company || tag?.org || '',
+                    // Prefer whatever's on the live/recovered record itself, then the
+                    // tag-time snapshot, then fall back to the linkedin_profile_cache
+                    // enrichment lookup above to fill in just the pieces (name/title/org)
+                    // that are still blank — without overwriting real data from a richer source.
+                    name:        owned?.name  || unowned?.name  || recov?.name  || recovQ?.name  || tag?.name  || cached?.name  || '',
+                    title:       owned?.title || unowned?.title || recov?.title || recovQ?.title || tag?.title || cached?.title || '',
+                    org:         owned?.org   || unowned?.org   || recov?.org   || recovQ?.org   || tag?.org   || cached?.company || '',
                     profile:     recovQ?.profile || null
                 };
             });
@@ -10652,12 +10686,12 @@
                     Download the full report below for the exact list.
                     ${apifyCachedCount > 0 ? `
                     <div style="margin-top:0.75rem;">
-                        <div style="font-size:0.78rem;font-weight:700;margin-bottom:0.35rem;">Who's in the cache (first ${Math.min(15, keyApifyCache.size)} of ${apifyCachedCount.toLocaleString()}):</div>
+                        <div style="font-size:0.78rem;font-weight:700;margin-bottom:0.35rem;">Who's in the cache (first ${Math.min(15, missingKeys2.filter(k => keyApifyCache.has(k)).length)} of ${apifyCachedCount.toLocaleString()}):</div>
                         <div style="max-height:180px;overflow-y:auto;border:1px solid #fecaca;border-radius:8px;">
                             <table class="locate-owner-table" style="margin:0;">
                                 <thead><tr><th>Name</th><th>Title</th><th>Company</th></tr></thead>
                                 <tbody>
-                                    ${[...keyApifyCache.values()].slice(0, 15).map(c => `<tr>
+                                    ${missingKeys2.filter(k => keyApifyCache.has(k)).slice(0, 15).map(k => keyApifyCache.get(k)).map(c => `<tr>
                                         <td>${escHtml(c.name || '(name not in cached profile)')}</td>
                                         <td>${escHtml(c.title)}</td>
                                         <td>${escHtml(c.company)}</td>
@@ -10674,12 +10708,22 @@
                         </button>
                     </div>` : ''}
                 </div>` : ''}
+                ${partialBackfilledCount > 0 ? `
+                <div class="alert" style="margin-top:1.25rem;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a5f;">
+                    <i class="fas fa-magic"></i>
+                    <strong>${partialBackfilledCount.toLocaleString()}</strong> contact${partialBackfilledCount !== 1 ? 's' : ''} that ${partialBackfilledCount !== 1 ? 'were' : 'was'} already found or recoverable
+                    ${partialBackfilledCount !== 1 ? 'had' : 'had'} a blank Name, Title, or Organization on ${partialBackfilledCount !== 1 ? 'their own' : 'its own'} record — those gaps
+                    ${partialBackfilledCount !== 1 ? 'were' : 'was'} backfilled from the <code>linkedin_profile_cache</code> enrichment cache below, without touching anything that was already there.
+                    The full report (and both export formats) reflect the backfilled values.
+                </div>` : ''}
                 <div style="margin-top:1rem;font-size:0.78rem;color:var(--gray-500);">
                     <i class="fas fa-info-circle"></i> Matching uses each contact's LinkedIn URL (slug-based, robust to
                     formatting differences) against a full, ownership-agnostic scan of <code>prospect_contacts</code>,
                     <code>heyreach_contacts</code> and <code>connect_queue</code> — every document in each collection, not just
                     the ones tied to a current BDR email, so contacts with no owner or a customer-workspace owner are still
-                    found. The URL-matching technique itself is the same one used on
+                    found. Any contact still missing a Name, Title, or Organization from its own record is additionally
+                    checked against the <code>linkedin_profile_cache</code> enrichment cache to fill in those gaps. The
+                    URL-matching technique itself is the same one used on
                     <a href="outcomes.html" target="_blank" style="color:var(--primary);">Outcomes</a> and
                     <a href="monthly_research_plan.html" target="_blank" style="color:var(--primary);">Monthly Research Plan</a>.
                 </div>
