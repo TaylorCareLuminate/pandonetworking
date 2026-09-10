@@ -1300,6 +1300,21 @@
                 </select>
             </div>
 
+            <!-- Company data source (Company tab only) -->
+            <div class="selection-group" id="companySourceGroup" style="display:none; max-width:230px;">
+                <label for="companySourceSelect"><i class="fas fa-database"></i> Data Source</label>
+                <select id="companySourceSelect" onchange="setCompanySource(this.value)">
+                    <option value="live">Live Database</option>
+                    <option value="snapshot">Weekly Snapshot (instant)</option>
+                </select>
+            </div>
+
+            <!-- Company data source explainer (Company tab, Snapshot mode only) -->
+            <div class="selection-group" id="companySourceNote" style="display:none; flex:1.5; min-width:280px;">
+                <label><i class="fas fa-info-circle"></i> Scope</label>
+                <div style="padding:0.65rem 1rem;background:#fff7ed;border-radius:10px;font-size:0.85rem;color:#9a3412;border:1px solid #fdba74;" id="companySourceNoteText"></div>
+            </div>
+
             <!-- All BDRs note -->
             <div class="selection-group" id="allBdrsNote" style="display:none; flex:1.5; min-width:280px;">
                 <label><i class="fas fa-info-circle"></i> Scope</label>
@@ -1794,6 +1809,39 @@
     let _grouperConversationsByUrl = new Map(); // url → [{role:'BDR'|'Prospect', text}]
 
     // ── Tab switching ──────────────────────────────────────────────────────
+    // Company tab data source: 'live' (real-time Firestore/HeyReach queries,
+    // supports custom date range + message-variation breakdown) or 'snapshot'
+    // (instant, reads the same weekly analysis snapshot as "Across All BDRs").
+    let companyDataSource = 'live';
+
+    window.setCompanySource = function(src) {
+        companyDataSource = (src === 'snapshot') ? 'snapshot' : 'live';
+        updateCompanyTabControls();
+    };
+
+    // Shows/hides the controls that only make sense for a live query (date
+    // range, unsent-queue filter) and the Company-snapshot explainer note.
+    // Called on every tab switch and whenever the Company data source changes.
+    function updateCompanyTabControls() {
+        const isCompanySnapshot = currentTab === 'company' && companyDataSource === 'snapshot';
+
+        document.getElementById('companySourceGroup').style.display = currentTab === 'company' ? '' : 'none';
+        const note     = document.getElementById('companySourceNote');
+        const noteText = document.getElementById('companySourceNoteText');
+        if (note) {
+            note.style.display = isCompanySnapshot ? '' : 'none';
+            if (isCompanySnapshot && noteText) {
+                noteText.innerHTML = '<strong>Weekly Snapshot</strong> — loaded instantly from the same weekly analysis as "Across All BDRs," including hypothesis groups. Message-variation-level results and a custom date range aren\'t available from the snapshot — switch to Live Database for those.';
+            }
+        }
+
+        // Date range / unsent-queue filter only apply to a live query.
+        const hideLiveOnlyControls = currentTab === 'groups' || currentTab === 'all' || isCompanySnapshot;
+        document.getElementById('dateRangeGroup').style.display = hideLiveOnlyControls ? 'none' : '';
+        const filterUnsentRow = document.getElementById('filterUnsentRow');
+        if (filterUnsentRow) filterUnsentRow.style.display = hideLiveOnlyControls ? 'none' : '';
+    }
+
     window.switchTab = function(tab) {
         currentTab = tab;
         document.getElementById('tabBdr').classList.toggle('active',     tab === 'bdr');
@@ -1804,12 +1852,7 @@
         document.getElementById('companySelectorGroup').style.display   = tab === 'company' ? '' : 'none';
         document.getElementById('allBdrsNote').style.display            = tab === 'all'     ? '' : 'none';
         document.getElementById('groupsSelectorGroup').style.display    = tab === 'groups'  ? '' : 'none';
-        // All BDRs is read instantly from the latest weekly analysis snapshot —
-        // there's no live query to scope, so the date range / unsent-queue filter
-        // (which only apply to the live BDR/Company queries) are hidden for it.
-        document.getElementById('dateRangeGroup').style.display         = (tab === 'groups' || tab === 'all') ? 'none' : '';
-        const filterUnsentRow = document.getElementById('filterUnsentRow');
-        if (filterUnsentRow) filterUnsentRow.style.display = (tab === 'groups' || tab === 'all') ? 'none' : '';
+        updateCompanyTabControls();
         if (tab === 'groups') loadGroupsForOutcomes();
         // All BDRs has no controls to configure — load it immediately.
         if (tab === 'all') runAnalysis();
@@ -1979,7 +2022,7 @@
         complement:       { label: 'Organization Complement', icon: 'fa-star',            cls: 'complement' },
         fast_prospect:    { label: 'Fast Prospect',           icon: 'fa-paper-plane',     cls: 'fast-prospect' },
         about_me_connect: { label: 'Common Ground',           icon: 'fa-user-friends',    cls: 'about-me-connect' },
-        other:            { label: 'Other',                   icon: 'fa-question-circle', cls: 'other' },
+        other:            { label: 'Other/Harvest Follow-Up',  icon: 'fa-question-circle', cls: 'other' },
         total:            { label: 'All Types',               icon: 'fa-layer-group',     cls: 'total' },
     };
 
@@ -2913,13 +2956,8 @@
         if (!card || !body) return;
 
         // Load groups if not already done
-        if (!_outcomeGroups.length) {
-            try {
-                const snap = await getDocs(collection(emailDB, 'hypothesis_groups'));
-                _outcomeGroups = [];
-                snap.forEach(d => _outcomeGroups.push({ id: d.id, ...d.data() }));
-            } catch(e) { console.warn('hypothesis groups load:', e); return; }
-        }
+        await ensureOutcomeGroupsLoaded();
+        if (!_outcomeGroups.length) return;
 
         // Filter to groups whose BDRs overlap with the selected BDR/company BDRs
         const relevantGroups = _outcomeGroups.filter(g => {
@@ -3391,6 +3429,14 @@
         // manually "Save to Cache" so other users could load it instantly — the
         // weekly snapshot is already that shared cache, so neither step is needed.
         if (currentTab === 'all') { await runAllBdrsFromAnalysisSnapshot(); return; }
+        // Intercept for "By Company" when the Weekly Snapshot data source is
+        // selected — same idea, scoped to one client's segment in the snapshot.
+        if (currentTab === 'company' && companyDataSource === 'snapshot') {
+            const company = document.getElementById('companySelect').value;
+            if (!company) { showAlert('Please select a company.', 'warning'); return; }
+            await runCompanyFromAnalysisSnapshot(company);
+            return;
+        }
 
         const btn = document.getElementById('analyzeBtn');
         btn.disabled = true;
@@ -4495,7 +4541,14 @@
     }
 
     // ── Global Benchmark Comparison ───────────────────────────────────────────
+    // True only while rendering the "Across All BDRs" snapshot view itself
+    // (comparing the global benchmark against itself would be meaningless).
     let _isRenderingFromCache = false;
+    // True while rendering ANY snapshot-sourced view (All BDRs or a Company on
+    // the Weekly Snapshot data source) — no raw message text is available, so
+    // the Word Count card is hidden. Independent of _isRenderingFromCache above:
+    // a Company-snapshot view still gets a meaningful Global Benchmark comparison.
+    let _isSnapshotRender = false;
 
     function renderComparisonSection(currentResults, currentLabel) {
         const card = document.getElementById('benchmarkCompareCard');
@@ -5250,6 +5303,11 @@
 
         if (currentTab === 'all') {
             rowsToDisplay.sort((a, b) => {
+                // 'Other/Harvest Follow-Up' isn't a real outreach channel — always pin it
+                // to the bottom regardless of its (not meaningful) connections/meeting ratio.
+                if (a.type === 'other' && b.type === 'other') return 0;
+                if (a.type === 'other') return 1;
+                if (b.type === 'other') return -1;
                 const ca = connPerMeeting(a.sent, a.scheduled);
                 const cb = connPerMeeting(b.sent, b.scheduled);
                 if (ca === null && cb === null) return 0;
@@ -5266,7 +5324,9 @@
             const repPct   = pct(row.replied, row.accepted);
             const schedPct = pct(row.scheduled, row.replied);
             const isTotal  = row.type === 'total';
-            const connPerMtg = connPerMeeting(row.sent, row.scheduled);
+            // Connections/Meeting isn't a meaningful metric for the catch-all
+            // 'Other/Harvest Follow-Up' bucket — always render it as "—".
+            const connPerMtg = row.type === 'other' ? null : connPerMeeting(row.sent, row.scheduled);
 
             tbody.insertAdjacentHTML('beforeend', `
             <tr${isTotal ? ' class="total-row"' : ''}>
@@ -5381,9 +5441,10 @@
         // Recent connections highlight list (filterable by BDR)
         renderRecentConnections(_grouperSentItems, _grouperAcceptedUrls, _grouperTargetBdrs);
 
-        // Word count card — only available on a fresh analysis (not from cache)
+        // Word count card — only available on a fresh live analysis (no raw
+        // message text ships with the weekly analysis snapshot).
         const wcCard = document.getElementById('wordCountCard');
-        if (_isRenderingFromCache) {
+        if (_isSnapshotRender) {
             wcCard.style.display = 'none';
         } else {
             wcCard.style.display = '';
@@ -5653,12 +5714,11 @@
         };
     }
 
-    /** Build a renderResults()-shaped object from the analysis snapshot's
-     *  "overall" segment (all clients, all BDRs). */
-    function buildResultsFromAnalysisPayload(payload) {
-        const overall  = payload.overall || {};
-        const research = overall.research || {};
-        const funnel   = overall.funnel || {};
+    /** Build a renderResults()-shaped object from any analysis-snapshot Segment
+     *  (the "overall" segment for All BDRs, or a client segment for one Company). */
+    function buildResultsFromSegment(segment) {
+        const research = (segment && segment.research) || {};
+        const funnel    = (segment && segment.funnel) || {};
 
         // ── Message-type funnel rows (mirrors buildResults' `classify`) ──
         const buckets = {};
@@ -5676,7 +5736,11 @@
             if (ALL_BDRS_SECONDARY_TYPES.has(type) || !TYPE_LABELS[type]) type = 'other';
             addToBucket(type, rateRowToCounts(row));
         });
-        const rows = Object.keys(buckets).map(type => ({ type, ...buckets[type] }));
+        // 'Other/Harvest Follow-Up' always goes last, matching the live-query
+        // path's fixed type order — the snapshot's own row order isn't reliable.
+        const rows = Object.keys(buckets)
+            .sort((a, b) => (a === 'other') - (b === 'other'))
+            .map(type => ({ type, ...buckets[type] }));
 
         // ── Grand total — straight from the segment funnel (exact, not rate-derived) ──
         const grandTotal = {
@@ -5699,12 +5763,24 @@
         return { rows, grandTotal, bdrRows, profileBreakout: [], complementBreakout: [], editedBreakout: [] };
     }
 
+    /** Build a renderResults()-shaped object from the analysis snapshot's
+     *  "overall" segment (all clients, all BDRs). */
+    function buildResultsFromAnalysisPayload(payload) {
+        return buildResultsFromSegment(payload && payload.overall);
+    }
+
+    // Raw snapshot payload (kept in full so the Company tab can look up a
+    // specific client's segment — clients[slug] — including its hypothesis
+    // groups). Populated by loadGlobalBenchmark().
+    let _analysisPayloadRaw = null;
+
     /** Fetch + build the analysis snapshot once and cache it in memory. Safe to
      *  call repeatedly — later calls reuse the in-flight/completed promise. */
     function loadGlobalBenchmark() {
         if (_globalBenchmarkPromise) return _globalBenchmarkPromise;
         _globalBenchmarkPromise = (async () => {
             const payload = await fetchAnalysisPayload();
+            _analysisPayloadRaw = payload;
             const results = buildResultsFromAnalysisPayload(payload);
             _cachedPayload = {
                 results,
@@ -5723,6 +5799,24 @@
             throw e;
         });
         return _globalBenchmarkPromise;
+    }
+
+    // Loose match: case/whitespace-insensitive, ignoring punctuation, so small
+    // formatting differences between customerList's company name and the
+    // R pipeline's client.name don't prevent a match.
+    function looseNameKey(s) {
+        return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    }
+
+    /** Find a client's Segment in the snapshot by its display name (matches
+     *  customerList's company name against each client's `.name` field —
+     *  the payload's object keys are separately-generated slugs, not
+     *  guaranteed to be derivable from the name, so we don't rely on them). */
+    function findClientSegment(companyName) {
+        if (!_analysisPayloadRaw || !_analysisPayloadRaw.clients) return null;
+        const target = looseNameKey(companyName);
+        const clients = Object.values(_analysisPayloadRaw.clients);
+        return clients.find(c => looseNameKey(c.name) === target) || null;
     }
 
     async function runAllBdrsFromAnalysisSnapshot() {
@@ -5767,8 +5861,10 @@
 
             const rangeLabel = `Weekly analysis snapshot${meta.run_date ? ` · run ${meta.run_date}` : ''}`;
             _isRenderingFromCache = true;
+            _isSnapshotRender = true;
             renderResults(cache.results, `All BDRs (${cache.results.bdrRows.length})`, cache.results.grandTotal.sent, rangeLabel);
             _isRenderingFromCache = false;
+            _isSnapshotRender = false;
 
             // No live data-load issues are possible here (the snapshot fetch itself
             // either succeeded above or threw into the catch block below).
@@ -5784,6 +5880,189 @@
             btn.disabled = false;
             btn.innerHTML = '<i class="fas fa-chart-bar"></i> Analyze';
         }
+    }
+
+    // ── "By Company" — Weekly Snapshot data source ───────────────────────────
+    // Loads one client's segment from the same weekly analysis snapshot used by
+    // "Across All BDRs", including that client's hypothesis groups. No live
+    // Firestore/HeyReach queries for connect_queue/heyreach_activity/etc. — the
+    // only Firestore read is the (already cheap, already-used-elsewhere)
+    // hypothesis_groups collection, purely to attach group descriptions and
+    // defined message variations for display.
+    async function runCompanyFromAnalysisSnapshot(company) {
+        const btn = document.getElementById('analyzeBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading…';
+
+        document.getElementById('alertArea').innerHTML = '';
+        document.getElementById('dataIssuesBanner').style.display = 'none';
+        document.getElementById('resultsSection').style.display = 'none';
+        document.getElementById('exportBar').style.display = 'none';
+        document.getElementById('funnelCard').style.display = '';
+        document.getElementById('bdrBreakdownCard').style.display = 'none';
+        document.getElementById('profileBreakoutCard').style.display = 'none';
+        document.getElementById('complementBreakoutCard').style.display = 'none';
+        document.getElementById('editedBreakoutCard').style.display = 'none';
+        document.getElementById('hypothesisBreakdownCard').style.display = 'none';
+        document.getElementById('variationBreakdownCard').style.display = 'none';
+        document.getElementById('loadingPanel').style.display = 'block';
+        document.getElementById('loadingSteps').innerHTML = '';
+        const s1 = setLoadingStep('Loading latest weekly analysis snapshot…', 'active');
+
+        try {
+            await loadGlobalBenchmark(); // populates _analysisPayloadRaw + the Global Benchmark
+            const clientSeg = findClientSegment(company);
+            if (!clientSeg) {
+                updateLoadingStep(s1, `No weekly-analysis data found for "${company}"`, 'error');
+                showAlert(`No weekly-analysis snapshot data was found for "${company}." It may be too new, or its name may not match the R pipeline's export exactly — try Live Database instead.`, 'warning');
+                document.getElementById('loadingPanel').style.display = 'none';
+                document.getElementById('resultsSection').style.display = 'block';
+                document.getElementById('exportBar').style.display = 'flex';
+                renderEmptyResults();
+                return;
+            }
+
+            const meta = _cachedPayload?.meta || {};
+            updateLoadingStep(s1,
+                `Loaded ${(clientSeg.funnel?.n || 0).toLocaleString()} contacts for ${company} from the ${meta.run_date || 'latest'} weekly run`,
+                'done');
+
+            const results = buildResultsFromSegment(clientSeg);
+
+            // No raw contact records ship with the snapshot — clear anything left
+            // over from a previous run so AI Grouper / Recent Connections / Word
+            // Count correctly show "not available" for this view.
+            _grouperSentItems           = [];
+            _grouperTargetBdrs          = [];
+            _recentConnectionsItems     = [];
+            _recentConnectionsEnrichPromise = null;
+            _grouperAcceptedUrls        = new Map();
+            _grouperRepliedUrls         = new Set();
+            _grouperScheduledUrls       = new Set();
+            _grouperInboxBdrMessages    = [];
+            _grouperConversationsByUrl  = new Map();
+            showAiGrouperPanel();
+
+            const rangeLabel = `Weekly analysis snapshot${meta.run_date ? ` · run ${meta.run_date}` : ''}`;
+            _isSnapshotRender = true;
+            renderResults(results, company, results.grandTotal.sent, rangeLabel);
+            _isSnapshotRender = false;
+
+            await renderHypothesisGroupBreakdownFromSnapshot(clientSeg);
+
+            renderDataIssuesBanner([]);
+            document.getElementById('loadingPanel').style.display = 'none';
+            document.getElementById('resultsSection').style.display = 'block';
+            document.getElementById('exportBar').style.display = 'flex';
+        } catch (err) {
+            console.error('Company snapshot load error:', err);
+            updateLoadingStep(s1, `Error: ${err.message}`, 'error');
+            showAlert(`Could not load the weekly snapshot for ${company}: ${err.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fas fa-chart-bar"></i> Analyze';
+        }
+    }
+
+    // Loads the hypothesis_groups collection into _outcomeGroups exactly once,
+    // shared by the live-query and Weekly-Snapshot hypothesis breakdown paths.
+    async function ensureOutcomeGroupsLoaded() {
+        if (_outcomeGroups.length) return;
+        try {
+            const snap = await getDocs(collection(emailDB, 'hypothesis_groups'));
+            _outcomeGroups = [];
+            snap.forEach(d => _outcomeGroups.push({ id: d.id, ...d.data() }));
+        } catch (e) {
+            console.warn('[outcomes] hypothesis groups load failed:', e);
+        }
+    }
+
+    /** "Outcomes by Hypothesis Group" card for the Company-tab Weekly Snapshot
+     *  path. Every group's sent/accepted/replied/scheduled comes straight from
+     *  the snapshot's precomputed per-group funnel — no raw connect_queue/URL
+     *  matching needed. hypothesis_groups is still read from Firestore (one
+     *  cheap, already-shared collection query) purely to attach each group's
+     *  description and defined message variations for display; per-BDR,
+     *  per-month, and per-variation *results* aren't in the snapshot, so those
+     *  sub-views (available on Live Database) aren't offered here. */
+    async function renderHypothesisGroupBreakdownFromSnapshot(clientSeg) {
+        const card = document.getElementById('hypothesisBreakdownCard');
+        const body = document.getElementById('hypothesisBreakdownBody');
+        const meta = document.getElementById('hypothesisBreakdownMeta');
+        if (!card || !body) return;
+
+        const groupSegments = clientSeg.hypothesis_groups || {};
+        const groupKeys = Object.keys(groupSegments);
+        if (!groupKeys.length) { card.style.display = 'none'; return; }
+
+        await ensureOutcomeGroupsLoaded();
+
+        const COLOR_PALETTE = ['#0F2D4D','#C9973D','#059669','#f59e0b','#ef4444','#06b6d4','#ec4899','#84cc16'];
+        const rows = groupKeys.map((key, i) => {
+            const seg     = groupSegments[key];
+            const fsGroup = _outcomeGroups.find(g => g.id === seg.id) || null;
+            const funnel  = seg.funnel || {};
+            return {
+                seg, fsGroup,
+                color:     (fsGroup && fsGroup.color) || COLOR_PALETTE[i % COLOR_PALETTE.length],
+                sent:      funnel.n || 0,
+                accepted:  funnel.connected || 0,
+                replied:   funnel.replied || 0,
+                scheduled: funnel.scheduled || 0,
+                tagged:    fsGroup ? (fsGroup._chunked ? (fsGroup._totalContactCount || 0) : (fsGroup.contactLinkedInUrls || []).length) : null
+            };
+        }).sort((a, b) => b.sent - a.sent);
+
+        meta.textContent = `${rows.length} hypothesis group${rows.length !== 1 ? 's' : ''} · from the weekly analysis snapshot`;
+
+        const tableRows = rows.map(r => {
+            const accPct       = pct(r.accepted, r.sent);
+            const repPct       = pct(r.replied, r.accepted);
+            const schedPct     = pct(r.scheduled, r.replied);
+            const name         = (r.fsGroup && r.fsGroup.name) || r.seg.name || '(unnamed)';
+            const description  = r.fsGroup && r.fsGroup.description;
+            const variations   = (r.fsGroup && r.fsGroup.messageVariations) || [];
+            return `<tr>
+                <td>
+                    <div style="display:flex;align-items:center;gap:0.5rem;">
+                        <span style="width:10px;height:10px;border-radius:50%;background:${r.color};flex-shrink:0;display:inline-block;"></span>
+                        <div>
+                            <div style="font-weight:600;color:#374151;">${escHtml(name)}</div>
+                            ${description ? `<div style="font-size:0.77rem;color:#6b7280;margin-top:0.1rem;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(description)}">${escHtml(description)}</div>` : ''}
+                            ${variations.length ? `<div style="font-size:0.74rem;color:#9a3412;margin-top:0.15rem;"><i class="fas fa-vial" style="margin-right:0.25rem;"></i>${variations.length} variation${variations.length !== 1 ? 's' : ''}: ${variations.map(v => escHtml(v.label || v.id)).join(', ')}</div>` : ''}
+                        </div>
+                    </div>
+                </td>
+                <td style="text-align:center;color:#6b7280;">${r.tagged !== null ? r.tagged.toLocaleString() : '—'}</td>
+                ${hypoSentCell(r.sent)}
+                ${hypoMetricCell(r.accepted, accPct, 'bar-accepted')}
+                ${hypoMetricCell(r.replied, repPct, 'bar-replied')}
+                ${hypoMetricCell(r.scheduled, schedPct, 'bar-scheduled')}
+                ${hypoEffCell(r.sent, r.scheduled)}
+            </tr>`;
+        }).join('');
+
+        body.innerHTML = `
+        <div style="padding:0.65rem 1.5rem;background:#eff6ff;border-bottom:1px solid #bfdbfe;font-size:0.8rem;color:#1e40af;">
+            <i class="fas fa-info-circle" style="margin-right:0.3rem;"></i>
+            From the weekly analysis snapshot — per-BDR and per-month breakdowns within a group, and message-variation-level results, require Live Database.
+        </div>
+        <div style="overflow-x:auto;">
+        <table class="outcome-table" style="margin:0;">
+            <thead><tr>
+                <th style="min-width:200px;">Hypothesis Group</th>
+                <th>Tagged Contacts</th>
+                <th>Connection Sent</th>
+                <th>Connections Accepted</th>
+                <th>Replied</th>
+                <th>Scheduled Meeting</th>
+                <th title="How many connections need to be sent to produce one scheduled meeting">Connections / Meeting</th>
+            </tr></thead>
+            <tbody>${tableRows}</tbody>
+        </table>
+        </div>`;
+
+        card.style.display = '';
     }
 
     // ── AI Outreach Grouper ────────────────────────────────────────────────────
