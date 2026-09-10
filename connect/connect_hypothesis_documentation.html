@@ -2840,6 +2840,9 @@
             <button class="btn btn-outline" id="locateExportBtn" onclick="exportLocateReport()" style="display:none;">
                 <i class="fas fa-download"></i> Download Full Report (CSV)
             </button>
+            <button class="btn btn-outline" id="locateExportExcelBtn" onclick="exportLocateReportExcel()" style="display:none;">
+                <i class="fas fa-file-excel"></i> Download Full Report (Excel)
+            </button>
         </div>
     </div>
 </div><!-- end locate modal -->
@@ -10278,6 +10281,7 @@
         if (!group) { showAlert('Group not found. Please reload.', 'error'); return; }
 
         document.getElementById('locateExportBtn').style.display = 'none';
+        document.getElementById('locateExportExcelBtn').style.display = 'none';
         document.getElementById('locateSearchAllBtn').style.display = 'none';
         document.getElementById('locateGroupLabel').textContent =
             `Loading "${group.name || 'Unnamed Group'}"'s tagged contact list…`;
@@ -10681,6 +10685,7 @@
                 </div>
             `;
             document.getElementById('locateExportBtn').style.display = '';
+            document.getElementById('locateExportExcelBtn').style.display = '';
             document.getElementById('locateSearchAllBtn').style.display = '';
         } catch(e) {
             document.getElementById('locateContent').innerHTML =
@@ -10725,6 +10730,175 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+    };
+
+    // Lazy-load ExcelJS only when a user actually asks for an .xlsx export, so it
+    // doesn't slow down initial page load. Same CDN build used by my_leads.html.
+    async function loadExcelJS() {
+        if (window.ExcelJS) return;
+        await new Promise((resolve, reject) => {
+            const s = document.createElement('script');
+            s.src = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
+            s.onload = resolve;
+            s.onerror = () => reject(new Error('Failed to load ExcelJS library'));
+            document.head.appendChild(s);
+        });
+    }
+
+    // Colour coding per row status — mirrors the badge/stat colours already used
+    // in the Locate modal's own results UI, so the spreadsheet reads the same way.
+    const _locateStatusColors = {
+        found:              { bg: 'D1FAE5', fg: '065F46' }, // green  — Found & Owned
+        unowned:            { bg: 'CCFBF1', fg: '0F766E' }, // teal   — Found, Unowned/Workspace
+        recoverable:        { bg: 'FEF3C7', fg: '92400E' }, // amber  — Recoverable (HeyReach)
+        recoverable_queue:  { bg: 'EDE9FE', fg: '5B21B6' }, // purple — Recoverable (Queue Snapshot)
+        apify_cached:       { bg: 'E0F2FE', fg: '0369A1' }, // blue   — Recoverable (Apify Cache)
+        missing:            { bg: 'FEE2E2', fg: '991B1B' }, // red    — Truly Missing
+    };
+
+    // Export the current Locate report — every tagged contact ("lead") for this
+    // hypothesis group, together with where (if anywhere) it currently lives — as
+    // a well-formatted .xlsx file, mirroring the styling approach used for the
+    // Excel export on my_leads.html (branded banner row, styled header, frozen
+    // panes, autofilter, colour-coded status column, clickable LinkedIn links).
+    window.exportLocateReportExcel = async function() {
+        if (!_locateReport || !_locateReport.length) return;
+        const group = allGroups.find(g => g.id === _locateGroupId);
+
+        const btn = document.getElementById('locateExportExcelBtn');
+        const origHtml = btn ? btn.innerHTML : '';
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Building…'; }
+
+        try {
+            await loadExcelJS();
+
+            const wb = new ExcelJS.Workbook();
+            wb.creator = 'Pando Executive Networking CRM';
+            wb.created = new Date();
+
+            const groupName  = group?.name || 'Unnamed Group';
+            const exportDate = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+            const total       = _locateReport.length;
+            const statusCounts = {};
+            _locateReport.forEach(r => { statusCounts[r.status] = (statusCounts[r.status] || 0) + 1; });
+            const summary = Object.entries(statusCounts)
+                .map(([status, count]) => `${(_locateStatusLabel[status] || status)}: ${count.toLocaleString()}`)
+                .join('  |  ');
+
+            const C = {
+                headerBg:  '1a56db',
+                metaBg:    'dbeafe',
+                metaFg:    '1e3a5f',
+                altRowBg:  'eff6ff',
+                linkFg:    '1d4ed8',
+                borderCol: '93c5fd',
+            };
+            const baseFont = { name: 'Calibri', size: 11 };
+
+            const columns = [
+                { header: 'Name',                     key: 'name',      width: 24 },
+                { header: 'Title',                     key: 'title',     width: 30 },
+                { header: 'Organization',              key: 'org',       width: 26 },
+                { header: 'LinkedIn',                  key: 'url',       width: 12 },
+                { header: 'Status',                    key: 'status',    width: 26 },
+                { header: 'Source',                    key: 'source',    width: 24 },
+                { header: 'Owning/Recoverable BDR',     key: 'bdrName',   width: 22 },
+                { header: 'BDR Email',                 key: 'bdrEmail',  width: 28 },
+                { header: 'Company',                   key: 'company',   width: 20 },
+            ];
+            const colLetter = n => String.fromCharCode(64 + n);
+            const lastCol   = colLetter(columns.length);
+
+            const ws = wb.addWorksheet('Locate Report');
+            ws.views = [{ state: 'frozen', ySplit: 2 }];
+            ws.columns = columns.map(c => ({ key: c.key, width: c.width }));
+
+            // ── Row 1: info banner ──────────────────────────────────────────
+            ws.addRow({ name: `Pando Executive Networking CRM — Locate Report: ${groupName}  |  ${total.toLocaleString()} tagged contacts  |  ${summary}  |  Exported ${exportDate}` });
+            ws.mergeCells(`A1:${lastCol}1`);
+            const bannerCell = ws.getCell('A1');
+            bannerCell.font = { ...baseFont, bold: true, size: 12, color: { argb: 'FF' + C.metaFg } };
+            bannerCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.metaBg } };
+            bannerCell.alignment = { vertical: 'middle', horizontal: 'left', indent: 1, wrapText: true };
+            ws.getRow(1).height = 30;
+
+            // ── Row 2: column headers ────────────────────────────────────────
+            const headerValues = {};
+            columns.forEach(c => { headerValues[c.key] = c.header; });
+            ws.addRow(headerValues);
+            const headerRow = ws.getRow(2);
+            headerRow.height = 26;
+            headerRow.eachCell({ includeEmpty: true }, cell => {
+                cell.font = { ...baseFont, bold: true, color: { argb: 'FFFFFFFF' } };
+                cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.headerBg } };
+                cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: false };
+                cell.border = { bottom: { style: 'medium', color: { argb: 'FF' + C.borderCol } } };
+            });
+            ws.autoFilter = { from: { row: 2, column: 1 }, to: { row: 2, column: columns.length } };
+
+            // ── Data rows ─────────────────────────────────────────────────────
+            const urlIdx    = columns.findIndex(c => c.key === 'url') + 1;
+            const statusIdx = columns.findIndex(c => c.key === 'status') + 1;
+            const altBgFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.altRowBg } };
+
+            _locateReport.forEach((r, idx) => {
+                const rowObj = {
+                    name:     r.name    || '',
+                    title:    r.title   || '',
+                    org:      r.org     || '',
+                    url:      r.url     || '',
+                    status:   _locateStatusLabel[r.status] || r.status || '',
+                    source:   r.source  || '',
+                    bdrName:  r.bdrName || '',
+                    bdrEmail: r.bdrEmail || '',
+                    company:  r.company || '',
+                };
+                const dataRow = ws.addRow(rowObj);
+                dataRow.height = 18;
+
+                dataRow.eachCell({ includeEmpty: true }, cell => {
+                    cell.font = { ...baseFont };
+                    cell.alignment = { vertical: 'middle', wrapText: false };
+                    if (idx % 2 === 1) cell.fill = altBgFill;
+                });
+
+                // Colour-code the Status column per the same palette used in the modal
+                const colors = _locateStatusColors[r.status];
+                if (colors) {
+                    const statusCell = dataRow.getCell(statusIdx);
+                    statusCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + colors.bg } };
+                    statusCell.font = { ...baseFont, bold: true, color: { argb: 'FF' + colors.fg } };
+                    statusCell.alignment = { vertical: 'middle', horizontal: 'center' };
+                }
+
+                // LinkedIn as a clickable hyperlink showing "Open ↗"
+                if (r.url) {
+                    const urlCell = dataRow.getCell(urlIdx);
+                    urlCell.value = { text: 'Open ↗', hyperlink: r.url, tooltip: r.url };
+                    urlCell.font = { ...baseFont, color: { argb: 'FF' + C.linkFg }, underline: true };
+                    urlCell.alignment = { vertical: 'middle', horizontal: 'center' };
+                }
+            });
+
+            // ── Download ─────────────────────────────────────────────────────
+            const buffer = await wb.xlsx.writeBuffer();
+            const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const safeName = groupName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+            a.href = url;
+            a.download = `locate-contacts-${safeName}-${new Date().toISOString().slice(0, 10)}.xlsx`;
+            a.style.visibility = 'hidden';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error('[exportLocateReportExcel] Error:', e);
+            showAlert('Error generating Excel report: ' + e.message, 'danger');
+        } finally {
+            if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+        }
     };
 
     // Claims every 'unowned' row in the current locate report — real
