@@ -176,6 +176,7 @@
     <div class="tab-bar">
         <button class="tab-btn active" id="tabBtnSingle" onclick="switchTab('single')"><i class="fas fa-search"></i> Single Company</button>
         <button class="tab-btn" id="tabBtnBatch" onclick="switchTab('batch')"><i class="fas fa-list-ol"></i> Batch Test</button>
+        <button class="tab-btn" id="tabBtnHistory" onclick="switchTab('history')"><i class="fas fa-clock-rotate-left"></i> Saved Runs</button>
     </div>
 
     <!-- ── SINGLE COMPANY TAB ─────────────────────────────────────────────── -->
@@ -272,6 +273,27 @@ Allina Health Brain and Spine Institute | Minneapolis | MN"></textarea>
             </div>
         </div>
     </div>
+
+    <!-- ── SAVED RUNS (HISTORY) TAB ──────────────────────────────────────── -->
+    <div class="tab-panel" id="panelHistory">
+        <div class="card">
+            <div class="info-box">
+                <i class="fas fa-shield-halved"></i> Every single lookup and every batch row is saved here automatically the moment Railway responds — even if this tab, browser, or computer closes mid-run, nothing you've already paid for is lost. Click "View / Export" on any run below to load it back into the Batch Test tab.
+                This page only calls Brave Search + an OpenRouter AI model (no Apify) — for Apify-actor pipelines elsewhere in Connect, see the <a href="apify_runs_explorer.html">Apify Runs Explorer</a> instead.
+            </div>
+            <button class="btn btn-outline" onclick="loadHistory()"><i class="fas fa-rotate"></i> Refresh</button>
+            <div id="historyLoading" style="display:none;color:var(--gray-600);font-size:13px;margin-top:10px;">Loading saved runs…</div>
+            <div id="historyError" class="error-box" style="display:none;margin-top:10px;"></div>
+            <div class="batch-table-wrap" style="margin-top:14px;">
+                <table class="batch-table">
+                    <thead>
+                        <tr><th>Started</th><th>Type</th><th>Model</th><th>Companies</th><th>Found</th><th>Not Found</th><th>Errors</th><th></th></tr>
+                    </thead>
+                    <tbody id="historyTbody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
 </div>
 
 <script type="module">
@@ -280,6 +302,51 @@ Allina Health Brain and Spine Institute | Minneapolis | MN"></textarea>
     const RAILWAY_API = 'https://railwayclemail-production.up.railway.app';
     const FIND_URL_ENDPOINT = `${RAILWAY_API}/api/linkedin-contact-search/find-url-with-web-search-ai`;
     const BATCH_DELAY_MS = 600; // small pause between batch calls so we don't hammer Brave/OpenRouter
+
+    // ── Auto-save to Firestore (recovery for overnight/unattended runs) ────────
+    // Every single lookup and every batch row is written to Firestore the moment
+    // it comes back from Railway. Results here already cost money (Brave + an
+    // OpenRouter model call) so we never want a closed tab / OS update / crash to
+    // be the only copy of them again. Uses the same clemail-firestore-wrapper.js
+    // (routed through the Railway backend) that other admin pages here already
+    // use — no separate backend changes needed.
+    const HISTORY_COLLECTION = 'linkedin_url_finder_test_runs';
+    const { collection: fsCollection, doc: fsDoc, setDoc: fsSetDoc, getDocs: fsGetDocs,
+            query: fsQuery, orderBy: fsOrderBy, limit: fsLimitFn } = window.clemailFirestore;
+    const fsDb = window.clemailDb;
+
+    function newBatchId() {
+        return 'run_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    }
+
+    async function saveResultToHistory({ batchId, batchType, index, total, company_name, city, state, domain, industry, modelRequested, status, data, error, runStartedAt }) {
+        try {
+            const docId = `${batchId}_${String(index).padStart(4, '0')}`;
+            await fsSetDoc(fsDoc(fsDb, HISTORY_COLLECTION, docId), {
+                batch_id: batchId,
+                batch_type: batchType, // 'single' | 'batch'
+                index,
+                total_in_batch: total,
+                run_started_at: runStartedAt,
+                company_name: company_name || '',
+                city: city || '',
+                state: state || '',
+                domain: domain || '',
+                industry: industry || '',
+                model_requested: modelRequested || '',
+                status, // 'done' | 'error'
+                linkedin_url: data?.linkedin_url || null,
+                confidence: data?.confidence || null,
+                reasoning: data?.reasoning || null,
+                model_used: data?.model_used || null,
+                queries_used: data?.queries_used || [],
+                search_results: data?.search_results || [],
+                error: error || null
+            }, { merge: true });
+        } catch (err) {
+            console.warn('⚠️ Auto-save to history failed for', company_name, ':', err.message);
+        }
+    }
 
     function escHtml(s) {
         return String(s ?? '')
@@ -308,8 +375,11 @@ Allina Health Brain and Spine Institute | Minneapolis | MN"></textarea>
     window.switchTab = function (tab) {
         document.getElementById('tabBtnSingle').classList.toggle('active', tab === 'single');
         document.getElementById('tabBtnBatch').classList.toggle('active', tab === 'batch');
+        document.getElementById('tabBtnHistory').classList.toggle('active', tab === 'history');
         document.getElementById('panelSingle').classList.toggle('active', tab === 'single');
         document.getElementById('panelBatch').classList.toggle('active', tab === 'batch');
+        document.getElementById('panelHistory').classList.toggle('active', tab === 'history');
+        if (tab === 'history' && _historyBatches === null) loadHistory();
     };
 
     // ── Model dropdowns ───────────────────────────────────────────────────────
@@ -386,13 +456,26 @@ Allina Health Brain and Spine Institute | Minneapolis | MN"></textarea>
         document.getElementById('singleError').style.display = 'none';
         document.getElementById('singleResultCard').style.display = 'none';
 
+        const batchId = newBatchId();
+        const runStartedAt = new Date();
+
         try {
             const data = await callFindUrl({ company_name, domain, city, state, industry, model });
             document.getElementById('singleResultBody').innerHTML = renderResultBody(data);
             document.getElementById('singleResultCard').style.display = 'block';
+            await saveResultToHistory({
+                batchId, batchType: 'single', index: 0, total: 1,
+                company_name, city, state, domain, industry, modelRequested: model,
+                status: 'done', data, runStartedAt
+            });
         } catch (err) {
             document.getElementById('singleError').textContent = 'Error: ' + (err.message || String(err));
             document.getElementById('singleError').style.display = 'block';
+            await saveResultToHistory({
+                batchId, batchType: 'single', index: 0, total: 1,
+                company_name, city, state, domain, industry, modelRequested: model,
+                status: 'error', error: err.message || String(err), runStartedAt
+            });
         } finally {
             document.getElementById('singleLoading').style.display = 'none';
             document.getElementById('singleBtn').disabled = false;
@@ -462,6 +545,9 @@ Allina Health Brain and Spine Institute | Minneapolis | MN"></textarea>
         const model = document.getElementById('batchModel').value;
         _batchRows = rows.map(r => ({ ...r, status: 'pending', data: null, error: null }));
 
+        const batchId = newBatchId();
+        const runStartedAt = new Date();
+
         document.getElementById('batchBtn').disabled = true;
         document.getElementById('batchExportBtn').disabled = true;
         document.getElementById('batchError').style.display = 'none';
@@ -481,6 +567,13 @@ Allina Health Brain and Spine Institute | Minneapolis | MN"></textarea>
                 row.status = 'error';
                 row.error = err.message || String(err);
             }
+            // Save this row immediately — don't wait for the whole batch to finish,
+            // so a mid-batch crash/close still leaves everything up to this point recovered.
+            await saveResultToHistory({
+                batchId, batchType: 'batch', index: i, total: _batchRows.length,
+                company_name: row.company_name, city: row.city, state: row.state, modelRequested: model,
+                status: row.status, data: row.data, error: row.error, runStartedAt
+            });
             renderBatchTable();
             renderBatchSummary();
             if (i < _batchRows.length - 1) await new Promise(res => setTimeout(res, BATCH_DELAY_MS));
@@ -513,6 +606,95 @@ Allina Health Brain and Spine Institute | Minneapolis | MN"></textarea>
         a.download = `linkedin_url_finder_batch_${new Date().toISOString().slice(0, 10)}.csv`;
         a.click();
         URL.revokeObjectURL(a.href);
+    };
+
+    // ── Saved runs / history ─────────────────────────────────────────────────
+    let _historyBatches = null; // null = never loaded yet; array once loaded
+
+    window.loadHistory = async function () {
+        const tbody = document.getElementById('historyTbody');
+        const loadingEl = document.getElementById('historyLoading');
+        const errorEl = document.getElementById('historyError');
+        loadingEl.style.display = 'block';
+        errorEl.style.display = 'none';
+        tbody.innerHTML = '';
+        try {
+            const snap = await fsGetDocs(fsQuery(
+                fsCollection(fsDb, HISTORY_COLLECTION),
+                fsOrderBy('run_started_at', 'desc'),
+                fsLimitFn(3000)
+            ));
+            const byBatch = new Map();
+            snap.forEach(docSnap => {
+                const d = docSnap.data();
+                if (!d || !d.batch_id) return;
+                if (!byBatch.has(d.batch_id)) {
+                    byBatch.set(d.batch_id, {
+                        batch_id: d.batch_id,
+                        batch_type: d.batch_type,
+                        model: d.model_requested,
+                        run_started_at: (window.toDate && d.run_started_at) ? window.toDate(d.run_started_at) : null,
+                        rows: []
+                    });
+                }
+                byBatch.get(d.batch_id).rows.push(d);
+            });
+            _historyBatches = Array.from(byBatch.values())
+                .sort((a, b) => (b.run_started_at?.getTime?.() || 0) - (a.run_started_at?.getTime?.() || 0));
+            renderHistoryList();
+        } catch (err) {
+            errorEl.textContent = 'Error loading saved runs: ' + (err.message || String(err));
+            errorEl.style.display = 'block';
+        } finally {
+            loadingEl.style.display = 'none';
+        }
+    };
+
+    function renderHistoryList() {
+        const tbody = document.getElementById('historyTbody');
+        if (!_historyBatches || _historyBatches.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="8" style="color:var(--gray-500);">No saved runs yet — run a lookup and it'll show up here automatically.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = _historyBatches.map(b => {
+            const total = b.rows.length;
+            const found = b.rows.filter(r => r.status === 'done' && r.linkedin_url).length;
+            const notFound = b.rows.filter(r => r.status === 'done' && !r.linkedin_url).length;
+            const errors = b.rows.filter(r => r.status === 'error').length;
+            const when = (b.run_started_at instanceof Date && !isNaN(b.run_started_at)) ? b.run_started_at.toLocaleString() : '—';
+            return `<tr>
+                <td>${escHtml(when)}</td>
+                <td>${escHtml(b.batch_type || '—')}</td>
+                <td style="font-size:11px;">${escHtml(b.model || '—')}</td>
+                <td>${total}</td>
+                <td style="color:var(--success);font-weight:700;">${found}</td>
+                <td style="color:var(--danger);">${notFound}</td>
+                <td style="color:var(--warning);">${errors}</td>
+                <td><a href="javascript:void(0)" onclick="viewHistoryBatch('${b.batch_id}')">View / Export</a></td>
+            </tr>`;
+        }).join('');
+    }
+
+    window.viewHistoryBatch = function (batchId) {
+        const batch = _historyBatches?.find(b => b.batch_id === batchId);
+        if (!batch) return;
+        _batchRows = batch.rows.slice()
+            .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+            .map(r => ({
+                company_name: r.company_name, city: r.city, state: r.state,
+                status: r.status,
+                data: r.status === 'done' ? {
+                    linkedin_url: r.linkedin_url, confidence: r.confidence, reasoning: r.reasoning,
+                    model_used: r.model_used, queries_used: r.queries_used || [], search_results: r.search_results || []
+                } : null,
+                error: r.error
+            }));
+        switchTab('batch');
+        document.getElementById('batchResultCard').style.display = 'block';
+        document.getElementById('batchProgress').textContent = `Loaded saved run from history (${_batchRows.length} compan${_batchRows.length === 1 ? 'y' : 'ies'}).`;
+        document.getElementById('batchExportBtn').disabled = false;
+        renderBatchTable();
+        renderBatchSummary();
     };
 
     // ── Init ──────────────────────────────────────────────────────────────────
