@@ -143,6 +143,15 @@
         .ws-panel select { flex: 1; min-width: 200px; max-width: 360px; padding: 0.5rem 0.75rem; border: 2px solid #5eead4; border-radius: 8px; font-size: 0.88rem; background: white; }
         .ws-status { margin-top: 0.5rem; font-size: 0.8rem; color: #0f766e; min-height: 1.2em; }
 
+        /* Hypothesis-group assignment panel (optional, sits alongside the BDR/Workspace save) */
+        .hg-panel { background: #fdf4ff; border: 2px solid #e9d5ff; border-radius: 10px; padding: 1rem 1.25rem; margin-top: 1rem; }
+        .hg-panel select { flex: 1; min-width: 200px; max-width: 360px; padding: 0.5rem 0.75rem; border: 2px solid #e9d5ff; border-radius: 8px; font-size: 0.88rem; background: white; }
+        .hg-panel-title { font-weight: 700; font-size: 0.92rem; color: #7e22ce; margin-bottom: 0.4rem; display: flex; align-items: center; gap: 0.45rem; }
+        .hg-optional { font-weight: 400; color: var(--gray); font-size: 0.8rem; }
+        .hg-text-input { width: 100%; max-width: 360px; padding: 0.5rem 0.75rem; border: 2px solid #e9d5ff; border-radius: 8px; font-size: 0.88rem; font-family: inherit; }
+        .hg-text-input:focus { outline: none; border-color: #9333ea; }
+        .hg-status { margin-top: 0.5rem; font-size: 0.8rem; color: #7e22ce; min-height: 1.2em; }
+
         /* Stats row */
         .stats-row { display: flex; gap: 0.75rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
         .stat-pill { background: var(--light-gray); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.9rem; font-size: 0.82rem; font-weight: 600; display: flex; align-items: center; gap: 6px; }
@@ -333,6 +342,28 @@
                 </button>
             </div>
             <div class="ws-status" id="wsStatus"></div>
+        </div>
+
+        <!-- Optional: tag the same contacts onto a hypothesis group's contact list,
+             same storage shape as connect_hypothesis_documentation.html / manage_organization_contacts.html. -->
+        <div class="hg-panel">
+            <div class="hg-panel-title"><i class="fas fa-flask" style="color:#9333ea;"></i> Assign to Hypothesis Group <span class="hg-optional">(optional)</span></div>
+            <p class="form-help" style="margin:0 0 0.6rem 0;">
+                Adds these contacts' LinkedIn URLs to a hypothesis group at the same time you save them to the BDR/Workspace above.
+            </p>
+            <div class="ws-panel-row">
+                <select id="hgSelect" onchange="onHgSelectChange()">
+                    <option value="">-- Don't assign to a hypothesis group --</option>
+                    <option value="__new__">+ Create new hypothesis group…</option>
+                </select>
+                <button class="btn btn-ghost btn-sm" onclick="loadHgDropdown()" title="Refresh hypothesis group list">
+                    <i class="fas fa-sync-alt"></i> Refresh
+                </button>
+            </div>
+            <div id="hgNewNameRow" style="display:none;margin-top:0.6rem;">
+                <input type="text" id="hgNewName" class="hg-text-input" placeholder="New hypothesis group name…">
+            </div>
+            <div class="hg-status" id="hgStatus"></div>
         </div>
     </div>
 
@@ -894,7 +925,10 @@ async function refreshJobList() {
     let serverJobs = [];
     let serverReachable = true;
     try {
-        const resp = await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/jobs`);
+        // limit=200 (server default is 50) so an overnight/unattended batch checked the next
+        // morning doesn't get pushed out of the list just because other jobs ran in between —
+        // the underlying Firestore doc is never deleted, only this list's window was too small.
+        const resp = await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/jobs?limit=200`);
         const data = await resp.json();
         if (data.success) serverJobs = data.jobs;
     } catch (e) { serverReachable = false; }
@@ -1422,7 +1456,22 @@ async function saveSelected() {
     }
 
     const label = document.getElementById('wsTargetSelect').selectedOptions[0]?.textContent || target;
-    if (!confirm(`Save ${toSave.length} contact${toSave.length !== 1 ? 's' : ''} to "${label}"?`)) return;
+
+    // Hypothesis group is optional, but if "+ Create new…" is picked it needs a name
+    // before we ask the user to confirm anything.
+    const hgSel = document.getElementById('hgSelect');
+    const hgVal = hgSel ? hgSel.value : '';
+    let hgNote = '';
+    if (hgVal === '__new__') {
+        const newName = (document.getElementById('hgNewName')?.value || '').trim();
+        if (!newName) { alert('Enter a name for the new hypothesis group, or choose "Don\'t assign to a hypothesis group".'); return; }
+        hgNote = `\nHypothesis group: create new group "${newName}"`;
+    } else if (hgVal) {
+        const hgLabel = hgSel.selectedOptions[0]?.textContent || hgVal;
+        hgNote = `\nHypothesis group: also add to "${hgLabel}"`;
+    }
+
+    if (!confirm(`Save ${toSave.length} contact${toSave.length !== 1 ? 's' : ''} to "${label}"?${hgNote}`)) return;
 
     window._urlFinder_save(toSave, target);
 }
@@ -1745,13 +1794,16 @@ import { onAuthStateChanged, getAuth } from 'https://www.gstatic.com/firebasejs/
 
 await window.firebaseReady;
 
-const { collection, getDocs, addDoc, query, where, orderBy } = window.clemailFirestore;
+const { collection, getDocs, addDoc, query, where, orderBy, doc, getDoc, setDoc, updateDoc, Timestamp } = window.clemailFirestore;
 const db = window.clemailDb;
 let wsUser = null;
 
 onAuthStateChanged(getAuth(), async user => {
     wsUser = user;
-    if (user) await loadWSDropdown();
+    if (user) {
+        await loadWSDropdown();
+        await loadHgDropdown();
+    }
 });
 
 async function loadWSDropdown() {
@@ -1802,11 +1854,237 @@ async function loadWSDropdown() {
     } catch (e) { console.warn('Workspace load failed:', e.message); }
 }
 
+// ── Hypothesis group assignment ─────────────────────────────────────────────
+// Reuses the exact same `hypothesis_groups` storage shape (contactLinkedInUrls /
+// taggedContacts / contactNames, with large-group chunking into
+// hypothesis_group_chunks) as connect_hypothesis_documentation.html and
+// manage_organization_contacts.html, so a group tagged here is fully
+// interchangeable with those pages. Also stamps hypothesisGroupId/Name directly
+// onto each saved prospect_contacts doc, matching full_pipeline.html.
+const _HG_CONTACT_CHUNK_LIMIT = 700 * 1024; // 700 KB per chunk (safe margin under Firestore's 1MB doc limit)
+let _hgGroups = []; // [{ id, name }]
+
+function _normalizeHgUrl(url) {
+    if (!url || typeof url !== 'string') return null;
+    let u = url.trim().toLowerCase();
+    if (!u) return null;
+    u = u.replace(/^https?:\/\//, '').replace(/^www\./, '');
+    u = u.split('?')[0].split('#')[0];
+    u = u.replace(/\/+$/, '');
+    return u || null;
+}
+
+async function _readHgGroupContacts(ref, data) {
+    if (!data._chunked) {
+        return { urls: data.contactLinkedInUrls || [], tagged: data.taggedContacts || [] };
+    }
+    const gid = ref.id;
+    const count = data._chunkCount || 0;
+    const urls = [], tagged = [];
+    for (let i = 0; i < count; i++) {
+        try {
+            const snap = await getDoc(doc(db, 'hypothesis_group_chunks', `${gid}_${i}`));
+            if (snap.exists) {
+                const d = snap.data();
+                urls.push(...(d.contactLinkedInUrls || []));
+                tagged.push(...(d.taggedContacts || []));
+            }
+        } catch (e) { console.warn(`[Hypothesis Group] Failed to read chunk ${i} for group ${gid}:`, e.message); }
+    }
+    return { urls, tagged };
+}
+
+async function _writeHgGroupContacts(ref, urls, tagged) {
+    const trySize = JSON.stringify({ contactLinkedInUrls: urls, taggedContacts: tagged }).length;
+    if (trySize <= _HG_CONTACT_CHUNK_LIMIT) {
+        await updateDoc(ref, {
+            contactLinkedInUrls: urls,
+            taggedContacts:      tagged,
+            _chunked:            false,
+            _chunkCount:         0,
+            _totalContactCount:  null,
+            updatedAt:           Timestamp.now()
+        });
+        return;
+    }
+
+    const gid = ref.id;
+    const chunks = [];
+    let cu = [], ct = [];
+    for (let i = 0; i < urls.length; i++) {
+        cu.push(urls[i]);
+        if (tagged[i]) ct.push(tagged[i]);
+        if (JSON.stringify({ contactLinkedInUrls: cu, taggedContacts: ct }).length >= _HG_CONTACT_CHUNK_LIMIT) {
+            cu.pop();
+            if (tagged[i]) ct.pop();
+            chunks.push({ contactLinkedInUrls: [...cu], taggedContacts: [...ct] });
+            cu = [urls[i]];
+            ct = tagged[i] ? [tagged[i]] : [];
+        }
+    }
+    if (cu.length) chunks.push({ contactLinkedInUrls: cu, taggedContacts: ct });
+
+    for (let i = 0; i < chunks.length; i++) {
+        await setDoc(doc(db, 'hypothesis_group_chunks', `${gid}_${i}`), chunks[i]);
+    }
+
+    await updateDoc(ref, {
+        contactLinkedInUrls: [],
+        taggedContacts:      [],
+        _chunked:            true,
+        _chunkCount:         chunks.length,
+        _totalContactCount:  urls.length,
+        updatedAt:           Timestamp.now()
+    });
+}
+
+/** Populate the "Assign to Hypothesis Group" dropdown from the hypothesis_groups collection. */
+async function loadHgDropdown() {
+    const sel = document.getElementById('hgSelect');
+    if (!sel) return;
+    const prevVal = sel.value;
+    try {
+        const snap = await getDocs(query(collection(db, 'hypothesis_groups'), orderBy('name')));
+        _hgGroups = [];
+        snap.forEach(d => {
+            const data = d.data();
+            if (!data.name) return;
+            _hgGroups.push({ id: d.id, name: data.name });
+        });
+    } catch (e) {
+        console.warn('Hypothesis group load failed:', e.message);
+    }
+
+    sel.innerHTML =
+        '<option value="">-- Don\'t assign to a hypothesis group --</option>' +
+        '<option value="__new__">+ Create new hypothesis group…</option>' +
+        _hgGroups.map(g => `<option value="${g.id}">${escHtml(g.name)}</option>`).join('');
+    if (prevVal && (prevVal === '__new__' || _hgGroups.some(g => g.id === prevVal))) sel.value = prevVal;
+}
+
+/** Toggle the "new group name" input based on the dropdown selection. */
+function onHgSelectChange() {
+    const sel = document.getElementById('hgSelect');
+    const row = document.getElementById('hgNewNameRow');
+    if (row) row.style.display = sel?.value === '__new__' ? '' : 'none';
+    const statusEl = document.getElementById('hgStatus');
+    if (statusEl) statusEl.textContent = '';
+}
+
+/**
+ * Adds `toSave`'s LinkedIn URLs/names/titles/companies to whichever hypothesis
+ * group is selected in the #hgSelect dropdown — creating a new group first if
+ * "+ Create new hypothesis group…" was chosen. No-ops (returns null) if nothing
+ * is selected. Runs BEFORE the prospect_contacts docs are written so the
+ * resulting {groupId, groupName} can be stamped onto each of them too.
+ */
+async function _assignToHypothesisGroup(toSave, targetBDR) {
+    const sel = document.getElementById('hgSelect');
+    const groupSel = sel ? sel.value : '';
+    if (!groupSel) return null;
+
+    const statusEl = document.getElementById('hgStatus');
+    const setStatus = (msg) => { if (statusEl) statusEl.textContent = msg; };
+
+    // Build de-duped tagged-contact rows from what's about to be saved.
+    const taggedNew = [];
+    const seenUrls = new Set();
+    toSave.forEach(m => {
+        const rawUrl = resultUrl(m);
+        const norm = _normalizeHgUrl(rawUrl);
+        if (!norm || seenUrls.has(norm)) return;
+        seenUrls.add(norm);
+        taggedNew.push({
+            name:        profileName(m.match) || m.contact?.name || '',
+            linkedInUrl: rawUrl,
+            title:       profileTitle(m.match) || m.contact?.title || '',
+            org:         profileCompany(m.match) || m.contact?.company || ''
+        });
+    });
+    if (!taggedNew.length) return null;
+
+    try {
+        if (groupSel === '__new__') {
+            const newName = (document.getElementById('hgNewName')?.value || '').trim();
+            if (!newName) {
+                setStatus('⚠️ Enter a name for the new hypothesis group (or choose an existing one / "Don\'t assign").');
+                return null;
+            }
+            setStatus(`Creating hypothesis group "${newName}"…`);
+            const isWorkspace = (targetBDR || '').startsWith('__ws__:');
+            const metaPayload = {
+                name: newName,
+                description: '',
+                color: '#0F2D4D',
+                bdrEmails: isWorkspace ? [] : [targetBDR],
+                bdrEmail: isWorkspace ? null : targetBDR,
+                contactSource: 'LinkedIn URL Finder',
+                workspaceId: isWorkspace ? targetBDR.slice('__ws__:'.length) : null,
+                workspaceName: null,
+                importBatchGroupId: null,
+                sourcePrompts: [],
+                messageVariations: [],
+                sourceBatchIds: [],
+                targetContactInstructions: '',
+                messageReviewInstructions: '',
+                contactLinkedInUrls: [],
+                taggedContacts: [],
+                contactNames: [],
+                createdAt: Timestamp.now(),
+                createdBy: wsUser?.email || '',
+                updatedAt: Timestamp.now()
+            };
+            const groupRef = await addDoc(collection(db, 'hypothesis_groups'), metaPayload);
+            await _writeHgGroupContacts(groupRef, taggedNew.map(t => t.linkedInUrl), taggedNew);
+            await updateDoc(groupRef, { contactNames: taggedNew.map(t => t.name) });
+            setStatus(`✓ Created "${newName}" with ${taggedNew.length} contact(s).`);
+            await loadHgDropdown();
+            const newSel = document.getElementById('hgSelect');
+            if (newSel) newSel.value = groupRef.id;
+            return { groupId: groupRef.id, groupName: newName };
+        }
+
+        const groupRef = doc(db, 'hypothesis_groups', groupSel);
+        const snap = await getDoc(groupRef);
+        if (!snap.exists) {
+            setStatus('⚠️ Selected hypothesis group no longer exists.');
+            return null;
+        }
+        const data = snap.data();
+        const groupName = data.name || groupSel;
+        setStatus(`Adding ${taggedNew.length} contact(s) to "${groupName}"…`);
+
+        const { urls: existingUrls, tagged: existingTagged } = await _readHgGroupContacts(groupRef, data);
+        const existingSet = new Set(existingUrls.map(u => _normalizeHgUrl(u)));
+        const filteredNew = taggedNew.filter(t => !existingSet.has(_normalizeHgUrl(t.linkedInUrl)));
+
+        if (filteredNew.length) {
+            await _writeHgGroupContacts(groupRef, [...existingUrls, ...filteredNew.map(t => t.linkedInUrl)], [...existingTagged, ...filteredNew]);
+            const existingNames = new Set(data.contactNames || []);
+            const newNames = filteredNew.map(t => t.name).filter(n => n && !existingNames.has(n));
+            if (newNames.length) await updateDoc(groupRef, { contactNames: [...(data.contactNames || []), ...newNames] });
+            setStatus(`✓ Added ${filteredNew.length} contact(s) to "${groupName}".`);
+        } else {
+            setStatus(`All ${taggedNew.length} contact(s) were already in "${groupName}".`);
+        }
+        return { groupId: groupSel, groupName };
+    } catch (e) {
+        console.error('Hypothesis group assignment failed:', e.message);
+        setStatus(`⚠️ Hypothesis group assignment failed: ${e.message}`);
+        return null;
+    }
+}
+
 window._urlFinder_save = async function(toSave, targetBDR) {
     const statusEl = document.getElementById('wsStatus');
     const btn      = document.getElementById('btnSave');
     statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…';
     btn.disabled = true;
+
+    // Resolve the hypothesis group (creating/updating it) BEFORE writing the
+    // prospect_contacts docs below, so each doc can be stamped with the same
+    // hypothesisGroupId/hypothesisGroupName the group itself ends up with.
+    const hgResult = await _assignToHypothesisGroup(toSave, targetBDR);
 
     // Fetch existing LinkedIn URLs in this BDR/workspace to deduplicate
     let existingUrls = new Set();
@@ -1866,7 +2144,10 @@ window._urlFinder_save = async function(toSave, targetBDR) {
             source:       isManual ? 'linkedin_url_finder_manual' : 'linkedin_url_finder',
             aiMatched:    !isManual,
             aiMatchReason: m.aiReason || '',
-            aiMatchConfidence: m.confidence || ''
+            aiMatchConfidence: m.confidence || '',
+            // Hypothesis group (optional — see #hgSelect above Save button)
+            hypothesisGroupId:   hgResult ? hgResult.groupId   : null,
+            hypothesisGroupName: hgResult ? hgResult.groupName : null
         };
 
         try {
@@ -1878,7 +2159,8 @@ window._urlFinder_save = async function(toSave, targetBDR) {
 
     statusEl.textContent = `✅ Saved ${saved} contact${saved !== 1 ? 's' : ''}` +
         (skipped ? ` · ${skipped} already existed` : '') +
-        (failed  ? ` · ${failed} failed` : '') + '.';
+        (failed  ? ` · ${failed} failed` : '') +
+        (hgResult ? ` · tagged to hypothesis group "${hgResult.groupName}"` : '') + '.';
     btn.disabled = false;
 };
 </script>
