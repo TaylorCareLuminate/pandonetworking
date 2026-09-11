@@ -16314,11 +16314,57 @@
                 });
             } catch (_) { /* best effort */ }
 
+            // Some LinkedIn seats are only linked to a BDR via bdr_leaders.bdrLeaderId
+            // (linkedin_accounts.bdrLeaderId), not a direct linkedin_accounts.bdrEmail match —
+            // so the map above silently misses them. This is the exact same gap
+            // harvest_pool_service.js's buildActivityMatchContext() fixed for the Harvest Pool
+            // feature (verified in production: one BDR had 552 real CONNECTION_REQUEST_ACCEPTED
+            // events that a bdrEmail-only match completely missed). Resolve those extra seats
+            // per-colleague and fold them into the same maps used below.
+            async function fullAiRegisterExtraSeatsForColleague(email) {
+                if (!email) return;
+                try {
+                    const leaderSnap = await fetchFn(q(col(db, 'bdr_leaders'), wh('primaryEmail', '==', email)), { pageSize: 5, timeoutMs: 30000, maxRetries: 2 });
+                    let leaderDocId = null;
+                    leaderSnap.forEach(d => { if (!leaderDocId) leaderDocId = d.id; });
+                    if (!leaderDocId) return;
+                    const seatSnap = await fetchFn(q(col(db, 'linkedin_accounts'), wh('bdrLeaderId', '==', leaderDocId)), { pageSize: 50, timeoutMs: 30000, maxRetries: 2 });
+                    const emailLower = email.toLowerCase();
+                    seatSnap.forEach(d => {
+                        const data = d.data();
+                        if (!data.heyreachAccountId) return;
+                        const idStr = String(data.heyreachAccountId);
+                        linkedInAccountIdMap.set(idStr, emailLower);
+                        if (!emailToAccountIds.has(emailLower)) emailToAccountIds.set(emailLower, new Set());
+                        emailToAccountIds.get(emailLower).add(idStr);
+                    });
+                } catch (_) { /* best effort */ }
+            }
+
+            // Extracts the LinkedIn account/seat ID from a heyreach_activity doc, falling back
+            // to the raw webhook payload's sender.id when the top-level field wasn't populated
+            // (older/backfilled records) — mirrors extractLinkedInAccountIdFromActivity() in
+            // harvest_pool_service.js.
+            function fullAiExtractActivityAccountId(data) {
+                if (data && data.linkedInAccountId != null && data.linkedInAccountId !== '') {
+                    return String(data.linkedInAccountId);
+                }
+                try {
+                    const sid = data && data.rawData && data.rawData.sender && data.rawData.sender.id;
+                    if (sid != null && sid !== '') return String(sid);
+                } catch (_) { /* ignore */ }
+                return null;
+            }
+
             const candidateMap = new Map();
 
             for (const colleague of colleagues) {
                 const colleagueLinkedInEmail = linkedInEmailMap.get(colleague.primaryEmail) || colleague.primaryEmail;
                 addLog(`   🔍 Checking connections for ${colleague.name || colleague.primaryEmail}...`, 'info');
+                await fullAiRegisterExtraSeatsForColleague(colleague.primaryEmail);
+                if (colleagueLinkedInEmail !== colleague.primaryEmail) {
+                    await fullAiRegisterExtraSeatsForColleague(colleagueLinkedInEmail);
+                }
 
                 const connectQueueUrls = new Set();
                 const connectQueueProfileMap = new Map();
@@ -16527,9 +16573,12 @@
                             const data = d.data();
                             let bdrMatch = (data.bdrEmail && actEmailSet.has(data.bdrEmail.toLowerCase())) ||
                                             (data.accountEmail && actEmailSet.has(data.accountEmail.toLowerCase()));
-                            if (!bdrMatch && data.linkedInAccountId) {
-                                const mapped = linkedInAccountIdMap.get(String(data.linkedInAccountId));
-                                bdrMatch = mapped && actEmailSet.has(mapped);
+                            if (!bdrMatch) {
+                                const accId = fullAiExtractActivityAccountId(data);
+                                if (accId) {
+                                    const mapped = linkedInAccountIdMap.get(accId);
+                                    bdrMatch = mapped && actEmailSet.has(mapped);
+                                }
                             }
                             if (!bdrMatch) return;
                             const rawUrl = data.leadProfileUrl || '';
@@ -21394,6 +21443,48 @@
                     addSCLog(`   ⚠️ Could not load linkedin_accounts mapping: ${liErr.message}`, 'warning');
                 }
 
+                // Some LinkedIn seats are only linked to a BDR via bdr_leaders.bdrLeaderId
+                // (linkedin_accounts.bdrLeaderId), not a direct linkedin_accounts.bdrEmail match —
+                // so the map above silently misses them. This is the exact same gap
+                // harvest_pool_service.js's buildActivityMatchContext() fixed for the Harvest Pool
+                // feature (verified in production: one BDR had 552 real CONNECTION_REQUEST_ACCEPTED
+                // events that a bdrEmail-only match completely missed). Resolve those extra seats
+                // per-colleague and fold them into the same maps used below.
+                async function scRegisterExtraSeatsForColleague(email) {
+                    if (!email) return;
+                    try {
+                        const leaderSnap = await getDocs(query(collection(db, 'bdr_leaders'), where('primaryEmail', '==', email), limit(5)));
+                        let leaderDocId = null;
+                        leaderSnap.forEach(d => { if (!leaderDocId) leaderDocId = d.id; });
+                        if (!leaderDocId) return;
+                        const seatSnap = await getDocs(query(collection(db, 'linkedin_accounts'), where('bdrLeaderId', '==', leaderDocId)));
+                        const emailLower = email.toLowerCase();
+                        seatSnap.forEach(d => {
+                            const data = d.data();
+                            if (!data.heyreachAccountId) return;
+                            const idStr = String(data.heyreachAccountId);
+                            linkedInAccountIdMap.set(idStr, emailLower);
+                            if (!emailToAccountIds.has(emailLower)) emailToAccountIds.set(emailLower, new Set());
+                            emailToAccountIds.get(emailLower).add(idStr);
+                        });
+                    } catch (_) { /* best effort */ }
+                }
+
+                // Extracts the LinkedIn account/seat ID from a heyreach_activity doc, falling back
+                // to the raw webhook payload's sender.id when the top-level field wasn't populated
+                // (older/backfilled records) — mirrors extractLinkedInAccountIdFromActivity() in
+                // harvest_pool_service.js.
+                function scExtractActivityAccountId(data) {
+                    if (data && data.linkedInAccountId != null && data.linkedInAccountId !== '') {
+                        return String(data.linkedInAccountId);
+                    }
+                    try {
+                        const sid = data && data.rawData && data.rawData.sender && data.rawData.sender.id;
+                        if (sid != null && sid !== '') return String(sid);
+                    } catch (_) { /* ignore */ }
+                    return null;
+                }
+
                 // Map: normalizedUrl → { contact data, colleagues: [{name, email}] }
                 const candidateMap = new Map();
 
@@ -21417,6 +21508,10 @@
                 for (const colleague of colleagues) {
                     const colleagueLinkedInEmail = linkedInEmailMap.get(colleague.primaryEmail) || colleague.primaryEmail;
                     addSCLog(`   Checking connections for ${colleague.name || colleague.primaryEmail}...`);
+                    await scRegisterExtraSeatsForColleague(colleague.primaryEmail);
+                    if (colleagueLinkedInEmail !== colleague.primaryEmail) {
+                        await scRegisterExtraSeatsForColleague(colleagueLinkedInEmail);
+                    }
 
                     try {
                         // ── Step 2a: Load connect_queue URLs + profile data for this colleague ─
@@ -21704,9 +21799,12 @@
                                     let bdrMatch =
                                         (data.bdrEmail     && actEmailSet.has(data.bdrEmail.toLowerCase())) ||
                                         (data.accountEmail && actEmailSet.has(data.accountEmail.toLowerCase()));
-                                    if (!bdrMatch && data.linkedInAccountId) {
-                                        const mapped = linkedInAccountIdMap.get(String(data.linkedInAccountId));
-                                        if (mapped && actEmailSet.has(mapped)) bdrMatch = true;
+                                    if (!bdrMatch) {
+                                        const accId = scExtractActivityAccountId(data);
+                                        if (accId) {
+                                            const mapped = linkedInAccountIdMap.get(accId);
+                                            if (mapped && actEmailSet.has(mapped)) bdrMatch = true;
+                                        }
                                     }
                                     if (!bdrMatch) return;
 
