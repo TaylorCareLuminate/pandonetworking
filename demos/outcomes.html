@@ -2034,7 +2034,7 @@
         complement:       { label: 'Organization Complement', icon: 'fa-star',            cls: 'complement' },
         fast_prospect:    { label: 'Fast Prospect',           icon: 'fa-paper-plane',     cls: 'fast-prospect' },
         about_me_connect: { label: 'Common Ground',           icon: 'fa-user-friends',    cls: 'about-me-connect' },
-        other:            { label: 'Other',                   icon: 'fa-question-circle', cls: 'other' },
+        other:            { label: 'Other/Harvest Follow-Up',  icon: 'fa-question-circle', cls: 'other' },
         total:            { label: 'All Types',               icon: 'fa-layer-group',     cls: 'total' },
     };
 
@@ -2045,20 +2045,23 @@
         if (_initDone) return;   // ignore cross-tab re-fires
         _initDone = true;
         // Demos version: skip the interactive BDR/Company/Groups selection UI
-        // entirely and go straight to whichever "All BDRs" snapshot is cached.
+        // entirely and go straight to the latest weekly analysis snapshot (the
+        // same precomputed data source analysis_results.html uses) — no live
+        // BDR-by-BDR database queries for this read-only page.
         document.getElementById('loadingPanel').style.display = 'block';
-        await checkForCache();
-        document.getElementById('loadingPanel').style.display = 'none';
-        if (_cachedPayload) {
+        try {
             await window.loadFromCache();
-        } else {
+        } catch (e) {
+            console.warn('[outcomes demo] snapshot load failed:', e.message);
             const resultsSection = document.getElementById('resultsSection');
             resultsSection.innerHTML = `
                 <div style="text-align:center;padding:4rem 2rem;color:var(--gray-500);">
                     <i class="fas fa-database" style="font-size:2.5rem;opacity:0.3;margin-bottom:1rem;display:block;"></i>
-                    No cached data is available yet. Please check back later.
+                    No analysis snapshot is available yet. Please check back later.
                 </div>`;
             resultsSection.style.display = 'block';
+        } finally {
+            document.getElementById('loadingPanel').style.display = 'none';
         }
     });
 
@@ -4796,6 +4799,11 @@
 
         if (currentTab === 'all') {
             rowsToDisplay.sort((a, b) => {
+                // 'Other/Harvest Follow-Up' isn't a real outreach channel — always pin it
+                // to the bottom regardless of its (not meaningful) connections/meeting ratio.
+                if (a.type === 'other' && b.type === 'other') return 0;
+                if (a.type === 'other') return 1;
+                if (b.type === 'other') return -1;
                 const ca = connPerMeeting(a.sent, a.scheduled);
                 const cb = connPerMeeting(b.sent, b.scheduled);
                 if (ca === null && cb === null) return 0;
@@ -4812,7 +4820,9 @@
             const repPct   = pct(row.replied, row.accepted);
             const schedPct = pct(row.scheduled, row.replied);
             const isTotal  = row.type === 'total';
-            const connPerMtg = connPerMeeting(row.sent, row.scheduled);
+            // Connections/Meeting isn't a meaningful metric for the catch-all
+            // 'Other/Harvest Follow-Up' bucket — always render it as "—".
+            const connPerMtg = row.type === 'other' ? null : connPerMeeting(row.sent, row.scheduled);
 
             tbody.insertAdjacentHTML('beforeend', `
             <tr${isTotal ? ' class="total-row"' : ''}>
@@ -5118,92 +5128,177 @@
         showSaveBar('saved', now);
     };
 
-    // ── All-BDRs Result Cache (Firestore — shared across all users) ──────────
-    // Stored as a single document: app_cache/allbdrs_outcomes
-    // Only the computed results object (numbers + short strings) is saved —
-    // no raw prospect records, so the write is very small.
-    const CACHE_DOC_PATH = ['app_cache', 'allbdrs_outcomes'];
-
-    // In-memory copy so loadFromCache doesn't need a second read
+    // ── "All BDRs" — read from the shared weekly analysis snapshot ───────────
+    // This replaces the old flow of reading a manually-saved app_cache/
+    // allbdrs_outcomes Firestore doc. Instead we read the same precomputed
+    // snapshot that analysis_results.html reads (published weekly to Firebase
+    // RTDB at ConnectAnalysis/latest, with a local connect_analysis/latest.json
+    // fallback) — no BDR-by-BDR database reads at all, and nothing to
+    // manually "save to cache" — the snapshot always reflects the latest
+    // weekly run automatically.
+    //
+    // In-memory copy of { results, viewLabel, meta } built from that snapshot.
     let _cachedPayload = null;
+    let _globalBenchmarkPromise = null;
+    let _analysisPayloadRaw = null;
 
-    async function saveAllBdrsCache(results, viewLabel, sentCount, rangeLabel) {
+    // Same funnel-sanity check analysis_results.html uses before trusting a run
+    // (guards against a bad export inverting replied/scheduled counts).
+    function isAnalysisFunnelUsable(funnel) {
+        if (!funnel) return false;
+        if ((funnel.scheduled || 0) > (funnel.replied || 0)) return false;
+        if ((funnel.cond_meeting_rate || 0) > 100) return false;
+        return true;
+    }
+
+    // This is a shared/demo page, so — same as demos/analysis_results.html —
+    // it only ever reads the pre-de-identified static exports (client/company
+    // names swapped for "Company_###"; see connect/connect_analysis/
+    // regenerate_manifest.js), never the live Firebase RTDB snapshot or the
+    // raw local JSON, so a real client name is never fetched into this page.
+    async function fetchLocalDeidentifiedManifest() {
         try {
-            const payload = {
-                pulledAt:           new Date().toISOString(),
-                pulledBy:           (window.auth?.currentUser?.email || 'unknown'),
-                viewLabel,
-                sentCount,
-                rangeLabel,
-                results
-            };
-            const cacheRef = doc(emailDB, CACHE_DOC_PATH[0], CACHE_DOC_PATH[1]);
-            await setDoc(cacheRef, payload);
-            _cachedPayload = payload;
-            const json = JSON.stringify(payload);
-            console.log(`💾 Outcomes cache saved to Firestore (${(json.length / 1024).toFixed(1)} KB) — visible to all users on next load`);
-            const pill = document.getElementById('tabAllCachePill');
-            if (pill) pill.style.display = '';
-        } catch(e) {
-            console.error('❌ Could not save outcomes cache to Firestore:', e.message || e);
-            console.warn('Cache save failed — analysis results are still displayed but will not be offered to other users.');
+            const resp = await fetch('../connect/connect_analysis/manifest_deidentified.json', { cache: 'no-store' });
+            if (!resp.ok) return [];
+            const data = await resp.json();
+            return (data.runs || []).map(r => ({ run_date: r.run_date, file: r.file }));
+        } catch (e) {
+            console.warn('[outcomes demo] No local de-identified analysis manifest found:', e.message);
+            return [];
         }
     }
 
-    async function fetchCachePayload() {
-        const cacheRef = doc(emailDB, CACHE_DOC_PATH[0], CACHE_DOC_PATH[1]);
-        const snap = await getDoc(cacheRef);
-        if (!snap || !snap.exists) return null;
-        const data = snap.data();
-        return (data && data.pulledAt && data.results) ? data : null;
-    }
-
-    async function checkForCache() {
+    async function fetchAnalysisPayload() {
         try {
-            const cache = await fetchCachePayload();
-            if (!cache) {
-                console.log('💾 Outcomes cache: no Firestore data found — run All BDRs to prime the cache');
-                return;
+            const resp = await fetch('../connect/connect_analysis/latest_deidentified.json', { cache: 'no-store' });
+            if (resp.ok) {
+                const payload = await resp.json();
+                if (isAnalysisFunnelUsable(payload?.overall?.funnel)) return payload;
+                console.warn('[outcomes demo] latest_deidentified.json has an incoherent funnel; trying previous dated runs.');
             }
-            _cachedPayload = cache;
-            console.log('💾 Outcomes cache: found data from', cache.pulledAt, '(by', cache.pulledBy || 'unknown', ') — showing banner');
-            const banner = document.getElementById('cacheBanner');
-            const sub    = document.getElementById('cacheBannerSub');
-            const d      = new Date(cache.pulledAt);
-            const label  = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-                         + ' at '
-                         + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-            const puller = cache.pulledBy ? ` · pulled by ${cache.pulledBy.split('@')[0]}` : '';
-            sub.textContent = `Last pulled: ${label} · ${cache.viewLabel || 'All BDRs'}${puller}`;
-            banner.style.display = '';
-            const pill = document.getElementById('tabAllCachePill');
-            if (pill) pill.style.display = '';
-        } catch(e) {
-            console.warn('💾 Outcomes cache check failed:', e);
+        } catch (e) {
+            console.warn('[outcomes demo] connect_analysis/latest_deidentified.json not available:', e.message);
         }
-    }
-
-    window.loadFromCache = async function() {
-        // Use in-memory copy if already fetched; otherwise query Firestore
-        let cache = _cachedPayload;
-        if (!cache) {
-            const loadBtn = document.querySelector('.btn-cache-load');
-            if (loadBtn) { loadBtn.disabled = true; loadBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading…'; }
+        const candidates = await fetchLocalDeidentifiedManifest();
+        for (const candidate of candidates) {
+            if (!candidate.file) continue;
             try {
-                cache = await fetchCachePayload();
-                _cachedPayload = cache;
-            } catch(e) {
-                showAlert('Could not load cached data from Firestore: ' + e.message, 'error');
-                return;
-            } finally {
-                const lb = document.querySelector('.btn-cache-load');
-                if (lb) { lb.disabled = false; lb.innerHTML = '<i class="fas fa-bolt"></i> Load Cached Results'; }
-            }
+                const resp = await fetch(`../connect/connect_analysis/${candidate.file}`, { cache: 'no-store' });
+                if (!resp.ok) continue;
+                const payload = await resp.json();
+                if (isAnalysisFunnelUsable(payload?.overall?.funnel)) return payload;
+            } catch (e) { /* try next dated run */ }
         }
-        if (!cache || !cache.results) { showAlert('No cached data found.', 'warning'); return; }
+        throw new Error('No de-identified analysis data is available yet. Check back after the next weekly export.');
+    }
 
-        document.getElementById('cacheBanner').style.display = 'none';
-        document.getElementById('saveCacheBar').style.display = 'none';
+    // Message-type levels that fold into "Other/Harvest Follow-Up" for this
+    // All-BDRs view (same restriction as the five-primary-types + Other rule
+    // used below in renderResults).
+    const ALL_BDRS_SECONDARY_TYPES = new Set(['contact_news', 'story_search', 'recovered_post', 'complement']);
+
+    /** Convert one research RateRow (level/n/connect_rate/reply_rate/meeting_rate)
+     *  into raw counts, matching the {sent,accepted,replied,scheduled} shape this
+     *  page's tables expect. Rates in the snapshot are already "% of n" (same
+     *  convention as the funnel), so counts are back-derived — rounding may be
+     *  off by ~1 vs. a live count, which is fine for this summary. */
+    function rateRowToCounts(row) {
+        const n = row.n || 0;
+        return {
+            sent:      n,
+            accepted:  Math.round(n * (row.connect_rate || 0) / 100),
+            replied:   Math.round(n * (row.reply_rate   || 0) / 100),
+            scheduled: Math.round(n * (row.meeting_rate || 0) / 100)
+        };
+    }
+
+    /** Build a renderResults()-shaped object from the analysis snapshot's
+     *  "overall" segment (all clients, all BDRs). */
+    function buildResultsFromSegment(segment) {
+        const research = (segment && segment.research) || {};
+        const funnel    = (segment && segment.funnel) || {};
+
+        // ── Message-type funnel rows ──
+        const buckets = {};
+        function addToBucket(type, c) {
+            if (!buckets[type]) buckets[type] = { sent: 0, accepted: 0, replied: 0, scheduled: 0 };
+            buckets[type].sent      += c.sent;
+            buckets[type].accepted  += c.accepted;
+            buckets[type].replied   += c.replied;
+            buckets[type].scheduled += c.scheduled;
+        }
+        (research.message_type || []).forEach(row => {
+            if (!row.n) return;
+            // Legacy 'news' merges into 'org_news'.
+            let type = row.level === 'news' ? 'org_news' : (row.level || 'other');
+            if (ALL_BDRS_SECONDARY_TYPES.has(type) || !TYPE_LABELS[type]) type = 'other';
+            addToBucket(type, rateRowToCounts(row));
+        });
+        // 'Other/Harvest Follow-Up' always goes last — the snapshot's own row
+        // order isn't reliable.
+        const rows = Object.keys(buckets)
+            .sort((a, b) => (a === 'other') - (b === 'other'))
+            .map(type => ({ type, ...buckets[type] }));
+
+        // ── Grand total — straight from the segment funnel (exact, not rate-derived) ──
+        const grandTotal = {
+            type:      'total',
+            sent:      funnel.n || 0,
+            accepted:  funnel.connected || 0,
+            replied:   funnel.replied || 0,
+            scheduled: funnel.scheduled || 0
+        };
+
+        // ── Per-BDR rows ──
+        const bdrRows = (research.bdr_performance || [])
+            .filter(row => row.level) // drop the blank/unattributed level some runs include
+            .map(row => ({ name: row.level, ...rateRowToCounts(row) }))
+            .sort((a, b) => b.sent - a.sent);
+
+        // Prefix/suffix and edit-status breakouts aren't captured by the weekly
+        // analysis snapshot — those cards simply won't render.
+        return { rows, grandTotal, bdrRows, profileBreakout: [], complementBreakout: [], editedBreakout: [] };
+    }
+
+    function buildResultsFromAnalysisPayload(payload) {
+        return buildResultsFromSegment(payload && payload.overall);
+    }
+
+    /** Fetch + build the analysis snapshot once and cache it in memory. Safe to
+     *  call repeatedly — later calls reuse the in-flight/completed promise. */
+    function loadGlobalBenchmark() {
+        if (_globalBenchmarkPromise) return _globalBenchmarkPromise;
+        _globalBenchmarkPromise = (async () => {
+            const payload = await fetchAnalysisPayload();
+            _analysisPayloadRaw = payload;
+            const results = buildResultsFromAnalysisPayload(payload);
+            _cachedPayload = {
+                results,
+                viewLabel: 'All BDRs',
+                meta: payload.meta || {},
+                generatedAt: payload.meta?.generated_at || null
+            };
+            return _cachedPayload;
+        })().catch(e => {
+            console.warn('[outcomes demo] loadGlobalBenchmark failed:', e.message);
+            _globalBenchmarkPromise = null; // allow retry on next call
+            throw e;
+        });
+        return _globalBenchmarkPromise;
+    }
+
+    /** Loads the latest weekly analysis snapshot and renders it as the (only)
+     *  view this read-only demo page shows. */
+    window.loadFromCache = async function() {
+        const cache = await loadGlobalBenchmark();
+        const meta  = cache.meta || {};
+
+        // This demo only ever shows the "All BDRs" view — set currentTab so the
+        // shared renderResults() logic restricts to the five primary message
+        // types + Other/Harvest Follow-Up and sorts Other to the bottom, same
+        // as the "Across All BDRs" tab on the full outcomes page.
+        currentTab = 'all';
+
         document.getElementById('alertArea').innerHTML = '';
         document.getElementById('resultsSection').style.display = 'none';
         document.getElementById('exportBar').style.display = 'none';
@@ -5216,7 +5311,9 @@
         document.getElementById('variationBreakdownCard').style.display = 'none';
         _pendingSave = null;
 
-        // Clear sentItems + URL sets when loading from cache — raw contacts not available
+        // No raw contact records ship with the snapshot — clear anything left
+        // over so AI Grouper / Recent Connections / Word Count correctly show
+        // "not available" for this view.
         _grouperSentItems           = [];
         _grouperTargetBdrs          = [];
         _recentConnectionsItems     = [];
@@ -5227,38 +5324,25 @@
         _grouperConversationsByUrl  = new Map();
         showAiGrouperPanel(); // will show panel with "run fresh analysis" note
 
-        const d = new Date(cache.pulledAt);
-        const pulledLabel = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-                          + ' at '
-                          + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-        const puller = cache.pulledBy ? ` by ${cache.pulledBy.split('@')[0]}` : '';
+        const rangeLabel = `Weekly analysis snapshot${meta.run_date ? ` · run ${meta.run_date}` : ''}`;
 
         _isRenderingFromCache = true;
         renderResults(
             cache.results,
-            cache.viewLabel || 'All BDRs',
-            cache.sentCount || 0,
-            (cache.rangeLabel || cache.rangeLabelOverride || 'All Time') + ` · Cached ${pulledLabel}${puller}`
+            `All BDRs (${cache.results.bdrRows.length})`,
+            cache.results.grandTotal.sent,
+            rangeLabel
         );
         _isRenderingFromCache = false;
 
         document.getElementById('resultsSection').style.display = 'block';
-            document.getElementById('exportBar').style.display = 'flex';
+        document.getElementById('exportBar').style.display = 'flex';
 
         document.getElementById('alertArea').innerHTML = `
             <div class="alert info" style="display:flex;align-items:center;gap:0.6rem;">
-                <i class="fas fa-database"></i>
-                Showing cached results from ${pulledLabel}${puller}.
-                <button onclick="dismissCacheBanner(); document.getElementById('alertArea').innerHTML='';"
-                    style="margin-left:auto;padding:0.3rem 0.9rem;border:1.5px solid #12314C;border-radius:6px;
-                           background:white;color:#12314C;font-weight:600;cursor:pointer;font-size:0.85rem;">
-                    Pull Fresh Instead
-                </button>
+                <i class="fas fa-bolt"></i>
+                Showing results from the ${meta.run_date ? meta.run_date + ' ' : ''}weekly analysis snapshot — loaded instantly, no live database query needed.
             </div>`;
-    };
-
-    window.dismissCacheBanner = function() {
-        document.getElementById('cacheBanner').style.display = 'none';
     };
 
     // ── AI Outreach Grouper ────────────────────────────────────────────────────
