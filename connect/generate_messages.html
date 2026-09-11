@@ -3413,6 +3413,27 @@
                         </div>
 
                         <div style="margin-top:10px; padding-top:10px; border-top:1px solid #a7f3d0;">
+                            <label style="font-size:12px;font-weight:600;color:var(--gray-700);margin:0 0 6px 0;display:flex;align-items:center;gap:8px;">
+                                <i class="fas fa-link" style="color:#0d9488;margin-right:2px;"></i> Connection status to pull
+                            </label>
+                            <div style="display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--gray-700);">
+                                <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
+                                    <input type="radio" name="fullAiColleagueConnectionStatus" value="accepted" checked
+                                        style="accent-color:#0d9488;width:14px;height:14px;cursor:pointer;margin-top:2px;flex-shrink:0;"
+                                        onchange="fullAiUpdateColleagueConnectionStatusHelp()">
+                                    <span><strong>Accepted only</strong> — pull contacts who accepted the source BDR's connection request (default)</span>
+                                </label>
+                                <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
+                                    <input type="radio" name="fullAiColleagueConnectionStatus" value="reached_out"
+                                        style="accent-color:#0d9488;width:14px;height:14px;cursor:pointer;margin-top:2px;flex-shrink:0;"
+                                        onchange="fullAiUpdateColleagueConnectionStatusHelp()">
+                                    <span><strong>Reached out</strong> — pull anyone the source BDR sent a connection request to, whether or not they accepted (lets you try a different BDR/angle on people who didn't connect)</span>
+                                </label>
+                            </div>
+                            <div class="form-help" style="margin-top:6px;" id="fullAiColleagueConnectionStatusHelp">Only pulls contacts confirmed as accepted connections (via HeyReach sync/activity).</div>
+                        </div>
+
+                        <div style="margin-top:10px; padding-top:10px; border-top:1px solid #a7f3d0;">
                             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:6px;">
                                 <label style="font-size:12px;font-weight:600;color:var(--gray-700);margin:0;display:flex;align-items:center;gap:8px;cursor:pointer;">
                                     <input type="checkbox" id="fullAiColleagueHypGroupEnabled"
@@ -16193,6 +16214,23 @@
             return !!document.getElementById('fullAiColleagueCategoryFilterEnabled')?.checked;
         }
 
+        // "Connection status to pull" radios — 'accepted' (default) only pulls contacts
+        // confirmed as accepted connections; 'reached_out' also includes anyone the source
+        // BDR sent a connect request to but who hasn't (yet) accepted, so a different BDR
+        // can try a different angle on them.
+        function fullAiGetColleagueConnectionStatusMode() {
+            const checked = document.querySelector('input[name="fullAiColleagueConnectionStatus"]:checked');
+            return checked?.value === 'reached_out' ? 'reached_out' : 'accepted';
+        }
+
+        window.fullAiUpdateColleagueConnectionStatusHelp = function() {
+            const help = document.getElementById('fullAiColleagueConnectionStatusHelp');
+            if (!help) return;
+            help.innerHTML = fullAiGetColleagueConnectionStatusMode() === 'reached_out'
+                ? 'Pulls every contact the source BDR sent a connect request to — <strong>accepted, still pending, or declined</strong>. Useful for having a different BDR try a fresh angle on people who never connected.'
+                : 'Only pulls contacts confirmed as accepted connections (via HeyReach sync/activity).';
+        };
+
         function fullAiGetColleagueCategoryFilters() {
             const selectedResponse = new Set();
             document.querySelectorAll('input[name="fullAiColleagueResponseCategory"]:checked').forEach(cb => selectedResponse.add(cb.value));
@@ -16222,23 +16260,32 @@
         document.getElementById('fullAiBdrSelect')?.addEventListener('change', fullAiRefreshColleagueList);
 
         /**
-         * Finds contacts already connected (via the Connect system) to one or more
-         * selected colleague BDRs, filters out anyone already connected/queued/excluded
+         * Finds contacts connected to (or, in 'reached_out' mode, simply targeted by) one or
+         * more selected colleague BDRs, filters out anyone already connected/queued/excluded
          * for the target BDR or outside the selected conversation categories, then copies
          * survivors into the target BDR's prospect list (same "copy + moveBatchId" pattern
          * as fullAiPullContactsFromWorkspace) so the normal Full AI Generate pipeline can
          * run on them afterward.
+         *
+         * @param connectionStatusMode 'accepted' (default) only pulls contacts confirmed as
+         *   accepted connections (via heyreach_contacts/heyreach_activity). 'reached_out' also
+         *   pulls anyone the source BDR simply sent a connect request to via connect_queue,
+         *   regardless of whether they ever accepted — lets a different BDR try a fresh angle
+         *   on people who didn't connect the first time.
          * Returns { moveBatchId, pulled, stats }.
          */
-        async function fullAiPullContactsFromColleagues({ bdrEmail, colleagues, count, selectedResponse, hypothesisGroupUrlSet, addLog }) {
+        async function fullAiPullContactsFromColleagues({ bdrEmail, colleagues, count, selectedResponse, hypothesisGroupUrlSet, connectionStatusMode, addLog }) {
             if (!bdrEmail) throw new Error('No BDR selected');
             if (!colleagues || !colleagues.length) throw new Error('No source BDRs selected');
+            const reachedOutMode = connectionStatusMode === 'reached_out';
 
             const { collection: col, query: q, where: wh, getDocs: gd, getAllDocs: gad,
                     addDoc: ad } = window.clemailFirestore;
             const fetchFn = gad || gd;
 
-            addLog(`👥 Scanning ${colleagues.length} source BDR(s) for accepted Connect-system connections...`, 'info');
+            addLog(reachedOutMode
+                ? `👥 Scanning ${colleagues.length} source BDR(s) for Connect-system outreach (accepted or not)...`
+                : `👥 Scanning ${colleagues.length} source BDR(s) for accepted Connect-system connections...`, 'info');
 
             if (linkedInEmailMap.size === 0) {
                 addLog('   🔄 Loading LinkedIn email associations (not yet cached)...', 'info');
@@ -16407,7 +16454,10 @@
                 }
 
                 if (connectQueueUrls.size === 0) {
-                    addLog(`   ⚠️ No connect_queue "connect" record(s) found for ${colleague.name || colleague.primaryEmail} — will still check for accepted connections via heyreach_contacts/heyreach_activity directly (connect_queue is used for profile-data enrichment only, not as an eligibility gate).`, 'warning');
+                    addLog(reachedOutMode
+                        ? `   ⚠️ No connect_queue "connect" record(s) found for ${colleague.name || colleague.primaryEmail} — nothing to pull for them in "Reached out" mode (it relies entirely on connect_queue).`
+                        : `   ⚠️ No connect_queue "connect" record(s) found for ${colleague.name || colleague.primaryEmail} — will still check for accepted connections via heyreach_contacts/heyreach_activity directly (connect_queue is used for profile-data enrichment only, not as an eligibility gate).`,
+                        'warning');
                 }
 
                 const colleagueInboxByUrl = new Map();
@@ -16607,7 +16657,24 @@
                     }
                 }
 
-                if (hypothesisGroupUrlSet && hypothesisGroupUrlSet.size > 0) {
+                // "Reached out" mode: on top of confirmed-accepted candidates above, also add
+                // EVERY contact this colleague simply sent a connect request to via connect_queue
+                // — accepted, still pending, or declined. addCandidate() no longer requires
+                // connectQueueUrls membership (see note above), so this reuses it directly with
+                // connect_queue's own profile data; it's a no-op for anyone already added.
+                if (reachedOutMode && connectQueueProfileMap.size > 0) {
+                    connectQueueProfileMap.forEach((cq, normUrl) => {
+                        addCandidate(cq.linkedInUrl || normUrl, cq);
+                    });
+                    const totalForColleague = [...candidateMap.values()].filter(c => c.colleagues.some(cc => cc.email === colleague.primaryEmail)).length;
+                    addLog(`   📤 Reached-out mode: ${totalForColleague} total contact(s) ${colleague.name || colleague.primaryEmail} sent a connect request to are eligible (accepted or not).`, 'success');
+                }
+
+                // Group enrichment only matters in 'accepted' mode: it bridges a URL-format
+                // mismatch (hypothesis group vs. heyreach_activity slug) for a connection we've
+                // *confirmed* was accepted. In 'reached_out' mode every connect_queue URL was
+                // already added directly above, so this would be redundant.
+                if (!reachedOutMode && hypothesisGroupUrlSet && hypothesisGroupUrlSet.size > 0) {
                     let enriched = 0;
                     for (const normGroupUrl of hypothesisGroupUrlSet) {
                         if (candidateMap.has(normGroupUrl)) continue;
@@ -16705,7 +16772,7 @@
             const toPull = groupFiltered.slice(0, count);
 
             const moveBatchId = `fullai-colleague-pull-${Date.now()}`;
-            const moveBatchLabel = `Full AI pull from BDR connections (${colleagues.map(c => c.name || c.primaryEmail).join(', ')})`;
+            const moveBatchLabel = `Full AI pull from BDR ${reachedOutMode ? 'outreach' : 'connections'} (${colleagues.map(c => c.name || c.primaryEmail).join(', ')})`;
             const nowIso = new Date().toISOString();
             const pulledBy = window.auth?.currentUser?.email || 'unknown';
             const pulled = [];
@@ -16724,6 +16791,7 @@
                     bdrEmail: bdrEmail,
                     linkedInAccountEmail: bdrEmail,
                     source: 'full_ai_colleague_pull',
+                    sourceConnectionStatus: reachedOutMode ? 'reached_out' : 'accepted',
                     sourceColleagueEmails: c.colleagues.map(cc => cc.email),
                     sourceColleagueNames: c.colleagues.map(cc => cc.name),
                     moveBatchId,
@@ -17399,12 +17467,17 @@
                     if (sourceHypUrlSet) {
                         addLog(`🔬 Source hypothesis group filter: ${sourceHypUrlSet.size} contact URL(s) across selected group(s).`, 'info');
                     }
+                    const colleagueConnectionStatusMode = fullAiGetColleagueConnectionStatusMode();
+                    if (colleagueConnectionStatusMode === 'reached_out') {
+                        addLog(`   📤 Connection status: Reached out (includes contacts who haven't accepted yet)`, 'info');
+                    }
                     colleaguePullResult = await fullAiPullContactsFromColleagues({
                         bdrEmail,
                         colleagues: selectedColleagues,
                         count,
                         selectedResponse: colleagueSelectedResponse,
                         hypothesisGroupUrlSet: sourceHypUrlSet,
+                        connectionStatusMode: colleagueConnectionStatusMode,
                         addLog
                     });
                     if (!colleaguePullResult.pulled.length) {

@@ -120,6 +120,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'BDR Email Change', href: 'recover_orphaned_messages.html', icon: 'fa-at' },
                 { label: 'BDR Review Audit', href: 'review_review.html', icon: 'fa-clipboard-check' },
                 { label: 'Weekly Summaries', href: 'email_summary.html', icon: 'fa-envelope-open-text' },
+                { label: 'Outreach Updates & CRM Sync', href: 'outreach_updates_admin.html', icon: 'fa-satellite-dish' },
                 { label: 'Harvest Pool (admin)', href: 'harvest_pool_admin.html', icon: 'fa-seedling' },
                 { label: 'divider' },
                 // Cleanup & Maintenance
