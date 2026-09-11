@@ -16456,6 +16456,15 @@
                     } catch (_) { /* best effort */ }
                 }
 
+                // Tracks URLs *confirmed* as accepted connections for this colleague, via
+                // heyreach_contacts sync and/or heyreach_activity CONNECTION_REQUEST_ACCEPTED
+                // events. This is the ONLY set the group-enrichment bridge below is allowed to
+                // trust — being present in connect_queue only means a connect request was SENT,
+                // not that it was accepted. (Hypothesis groups are just target-contact lists and
+                // are not filtered by connection status, so group membership alone must never be
+                // treated as proof of acceptance.)
+                const colleagueAcceptedUrls = new Set();
+
                 function addCandidate(rawUrl, data) {
                     const normUrl = normalizeLinkedInUrl(rawUrl);
                     if (!normUrl) return;
@@ -16491,7 +16500,10 @@
                     heySnap.forEach(d => {
                         const data = d.data();
                         const rawUrl = data.linkedin_url || data.profileUrl || data.leadProfileUrl || data.linkedInUrl || '';
-                        if (rawUrl) addCandidate(rawUrl, data);
+                        if (!rawUrl) return;
+                        const normUrl = normalizeLinkedInUrl(rawUrl);
+                        if (normUrl) colleagueAcceptedUrls.add(normUrl);
+                        addCandidate(rawUrl, data);
                     });
                     const added = [...candidateMap.values()].filter(c => c.colleagues.some(cc => cc.email === colleague.primaryEmail)).length;
                     addLog(added > 0
@@ -16500,6 +16512,13 @@
                         added > 0 ? 'success' : 'info');
                 } else {
                     addLog(`   🔄 heyreach_contacts not synced for ${colleague.name || colleague.primaryEmail} — checking connection acceptance events...`, 'info');
+                }
+
+                // Always cross-check heyreach_activity's CONNECTION_REQUEST_ACCEPTED events too,
+                // regardless of whether heyreach_contacts had anything. This (a) catches accepted
+                // connections missing from a partially-synced heyreach_contacts snapshot, and
+                // (b) builds the ONLY acceptance signal the group-enrichment bridge below trusts.
+                {
                     const actEmailSet = new Set([colleague.primaryEmail.toLowerCase(), colleagueLinkedInEmail.toLowerCase()]);
                     try {
                         const actSnap = await fetchFn(q(col(db, 'heyreach_activity'), wh('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED')), { pageSize: 10000, timeoutMs: 90000, maxRetries: 2 });
@@ -16515,14 +16534,17 @@
                             if (!bdrMatch) return;
                             const rawUrl = data.leadProfileUrl || '';
                             if (!rawUrl) return;
-                            const beforeHas = candidateMap.has(normalizeLinkedInUrl(rawUrl));
+                            const normUrl = normalizeLinkedInUrl(rawUrl);
+                            if (normUrl) colleagueAcceptedUrls.add(normUrl);
+                            const beforeHas = normUrl ? candidateMap.has(normUrl) : false;
                             addCandidate(rawUrl, data);
-                            if (!beforeHas && candidateMap.has(normalizeLinkedInUrl(rawUrl))) added++;
+                            if (!beforeHas && normUrl && candidateMap.has(normUrl)) added++;
                         });
-                        addLog(added > 0
-                            ? `   ✅ Found ${added} accepted prospect(s) for ${colleague.name || colleague.primaryEmail} (via connection acceptance events).`
-                            : `   ℹ️ ${colleague.name || colleague.primaryEmail}: no matching accepted connection events found.`,
-                            added > 0 ? 'success' : 'info');
+                        if (added > 0) {
+                            addLog(`   ✅ Found ${added} additional accepted prospect(s) for ${colleague.name || colleague.primaryEmail} (via connection acceptance events).`, 'success');
+                        } else if (!heySnap || heySnap.empty) {
+                            addLog(`   ℹ️ ${colleague.name || colleague.primaryEmail}: no matching accepted connection events found.`, 'info');
+                        }
                     } catch (e) {
                         addLog(`   ⚠️ Could not load heyreach_activity for ${colleague.name || colleague.primaryEmail}: ${e.message}`, 'warning');
                     }
@@ -16535,6 +16557,11 @@
                         if (existingQueueUrls.has(normGroupUrl) || existingProspectUrls.has(normGroupUrl)) continue;
                         if (excludedUrls.has(normGroupUrl) || targetConnectedUrls.has(normGroupUrl)) continue;
                         if (!connectQueueProfileMap.has(normGroupUrl)) continue;
+                        // Group membership is NOT proof of acceptance — hypothesis groups are
+                        // just target-contact lists (they include everyone, accepted or not).
+                        // Only bridge a URL-format mismatch for a connection we've *confirmed*
+                        // was actually accepted.
+                        if (!colleagueAcceptedUrls.has(normGroupUrl)) continue;
                         const cqProfile = connectQueueProfileMap.get(normGroupUrl);
                         candidateMap.set(normGroupUrl, {
                             linkedInUrl: cqProfile.linkedInUrl || normGroupUrl,
@@ -16553,7 +16580,7 @@
                         enriched++;
                     }
                     if (enriched > 0) {
-                        addLog(`   🔗 Group enrichment: added ${enriched} group member(s) via connect_queue data for ${colleague.name || colleague.primaryEmail}.`, 'success');
+                        addLog(`   🔗 Group enrichment: added ${enriched} confirmed-accepted group member(s) via connect_queue data for ${colleague.name || colleague.primaryEmail}.`, 'success');
                     }
                 }
             }
@@ -21579,6 +21606,14 @@
                             if (!s2.empty) heySnap = s2;
                         }
 
+                        // Tracks URLs *confirmed* as accepted connections for this colleague, via
+                        // heyreach_contacts sync and/or heyreach_activity CONNECTION_REQUEST_ACCEPTED
+                        // events. This is the ONLY set the group-enrichment bridge below is allowed
+                        // to trust — being present in connect_queue only means a connect request was
+                        // SENT, not accepted, and hypothesis groups are just target-contact lists
+                        // that are not filtered by connection status.
+                        const colleagueAcceptedUrls = new Set();
+
                         /** Helper: add a contact record to candidateMap for this colleague.
                          *  Falls back to connectQueueProfileMap for any missing profile fields.
                          *  Stores cached inboxData on each colleague entry for category filtering
@@ -21622,7 +21657,10 @@
                             heySnap.forEach(d => {
                                 const data = d.data();
                                 const rawUrl = data.linkedin_url || data.profileUrl || data.leadProfileUrl || data.linkedInUrl || '';
-                                if (rawUrl) added = scAddCandidate(rawUrl, data, added);
+                                if (!rawUrl) return;
+                                const normUrl = normalizeLinkedInUrl(rawUrl);
+                                if (normUrl) colleagueAcceptedUrls.add(normUrl);
+                                added = scAddCandidate(rawUrl, data, added);
                             });
                             if (added > 0) {
                                 addSCLog(`   ✅ Found ${added} accepted Connect-created prospect(s) for ${colleague.name || colleague.primaryEmail}.`, 'success');
@@ -21630,15 +21668,20 @@
                                 addSCLog(`   ℹ️ ${colleague.name || colleague.primaryEmail}: heyreach_contacts loaded but none matched Connect-system outreach records.`);
                             }
                         } else {
-                            // ── Step 2b-fallback: heyreach_contacts not synced yet ──────────────
-                            // Use heyreach_activity (CONNECTION_REQUEST_ACCEPTED events) — the same
-                            // source review_replies.html uses for its follow-up scan.
-                            // Activity events are already campaign-only (HeyReach-originated), so
-                            // no connect_queue URL cross-reference is needed here.
-                            // Profile data (leadFirstName, leadLastName, leadPosition, leadCompany)
-                            // lives directly on each activity document.
                             addSCLog(`   🔄 heyreach_contacts not synced for ${colleague.name || colleague.primaryEmail} — checking connection acceptance events...`);
+                        }
 
+                        // ── Step 2b-fallback: always cross-check heyreach_activity too ──────────
+                        // Use heyreach_activity (CONNECTION_REQUEST_ACCEPTED events) — the same
+                        // source review_replies.html uses for its follow-up scan. This both catches
+                        // accepted connections missing from a partially-synced heyreach_contacts
+                        // snapshot, and builds the ONLY acceptance signal the group-enrichment
+                        // bridge below trusts.
+                        // Activity events are already campaign-only (HeyReach-originated), so
+                        // no connect_queue URL cross-reference is needed here.
+                        // Profile data (leadFirstName, leadLastName, leadPosition, leadCompany)
+                        // lives directly on each activity document.
+                        {
                             const actEmailSet = new Set([
                                 colleague.primaryEmail.toLowerCase(),
                                 colleagueLinkedInEmail.toLowerCase()
@@ -21652,6 +21695,7 @@
                                 ));
 
                                 const seenActUrls = new Set();
+                                let actAdded = 0;
                                 actSnap.forEach(d => {
                                     const data = d.data();
 
@@ -21672,6 +21716,7 @@
                                     const normUrl = normalizeLinkedInUrl(rawUrl);
                                     if (!normUrl || seenActUrls.has(normUrl)) return;
                                     seenActUrls.add(normUrl);
+                                    colleagueAcceptedUrls.add(normUrl);
 
                                     // Skip if already in current BDR's queue or prospect list
                                     if (existingQueueUrls.has(normUrl) || existingProspectUrls.has(normUrl)) return;
@@ -21695,13 +21740,14 @@
                                             email: colleague.primaryEmail,
                                             inboxData: colleagueInboxByUrl.get(normUrl) || null
                                         });
+                                        actAdded++;
                                         added++;
                                     }
                                 });
 
-                                if (added > 0) {
-                                    addSCLog(`   ✅ Found ${added} accepted prospect(s) for ${colleague.name || colleague.primaryEmail} (confirmed via connection acceptance events).`, 'success');
-                                } else {
+                                if (actAdded > 0) {
+                                    addSCLog(`   ✅ Found ${actAdded} additional accepted prospect(s) for ${colleague.name || colleague.primaryEmail} (confirmed via connection acceptance events).`, 'success');
+                                } else if (!heySnap || heySnap.empty) {
                                     addSCLog(`   ℹ️ ${colleague.name || colleague.primaryEmail}: no matching accepted connection events found — connections may still be pending.`);
                                 }
                             } catch (actErr) {
@@ -21715,13 +21761,17 @@
                         // (e.g., group has "john-doe", activity has "john-doe-ab1234c").
                         // For every group member whose CQ-normalized URL is in connectQueueProfileMap
                         // but NOT yet in candidateMap, add them directly so the group filter step
-                        // can include them. This trusts the group to represent accepted connections.
+                        // can include them — but ONLY if we've confirmed via colleagueAcceptedUrls
+                        // that this person actually accepted the connection. Group membership alone
+                        // is NOT proof of acceptance (hypothesis groups are just target-contact
+                        // lists that include everyone, accepted or not).
                         if (preloadedGroupUrlSet !== null && preloadedGroupUrlSet.size > 0) {
                             let enriched = 0;
                             for (const normGroupUrl of preloadedGroupUrlSet) {
                                 if (candidateMap.has(normGroupUrl)) continue; // already found via activity
                                 if (existingQueueUrls.has(normGroupUrl) || existingProspectUrls.has(normGroupUrl)) continue;
                                 if (!connectQueueProfileMap.has(normGroupUrl)) continue; // not in this colleague's CQ
+                                if (!colleagueAcceptedUrls.has(normGroupUrl)) continue; // not a confirmed acceptance
                                 const cqProfile = connectQueueProfileMap.get(normGroupUrl);
                                 const inboxData = colleagueInboxByUrl.get(normGroupUrl) || null;
                                 candidateMap.set(normGroupUrl, {
@@ -21741,7 +21791,7 @@
                                 enriched++;
                             }
                             if (enriched > 0) {
-                                addSCLog(`   🔗 Group enrichment: added ${enriched} group member(s) via connect_queue data (URL-format bridge).`, 'success');
+                                addSCLog(`   🔗 Group enrichment: added ${enriched} confirmed-accepted group member(s) via connect_queue data (URL-format bridge).`, 'success');
                             }
                         }
 
