@@ -1082,6 +1082,23 @@
             line-height: 1;
         }
         .card-export-btn:hover { background: #b91c1c; color: white; }
+        .card-duplicate-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            padding: 0.28rem 0.65rem;
+            background: white;
+            color: var(--success);
+            border: 1.5px solid var(--success);
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+            font-family: inherit;
+            line-height: 1;
+        }
+        .card-duplicate-btn:hover { background: var(--success); color: white; }
 
         /* ── Target Export Selection (PDF export "Targets" feature) ── */
         .group-card.select-mode { cursor: pointer; }
@@ -2503,6 +2520,9 @@
             </button>
             <button class="btn btn-accent" id="splitGroupBtn" onclick="openSplitFromEdit()" style="display:none;margin-right:auto;margin-left:0.5rem;">
                 <i class="fas fa-code-branch"></i> Split Group
+            </button>
+            <button class="btn btn-outline" id="duplicateGroupBtn" onclick="duplicateGroup(currentGroupId)" style="display:none;margin-right:auto;margin-left:0.5rem;border-color:var(--success);color:var(--success);">
+                <i class="fas fa-clone"></i> Duplicate Group
             </button>
             <button class="btn btn-primary" id="saveGroupBtn" onclick="saveGroup()">
                 <i class="fas fa-save"></i> Save Group
@@ -3935,6 +3955,9 @@
                         <button class="card-split-btn" onclick="event.stopPropagation(); openSplitModal('${g.id}')">
                             <i class="fas fa-code-branch"></i> Split
                         </button>
+                        <button class="card-duplicate-btn" onclick="event.stopPropagation(); duplicateGroup('${g.id}')" title="Duplicate this group (all fields, contacts, batches, prompts &amp; variations) — you'll rename the copy">
+                            <i class="fas fa-clone"></i> Duplicate
+                        </button>
                         <button class="card-export-btn" onclick="event.stopPropagation(); exportSingleTargetPdf('${g.id}')" title="Export this Target to a branded PDF">
                             <i class="fas fa-file-pdf"></i> Export
                         </button>
@@ -4134,6 +4157,7 @@
         document.getElementById('modalTitle').textContent = 'New Hypothesis Group';
         document.getElementById('deleteGroupBtn').style.display = 'none';
         document.getElementById('splitGroupBtn').style.display = 'none';
+        document.getElementById('duplicateGroupBtn').style.display = 'none';
         clearModalForm();
         buildColorPicker();
         renderTaggedContacts();
@@ -4156,6 +4180,7 @@
         document.getElementById('modalTitle').textContent = 'Edit Hypothesis Group';
         document.getElementById('deleteGroupBtn').style.display = '';
         document.getElementById('splitGroupBtn').style.display = '';
+        document.getElementById('duplicateGroupBtn').style.display = '';
 
         // Populate form
         document.getElementById('groupName').value        = group.name || '';
@@ -7735,6 +7760,78 @@
             await loadGroups();
         } catch(e) {
             showAlert('Error deleting: ' + e.message, 'error');
+        }
+    };
+
+    // ── Duplicate Group ──
+    // Creates a brand-new hypothesis group that's an exact copy of every field on
+    // the source group — description, color, BDRs, workspace, contact source,
+    // source prompts, message variations, batch IDs, review/target instructions,
+    // AND every tagged contact (transparently handling chunked groups with
+    // thousands of contacts via _readGroupContacts/_writeGroupContacts).
+    // The copy's name is suffixed with " (Copy)" and, once the edit modal opens
+    // on the new group, the name field is auto-focused + fully selected so the
+    // very next keystroke forces a rename before the user saves.
+    window.duplicateGroup = async function(groupId) {
+        const group = allGroups.find(g => g.id === groupId);
+        if (!group) { showAlert('Group not found.', 'danger'); return; }
+
+        if (!confirm(`Duplicate "${group.name || 'this group'}"?\n\nA full copy — all fields, contacts, batches, prompts & variations — will be created, and you'll be asked to rename it.`)) return;
+
+        try {
+            showAlert('Duplicating group…', 'info', 4000);
+
+            // Read the full contact set — transparently handles chunked groups
+            // (thousands of contacts stored in the hypothesis_group_chunks collection).
+            const srcRef = doc(db, 'hypothesis_groups', groupId);
+            const { urls, tagged } = await _readGroupContacts(srcRef, group);
+
+            // Copy every metadata field verbatim except identity/timestamps.
+            const newName = `${group.name || 'Unnamed Group'} (Copy)`;
+            const metaPayload = {
+                name:                       newName,
+                description:                group.description || '',
+                color:                      group.color || GROUP_COLORS[0],
+                bdrEmails:                  [...(group.bdrEmails || [])],
+                bdrEmail:                   group.bdrEmail || (group.bdrEmails?.[0] || null),
+                contactSource:              group.contactSource || '',
+                workspaceId:                group.workspaceId || null,
+                workspaceName:              group.workspaceName || null,
+                importBatchGroupId:         group.importBatchGroupId || null,
+                sourcePrompts:              JSON.parse(JSON.stringify(group.sourcePrompts || [])),
+                messageVariations:          JSON.parse(JSON.stringify(group.messageVariations || [])),
+                sourceBatchIds:             [...(group.sourceBatchIds || [])],
+                targetContactInstructions:  group.targetContactInstructions || '',
+                messageReviewInstructions:  group.messageReviewInstructions || '',
+                duplicatedFrom:             groupId,
+                createdAt:                  Timestamp.now(),
+                createdBy:                  auth.currentUser?.email || '',
+                updatedAt:                  Timestamp.now()
+            };
+
+            const newRef = await addDoc(collection(db, 'hypothesis_groups'), metaPayload);
+
+            // Copy contacts (re-chunks automatically if the set is large).
+            await _writeGroupContacts(newRef, urls, tagged);
+            await updateDoc(newRef, { contactNames: tagged.map(c => c.name || '') });
+
+            console.log(`[Duplicate Group] ✓ Duplicated "${group.name}" → "${newName}" (${newRef.id}), ${urls.length} contacts copied`);
+            showAlert(`✓ Duplicated "${group.name}" — rename the copy below and save.`, 'success', 6000);
+
+            await loadGroups();
+            await window.openEditModal(newRef.id);
+
+            // Force a rename: focus + fully select the name field so the user's
+            // very next keystroke replaces "<name> (Copy)" with something new.
+            const nameInput = document.getElementById('groupName');
+            if (nameInput) {
+                nameInput.focus();
+                nameInput.select();
+            }
+            document.getElementById('modalTitle').textContent = 'Rename Duplicated Hypothesis Group';
+        } catch(e) {
+            console.error('[Duplicate Group] Error:', e);
+            showAlert('Error duplicating group: ' + e.message, 'danger');
         }
     };
 
