@@ -11,7 +11,7 @@
     <script>
         // ── Auto-versioning / stale-cache guard (same pattern as export_outreach_history.html) ──
         (function () {
-            var PAGE_VERSION = '2026-09-11.1';
+            var PAGE_VERSION = '2026-09-11.3';
             var VERSION_URL = 'outreach_updates_admin.version.json';
             var GUARD_KEY = 'oua_version_reload_guard';
 
@@ -535,6 +535,14 @@
                         <option value="pipedrive">Pipedrive</option>
                         <option value="other">Other</option>
                     </select>
+                </div>
+                <div class="form-group">
+                    <label>AI Name Matching <span class="field-hint">(Gemini Flash-Lite)</span></label>
+                    <div class="toggle-wrap" style="padding-top:0.35rem;">
+                        <button class="toggle on" id="cfgAiToggle" onclick="toggleCfgAi()"></button>
+                        <span class="toggle-label" id="cfgAiLabel">On</span>
+                    </div>
+                    <span class="field-hint">When a company name doesn't exactly match the uploaded ID list, a low-cost AI model checks whether it's the same organization (e.g. "Children's Mercy Kansas City" → "Children's Mercy Hospital"). Confident matches are applied and cached; each name is only ever sent to the model once.</span>
                 </div>
             </div>
 
@@ -1107,6 +1115,7 @@
 
     // ── Configure modal ──────────────────────────────────────────────────────
     let cfgEnabled = false;
+    let cfgAiEnabled = true;
 
     window.openConfigModal = function(customerId) {
         currentCustomer = findCustomer(customerId);
@@ -1115,6 +1124,8 @@
 
         cfgEnabled = !!cfg.enabled;
         setToggle('cfgEnabledToggle', 'cfgEnabledLabel', cfgEnabled, 'Sync On', 'Off');
+        cfgAiEnabled = cfg.aiMatchingEnabled !== false; // default ON
+        setToggle('cfgAiToggle', 'cfgAiLabel', cfgAiEnabled, 'On', 'Off');
         document.getElementById('cfgFrequency').value = cfg.frequency === 'weekly' ? 'weekly' : 'daily';
         document.getElementById('cfgWeeklyDay').value = String(cfg.weeklyDay ?? 1);
         document.getElementById('cfgSendHour').value = String(cfg.sendHour ?? 6);
@@ -1135,6 +1146,10 @@
     window.toggleCfgEnabled = function() {
         cfgEnabled = !cfgEnabled;
         setToggle('cfgEnabledToggle', 'cfgEnabledLabel', cfgEnabled, 'Sync On', 'Off');
+    };
+    window.toggleCfgAi = function() {
+        cfgAiEnabled = !cfgAiEnabled;
+        setToggle('cfgAiToggle', 'cfgAiLabel', cfgAiEnabled, 'On', 'Off');
     };
     window.onCfgFrequencyChange = function() {
         const weekly = document.getElementById('cfgFrequency').value === 'weekly';
@@ -1174,6 +1189,7 @@
                 lookbackDays: document.getElementById('cfgLookback').value ? parseInt(document.getElementById('cfgLookback').value, 10) : null,
                 deliveryMethod: method,
                 crmType: document.getElementById('cfgCrmType').value,
+                aiMatchingEnabled: cfgAiEnabled,
                 webhookUrl: webhookUrl || null,
                 authHeaderName: document.getElementById('cfgAuthHeaderName').value.trim() || 'Authorization',
                 authToken: document.getElementById('cfgAuthToken').value.trim() || null,
@@ -1456,20 +1472,50 @@
     };
 
     // ── Preview + Run Now ────────────────────────────────────────────────────
-    window.previewCrmBatch = async function(customerId) {
+    const LOOKBACK_OPTIONS = [1, 2, 3, 7, 14, 30];
+
+    window.previewCrmBatch = async function(customerId, lookbackDays = null) {
         const customer = findCustomer(customerId);
         document.getElementById('previewModalTitle').textContent = `Batch Preview — ${customer.name}`;
         document.getElementById('previewModalBody').innerHTML =
             '<div class="loading-inline"><i class="fas fa-circle-notch spin"></i> Building batch preview on the Railway backend… this can take a minute.</div>';
         openModal('previewModalOverlay');
         try {
-            const r = await railwayPost('/api/outreach-updates/run-crm-sync', { customerId, dryRun: true });
+            const r = await railwayPost('/api/outreach-updates/run-crm-sync', {
+                customerId, dryRun: true, ...(lookbackDays ? { lookbackDays } : {})
+            });
             const unmatched = r.unmatchedCompanies || [];
             const sample = r.sampleRecords || [];
+            const aiMatches = r.aiMatches || [];
+            const usedLookback = r.lookbackDays;
+            const lookbackOpts = LOOKBACK_OPTIONS.includes(usedLookback) ? LOOKBACK_OPTIONS : [usedLookback, ...LOOKBACK_OPTIONS];
+            const periodTxt = r.periodStart && r.periodEnd
+                ? `${r.periodStart.slice(0, 10)} → ${r.periodEnd.slice(0, 10)}`
+                : '';
+
+            const fmtConf = (c) => c != null ? Math.round(c * 100) + '%' : '';
+            const crmIdCell = (rec) => {
+                if (!rec.crm_company_id) return '<span class="badge badge-warn">unmatched</span>';
+                const aiBadge = rec.crm_match_method === 'ai'
+                    ? ` <span class="badge badge-info" title="AI matched to &quot;${escHtml(rec.crm_company_name || '')}&quot;${rec.crm_match_confidence != null ? ' (' + fmtConf(rec.crm_match_confidence) + ' confidence)' : ''}"><i class="fas fa-wand-magic-sparkles"></i> AI</span>`
+                    : '';
+                return `<span class="mono">${escHtml(rec.crm_company_id)}</span>${aiBadge}`;
+            };
+
             document.getElementById('previewModalBody').innerHTML = `
+                <div class="form-grid" style="margin-bottom:0.9rem;align-items:flex-end;">
+                    <div class="form-group" style="min-width:200px;">
+                        <label>Period Covered</label>
+                        <select id="previewLookbackSelect" onchange="previewCrmBatch('${escHtml(customerId)}', parseInt(this.value, 10))">
+                            ${lookbackOpts.map(d => `<option value="${d}" ${d === usedLookback ? 'selected' : ''}>Last ${d} day${d === 1 ? '' : 's'}${d === usedLookback && !lookbackDays ? ' (configured)' : ''}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="form-group"><span class="small muted" style="padding-bottom:0.6rem;">${periodTxt}${lookbackDays ? ' · changing the period here only affects this preview and the "Deliver" button below — the scheduled sync keeps its configured period' : ''}</span></div>
+                </div>
                 <div class="stat-pills">
                     <span class="stat-pill"><strong>${r.recordCount}</strong> records in batch</span>
                     <span class="stat-pill good"><strong>${r.matchedRecordCount}</strong> matched to CRM IDs</span>
+                    ${r.aiMatchingEnabled ? `<span class="stat-pill ${r.aiMatchedRecordCount ? 'good' : ''}"><i class="fas fa-wand-magic-sparkles"></i> <strong>${r.aiMatchedRecordCount || 0}</strong> matched by AI</span>` : '<span class="stat-pill">AI matching off</span>'}
                     <span class="stat-pill ${unmatched.length ? 'warn' : 'good'}"><strong>${unmatched.length}</strong> unmatched compan${unmatched.length === 1 ? 'y' : 'ies'}</span>
                     <span class="stat-pill"><strong>${r.mappingCount}</strong> companies in ID list</span>
                     <span class="stat-pill">Delivery: <strong>${r.deliveryMethod === 'email' ? 'Email CSV' : 'Webhook'}</strong></span>
@@ -1480,29 +1526,35 @@
                     <span class="stat-pill">${r.summary.replies} replied</span>
                     <span class="stat-pill">${r.summary.meetings_scheduled} meetings</span>
                 </div>
+                ${aiMatches.length ? `
+                    <div class="alert info" style="margin-top:0.5rem;"><i class="fas fa-wand-magic-sparkles"></i>
+                    <span><strong>AI name matches</strong> (verify these look right — they're cached and reused on every future run):<br>
+                    ${aiMatches.slice(0, 25).map(m => `"${escHtml(m.company_name)}" → <strong>${escHtml(m.matched_to)}</strong> <span class="mono">(${escHtml(m.crm_company_id)}${m.confidence != null ? ', ' + fmtConf(m.confidence) : ''})</span>`).join('<br>')}
+                    ${aiMatches.length > 25 ? `<br>… and ${aiMatches.length - 25} more` : ''}</span></div>` : ''}
                 ${unmatched.length ? `
                     <div class="alert warning" style="margin-top:0.5rem;"><i class="fas fa-exclamation-triangle"></i>
-                    <span><strong>Companies with no CRM ID on file</strong> (records still included, with a blank <code>crm_company_id</code>):<br>
+                    <span><strong>Companies with no CRM ID on file</strong>${r.aiMatchingEnabled ? ' — neither an exact nor an AI match was found' : ''} (records still included, with a blank <code>crm_company_id</code>):<br>
                     ${unmatched.slice(0, 40).map(escHtml).join(', ')}${unmatched.length > 40 ? ` … and ${unmatched.length - 40} more` : ''}</span></div>` : ''}
-                <h4 style="font-size:0.95rem;font-weight:700;margin:0.9rem 0 0.5rem;">Sample records (first ${sample.length})</h4>
+                <h4 style="font-size:0.95rem;font-weight:700;margin:0.9rem 0 0.5rem;">Sample records (first ${sample.length} of ${r.recordCount})</h4>
                 <div class="table-wrapper" style="max-height:320px;overflow-y:auto;">
                     <table class="data-table">
-                        <thead><tr><th>CRM ID</th><th>Contact</th><th>Company</th><th>BDR</th><th>Sent</th><th>Connected</th><th>Replied</th><th>Meeting</th></tr></thead>
+                        <thead><tr><th>CRM ID</th><th>Contact</th><th>Company</th><th>BDR</th><th>Message</th><th>Sent</th><th>Connected</th><th>Replied</th><th>Meeting</th></tr></thead>
                         <tbody>${sample.map(rec => `<tr>
-                            <td class="mono">${rec.crm_company_id ? escHtml(rec.crm_company_id) : '<span class="badge badge-warn">unmatched</span>'}</td>
+                            <td>${crmIdCell(rec)}</td>
                             <td><div style="font-weight:600;">${escHtml(rec.contact_name || '—')}</div><div class="small muted">${escHtml(rec.contact_title || '')}</div></td>
                             <td>${escHtml(rec.company_name || '—')}</td>
                             <td class="small">${escHtml(rec.bdr_name || '')}</td>
+                            <td><div class="small muted" style="max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-style:italic;" title="${escHtml((rec.message_content || '').slice(0, 1500))}">${escHtml((rec.message_content || '').slice(0, 120)) || '—'}</div></td>
                             <td>${rec.outreach_sent ? '<span class="badge badge-on">Yes</span>' : '<span class="badge badge-off">No</span>'}</td>
                             <td>${rec.connection_accepted ? '<span class="badge badge-on">Yes</span>' : '<span class="badge badge-off">No</span>'}</td>
                             <td>${rec.replied ? '<span class="badge badge-on">Yes</span>' : '<span class="badge badge-off">No</span>'}</td>
                             <td>${rec.meeting_scheduled ? '<span class="badge badge-on">Yes</span>' : '<span class="badge badge-off">No</span>'}</td>
-                        </tr>`).join('') || '<tr><td colspan="8" class="muted" style="padding:1rem;">No outreach activity in this period.</td></tr>'}</tbody>
+                        </tr>`).join('') || '<tr><td colspan="9" class="muted" style="padding:1rem;">No outreach activity in this period. Try a longer period above.</td></tr>'}</tbody>
                     </table>
                 </div>
                 <div class="modal-foot">
                     <button class="btn btn-secondary" onclick="closeModal('previewModalOverlay')">Close</button>
-                    <button class="btn btn-primary" onclick="closeModal('previewModalOverlay'); runCrmBatchNow('${escHtml(customerId)}', null)"><i class="fas fa-bolt"></i> Deliver This Batch Now</button>
+                    <button class="btn btn-primary" onclick="closeModal('previewModalOverlay'); runCrmBatchNow('${escHtml(customerId)}', null, ${usedLookback})"><i class="fas fa-bolt"></i> Deliver This Batch Now (${usedLookback}d)</button>
                 </div>`;
         } catch (e) {
             console.error('Preview failed:', e);
@@ -1511,21 +1563,24 @@
         }
     };
 
-    window.runCrmBatchNow = async function(customerId, btn) {
+    window.runCrmBatchNow = async function(customerId, btn, lookbackDays = null) {
         const customer = findCustomer(customerId);
         const cfg = crmConfigs.get(customerId);
         if (!cfg) { showAlert('Configure this client first.', 'warning'); return; }
         const dest = cfg.deliveryMethod === 'email'
             ? `email the CSV batch file to ${(cfg.emailRecipients || []).join(', ') || '(no recipients set!)'}`
             : `POST the JSON batch to ${cfg.webhookUrl || '(no webhook URL set!)'}`;
-        if (!confirm(`Deliver the outreach batch for ${customer.name} now?\n\nThis will ${dest}.`)) return;
+        const periodNote = lookbackDays ? `\nPeriod: last ${lookbackDays} day${lookbackDays === 1 ? '' : 's'}.` : '';
+        if (!confirm(`Deliver the outreach batch for ${customer.name} now?\n\nThis will ${dest}.${periodNote}`)) return;
 
         const origHtml = btn ? btn.innerHTML : null;
         if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-circle-notch spin"></i> Running…'; }
         showAlert(`Building and delivering CRM batch for <strong>${escHtml(customer.name)}</strong>… this can take a minute.`, 'info', true);
         try {
-            const r = await railwayPost('/api/outreach-updates/run-crm-sync', { customerId, dryRun: false });
-            showAlert(`Batch <span class="mono">${escHtml(r.batchId)}</span> delivered for <strong>${escHtml(customer.name)}</strong> — ${r.recordCount} records (${r.matchedRecordCount} matched to CRM IDs${(r.unmatchedCompanies || []).length ? ', ' + r.unmatchedCompanies.length + ' unmatched companies' : ''}).`, 'success');
+            const r = await railwayPost('/api/outreach-updates/run-crm-sync', {
+                customerId, dryRun: false, ...(lookbackDays ? { lookbackDays } : {})
+            });
+            showAlert(`Batch <span class="mono">${escHtml(r.batchId)}</span> delivered for <strong>${escHtml(customer.name)}</strong> — ${r.recordCount} records (${r.matchedRecordCount} matched to CRM IDs${r.aiMatchedRecordCount ? ', ' + r.aiMatchedRecordCount + ' via AI' : ''}${(r.unmatchedCompanies || []).length ? ', ' + r.unmatchedCompanies.length + ' unmatched companies' : ''}).`, 'success');
         } catch (e) {
             console.error('Run now failed:', e);
             showAlert(`CRM batch for ${escHtml(customer.name)} failed: ${escHtml(e.message)}`, 'error', true);
@@ -1577,7 +1632,7 @@
                         ? `<span class="small" style="color:var(--danger);">${escHtml((e.error || '').slice(0, 140))}</span>`
                         : (e.type === 'admin_digest'
                             ? `<span class="small muted">${e.summary ? `${e.summary.outreach_sent} sent · ${e.summary.connections_accepted} connected · ${e.summary.replies} replied · ${e.summary.meetings_scheduled} meetings` : ''}</span>`
-                            : `<span class="small muted">${e.matchedRecordCount ?? 0} matched${e.unmatchedCompanyCount ? ` · ${e.unmatchedCompanyCount} unmatched cos.` : ''}${e.batchId ? ` · <span class="mono">${escHtml(e.batchId)}</span>` : ''}</span>`);
+                            : `<span class="small muted">${e.matchedRecordCount ?? 0} matched${e.aiMatchedRecordCount ? ` (${e.aiMatchedRecordCount} AI)` : ''}${e.unmatchedCompanyCount ? ` · ${e.unmatchedCompanyCount} unmatched cos.` : ''}${e.batchId ? ` · <span class="mono">${escHtml(e.batchId)}</span>` : ''}</span>`);
                     return `<tr>
                         <td class="small" style="white-space:nowrap;">${fmtDateTime(e.createdAt)}</td>
                         <td>${typeBadge}</td>
