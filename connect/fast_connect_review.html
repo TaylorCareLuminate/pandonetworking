@@ -12282,6 +12282,11 @@
         // if OpenRouter thinks too long. Reasoning models like Qwen 3.8 Max take
         // 2–18 minutes per batch and almost always 502.
         const QTE_BATCH_SIZE = 4;
+        // Hidden-reasoning models (DeepSeek, Qwen, Grok, Kimi, etc.) can burn their
+        // whole token budget on hidden "thinking" before writing any real output.
+        // Halving the batch size halves how much thinking+output they need to fit
+        // in one call, which meaningfully cuts down on empty/truncated responses.
+        const QTE_BATCH_SIZE_REASONING = 2;
         const QTE_CONCURRENCY = 3;
         const QTE_FETCH_TIMEOUT_MS = 75 * 1000;
         const QTE_MAX_RETRIES = 1;
@@ -12296,6 +12301,19 @@
 
         function qteIsSlowModel(slug) {
             return /qwen3\.8-max|opus|reasoning|gpt-5\.5|claude-opus-4/i.test(slug || '');
+        }
+
+        // Broader than qteIsSlowModel: any model whose provider is known to hide
+        // "thinking" tokens inside the response (billed against max_tokens) even
+        // when a low reasoning effort is requested. Used to shrink batch size and
+        // must stay in sync with the server-side check in RailwayCLemail's
+        // /api/ai-profile-eval (isHiddenReasoningModel).
+        function qteIsHiddenReasoningModel(slug) {
+            return /kimi|qwen|deepseek|grok/i.test(slug || '');
+        }
+
+        function qteBatchSizeFor(slug) {
+            return qteIsHiddenReasoningModel(slug) ? QTE_BATCH_SIZE_REASONING : QTE_BATCH_SIZE;
         }
 
         function qteParseResults(raw) {
@@ -12362,7 +12380,11 @@ Rules:
                             model,
                             prompt: userPrompt,
                             temperature: 0.2,
-                            max_tokens: 4000,
+                            // Generous budget so hidden-reasoning models (DeepSeek,
+                            // Qwen, Grok, Kimi) still have room left for the actual
+                            // JSON answer after their (capped) hidden thinking —
+                            // the server also enforces its own floor on top of this.
+                            max_tokens: 6000,
                             lowReasoning: true
                         }),
                         signal: controller.signal
@@ -12551,9 +12573,10 @@ Rules:
             };
 
             try {
+                const batchSize = qteBatchSizeFor(qteModel);
                 const batches = [];
-                for (let i = 0; i < toEdit.length; i += QTE_BATCH_SIZE) {
-                    batches.push(toEdit.slice(i, i + QTE_BATCH_SIZE));
+                for (let i = 0; i < toEdit.length; i += batchSize) {
+                    batches.push(toEdit.slice(i, i + batchSize));
                 }
 
                 let next = 0;
@@ -12595,7 +12618,12 @@ Rules:
                             consecutiveFails++;
                             if (consecutiveFails >= 3) {
                                 _qteAbort = true;
-                                showAlert(`Quick Text Edit stopped after 3 failed batches in a row (${batchErr.message}). Switch to Llama 4 Maverick / Gemini Flash / DeepSeek and re-run.`, 'danger');
+                                const otherModels = ['Llama 4 Maverick', 'Gemini Flash', 'DeepSeek']
+                                    .filter(m => !qteModel.toLowerCase().includes(m.toLowerCase().split(' ')[0]));
+                                const suggestion = otherModels.length
+                                    ? `Try ${otherModels.join(' / ')}, or just re-run — the server now retries empty/truncated responses automatically and uses smaller batches for reasoning models.`
+                                    : `Try re-running — the server now retries empty/truncated responses automatically with a bigger token budget.`;
+                                showAlert(`Quick Text Edit stopped after 3 failed batches in a row (${batchErr.message}). ${suggestion}`, 'danger');
                             }
                         }
                         processed += batch.length;
