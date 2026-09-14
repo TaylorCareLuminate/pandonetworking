@@ -32,6 +32,15 @@
  *   caller) so a held/booked time disappears from their pickers immediately;
  *   each widget also self-polls every 20s as a fallback for cross-tab/page
  *   changes the in-page pub/sub can't reach.
+ * @version 1.5.0 — fixed findConversationTextForContact() so the "AI-scan
+ *   missing info" email/phone lookup actually finds conversations: it now
+ *   queries all 4 fields a heyreach_inbox doc may be tagged with the owning
+ *   BDR under (bdrEmail/accountEmail/linkedInAccountEmail/uploadedByEmail —
+ *   was only checking 2), and falls back to rawData.messages when a doc's
+ *   messages live there instead of top-level `messages` (was only checking
+ *   top-level, which silently produced an empty conversation to scan for
+ *   most docs, so no email/phone was ever found even though the data was
+ *   right there).
  */
 (function () {
     'use strict';
@@ -529,6 +538,16 @@
     // Finds the LinkedIn conversation thread (heyreach_inbox) for a given
     // BDR + contact LinkedIn URL and flattens it to plain text. Best-effort:
     // returns '' if nothing matches (e.g. no reply has come in yet).
+    //
+    // A HeyReach doc can be tagged with the owning BDR under any of FOUR
+    // different fields depending on how it was ingested — 'accountEmail',
+    // 'bdrEmail', 'linkedInAccountEmail', or 'uploadedByEmail' (their LinkedIn
+    // login email frequently differs from their work email). Every other page
+    // that reads this collection (company_review_replies.html,
+    // conversation_lookup.html) queries all four; this used to only check two
+    // ('bdrEmail'/'accountEmail'), so conversations keyed by the other two
+    // fields were invisible here even though they showed up elsewhere.
+    const HEYREACH_BDR_EMAIL_FIELDS = ['bdrEmail', 'accountEmail', 'linkedInAccountEmail', 'uploadedByEmail'];
     async function findConversationTextForContact(bdrEmail, contactLiUrl) {
         if (!contactLiUrl || !bdrEmail) return '';
         const targetUrl = normalizeLiUrl(contactLiUrl);
@@ -537,10 +556,9 @@
             const { collection, getDocs, query, where } = fx();
             const inboxRef = collection(dbi(), 'heyreach_inbox');
             const email = bdrEmail.toLowerCase().trim();
-            const snaps = await Promise.all([
-                getDocs(query(inboxRef, where('bdrEmail', '==', email))).catch(() => ({ docs: [] })),
-                getDocs(query(inboxRef, where('accountEmail', '==', email))).catch(() => ({ docs: [] }))
-            ]);
+            const snaps = await Promise.all(HEYREACH_BDR_EMAIL_FIELDS.map(field =>
+                getDocs(query(inboxRef, where(field, '==', email))).catch(() => ({ docs: [] }))
+            ));
             const seen = new Set();
             for (const snap of snaps) {
                 for (const d of (snap.docs || [])) {
@@ -549,7 +567,14 @@
                     const data = d.data();
                     const url = normalizeLiUrl(data.leadProfileUrl || '');
                     if (url && url === targetUrl) {
-                        return (data.messages || []).map(m => m.body || m.text || m.message || '').filter(Boolean).join('\n');
+                        // The actual message array is frequently nested under
+                        // rawData.messages rather than top-level `messages` —
+                        // falling back to only `data.messages` (as this used to)
+                        // silently returned an empty conversation for those docs,
+                        // so the regex/AI scan below never had any text to find
+                        // an email or phone number in.
+                        const messages = data.rawData?.messages || data.messages || [];
+                        return messages.map(m => m.body || m.text || m.message || '').filter(Boolean).join('\n');
                     }
                 }
             }
