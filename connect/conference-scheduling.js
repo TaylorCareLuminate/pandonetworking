@@ -55,6 +55,12 @@
  *   falling back to (2) the BDR's inbox fetched with ALL alias emails
  *   (bdr_leaders.primaryEmail/.linkedInEmail + linkedin_email_associations),
  *   matched locally by URL or /in/<slug>. Diagnostic console logs added.
+ * @version 1.8.0 — backend-friendly fallback fetches: heyreach_inbox docs are
+ *   heavy (full rawData message history each), and the wrapper's default
+ *   5000-doc pages plus alias×field query fan-out were 502'ing Railway
+ *   mid-scan. Inbox fetches now use 1000-doc pages, tier-2 runs one alias at
+ *   a time, and a failed full-inbox load backs off for 30s instead of
+ *   re-attempting for every remaining contact in the scan.
  */
 (function () {
     'use strict';
@@ -727,18 +733,23 @@
                 const emails = [...await _bdrAliasEmails(key)];
                 const { collection, getDocs, query, where } = fx();
                 const inboxRef = collection(dbi(), 'heyreach_inbox');
-                const snaps = await Promise.all(emails.flatMap(email =>
-                    HEYREACH_BDR_EMAIL_FIELDS.map(field =>
-                        getDocs(query(inboxRef, where(field, '==', email))).catch(() => ({ docs: [] }))
-                    )
-                ));
+                // One alias at a time (its 4 field queries in parallel), with
+                // pageSize 1000. The sync tags bdrEmail/accountEmail/
+                // linkedInAccountEmail with the SAME value, so a matching alias
+                // returns ~3 copies of a busy BDR's heavy inbox — firing every
+                // alias × field combination at once has 502'd Railway.
                 const seen = new Set();
                 const out = [];
-                for (const snap of snaps) {
-                    for (const d of (snap.docs || [])) {
-                        if (seen.has(d.id)) continue;
-                        seen.add(d.id);
-                        out.push(d.data());
+                for (const email of emails) {
+                    const snaps = await Promise.all(HEYREACH_BDR_EMAIL_FIELDS.map(field =>
+                        getDocs(query(inboxRef, where(field, '==', email)), { pageSize: 1000 }).catch(() => ({ docs: [] }))
+                    ));
+                    for (const snap of snaps) {
+                        for (const d of (snap.docs || [])) {
+                            if (seen.has(d.id)) continue;
+                            seen.add(d.id);
+                            out.push(d.data());
+                        }
                     }
                 }
                 console.log(`🔎 [ConferenceScheduling] Inbox fetch for BDR ${key}: ${out.length} doc(s) across ${emails.length} alias email(s) [${emails.join(', ')}]`);
@@ -758,16 +769,31 @@
     // review dashboards) already read this whole collection routinely, so the
     // cost is normal for this app; the wrapper auto-paginates it.
     let _allInboxDocsPromise = null;
+    let _allInboxDocsFailedAt = 0;
+    const ALL_INBOX_RETRY_COOLDOWN_MS = 30000;
     function _fetchAllInboxDocs() {
         if (!_allInboxDocsPromise) {
+            // After a hard failure, don't re-attempt this heavy fetch for every
+            // subsequent contact in the same scan — that just hammers a backend
+            // that's already struggling. Skip tier 3 for a cooldown period.
+            if (_allInboxDocsFailedAt && (Date.now() - _allInboxDocsFailedAt) < ALL_INBOX_RETRY_COOLDOWN_MS) {
+                return Promise.resolve([]);
+            }
             _allInboxDocsPromise = (async () => {
                 const { collection, getDocs } = fx();
-                const snap = await getDocs(collection(dbi(), 'heyreach_inbox'));
+                // Small pages: heyreach_inbox docs are heavy (each embeds its
+                // full rawData message history), and the wrapper's default
+                // 5000-doc pages make Railway 502 under load. 1000-doc pages
+                // return the same complete set as smaller, reliable requests.
+                const snap = await getDocs(collection(dbi(), 'heyreach_inbox'), { pageSize: 1000 });
                 const docs = (snap.docs || []).map(d => d.data());
                 console.log(`🔎 [ConferenceScheduling] Full inbox fallback loaded: ${docs.length} doc(s)`);
                 return docs;
             })();
-            _allInboxDocsPromise.catch(() => { _allInboxDocsPromise = null; });
+            _allInboxDocsPromise.catch(() => {
+                _allInboxDocsFailedAt = Date.now();
+                _allInboxDocsPromise = null;
+            });
         }
         return _allInboxDocsPromise;
     }
