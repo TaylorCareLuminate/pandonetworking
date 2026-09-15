@@ -477,7 +477,7 @@
 
     <div class="page-header">
         <h1><i class="fab fa-linkedin"></i> LinkedIn Campaign Follow-up</h1>
-        <p>Find connections where no message was sent and deliver the intended message via Quick Message. Track how late follow-ups perform over time.</p>
+        <p>Find people who <strong>accepted</strong> a connection request but never got the intended message (common when HeyReach skipped the note). Send that message via Quick Message.</p>
     </div>
 
     <!-- Controls -->
@@ -534,7 +534,7 @@
     <div class="stats-row" id="statsRow" style="display:none">
         <div class="stat-card">
             <div class="stat-num" id="statAccepted">0</div>
-            <div class="stat-label">Connections Found</div>
+            <div class="stat-label">Accepted Our Invite</div>
         </div>
         <div class="stat-card orange">
             <div class="stat-num" id="statNoMsg">0</div>
@@ -896,7 +896,30 @@ function extractLinkedInUrl(data) {
         || data.prospectLinkedInUrl
         || data.li_url
         || data.rawData?.correspondentProfile?.profileUrl
+        || data.rawData?.correspondent?.profile_url
+        || data.leadLinkedInUrl
         || '';
+}
+
+function toMillis(ts) {
+    if (!ts) return null;
+    if (ts instanceof Date) return ts.getTime();
+    if (typeof ts === 'number') return ts < 1e12 ? ts * 1000 : ts;
+    if (typeof ts === 'string') {
+        const n = new Date(ts).getTime();
+        return Number.isNaN(n) ? null : n;
+    }
+    if (typeof ts.toDate === 'function') return ts.toDate().getTime();
+    if (ts.seconds !== undefined) return ts.seconds * 1000 + (ts.nanoseconds || 0) / 1e6;
+    if (ts._seconds !== undefined) return ts._seconds * 1000 + (ts._nanoseconds || 0) / 1e6;
+    return null;
+}
+
+function personKey(first, last) {
+    const f = String(first || '').toLowerCase().trim();
+    const l = String(last || '').toLowerCase().trim();
+    if (!f || !l) return '';
+    return `${f}|${l}`;
 }
 
 // ── SCAN ───────────────────────────────────────────────────────────────────
@@ -989,22 +1012,19 @@ window.startScan = async function() {
                 if (!url) return;
 
                 // Client-side date filter using connectedAt (string ISO or Firestore Timestamp)
-                if (data.connectedAt) {
-                    let connMs = null;
-                    if (typeof data.connectedAt === 'string') {
-                        connMs = new Date(data.connectedAt).getTime();
-                    } else if (data.connectedAt?.seconds) {
-                        connMs = data.connectedAt.seconds * 1000;
-                    } else if (data.connectedAt?.toDate) {
-                        connMs = data.connectedAt.toDate().getTime();
-                    }
+                const connectedAt = data.connectedAt
+                    || data.rawData?.connectedAt
+                    || data.rawData?.connectionDate
+                    || data.rawData?.connectedOn
+                    || null;
+                if (connectedAt) {
+                    const connMs = toMillis(connectedAt);
                     if (connMs && connMs < sinceDateMs) return; // older than look-back
                 }
 
                 if (!connectionsMap.has(url)) {
                     const firstName = data.firstName || data.first_name   || data.leadFirstName || '';
                     const lastName  = data.lastName  || data.last_name    || data.leadLastName  || '';
-                    const connectedAt = data.connectedAt || null;
                     connectionsMap.set(url, {
                         linkedInUrl: rawUrl || url,
                         name:        `${firstName} ${lastName}`.trim() || data.name || data.fullName || url,
@@ -1103,8 +1123,18 @@ window.startScan = async function() {
             )
         );
 
-        const systemContactUrlsSet = new Set(); // allowlist: came from PandoConnect
+        const systemContactUrlsSet = new Set(); // outreach we sent (invites / queue)
+        const systemPeople         = new Map(); // url → { firstName, lastName } for name fallback
         const seenActivityIds      = new Set();
+
+        function rememberSystemPerson(url, data) {
+            if (!url || systemPeople.has(url)) return;
+            const firstName = data.firstName || data.first_name || data.contactFirstName || data.leadFirstName || '';
+            const lastName  = data.lastName  || data.last_name  || data.contactLastName  || data.leadLastName  || '';
+            const k = personKey(firstName, lastName);
+            if (k) systemPeople.set(url, { firstName, lastName });
+        }
+
         activitySnaps2.forEach(res => {
             if (res.status !== 'fulfilled' || !res.value) return;
             res.value.forEach(d => {
@@ -1114,21 +1144,23 @@ window.startScan = async function() {
                 const url  = normUrl(extractLinkedInUrl(data));
                 if (!url) return;
 
-                // Profile-search noise is not outreach — don't let it gate the allowlist.
                 const activityType = (data.activityType || '').toLowerCase();
-                if (activityType !== 'search') systemContactUrlsSet.add(url);
-
-                const via        = (data.via        || '').toLowerCase();
-                const actionType = (data.actionType || '').toLowerCase();
-                const isMessage  = via.includes('quick_message') ||
-                                   via.includes('message_campaign') ||
-                                   actionType.includes('message') ||
-                                   activityType === 'message';
-                if (isMessage) msgSentSet.add(url);
+                const via          = (data.via        || '').toLowerCase();
+                const actionType   = (data.actionType || '').toLowerCase();
+                // Invites we pushed — not profile-search noise and not a later follow-up message
+                const isFollowUpMessage = via.includes('quick_message') ||
+                                          via.includes('message_campaign') ||
+                                          actionType.includes('message') ||
+                                          activityType === 'message';
+                if (activityType !== 'search' && !isFollowUpMessage) {
+                    systemContactUrlsSet.add(url);
+                    rememberSystemPerson(url, data);
+                }
+                if (isFollowUpMessage) msgSentSet.add(url);
             });
         });
 
-        console.log(`📊 connect_activity: ${seenActivityIds.size} unique docs, ${systemContactUrlsSet.size} outreach URLs, msgSentSet now ${msgSentSet.size}`);
+        console.log(`📊 connect_activity: ${seenActivityIds.size} unique docs, ${systemContactUrlsSet.size} invite URLs, msgSentSet now ${msgSentSet.size}`);
 
         // ── Step 2c: Load connect_queue (allowlist + intended messages) ─────
         // Must run BEFORE the allowlist. Queue docs store the URL as prospect_li_url
@@ -1160,7 +1192,12 @@ window.startScan = async function() {
                 const url  = normUrl(extractLinkedInUrl(data));
                 if (!url) return;
 
-                systemContactUrlsSet.add(url);
+                const msgType = (data.message_type || 'connect').toLowerCase();
+                // Connection requests we sent. Direct/harvest messages are not "the invite".
+                if (msgType === 'connect' || msgType === 'connection' || msgType === 'connect_only') {
+                    systemContactUrlsSet.add(url);
+                    rememberSystemPerson(url, data);
+                }
 
                 const msg = (data.message_to_contact || data.generated_message || data.messageContent || '').trim();
                 if (!msg) return;
@@ -1176,35 +1213,149 @@ window.startScan = async function() {
             });
         });
 
-        console.log(`📊 connect_queue: ${seenQueueIds.size} unique records, ${queueMap.size} with message text, allowlist now ${systemContactUrlsSet.size}`);
+        console.log(`📊 connect_queue: ${seenQueueIds.size} unique records, ${queueMap.size} with message text, invite allowlist now ${systemContactUrlsSet.size}`);
         if (systemContactUrlsSet.size > 0) {
-            console.log('   sample system keys:', [...systemContactUrlsSet].slice(0, 5));
+            console.log('   sample invite keys:', [...systemContactUrlsSet].slice(0, 5));
         }
 
-        setProgress(68, 'Filtering to system-originated connections…');
+        // ── Step 2d: CONNECTION_REQUEST_ACCEPTED (they actually accepted the invite) ──
+        setProgress(66, 'Loading accepted-connection events…');
+        const emailSet = new Set(emailsToQuery);
+        const acceptedEventUrls = new Map(); // url → { acceptedAt, firstName, lastName, profileUrl, company, position }
 
-        // ── Apply allowlist: keep only contacts touched by our system ────────
-        // If we have outreach/queue URLs, restrict to those. If that intersection
-        // is empty, the URL formats still don't match — skip rather than showing
-        // nothing (the previous bug: 707 connections → 0 after allowlist).
+        function activityBelongsToBdr(data) {
+            const be = (data.bdrEmail || '').toLowerCase();
+            const ae = (data.accountEmail || data.linkedInAccountEmail || '').toLowerCase();
+            if (be && emailSet.has(be)) return true;
+            if (ae && emailSet.has(ae)) return true;
+            const accId = data.linkedInAccountId != null ? String(data.linkedInAccountId) : '';
+            return accId && bdrAcctIds.has(accId);
+        }
+
+        function ingestAcceptedEvent(data) {
+            if (!activityBelongsToBdr(data)) return;
+            const rawUrl = extractLinkedInUrl(data);
+            const url = normUrl(rawUrl);
+            if (!url) return;
+            const acceptedAtMs = toMillis(data.timestamp || data.createdAt || data.acceptedAt);
+            if (acceptedAtMs && acceptedAtMs < sinceDateMs) return;
+            const firstName = data.leadFirstName || data.firstName || '';
+            const lastName  = data.leadLastName  || data.lastName  || '';
+            const prev = acceptedEventUrls.get(url);
+            if (!prev || (acceptedAtMs && acceptedAtMs > (toMillis(prev.connectedAt) || 0))) {
+                acceptedEventUrls.set(url, {
+                    linkedInUrl: rawUrl || url,
+                    name: `${firstName} ${lastName}`.trim() || url,
+                    firstName,
+                    lastName,
+                    company:  data.leadCompany || data.companyName || '',
+                    position: data.leadPosition || data.leadTitle || '',
+                    connectedAt: data.timestamp || data.createdAt || null,
+                    linkedInAccountId: data.linkedInAccountId || null,
+                    customerId: data.customerId || null,
+                });
+            }
+        }
+
+        const acceptedQueries = [
+            ...emailsToQuery.flatMap(email => [
+                getDocs(query(
+                    collection(emailDB, 'heyreach_activity'),
+                    where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
+                    where('bdrEmail', '==', email),
+                    limit(5000)
+                )).catch(() => null),
+                getDocs(query(
+                    collection(emailDB, 'heyreach_activity'),
+                    where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
+                    where('accountEmail', '==', email),
+                    limit(5000)
+                )).catch(() => null),
+            ]),
+            ...[...bdrAcctIds].flatMap(acctId => [
+                getDocs(query(
+                    collection(emailDB, 'heyreach_activity'),
+                    where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
+                    where('linkedInAccountId', '==', Number(acctId)),
+                    limit(5000)
+                )).catch(() => null),
+                getDocs(query(
+                    collection(emailDB, 'heyreach_activity'),
+                    where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
+                    where('linkedInAccountId', '==', acctId),
+                    limit(5000)
+                )).catch(() => null),
+            ])
+        ];
+        const acceptedSnaps = await Promise.all(acceptedQueries);
+        const seenAcceptedIds = new Set();
+        acceptedSnaps.forEach(snap => {
+            if (!snap) return;
+            snap.forEach(d => {
+                if (seenAcceptedIds.has(d.id)) return;
+                seenAcceptedIds.add(d.id);
+                ingestAcceptedEvent(d.data());
+            });
+        });
+        console.log(`📊 CONNECTION_REQUEST_ACCEPTED: ${seenAcceptedIds.size} events, ${acceptedEventUrls.size} accepted URLs in look-back`);
+
+        if (acceptedEventUrls.size === 0) {
+            try {
+                const fallbackSnap = await getDocs(query(
+                    collection(emailDB, 'heyreach_activity'),
+                    where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
+                    limit(10000)
+                ));
+                fallbackSnap.forEach(d => {
+                    if (seenAcceptedIds.has(d.id)) return;
+                    seenAcceptedIds.add(d.id);
+                    ingestAcceptedEvent(d.data());
+                });
+                console.log(`📊 Accepted fallback scan: ${acceptedEventUrls.size} URLs for this BDR`);
+            } catch (e) {
+                console.warn('⚠️ Accepted-events fallback failed:', e.message);
+            }
+        }
+
+        // People who accepted but are not yet in the heyreach_contacts sync still count.
+        for (const [url, info] of acceptedEventUrls) {
+            if (!connectionsMap.has(url)) connectionsMap.set(url, info);
+            else if (info.connectedAt && !connectionsMap.get(url).connectedAt) {
+                connectionsMap.get(url).connectedAt = info.connectedAt;
+            }
+        }
+        console.log(`📊 After merging accepted events: ${connectionsMap.size} connected people`);
+
+        setProgress(70, 'Keeping only people who accepted our invite…');
+
+        // Keep people who are in our network/accepted AND whom we actually invited.
+        // Never skip this — skipping it previously dumped the whole network onto the page.
         const beforeAllowlist = connectionsMap.size;
-        let useAllowlist = systemContactUrlsSet.size > 0;
-        if (useAllowlist) {
-            let overlap = 0;
-            for (const url of connectionsMap.keys()) {
-                if (systemContactUrlsSet.has(url)) overlap++;
+        const matchedUrls = new Set();
+        for (const url of connectionsMap.keys()) {
+            if (systemContactUrlsSet.has(url)) matchedUrls.add(url);
+        }
+        console.log(`📊 Invite overlap by URL: ${matchedUrls.size} of ${beforeAllowlist} accepted match ${systemContactUrlsSet.size} invites sent`);
+
+        if (matchedUrls.size === 0 && beforeAllowlist > 0 && systemPeople.size > 0) {
+            const systemByName = new Map();
+            for (const [url, p] of systemPeople) {
+                const k = personKey(p.firstName, p.lastName);
+                if (k && !systemByName.has(k)) systemByName.set(k, url);
             }
-            console.log(`📊 Allowlist overlap: ${overlap} of ${beforeAllowlist} connections match ${systemContactUrlsSet.size} system URLs`);
-            if (overlap === 0) {
-                console.warn('⚠️ Allowlist overlap is 0 after canonical URL matching — skipping allowlist so results are not wiped.');
-                useAllowlist = false;
-            } else {
-                for (const url of [...connectionsMap.keys()]) {
-                    if (!systemContactUrlsSet.has(url)) connectionsMap.delete(url);
-                }
+            for (const [url, c] of connectionsMap) {
+                const k = personKey(c.firstName, c.lastName);
+                if (k && systemByName.has(k)) matchedUrls.add(url);
+            }
+            console.log(`📊 Invite overlap after name fallback: ${matchedUrls.size}`);
+        }
+
+        if (systemContactUrlsSet.size > 0 || systemPeople.size > 0) {
+            for (const url of [...connectionsMap.keys()]) {
+                if (!matchedUrls.has(url)) connectionsMap.delete(url);
             }
         }
-        console.log(`📊 After allowlist filter: ${connectionsMap.size} connections (allowlist ${useAllowlist ? 'applied' : 'skipped'})`);
+        console.log(`📊 After accepted-invite filter: ${connectionsMap.size} people`);
 
         setProgress(72, 'Finding connections without messages…');
 
@@ -1218,8 +1369,8 @@ window.startScan = async function() {
 
         if (noMsgUrls.length === 0) {
             setProgress(100, connectionsMap.size === 0
-                ? 'No connections found — check that heyreach_contacts is synced for this BDR'
-                : 'All connections already have messages — nothing to follow up!');
+                ? 'No accepted invites found in this look-back window — pending connection requests are hidden until they accept'
+                : 'All accepted invites already have messages — nothing to follow up!');
             showContactList();
             return done();
         }
