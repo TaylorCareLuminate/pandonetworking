@@ -16316,11 +16316,14 @@
          * as fullAiPullContactsFromWorkspace) so the normal Full AI Generate pipeline can
          * run on them afterward.
          *
-         * @param connectionStatusMode 'accepted' (default) only pulls contacts who accepted
-         *   a connection request we sent (connect_queue / connect_activity / HeyReach
-         *   CONNECTION_REQUEST_ACCEPTED) — not the source BDR's entire LinkedIn network.
-         *   'reached_out' also pulls anyone the source BDR sent a connect request to,
-         *   whether or not they accepted.
+         * @param connectionStatusMode 'accepted' (default) only pulls contacts confirmed via
+         *   HeyReach's own CONNECTION_REQUEST_ACCEPTED webhook events — the same ground-truth
+         *   source outcomes.html's "Connections Accepted" stat uses — not the source BDR's
+         *   entire LinkedIn network (heyreach_contacts is used only to enrich name/title/company,
+         *   never to decide eligibility; a BDR's network is a mix of organic + invited contacts
+         *   built up over their whole tenure, so overlapping it with all-time invite history
+         *   hugely overcounts real accepted invites). 'reached_out' also pulls anyone the
+         *   source BDR sent a connect request to via connect_queue, whether or not they accepted.
          * Returns { moveBatchId, pulled, stats }.
          */
         async function fullAiPullContactsFromColleagues({ bdrEmail, colleagues, count, selectedResponse, hypothesisGroupUrlSet, connectionStatusMode, addLog }) {
@@ -16634,9 +16637,11 @@
                 }
 
                 // Tracks URLs *confirmed* as accepted connections for this colleague, via
-                // heyreach_contacts sync and/or heyreach_activity CONNECTION_REQUEST_ACCEPTED
-                // events. This is the ONLY set the group-enrichment bridge below is allowed to
-                // trust — being present in connect_queue only means a connect request was SENT,
+                // heyreach_activity's CONNECTION_REQUEST_ACCEPTED events (the ONLY reliable
+                // acceptance signal — see note below on why heyreach_contacts network sync is
+                // NOT used to confirm acceptance). This is the ONLY set the group-enrichment
+                // bridge below is allowed to trust — being present in connect_queue only means
+                // a connect request was SENT,
                 // not that it was accepted. (Hypothesis groups are just target-contact lists and
                 // are not filtered by connection status, so group membership alone must never be
                 // treated as proof of acceptance.)
@@ -16678,30 +16683,35 @@
                     }
                 }
 
+                // heyreach_contacts (this colleague's CURRENT LinkedIn network) must never gate
+                // eligibility — being in someone's network today only proves they're connected,
+                // not that the connection came from Connect/HeyReach outreach. Verified against
+                // production data: for 2 BDRs with ~3,500 and ~700 network contacts respectively
+                // that overlapped their all-time invite history, the real ground-truth accepted
+                // count (HeyReach's own CONNECTION_REQUEST_ACCEPTED events, same source
+                // outcomes.html uses) was only 291 total — a >10x gap versus the network-overlap
+                // approach this used to use. heySnap is kept only as an enrichment lookup
+                // (name/title/company) for candidates found via the two real eligibility
+                // sources: HeyReach's CONNECTION_REQUEST_ACCEPTED events below, and — in
+                // "reached out" mode only — connect_queue.
+                const heySnapByUrl = new Map();
                 if (heySnap && !heySnap.empty) {
                     heySnap.forEach(d => {
                         const data = d.data();
                         const rawUrl = data.linkedin_url || data.profileUrl || data.leadProfileUrl || data.linkedInUrl || '';
-                        if (!rawUrl) return;
                         const normUrl = normalizeLinkedInUrl(rawUrl);
-                        // My Network ≠ Connect-created. Only treat as accepted-our-effort
-                        // when this person is someone we invited.
-                        if (normUrl && ourEffortUrls.has(normUrl)) colleagueAcceptedUrls.add(normUrl);
-                        addCandidate(rawUrl, data);
+                        if (normUrl) heySnapByUrl.set(normUrl, { rawUrl, data });
                     });
-                    const added = [...candidateMap.values()].filter(c => c.colleagues.some(cc => cc.email === colleague.primaryEmail)).length;
-                    addLog(added > 0
-                        ? `   ✅ Found ${added} eligible accepted Connect-created prospect(s) for ${colleague.name || colleague.primaryEmail} (of ${heySnap.size} network contacts).`
-                        : `   ℹ️ ${colleague.name || colleague.primaryEmail}: ${heySnap.size} LinkedIn connection(s) synced, but none were Connect-system invites still eligible to pull.`,
-                        added > 0 ? 'success' : 'info');
+                    addLog(`   🔄 ${colleague.name || colleague.primaryEmail}: ${heySnap.size} LinkedIn connection(s) synced (used only to enrich name/title/company below — not eligibility).`, 'info');
                 } else {
                     addLog(`   🔄 heyreach_contacts not synced for ${colleague.name || colleague.primaryEmail} — checking connection acceptance events...`, 'info');
                 }
 
-                // Always cross-check heyreach_activity's CONNECTION_REQUEST_ACCEPTED events too,
-                // regardless of whether heyreach_contacts had anything. This (a) catches accepted
-                // connections missing from a partially-synced heyreach_contacts snapshot, and
-                // (b) builds the ONLY acceptance signal the group-enrichment bridge below trusts.
+                // The ONLY source of truth for "accepted" eligibility: HeyReach's own
+                // CONNECTION_REQUEST_ACCEPTED webhook events, matched to this BDR the same way
+                // outcomes.html's ground-truth "Connections Accepted" stat does (bdrEmail /
+                // accountEmail / linkedInAccountId mapping). This is what keeps the pulled count
+                // aligned with what you see on that page.
                 {
                     const actEmailSet = new Set([colleague.primaryEmail.toLowerCase(), colleagueLinkedInEmail.toLowerCase()]);
                     try {
@@ -16727,12 +16737,15 @@
                                 colleagueAcceptedUrls.add(normUrl);
                             }
                             const beforeHas = normUrl ? candidateMap.has(normUrl) : false;
-                            addCandidate(rawUrl, data, { fromOurEffortEvent: true });
+                            // Prefer heyreach_contacts for name/title/company when we have a
+                            // network match — it's kept fresher than the one-time webhook payload.
+                            const enrich = normUrl ? heySnapByUrl.get(normUrl) : null;
+                            addCandidate(enrich ? enrich.rawUrl : rawUrl, enrich ? { ...data, ...enrich.data } : data, { fromOurEffortEvent: true });
                             if (!beforeHas && normUrl && candidateMap.has(normUrl)) added++;
                         });
                         if (added > 0) {
-                            addLog(`   ✅ Found ${added} additional accepted prospect(s) for ${colleague.name || colleague.primaryEmail} (via connection acceptance events).`, 'success');
-                        } else if (!heySnap || heySnap.empty) {
+                            addLog(`   ✅ Found ${added} accepted Connect-created prospect(s) for ${colleague.name || colleague.primaryEmail} (via HeyReach CONNECTION_REQUEST_ACCEPTED events).`, 'success');
+                        } else {
                             addLog(`   ℹ️ ${colleague.name || colleague.primaryEmail}: no matching accepted connection events found.`, 'info');
                         }
                     } catch (e) {
