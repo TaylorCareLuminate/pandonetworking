@@ -41,6 +41,11 @@
  *   top-level, which silently produced an empty conversation to scan for
  *   most docs, so no email/phone was ever found even though the data was
  *   right there).
+ * @version 1.6.0 — added findConversationsForContacts() + conversationKeyFor()
+ *   for the PDF report's conversation-transcript appendix: batch-fetches each
+ *   BDR's heyreach_inbox once and returns structured transcripts
+ *   ([{ sender, text, at }]) for every requested contact, instead of one
+ *   4-query lookup per contact.
  */
 (function () {
     'use strict';
@@ -548,40 +553,120 @@
     // ('bdrEmail'/'accountEmail'), so conversations keyed by the other two
     // fields were invisible here even though they showed up elsewhere.
     const HEYREACH_BDR_EMAIL_FIELDS = ['bdrEmail', 'accountEmail', 'linkedInAccountEmail', 'uploadedByEmail'];
+
+    // Firestore timestamps arrive in several shapes depending on the transport
+    // (native SDK object, REST-wrapper {seconds}/{_seconds}, ISO string, ms).
+    function _tsToDate(ts) {
+        if (!ts) return null;
+        if (ts instanceof Date) return ts;
+        if (typeof ts.toDate === 'function') { try { return ts.toDate(); } catch (e) { return null; } }
+        if (ts.seconds !== undefined) return new Date(ts.seconds * 1000);
+        if (ts._seconds !== undefined) return new Date(ts._seconds * 1000);
+        if (typeof ts === 'number' || typeof ts === 'string') {
+            const d = new Date(ts);
+            return isNaN(d) ? null : d;
+        }
+        return null;
+    }
+
+    // The actual message array is frequently nested under rawData.messages
+    // rather than top-level `messages` — reading only `data.messages` silently
+    // returns an empty conversation for those docs.
+    function _extractTranscript(data) {
+        const raw = (data.rawData && Array.isArray(data.rawData.messages) && data.rawData.messages.length > 0)
+            ? data.rawData.messages
+            : (Array.isArray(data.messages) ? data.messages : []);
+        const msgs = raw.map(m => ({
+            sender: (m.sender === 'ME' || m.sender === 'account') ? 'bdr' : 'contact',
+            text: String(m.body || m.text || m.message || '').trim(),
+            at: _tsToDate(m.createdAt || m.timestamp)
+        })).filter(m => m.text);
+        // Only reorder when every message is dated — a partial sort would
+        // scramble an already-correct stored order.
+        if (msgs.length > 1 && msgs.every(m => m.at)) msgs.sort((a, b) => a.at - b.at);
+        return msgs;
+    }
+
+    // All heyreach_inbox docs belonging to one BDR, deduped across the four
+    // fields a doc may be tagged with the owning BDR under.
+    async function _fetchInboxDocsForBdr(email) {
+        const { collection, getDocs, query, where } = fx();
+        const inboxRef = collection(dbi(), 'heyreach_inbox');
+        const snaps = await Promise.all(HEYREACH_BDR_EMAIL_FIELDS.map(field =>
+            getDocs(query(inboxRef, where(field, '==', email))).catch(() => ({ docs: [] }))
+        ));
+        const seen = new Set();
+        const out = [];
+        for (const snap of snaps) {
+            for (const d of (snap.docs || [])) {
+                if (seen.has(d.id)) continue;
+                seen.add(d.id);
+                out.push(d.data());
+            }
+        }
+        return out;
+    }
+
     async function findConversationTextForContact(bdrEmail, contactLiUrl) {
         if (!contactLiUrl || !bdrEmail) return '';
         const targetUrl = normalizeLiUrl(contactLiUrl);
         if (!targetUrl) return '';
         try {
-            const { collection, getDocs, query, where } = fx();
-            const inboxRef = collection(dbi(), 'heyreach_inbox');
-            const email = bdrEmail.toLowerCase().trim();
-            const snaps = await Promise.all(HEYREACH_BDR_EMAIL_FIELDS.map(field =>
-                getDocs(query(inboxRef, where(field, '==', email))).catch(() => ({ docs: [] }))
-            ));
-            const seen = new Set();
-            for (const snap of snaps) {
-                for (const d of (snap.docs || [])) {
-                    if (seen.has(d.id)) continue;
-                    seen.add(d.id);
-                    const data = d.data();
-                    const url = normalizeLiUrl(data.leadProfileUrl || '');
-                    if (url && url === targetUrl) {
-                        // The actual message array is frequently nested under
-                        // rawData.messages rather than top-level `messages` —
-                        // falling back to only `data.messages` (as this used to)
-                        // silently returned an empty conversation for those docs,
-                        // so the regex/AI scan below never had any text to find
-                        // an email or phone number in.
-                        const messages = data.rawData?.messages || data.messages || [];
-                        return messages.map(m => m.body || m.text || m.message || '').filter(Boolean).join('\n');
-                    }
+            const docs = await _fetchInboxDocsForBdr(bdrEmail.toLowerCase().trim());
+            for (const data of docs) {
+                if (normalizeLiUrl(data.leadProfileUrl || '') === targetUrl) {
+                    return _extractTranscript(data).map(m => m.text).join('\n');
                 }
             }
         } catch (e) {
             console.warn('⚠️ [ConferenceScheduling] Conversation lookup failed:', e.message);
         }
         return '';
+    }
+
+    /** Stable lookup key used by findConversationsForContacts' result Map. */
+    function conversationKeyFor(bdrEmail, contactLiUrl) {
+        return `${String(bdrEmail || '').toLowerCase().trim()}||${normalizeLiUrl(contactLiUrl || '')}`;
+    }
+
+    /**
+     * Batch transcript lookup for the PDF report appendix. Takes
+     * [{ bdrEmail, contactLiUrl }] and returns a Map keyed by
+     * conversationKeyFor(bdrEmail, contactLiUrl) whose values are structured
+     * transcripts: [{ sender: 'bdr'|'contact', text, at: Date|null }].
+     *
+     * Fetches each unique BDR's inbox ONCE (4 field queries) and matches all
+     * of that BDR's contacts locally — per-contact lookups would fire
+     * 4 × N queries for a report with N contacts.
+     */
+    async function findConversationsForContacts(pairs) {
+        const result = new Map();
+        const wantedByBdr = new Map(); // bdrEmailLower -> Set<normalizedUrl>
+        (pairs || []).forEach(p => {
+            if (!p || !p.bdrEmail || !p.contactLiUrl) return;
+            const email = String(p.bdrEmail).toLowerCase().trim();
+            const url = normalizeLiUrl(p.contactLiUrl);
+            if (!email || !url) return;
+            if (!wantedByBdr.has(email)) wantedByBdr.set(email, new Set());
+            wantedByBdr.get(email).add(url);
+        });
+        await Promise.all([...wantedByBdr.entries()].map(async ([email, wanted]) => {
+            try {
+                const docs = await _fetchInboxDocsForBdr(email);
+                for (const data of docs) {
+                    const url = normalizeLiUrl(data.leadProfileUrl || '');
+                    if (!url || !wanted.has(url)) continue;
+                    const key = `${email}||${url}`;
+                    const transcript = _extractTranscript(data);
+                    const existing = result.get(key);
+                    // Duplicate docs for the same lead can exist — keep the fullest.
+                    if (!existing || transcript.length > existing.length) result.set(key, transcript);
+                }
+            } catch (e) {
+                console.warn('⚠️ [ConferenceScheduling] Transcript batch fetch failed for', email, e.message);
+            }
+        }));
+        return result;
     }
 
     // ── AI / regex scanning for missing email + phone ──────────────────
@@ -969,8 +1054,9 @@
         // Meeting requests
         getMeetingRequest, getMeetingRequestsForConference, getAllMeetingRequests,
         saveMeetingRequest, cancelMeetingRequest, updateMeetingRequestFields, setMeetingRequestHoldState,
-        // Scanning
+        // Scanning / transcripts
         regexScan, aiScan, scanContactInfo, findConversationTextForContact,
+        findConversationsForContacts, conversationKeyFor,
         // Widget
         mountWidget,
         // Utils (exposed for the report/PDF page)

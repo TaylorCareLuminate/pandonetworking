@@ -1061,6 +1061,35 @@
             border-color: #fcd34d;
         }
 
+        .btn-admin-subtle.primary {
+            color: var(--primary);
+            border-color: var(--primary);
+        }
+
+        .btn-admin-subtle.primary:hover {
+            background: #e0f2fe;
+            color: var(--primary);
+            border-color: var(--primary);
+        }
+
+        .edit-msg-textarea {
+            width: 100%;
+            min-height: 110px;
+            padding: 0.75rem;
+            border: 1.5px solid var(--border);
+            border-radius: 8px;
+            font-family: inherit;
+            font-size: 0.92rem;
+            line-height: 1.5;
+            resize: vertical;
+        }
+
+        .edit-msg-textarea.over-limit {
+            border-color: var(--danger);
+            background: #fff5f5;
+            box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18);
+        }
+
         /* ── Message Detail Modal ──────────────────────────────── */
         .msg-modal-overlay {
             position: fixed;
@@ -1718,6 +1747,46 @@
         </div>
     </div>
 
+    <!-- Edit In-Process Message Modal — lets a contact adjust their own not-yet-sent
+         message. Deliberately shows nothing about accounts/campaigns/internal IDs. -->
+    <div id="editMessageModalOverlay" class="msg-modal-overlay" onclick="if(event.target===this)closeEditMessageModal()">
+        <div class="msg-modal" style="max-width:560px;">
+            <div class="msg-modal-header">
+                <div style="flex:1; min-width:0;">
+                    <div class="msg-modal-title"><i class="fas fa-pen"></i> Edit Your Message</div>
+                    <div class="msg-modal-subtitle" id="editModalContactName"></div>
+                </div>
+                <button class="msg-modal-close" onclick="closeEditMessageModal()" title="Close">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="msg-modal-body">
+                <p style="font-size:0.85rem;color:var(--gray);margin:0;">
+                    This message hasn&rsquo;t gone out yet — you can adjust the wording below before it sends.
+                    Saving updates the message immediately.
+                </p>
+                <div>
+                    <textarea id="editMessageTextarea" class="edit-msg-textarea" placeholder="Type your message…"></textarea>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.35rem;gap:0.75rem;">
+                        <span id="editMessageCharCount" style="font-size:0.78rem;color:var(--gray);">0 / 200 characters</span>
+                        <span id="editMessageWarning" style="font-size:0.78rem;color:var(--danger);font-weight:700;display:none;">
+                            <i class="fas fa-exclamation-triangle"></i> Over the 200-character LinkedIn connection limit
+                        </span>
+                    </div>
+                </div>
+                <div id="editMessageStatus" style="font-size:0.85rem;display:none;"></div>
+            </div>
+            <div class="msg-modal-footer">
+                <button id="editMessageSaveBtn" class="btn btn-primary" style="font-size:0.85rem;padding:0.6rem 1.2rem;" onclick="saveEditedMessage()">
+                    <i class="fas fa-save"></i> Save Changes
+                </button>
+                <button onclick="closeEditMessageModal()" class="btn btn-secondary">
+                    <i class="fas fa-times"></i> Cancel
+                </button>
+            </div>
+        </div>
+    </div>
+
     <!-- Load auth.js first for authentication -->
     <script src="../js/auth.js"></script>
     <!-- CLEmail Secure API Wrapper -->
@@ -2048,6 +2117,10 @@
         async function loadQueueCompanyMap(targetUserEmail, targetLinkedInEmail) {
             const queueCompanyMap = new Map(); // canonical linkedin url -> company name
             const queueContentMap = new Map(); // canonical linkedin url -> message content (from connect_queue, same as in_processes_today.html)
+            // canonical linkedin url -> { id, campaignId, accountId } — lets queued (in-process)
+            // rows be edited from this page (see openEditMessageModal) without ever needing to
+            // show the underlying connect_queue doc id / campaign id / account id in the UI.
+            const queueDocIdMap = new Map();
 
             // ── 1. connect_queue ─────────────────────────────────────────────
             try {
@@ -2082,6 +2155,15 @@
                         if (canonUrl && !queueContentMap.has(canonUrl)) {
                             const content = extractHeyReachContent(data);
                             if (content) queueContentMap.set(canonUrl, content);
+                        }
+                        // Track the doc id (+ campaign/account id, kept server-side/audit-only —
+                        // never rendered) so a still-queued row can be edited from this page.
+                        if (canonUrl && !queueDocIdMap.has(canonUrl)) {
+                            queueDocIdMap.set(canonUrl, {
+                                id: doc.id,
+                                campaignId: data.heyreach_campaign_id || data.campaign_id || data.campaignId || null,
+                                accountId: data.heyreach_account_id || data.accountId || null
+                            });
                         }
                     });
                 });
@@ -2123,7 +2205,7 @@
             // Diagnostic: show first 3 entries so we can verify key format
             Array.from(queueCompanyMap.entries()).slice(0, 3)
                 .forEach(([k, v]) => console.log(`   🔑 Map sample: "${k}" → "${v}"`));
-            return { companyMap: queueCompanyMap, contentMap: queueContentMap };
+            return { companyMap: queueCompanyMap, contentMap: queueContentMap, docIdMap: queueDocIdMap };
         }
 
         // Load Do Not Send list from deleted_prospect_organizations
@@ -2504,7 +2586,7 @@
                 console.log(`   Loading messages since: ${sinceDate.toISOString()}`);
                 
                 // Get all lookup data in parallel
-                const [accountIdMapping, { nameMap: contactNamesMap, companyMap: contactCompanyMap }, { dnsNames, dnsReasons, dnsDeletedAt }, { companyMap: queueCompanyMap, contentMap: queueContentMap }] = await Promise.all([
+                const [accountIdMapping, { nameMap: contactNamesMap, companyMap: contactCompanyMap }, { dnsNames, dnsReasons, dnsDeletedAt }, { companyMap: queueCompanyMap, contentMap: queueContentMap, docIdMap: queueDocIdMap }] = await Promise.all([
                     getLinkedInAccountIdMapping(),
                     loadContactNames(targetUserEmail, targetLinkedInEmail),
                     loadDNSList(targetUserEmail),
@@ -3219,6 +3301,12 @@
                     if (item.isHeyReachQueued && url) {
                         const queuedContent = queueContentMap.get(url);
                         if (queuedContent) { item.sentItem.message = queuedContent; queueContentApplied++; }
+                        const queueMeta = queueDocIdMap.get(url);
+                        if (queueMeta) {
+                            item.queueDocId = queueMeta.id;
+                            item.queueCampaignId = queueMeta.campaignId;
+                            item.queueAccountId = queueMeta.accountId;
+                        }
                     }
                 });
                 console.log(`✅ HeyReach status: ${[...heyreachSentUrls].length} confirmed sent URLs; ${sentItems.filter(i=>i.isHeyReachQueued).length} items still in queue (${queueContentApplied} content values applied from connect_queue; ${excludedGarbled} excluded as garbled URLs, ${excludedStale} excluded as >3-week stale pending bulk live-status check)`);
@@ -3680,8 +3768,16 @@
             if (isUpcoming) {
                 // Combined button for ALL users on upcoming cards
                 const safeName = escapeHtml(contact.contactName).replace(/'/g, "\\'");
+                const editBtnHtml = item.queueDocId
+                    ? `<button class="btn-admin-subtle primary"
+                            onclick="event.stopPropagation();openEditMessageModal('${sent.id}')"
+                            title="Edit this message before it sends">
+                            <i class="fas fa-pen"></i> Edit Message
+                        </button>`
+                    : '';
                 adminActionsHtml = `
                     <div class="card-admin-actions">
+                        ${editBtnHtml}
                         <button class="btn-admin-subtle danger btn-remove-delete"
                             onclick="event.stopPropagation();removeAndDeleteQueued('${sent.id}','${safeName}','${contact.profileUrl}')"
                             title="Remove from HeyReach campaign and delete this record">
@@ -4269,6 +4365,186 @@
 
         window.openMessageModal = openMessageModal;
         window.closeMessageModal = closeMessageModal;
+
+        // ══════════════════════════════════════════════════════════════════
+        // Edit in-process message — self-service editing for the contact
+        // (external, non-admin BDR client) or admin viewing "as" a BDR, for
+        // their OWN queued-but-not-yet-sent messages. Deliberately never
+        // shows account ID / campaign ID / any HeyReach plumbing — those are
+        // resolved entirely server-side by /api/connect-queue/sync-in-process-to-heyreach.
+        // Every save is logged to `connect_message_edits` for admin reporting
+        // and the Opus edit-diff analysis on message_edit_reports.html.
+        // ══════════════════════════════════════════════════════════════════
+        const EDIT_MESSAGE_CHAR_LIMIT = 200;
+        let _editMessageContext = null; // { activityId, queueId, item }
+
+        function openEditMessageModal(activityId) {
+            const item = allSentItems.find(i => i.sentItem.id === activityId);
+            if (!item) return;
+            if (!item.queueDocId) {
+                showDeleteToast('This message can\'t be edited right now — its queue record could not be identified. Please contact your account manager.', true);
+                return;
+            }
+            _editMessageContext = { activityId, queueId: item.queueDocId, item };
+            document.getElementById('editModalContactName').textContent = item.contact.contactName || '';
+            const ta = document.getElementById('editMessageTextarea');
+            ta.value = item.sentItem.message || '';
+            updateEditMessageCharCount();
+            const statusEl = document.getElementById('editMessageStatus');
+            statusEl.style.display = 'none';
+            statusEl.textContent = '';
+            const saveBtn = document.getElementById('editMessageSaveBtn');
+            saveBtn.disabled = false;
+            saveBtn.innerHTML = '<i class="fas fa-save"></i> Save Changes';
+            document.getElementById('editMessageModalOverlay').classList.add('open');
+            document.body.style.overflow = 'hidden';
+            setTimeout(() => ta.focus(), 0);
+        }
+        window.openEditMessageModal = openEditMessageModal;
+
+        function closeEditMessageModal() {
+            document.getElementById('editMessageModalOverlay').classList.remove('open');
+            document.body.style.overflow = '';
+            _editMessageContext = null;
+        }
+        window.closeEditMessageModal = closeEditMessageModal;
+
+        function updateEditMessageCharCount() {
+            const ta = document.getElementById('editMessageTextarea');
+            const len = ta.value.length;
+            const over = len > EDIT_MESSAGE_CHAR_LIMIT;
+            ta.classList.toggle('over-limit', over);
+            document.getElementById('editMessageCharCount').textContent = `${len} / ${EDIT_MESSAGE_CHAR_LIMIT} characters`;
+            document.getElementById('editMessageCharCount').style.color = over ? 'var(--danger)' : 'var(--gray)';
+            document.getElementById('editMessageWarning').style.display = over ? 'inline' : 'none';
+            const saveBtn = document.getElementById('editMessageSaveBtn');
+            if (saveBtn) saveBtn.disabled = over || len === 0;
+        }
+        document.getElementById('editMessageTextarea')?.addEventListener('input', updateEditMessageCharCount);
+
+        // Saves an edit in two steps — Firestore (source of truth the HeyReach sync
+        // reads from — "important") then the HeyReach push itself ("critical" — this
+        // is the actual outgoing message). Always writes a `connect_message_edits`
+        // audit doc afterward, best-effort, recording the outcome of both steps.
+        async function saveEditedMessage() {
+            if (!_editMessageContext) return;
+            const { activityId, queueId, item } = _editMessageContext;
+            const ta = document.getElementById('editMessageTextarea');
+            const newMessage = ta.value.trim();
+            const statusEl = document.getElementById('editMessageStatus');
+            statusEl.style.display = 'block';
+
+            if (!newMessage) {
+                statusEl.style.color = 'var(--danger)';
+                statusEl.textContent = 'Message can\'t be empty.';
+                return;
+            }
+            if (newMessage.length > EDIT_MESSAGE_CHAR_LIMIT) {
+                statusEl.style.color = 'var(--danger)';
+                statusEl.textContent = `Message is over the ${EDIT_MESSAGE_CHAR_LIMIT}-character limit — please shorten it.`;
+                return;
+            }
+            const oldMessage = (item.sentItem.message || '').trim();
+            if (newMessage === oldMessage) {
+                closeEditMessageModal();
+                return;
+            }
+
+            const saveBtn = document.getElementById('editMessageSaveBtn');
+            saveBtn.disabled = true;
+            saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…';
+            statusEl.style.color = 'var(--gray)';
+            statusEl.textContent = 'Saving your changes…';
+
+            const { doc: fsDoc, getDoc: fsGetDoc, updateDoc: fsUpdateDoc, collection: fsCollection, addDoc: fsAddDoc } = window.clemailFirestore;
+            let firebaseOk = false, firebaseError = null;
+            let heyreachOk = false, heyreachError = null;
+            let queueSnapshot = null;
+
+            // Step 1 — Firestore (important): this is the value the HeyReach sync
+            // endpoint below reads, so it must land first or the old text would go out.
+            try {
+                const queueRef = fsDoc(window.clemailDb, 'connect_queue', queueId);
+                queueSnapshot = await fsGetDoc(queueRef);
+                if (!queueSnapshot.exists) throw new Error('This message is no longer in the queue — it may have already been sent.');
+                await fsUpdateDoc(queueRef, {
+                    message_to_contact: newMessage,
+                    lastEditedBy: (currentUser && currentUser.email) || 'contact_self_edit',
+                    lastEditedAt: new Date().toISOString(),
+                    editedByContact: true
+                });
+                firebaseOk = true;
+            } catch (err) {
+                firebaseError = err.message || String(err);
+            }
+
+            // Step 2 — HeyReach (critical): resolves campaign/account/list/API key
+            // entirely server-side, so nothing technical is ever sent from this page.
+            if (firebaseOk) {
+                statusEl.textContent = 'Saved — pushing the update to HeyReach…';
+                try {
+                    const resp = await fetch(`${BACKEND_API_URL}/api/connect-queue/sync-in-process-to-heyreach`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ queueIds: [queueId] })
+                    });
+                    const j = await resp.json().catch(() => ({}));
+                    const row = j && Array.isArray(j.results) ? j.results[0] : null;
+                    heyreachOk = !!(resp.ok && j.success && row && row.ok);
+                    if (!heyreachOk) heyreachError = (row && row.error) || j.error || `HTTP ${resp.status}`;
+                } catch (err) {
+                    heyreachError = err.message || String(err);
+                }
+            }
+
+            // Step 3 — audit trail (best-effort, never blocks the user-facing result).
+            // Intentionally includes campaign/account id for admin reporting only —
+            // never surfaced anywhere in this page's UI.
+            try {
+                const qData = (queueSnapshot && queueSnapshot.exists) ? queueSnapshot.data() : {};
+                await fsAddDoc(fsCollection(window.clemailDb, 'connect_message_edits'), {
+                    queueId,
+                    activityId,
+                    contactName: item.contact.contactName || '',
+                    linkedinUrl: item.contact.profileUrl || '',
+                    oldMessage,
+                    newMessage,
+                    oldLength: oldMessage.length,
+                    newLength: newMessage.length,
+                    bdrEmail: (selectedBdrEmail || window._sentMessagesViewerBDR?.email || window._sentMessagesOwnBDREmail || (currentUser && currentUser.email) || '').toLowerCase(),
+                    editedByEmail: (currentUser && currentUser.email) || '',
+                    editedByIsAdmin: !!isAdmin,
+                    campaignId: qData.heyreach_campaign_id || qData.campaign_id || qData.campaignId || item.queueCampaignId || null,
+                    accountId: qData.heyreach_account_id || item.queueAccountId || null,
+                    firestoreSuccess: firebaseOk,
+                    firestoreError: firebaseError,
+                    heyreachSuccess: heyreachOk,
+                    heyreachError: heyreachError,
+                    createdAt: new Date().toISOString()
+                });
+            } catch (auditErr) {
+                console.warn('[EditMessage] Failed to write audit record (non-fatal):', auditErr.message);
+            }
+
+            saveBtn.disabled = false;
+            saveBtn.innerHTML = '<i class="fas fa-save"></i> Save Changes';
+
+            if (firebaseOk && heyreachOk) {
+                item.sentItem.message = newMessage;
+                renderTable();
+                showDeleteToast('<i class="fas fa-check-circle"></i> Message updated.');
+                closeEditMessageModal();
+            } else if (firebaseOk && !heyreachOk) {
+                item.sentItem.message = newMessage;
+                renderTable();
+                statusEl.style.color = 'var(--danger)';
+                statusEl.textContent = `Saved, but pushing to HeyReach failed (${heyreachError || 'unknown error'}). Click "Save Changes" again to retry the push.`;
+            } else {
+                statusEl.style.color = 'var(--danger)';
+                statusEl.textContent = `Could not save your changes: ${firebaseError || 'unknown error'}. Please try again.`;
+            }
+        }
+        window.saveEditedMessage = saveEditedMessage;
 
         // Show a brief non-blocking toast notification
         function showDeleteToast(message, isError = false) {
