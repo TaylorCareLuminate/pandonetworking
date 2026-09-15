@@ -46,6 +46,15 @@
  *   BDR's heyreach_inbox once and returns structured transcripts
  *   ([{ sender, text, at }]) for every requested contact, instead of one
  *   4-query lookup per contact.
+ * @version 1.7.0 — conversation lookup actually finds docs now. heyreach_inbox
+ *   tags bdrEmail/accountEmail/linkedInAccountEmail with the LINKEDIN
+ *   account's email (see heyreach_inbox_service.js), which for many BDRs is
+ *   not the work email stored on meeting requests — so every email-equality
+ *   query returned 0 docs and the scan flew through contacts finding nothing.
+ *   Lookup is now (1) a targeted where('leadProfileUrl','in',variants) query,
+ *   falling back to (2) the BDR's inbox fetched with ALL alias emails
+ *   (bdr_leaders.primaryEmail/.linkedInEmail + linkedin_email_associations),
+ *   matched locally by URL or /in/<slug>. Diagnostic console logs added.
  */
 (function () {
     'use strict';
@@ -587,41 +596,220 @@
         return msgs;
     }
 
-    // All heyreach_inbox docs belonging to one BDR, deduped across the four
-    // fields a doc may be tagged with the owning BDR under.
-    async function _fetchInboxDocsForBdr(email) {
-        const { collection, getDocs, query, where } = fx();
-        const inboxRef = collection(dbi(), 'heyreach_inbox');
-        const snaps = await Promise.all(HEYREACH_BDR_EMAIL_FIELDS.map(field =>
-            getDocs(query(inboxRef, where(field, '==', email))).catch(() => ({ docs: [] }))
-        ));
-        const seen = new Set();
-        const out = [];
-        for (const snap of snaps) {
-            for (const d of (snap.docs || [])) {
-                if (seen.has(d.id)) continue;
-                seen.add(d.id);
-                out.push(d.data());
-            }
+    // ── Locating the conversation doc ────────────────────────────────────
+    // IMPORTANT: heyreach_inbox docs tag bdrEmail / accountEmail /
+    // linkedInAccountEmail with the LINKEDIN ACCOUNT's email address (see
+    // RailwayCLemail/services/heyreach_inbox_service.js storeConversation()),
+    // which for many BDRs is NOT their work email — the email stored on
+    // conference_meeting_requests. Querying by that work email alone finds
+    // nothing for those BDRs. So:
+    //   1) PRIMARY: query by the contact's leadProfileUrl directly (a handful
+    //      of URL-format variants via one 'in' query — same approach as
+    //      conversation_lookup.html's URL search). Tiny, targeted, and
+    //      completely sidesteps the BDR-email alias problem.
+    //   2) FALLBACK: expand the BDR's work email into every known alias
+    //      (bdr_leaders.primaryEmail / .linkedInEmail +
+    //      linkedin_email_associations authEmail→linkedInEmail), fetch all of
+    //      that BDR's inbox docs, and match the lead URL locally.
+
+    function _liSlug(url) {
+        const m = String(url || '').toLowerCase().match(/\/in\/([^\/?#]+)/);
+        try { return m ? decodeURIComponent(m[1]).replace(/\/+$/, '') : ''; } catch (e) { return m ? m[1] : ''; }
+    }
+
+    // Same lead? Exact normalized URL match, else /in/<slug> match (covers
+    // country subdomains, tracking params, trailing-slash/case differences).
+    function _sameLead(urlA, urlB) {
+        const na = normalizeLiUrl(urlA), nb = normalizeLiUrl(urlB);
+        if (na && na === nb) return true;
+        const sa = _liSlug(urlA), sb = _liSlug(urlB);
+        return !!(sa && sa === sb);
+    }
+
+    // The handful of ways the same profile URL tends to be stored (raw from
+    // HeyReach vs. cleaned by review pages): case, trailing slash, www.
+    // Capped at 10 — the Firestore 'in' operator limit.
+    function _urlVariants(url) {
+        const raw = String(url || '').trim();
+        if (!raw) return [];
+        const out = new Set();
+        [raw, raw.toLowerCase()].forEach(u => {
+            const noSlash = u.replace(/\/+$/, '');
+            out.add(noSlash);
+            out.add(noSlash + '/');
+        });
+        const canon = raw.toLowerCase().replace(/\/+$/, '').replace(/^https?:\/\/(www\.)?/, '');
+        [`https://${canon}`, `https://www.${canon}`].forEach(u => {
+            out.add(u);
+            out.add(u + '/');
+        });
+        return [...out].slice(0, 10);
+    }
+
+    async function _queryInboxByLeadUrl(contactLiUrl) {
+        const variants = _urlVariants(contactLiUrl);
+        if (variants.length === 0) return [];
+        const { collection, getDocs, query, where, limit } = fx();
+        const snap = await getDocs(query(
+            collection(dbi(), 'heyreach_inbox'),
+            where('leadProfileUrl', 'in', variants),
+            limit(20)
+        )).catch(e => {
+            console.warn('⚠️ [ConferenceScheduling] leadProfileUrl query failed:', e.message);
+            return { docs: [] };
+        });
+        return (snap.docs || []).map(d => d.data());
+    }
+
+    // bdr_leaders + linkedin_email_associations, loaded once per page.
+    let _bdrAliasDataPromise = null;
+    function _loadBdrAliasData() {
+        if (!_bdrAliasDataPromise) {
+            _bdrAliasDataPromise = (async () => {
+                const { collection, getDocs } = fx();
+                const [bdrSnap, assocSnap] = await Promise.all([
+                    getDocs(collection(dbi(), 'bdr_leaders')).catch(() => ({ docs: [] })),
+                    getDocs(collection(dbi(), 'linkedin_email_associations')).catch(() => ({ docs: [] }))
+                ]);
+                const bdrs = (bdrSnap.docs || []).map(d => d.data());
+                const assoc = new Map(); // authEmail (lower) -> linkedInEmail (as stored)
+                (assocSnap.docs || []).forEach(d => {
+                    const a = d.data();
+                    if (a.authEmail && a.linkedInEmail) {
+                        assoc.set(String(a.authEmail).toLowerCase().trim(), String(a.linkedInEmail).trim());
+                    }
+                });
+                return { bdrs, assoc };
+            })();
         }
-        return out;
+        return _bdrAliasDataPromise;
+    }
+
+    // Every email address that might tag this BDR's heyreach_inbox docs.
+    // Includes original casing AND lowercase of each alias — the sync stores
+    // the LinkedIn email exactly as HeyReach reports it.
+    async function _bdrAliasEmails(bdrEmail) {
+        const lower = String(bdrEmail || '').toLowerCase().trim();
+        const aliases = new Set();
+        if (!lower) return aliases;
+        aliases.add(lower);
+        try {
+            const { bdrs, assoc } = await _loadBdrAliasData();
+            const bdr = bdrs.find(b =>
+                String(b.primaryEmail || '').toLowerCase().trim() === lower ||
+                String(b.linkedInEmail || '').toLowerCase().trim() === lower);
+            [bdr && bdr.primaryEmail, bdr && bdr.linkedInEmail].forEach(e => {
+                if (e) {
+                    aliases.add(String(e).trim());
+                    aliases.add(String(e).toLowerCase().trim());
+                }
+            });
+            [...aliases].forEach(a => {
+                const li = assoc.get(a.toLowerCase());
+                if (li) {
+                    aliases.add(li);
+                    aliases.add(li.toLowerCase());
+                }
+            });
+        } catch (e) { /* best-effort — still query with the input email */ }
+        return aliases;
+    }
+
+    // All heyreach_inbox docs belonging to one BDR: every alias email × every
+    // field a doc may be tagged under, deduped. Cached per page load since a
+    // scan/report loops many contacts sharing the same few BDRs.
+    const _inboxDocsByBdrCache = new Map();
+    function _fetchInboxDocsForBdr(bdrEmail) {
+        const key = String(bdrEmail || '').toLowerCase().trim();
+        if (!key) return Promise.resolve([]);
+        if (!_inboxDocsByBdrCache.has(key)) {
+            const promise = (async () => {
+                const emails = [...await _bdrAliasEmails(key)];
+                const { collection, getDocs, query, where } = fx();
+                const inboxRef = collection(dbi(), 'heyreach_inbox');
+                const snaps = await Promise.all(emails.flatMap(email =>
+                    HEYREACH_BDR_EMAIL_FIELDS.map(field =>
+                        getDocs(query(inboxRef, where(field, '==', email))).catch(() => ({ docs: [] }))
+                    )
+                ));
+                const seen = new Set();
+                const out = [];
+                for (const snap of snaps) {
+                    for (const d of (snap.docs || [])) {
+                        if (seen.has(d.id)) continue;
+                        seen.add(d.id);
+                        out.push(d.data());
+                    }
+                }
+                console.log(`🔎 [ConferenceScheduling] Inbox fetch for BDR ${key}: ${out.length} doc(s) across ${emails.length} alias email(s) [${emails.join(', ')}]`);
+                return out;
+            })();
+            promise.catch(() => _inboxDocsByBdrCache.delete(key));
+            _inboxDocsByBdrCache.set(key, promise);
+        }
+        return _inboxDocsByBdrCache.get(key);
+    }
+
+    // Final safety net: the WHOLE heyreach_inbox, fetched once per page and
+    // matched locally. Needed because Firestore equality is case-sensitive and
+    // both the URL and the tag emails are stored exactly as HeyReach reports
+    // them — a doc whose stored casing differs from every queried variant is
+    // invisible to tiers 1 and 2. Other pages (company_review_replies, the
+    // review dashboards) already read this whole collection routinely, so the
+    // cost is normal for this app; the wrapper auto-paginates it.
+    let _allInboxDocsPromise = null;
+    function _fetchAllInboxDocs() {
+        if (!_allInboxDocsPromise) {
+            _allInboxDocsPromise = (async () => {
+                const { collection, getDocs } = fx();
+                const snap = await getDocs(collection(dbi(), 'heyreach_inbox'));
+                const docs = (snap.docs || []).map(d => d.data());
+                console.log(`🔎 [ConferenceScheduling] Full inbox fallback loaded: ${docs.length} doc(s)`);
+                return docs;
+            })();
+            _allInboxDocsPromise.catch(() => { _allInboxDocsPromise = null; });
+        }
+        return _allInboxDocsPromise;
+    }
+
+    // Core lookup: structured transcript ([{ sender, text, at }]) or null.
+    async function _findTranscriptForContact(bdrEmail, contactLiUrl) {
+        if (!contactLiUrl) return null;
+        try {
+            // 1) Targeted URL query.
+            let docs = await _queryInboxByLeadUrl(contactLiUrl);
+            // 2) Fallback: this BDR's whole (alias-expanded) inbox, matched locally.
+            if (docs.length === 0 && bdrEmail) {
+                const all = await _fetchInboxDocsForBdr(bdrEmail);
+                docs = all.filter(d => _sameLead(d.leadProfileUrl, contactLiUrl));
+            }
+            // 3) Last resort: whole collection, matched locally (covers stored
+            //    casing that no server-side equality variant can reach).
+            if (docs.length === 0) {
+                const all = await _fetchAllInboxDocs();
+                docs = all.filter(d => _sameLead(d.leadProfileUrl, contactLiUrl));
+            }
+            if (docs.length === 0) {
+                console.log(`🔎 [ConferenceScheduling] No conversation found for ${contactLiUrl} (bdr: ${bdrEmail || '—'})`);
+                return null;
+            }
+            // Duplicate docs for the same lead can exist — use the fullest transcript.
+            let best = null;
+            for (const d of docs) {
+                const t = _extractTranscript(d);
+                if (!best || t.length > best.length) best = t;
+            }
+            console.log(`🔎 [ConferenceScheduling] Conversation found for ${contactLiUrl}: ${docs.length} doc(s), best transcript has ${best.length} message(s)`);
+            return best && best.length > 0 ? best : null;
+        } catch (e) {
+            console.warn('⚠️ [ConferenceScheduling] Conversation lookup failed:', e.message);
+            return null;
+        }
     }
 
     async function findConversationTextForContact(bdrEmail, contactLiUrl) {
-        if (!contactLiUrl || !bdrEmail) return '';
-        const targetUrl = normalizeLiUrl(contactLiUrl);
-        if (!targetUrl) return '';
-        try {
-            const docs = await _fetchInboxDocsForBdr(bdrEmail.toLowerCase().trim());
-            for (const data of docs) {
-                if (normalizeLiUrl(data.leadProfileUrl || '') === targetUrl) {
-                    return _extractTranscript(data).map(m => m.text).join('\n');
-                }
-            }
-        } catch (e) {
-            console.warn('⚠️ [ConferenceScheduling] Conversation lookup failed:', e.message);
-        }
-        return '';
+        const transcript = await _findTranscriptForContact(bdrEmail, contactLiUrl);
+        return transcript ? transcript.map(m => m.text).join('\n') : '';
     }
 
     /** Stable lookup key used by findConversationsForContacts' result Map. */
@@ -635,37 +823,23 @@
      * conversationKeyFor(bdrEmail, contactLiUrl) whose values are structured
      * transcripts: [{ sender: 'bdr'|'contact', text, at: Date|null }].
      *
-     * Fetches each unique BDR's inbox ONCE (4 field queries) and matches all
-     * of that BDR's contacts locally — per-contact lookups would fire
-     * 4 × N queries for a report with N contacts.
+     * Each contact resolves via the same targeted-URL-first lookup as the
+     * scan (see _findTranscriptForContact); the per-BDR fallback inbox fetch
+     * is cached so it runs at most once per BDR. Runs a few contacts at a
+     * time to keep the Railway backend happy.
      */
     async function findConversationsForContacts(pairs) {
         const result = new Map();
-        const wantedByBdr = new Map(); // bdrEmailLower -> Set<normalizedUrl>
-        (pairs || []).forEach(p => {
-            if (!p || !p.bdrEmail || !p.contactLiUrl) return;
-            const email = String(p.bdrEmail).toLowerCase().trim();
-            const url = normalizeLiUrl(p.contactLiUrl);
-            if (!email || !url) return;
-            if (!wantedByBdr.has(email)) wantedByBdr.set(email, new Set());
-            wantedByBdr.get(email).add(url);
-        });
-        await Promise.all([...wantedByBdr.entries()].map(async ([email, wanted]) => {
-            try {
-                const docs = await _fetchInboxDocsForBdr(email);
-                for (const data of docs) {
-                    const url = normalizeLiUrl(data.leadProfileUrl || '');
-                    if (!url || !wanted.has(url)) continue;
-                    const key = `${email}||${url}`;
-                    const transcript = _extractTranscript(data);
-                    const existing = result.get(key);
-                    // Duplicate docs for the same lead can exist — keep the fullest.
-                    if (!existing || transcript.length > existing.length) result.set(key, transcript);
-                }
-            } catch (e) {
-                console.warn('⚠️ [ConferenceScheduling] Transcript batch fetch failed for', email, e.message);
-            }
-        }));
+        const valid = (pairs || []).filter(p => p && p.contactLiUrl);
+        const CHUNK = 5;
+        for (let i = 0; i < valid.length; i += CHUNK) {
+            await Promise.all(valid.slice(i, i + CHUNK).map(async p => {
+                const key = conversationKeyFor(p.bdrEmail, p.contactLiUrl);
+                if (result.has(key)) return;
+                const transcript = await _findTranscriptForContact(p.bdrEmail, p.contactLiUrl);
+                if (transcript) result.set(key, transcript);
+            }));
+        }
         return result;
     }
 

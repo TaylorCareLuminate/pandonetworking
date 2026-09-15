@@ -1438,10 +1438,10 @@
             </div>
 
             <div class="control-group">
-                <label for="timeRange">
+                <label for="timeRange" title="Also bounds how far back the in-process message lookup scans, so a wider range means a slower refresh.">
                     <i class="fas fa-calendar-alt"></i> Time Range:
                 </label>
-                <select id="timeRange">
+                <select id="timeRange" title="Also bounds how far back the in-process message lookup scans, so a wider range means a slower refresh.">
                     <option value="7">Last 7 days</option>
                     <option value="14">Last 14 days</option>
                     <option value="30" selected>Last 30 days</option>
@@ -2114,7 +2114,12 @@
         // Load company names from connect_queue AND prospect_contacts
         // connect_queue has prospect_company from the CSV upload
         // prospect_contacts has company from the original prospect data
-        async function loadQueueCompanyMap(targetUserEmail, targetLinkedInEmail) {
+        // Empty-snapshot stand-in used when an individual connect_queue query fails
+        // (e.g. a missing Firestore composite index) so one bad query variant can't
+        // wipe out the other, successfully-loaded variants.
+        const EMPTY_SNAP = { forEach: () => {} };
+
+        async function loadQueueCompanyMap(targetUserEmail, targetLinkedInEmail, sinceDate = null) {
             const queueCompanyMap = new Map(); // canonical linkedin url -> company name
             const queueContentMap = new Map(); // canonical linkedin url -> message content (from connect_queue, same as in_processes_today.html)
             // canonical linkedin url -> { id, campaignId, accountId } — lets queued (in-process)
@@ -2127,15 +2132,43 @@
                 console.log('🏢 Loading company names from connect_queue...');
                 const queueRef = collection(emailDB, 'connect_queue');
 
+                // Bound the scan to the selected Time Range instead of the account's
+                // entire connect_queue history. `uploaded_date` is a plain ISO string
+                // written by every message-creation path (mass_upload, generate_messages,
+                // full-ai-generate, etc.), so a lexicographic `>=` comparison works fine
+                // without needing a Firestore Timestamp field.
+                //
+                // A hardcoded limit(5000) here previously silently truncated this scan
+                // for BDRs with 20,000+ connect_queue rows, which meant most "still in
+                // queue" items never got a company/content match AND (more importantly)
+                // never resolved a queueDocId — so the "Edit Message" button on Upcoming
+                // Outreach cards would silently fail to render for most rows. Filtering
+                // by date (rather than truncating with an arbitrary doc-count cap) fixes
+                // that while keeping the scan bounded.
+                //
+                // NOTE: each equality+range combo below (account_email/bdr_leader_email/
+                // bdr_auth_email + uploaded_date) needs its own Firestore composite index.
+                // These are declared in firestore.indexes.json in both the pandonetworking
+                // and RailwayCLemail repos — deploy with `firebase deploy --only
+                // firestore:indexes` if a variant below logs an "index required" warning.
+                // Each query is caught independently so a missing index on one variant
+                // doesn't blank out the other variants' results.
+                const sinceIso = sinceDate ? sinceDate.toISOString() : null;
+                const withSince = (...clauses) => sinceIso ? [...clauses, where('uploaded_date', '>=', sinceIso)] : clauses;
+                const safeQuery = (label, constraints) => getDocs(query(queueRef, ...constraints)).catch(err => {
+                    console.warn(`⚠️ connect_queue query [${label}] failed (possibly a missing composite index — check for a "create index" link in the error below):`, err.message || err);
+                    return EMPTY_SNAP;
+                });
+
                 const queueSnaps = await Promise.all([
                     // bdr_leader_email  (mass_upload path)
-                    getDocs(query(queueRef, where('bdr_leader_email', '==', targetUserEmail), limit(5000))),
+                    safeQuery('bdr_leader_email', withSince(where('bdr_leader_email', '==', targetUserEmail))),
                     // bdr_auth_email    (generate_messages path)
-                    getDocs(query(queueRef, where('bdr_auth_email', '==', targetUserEmail), limit(5000))),
+                    safeQuery('bdr_auth_email', withSince(where('bdr_auth_email', '==', targetUserEmail))),
                     // account_email     (same lookup in_processes_today.html uses, both emails)
-                    getDocs(query(queueRef, where('account_email', '==', targetUserEmail), limit(5000))),
+                    safeQuery('account_email', withSince(where('account_email', '==', targetUserEmail))),
                     ...(targetLinkedInEmail && targetLinkedInEmail !== targetUserEmail
-                        ? [getDocs(query(queueRef, where('account_email', '==', targetLinkedInEmail), limit(5000)))]
+                        ? [safeQuery('account_email(linked)', withSince(where('account_email', '==', targetLinkedInEmail)))]
                         : []),
                 ]);
 
@@ -2167,7 +2200,7 @@
                         }
                     });
                 });
-                console.log(`   📋 connect_queue: ${queueCount} URL→company pairs loaded, ${queueContentMap.size} URL→content pairs loaded`);
+                console.log(`   📋 connect_queue${sinceIso ? ` (since ${sinceIso.split('T')[0]})` : ''}: ${queueCount} URL→company pairs loaded, ${queueContentMap.size} URL→content pairs loaded, ${queueDocIdMap.size} URL→docId pairs loaded`);
             } catch (err) {
                 console.warn('⚠️ Could not load connect_queue company map:', err.message);
             }
@@ -2590,7 +2623,7 @@
                     getLinkedInAccountIdMapping(),
                     loadContactNames(targetUserEmail, targetLinkedInEmail),
                     loadDNSList(targetUserEmail),
-                    loadQueueCompanyMap(targetUserEmail, targetLinkedInEmail)
+                    loadQueueCompanyMap(targetUserEmail, targetLinkedInEmail, sinceDate)
                 ]);
                 
                 // Query connect_activity for push actions (this is the source of truth!)
@@ -5705,7 +5738,7 @@
             const [activityDocs, { nameMap: contactNamesMap, companyMap: contactCompanyMap }, { companyMap: queueCompanyMap }] = await Promise.all([
                 fetchSentActivityForBdr(targetEmail, targetLinkedInEmail),
                 loadContactNames(targetEmail, targetLinkedInEmail),
-                loadQueueCompanyMap(targetEmail, targetLinkedInEmail)
+                loadQueueCompanyMap(targetEmail, targetLinkedInEmail, sinceDate)
             ]);
 
             const repliesMap = new Map();
