@@ -1967,6 +1967,7 @@
           Pick a <strong>primary</strong> (kept) and <strong>secondary</strong> (archived) account. Activity timeline, contacts,
           opportunities, revenue and documents are combined into the primary. For profile fields you'll choose which value to keep.
           The secondary is soft-archived (data preserved, hidden from lists) and can be restored by an admin.
+          Use <strong>Not duplicates</strong> to hide a suggestion permanently (everyone); restore it from the Ignored tab.
         </div>
 
         <!-- Tabs -->
@@ -1976,6 +1977,9 @@
           </button>
           <button class="merge-tab" data-tab="manual" onclick="switchMergeTab('manual')">
             <i class="fas fa-hand-pointer"></i> Manual Pick
+          </button>
+          <button class="merge-tab" data-tab="ignored" onclick="switchMergeTab('ignored')">
+            <i class="fas fa-ban"></i> Ignored <span id="ignoredMergeCount"></span>
           </button>
         </div>
 
@@ -1991,6 +1995,16 @@
             <div style="text-align: center; color: #999; padding: 2rem;">
               <i class="fas fa-spinner fa-spin"></i> Scanning...
             </div>
+          </div>
+        </div>
+
+        <!-- Ignored / do-not-merge panel -->
+        <div id="mergeTabIgnored" class="merge-tab-panel" style="display: none;">
+          <div style="margin-bottom: 0.75rem;">
+            <small style="color: #666;">Accounts marked <strong>Not duplicates</strong> stay hidden from Suggested Duplicates for everyone. Restore a group to see it again. Manual Pick can still merge them.</small>
+          </div>
+          <div id="ignoredDuplicateGroupsList">
+            <div style="text-align: center; color: #999; padding: 2rem;">None yet.</div>
           </div>
         </div>
 
@@ -2630,6 +2644,7 @@
               ownerId: data.assignedSalesContact?.id || '',
               updatedAt: data.updatedAt || '',
               createdAt: data.createdAt || '',
+              doNotMergeWith: data.doNotMergeWith && typeof data.doNotMergeWith === 'object' ? data.doNotMergeWith : {},
               contactsCount: (data.contacts || []).length,
               opportunitiesCount: (data.opportunities || []).length,
               userLoginCount: 0 // Will be updated if we load user data
@@ -4116,6 +4131,93 @@
         .trim();
     }
 
+    let _lastDupGroups = [];
+    let _lastIgnoredGroups = [];
+
+    function _pairDismissed(a, b) {
+      if (!a || !b || a.id === b.id) return false;
+      return !!(a.doNotMergeWith && a.doNotMergeWith[b.id]) ||
+             !!(b.doNotMergeWith && b.doNotMergeWith[a.id]);
+    }
+
+    function _accountPairs(accounts) {
+      const pairs = [];
+      for (let i = 0; i < accounts.length; i++) {
+        for (let j = i + 1; j < accounts.length; j++) {
+          pairs.push([accounts[i], accounts[j]]);
+        }
+      }
+      return pairs;
+    }
+
+    function _connectedComponents(accounts, edgeFn) {
+      const n = accounts.length;
+      const seen = new Array(n).fill(false);
+      const comps = [];
+      for (let i = 0; i < n; i++) {
+        if (seen[i]) continue;
+        const stack = [i];
+        seen[i] = true;
+        const members = [];
+        while (stack.length) {
+          const u = stack.pop();
+          members.push(accounts[u]);
+          for (let v = 0; v < n; v++) {
+            if (seen[v] || !edgeFn(accounts[u], accounts[v])) continue;
+            seen[v] = true;
+            stack.push(v);
+          }
+        }
+        comps.push(members);
+      }
+      return comps;
+    }
+
+    function _dupAccountRowsHtml(accounts) {
+      return accounts.map(a => {
+        const updatedText = a.updatedAt ? new Date(a.updatedAt).toLocaleDateString() : 'unknown';
+        const createdText = a.createdAt ? new Date(a.createdAt).toLocaleDateString() : 'unknown';
+        return `
+            <div class="dup-row">
+              <div>
+                <strong>${escapeHtml(a.name)}</strong>
+                ${a.domain ? `<small style="margin-left: 6px;">${escapeHtml(a.domain)}</small>` : ''}
+                <div style="font-size: 0.82rem; color: #666; margin-top: 2px;">
+                  <span title="Stage">${escapeHtml(a.stage || 'No stage')}</span>
+                  ${a.location ? ' · <span title="Location">' + escapeHtml(a.location) + '</span>' : ''}
+                  · <span title="Created">Created ${createdText}</span>
+                  · <span title="Updated">Updated ${updatedText}</span>
+                  · <span title="Owner">${escapeHtml(a.owner || 'Unassigned')}</span>
+                </div>
+              </div>
+              <div style="display: flex; gap: 6px; flex-shrink: 0;">
+                <a href="account-detail.html?id=${a.id}" target="_blank" class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.8rem; text-decoration: none;">
+                  <i class="fas fa-external-link-alt"></i> Open
+                </a>
+              </div>
+            </div>
+          `;
+      }).join('');
+    }
+
+    function _applyLocalDoNotMerge(a, b, meta) {
+      a.doNotMergeWith = a.doNotMergeWith || {};
+      b.doNotMergeWith = b.doNotMergeWith || {};
+      a.doNotMergeWith[b.id] = { at: meta.at, by: meta.by, otherName: b.name };
+      b.doNotMergeWith[a.id] = { at: meta.at, by: meta.by, otherName: a.name };
+    }
+
+    function _clearLocalDoNotMerge(a, b) {
+      if (a.doNotMergeWith) delete a.doNotMergeWith[b.id];
+      if (b.doNotMergeWith) delete b.doNotMergeWith[a.id];
+    }
+
+    function _updateIgnoredMergeCount(n) {
+      const el = document.getElementById('ignoredMergeCount');
+      if (!el) return;
+      el.textContent = n > 0 ? `(${n})` : '';
+    }
+
     // Open the merge modal; optionally preselect an account by id
     window.openMergeModal = function(preselectId) {
       const modal = document.getElementById('mergeAccountsModal');
@@ -4149,6 +4251,7 @@
       });
       document.getElementById('mergeTabAuto').style.display = tab === 'auto' ? 'block' : 'none';
       document.getElementById('mergeTabManual').style.display = tab === 'manual' ? 'block' : 'none';
+      document.getElementById('mergeTabIgnored').style.display = tab === 'ignored' ? 'block' : 'none';
     };
 
     function _populateManualMergeSelectors(preselectId) {
@@ -4168,6 +4271,7 @@
     // Scan allAccounts for likely duplicates
     window.findDuplicates = function() {
       const container = document.getElementById('duplicateGroupsList');
+      const ignoredContainer = document.getElementById('ignoredDuplicateGroupsList');
       container.innerHTML = '<div style="text-align:center;color:#999;padding:1rem;"><i class="fas fa-spinner fa-spin"></i> Scanning...</div>';
 
       const byName = new Map();
@@ -4196,47 +4300,74 @@
       _mergeNameVariantBuckets(byName).forEach((list) => addGroup('Name match', list));
       byDomain.forEach((list) => addGroup('Domain match', list));
 
-      const groups = Array.from(groupMap.values())
-        .sort((g1, g2) => g2.accounts.length - g1.accounts.length);
+      const suggestionGroups = [];
+      const suggestionKeys = new Set();
+      Array.from(groupMap.values()).forEach(g => {
+        _connectedComponents(g.accounts, (a, b) => !_pairDismissed(a, b))
+          .filter(comp => comp.length >= 2)
+          .forEach(comp => {
+            const key = comp.map(a => a.id).sort().join('|');
+            if (suggestionKeys.has(key)) return;
+            suggestionKeys.add(key);
+            suggestionGroups.push({ reason: g.reason, accounts: comp });
+          });
+      });
+      const groups = suggestionGroups.sort((g1, g2) => g2.accounts.length - g1.accounts.length);
+      _lastDupGroups = groups;
+
+      const byId = new Map(allAccounts.map(a => [a.id, a]));
+      const dismissedTouched = [];
+      const seenIgnored = new Set();
+      allAccounts.forEach(a => {
+        if (!a.doNotMergeWith) return;
+        Object.keys(a.doNotMergeWith).forEach(otherId => {
+          const b = byId.get(otherId);
+          if (!b) return;
+          if (!seenIgnored.has(a.id)) { seenIgnored.add(a.id); dismissedTouched.push(a); }
+          if (!seenIgnored.has(b.id)) { seenIgnored.add(b.id); dismissedTouched.push(b); }
+        });
+      });
+      const ignoredComps = _connectedComponents(dismissedTouched, _pairDismissed)
+        .filter(comp => comp.length >= 2);
+      _lastIgnoredGroups = ignoredComps.map(accounts => ({ accounts }));
+      _updateIgnoredMergeCount(_lastIgnoredGroups.length);
+
+      if (ignoredContainer) {
+        if (_lastIgnoredGroups.length === 0) {
+          ignoredContainer.innerHTML = `
+            <div style="text-align: center; color: #666; padding: 2rem;">
+              <p style="margin: 0;">No ignored duplicate groups.</p>
+              <small>Use <strong>Not duplicates</strong> on a suggestion to hide it here.</small>
+            </div>`;
+        } else {
+          ignoredContainer.innerHTML = _lastIgnoredGroups.map((g, gi) => `
+            <div class="dup-group">
+              <div class="dup-group-title">
+                <i class="fas fa-ban"></i> Do not merge · ${g.accounts.length} accounts
+              </div>
+              ${_dupAccountRowsHtml(g.accounts)}
+              <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; align-items: center; flex-wrap: wrap;">
+                <button class="btn btn-secondary" style="padding: 6px 14px;" onclick="_restoreDuplicateGroup(${gi})">
+                  <i class="fas fa-undo"></i> Restore to suggestions
+                </button>
+              </div>
+            </div>
+          `).join('');
+        }
+      }
 
       if (groups.length === 0) {
         container.innerHTML = `
           <div style="text-align: center; color: #666; padding: 2rem;">
             <i class="fas fa-check-circle" style="font-size: 2.5rem; color: var(--success); margin-bottom: 12px;"></i>
             <p style="margin: 0;">No duplicate accounts detected.</p>
-            <small>Try the <strong>Manual Pick</strong> tab to merge any two accounts.</small>
+            <small>Try the <strong>Manual Pick</strong> tab to merge any two accounts${_lastIgnoredGroups.length ? ', or restore a group from <strong>Ignored</strong>' : ''}.</small>
           </div>
         `;
         return;
       }
 
       container.innerHTML = groups.map((g, gi) => {
-        const rowsHtml = g.accounts.map(a => {
-          const updatedText = a.updatedAt ? new Date(a.updatedAt).toLocaleDateString() : 'unknown';
-          const createdText = a.createdAt ? new Date(a.createdAt).toLocaleDateString() : 'unknown';
-          return `
-            <div class="dup-row">
-              <div>
-                <strong>${escapeHtml(a.name)}</strong>
-                ${a.domain ? `<small style="margin-left: 6px;">${escapeHtml(a.domain)}</small>` : ''}
-                <div style="font-size: 0.82rem; color: #666; margin-top: 2px;">
-                  <span title="Stage">${escapeHtml(a.stage || 'No stage')}</span>
-                  ${a.location ? ' · <span title="Location">' + escapeHtml(a.location) + '</span>' : ''}
-                  · <span title="Created">Created ${createdText}</span>
-                  · <span title="Updated">Updated ${updatedText}</span>
-                  · <span title="Owner">${escapeHtml(a.owner || 'Unassigned')}</span>
-                </div>
-              </div>
-              <div style="display: flex; gap: 6px; flex-shrink: 0;">
-                <a href="account-detail.html?id=${a.id}" target="_blank" class="btn btn-secondary" style="padding: 4px 10px; font-size: 0.8rem; text-decoration: none;">
-                  <i class="fas fa-external-link-alt"></i> Open
-                </a>
-              </div>
-            </div>
-          `;
-        }).join('');
-
-        // Default primary = most recently updated
         const sortedByUpdated = [...g.accounts].sort((a, b) => {
           const da = new Date(a.updatedAt || a.createdAt || 0).getTime();
           const db_ = new Date(b.updatedAt || b.createdAt || 0).getTime();
@@ -4245,7 +4376,6 @@
         const defaultPrimary = sortedByUpdated[0];
         const defaultSecondary = sortedByUpdated[1];
 
-        // For groups of exactly 2, offer a one-click merge button
         const mergeBtn = g.accounts.length === 2
           ? `<button class="btn btn-primary" style="padding: 6px 14px;" onclick="_startMergeFromGroup('${defaultPrimary.id}','${defaultSecondary.id}')">
                 <i class="fas fa-code-branch"></i> Merge (newer kept)
@@ -4265,13 +4395,68 @@
             <div class="dup-group-title">
               <i class="fas fa-object-group"></i> ${escapeHtml(g.reason)} · ${g.accounts.length} accounts
             </div>
-            ${rowsHtml}
+            ${_dupAccountRowsHtml(g.accounts)}
             <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; align-items: center; flex-wrap: wrap;">
+              <button class="btn btn-secondary" style="padding: 6px 14px;" onclick="_dismissDuplicateGroup(${gi})" title="Stop suggesting these accounts as duplicates">
+                <i class="fas fa-ban"></i> Not duplicates
+              </button>
               ${mergeBtn}
             </div>
           </div>
         `;
       }).join('');
+    };
+
+    window._dismissDuplicateGroup = async function(groupIndex) {
+      const g = _lastDupGroups[groupIndex];
+      if (!g || !g.accounts || g.accounts.length < 2) return;
+      const names = g.accounts.map(a => a.name).join(', ');
+      if (!confirm(`Hide these ${g.accounts.length} accounts from Suggested Duplicates?\n\n${names}\n\nThey will stay hidden for everyone until restored from the Ignored tab. Manual Pick can still merge them.`)) {
+        return;
+      }
+      try {
+        const { set } = await import('https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js');
+        const meta = {
+          at: new Date().toISOString(),
+          by: auth.currentUser?.email || 'Unknown'
+        };
+        const writes = [];
+        _accountPairs(g.accounts).forEach(([a, b]) => {
+          _applyLocalDoNotMerge(a, b, meta);
+          writes.push(set(ref(db, `hccrm/leads/${a.id}/doNotMergeWith/${b.id}`), {
+            at: meta.at, by: meta.by, otherName: b.name
+          }));
+          writes.push(set(ref(db, `hccrm/leads/${b.id}/doNotMergeWith/${a.id}`), {
+            at: meta.at, by: meta.by, otherName: a.name
+          }));
+        });
+        await Promise.all(writes);
+        findDuplicates();
+      } catch (err) {
+        console.error('❌ Failed to save do-not-merge:', err);
+        alert('Could not save “not duplicates”: ' + err.message);
+      }
+    };
+
+    window._restoreDuplicateGroup = async function(groupIndex) {
+      const g = _lastIgnoredGroups[groupIndex];
+      if (!g || !g.accounts || g.accounts.length < 2) return;
+      try {
+        const { remove } = await import('https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js');
+        const writes = [];
+        _accountPairs(g.accounts).forEach(([a, b]) => {
+          if (!_pairDismissed(a, b)) return;
+          _clearLocalDoNotMerge(a, b);
+          writes.push(remove(ref(db, `hccrm/leads/${a.id}/doNotMergeWith/${b.id}`)));
+          writes.push(remove(ref(db, `hccrm/leads/${b.id}/doNotMergeWith/${a.id}`)));
+        });
+        await Promise.all(writes);
+        findDuplicates();
+        switchMergeTab('auto');
+      } catch (err) {
+        console.error('❌ Failed to restore duplicate suggestion:', err);
+        alert('Could not restore suggestions: ' + err.message);
+      }
     };
 
     window._startMergeFromGroup = function(primaryId, secondaryId) {
@@ -4298,6 +4483,11 @@
       if (primaryId === secondaryId) {
         alert('Primary and secondary must be different accounts.');
         return;
+      }
+      const primary = allAccounts.find(a => a.id === primaryId);
+      const secondary = allAccounts.find(a => a.id === secondaryId);
+      if (primary && secondary && _pairDismissed(primary, secondary)) {
+        if (!confirm('These accounts were marked as not duplicates. Merge anyway?')) return;
       }
       _openMergeCompare(primaryId, secondaryId);
     };
