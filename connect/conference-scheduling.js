@@ -76,6 +76,23 @@
  *   mismatches, now cheaper to reach since it's tier 4, not tier 2.
  *   findConversationTextForContact/findConversationsForContacts now also
  *   accept contactFirstName/contactLastName for the name-match tier.
+ * @version 1.10.0 — added the missing THIRD conversation source:
+ *   heyreach_activity (HeyReach's webhook event stream). Confirmed directly
+ *   against production Firestore data: every meeting-request contact that
+ *   v1.9 still reported "no conversation found" for (Misty Theriot, Kate
+ *   Stirek, Kelly Murphy, Akshay Raut, and others under BDR
+ *   betsy@carta.healthcare) has ZERO docs in heyreach_inbox under any field —
+ *   confirmed by a full 36,031-doc admin-SDK scan — but has a real,
+ *   multi-event back-and-forth in heyreach_activity, which this file never
+ *   queried at all. That collection stores each reply as a separate webhook
+ *   doc carrying a growing rawData.recent_messages array rather than one doc
+ *   per lead, so _findByActivityWebhook() fetches every doc matching the
+ *   contact's leadProfileUrl and merges/de-dupes their message arrays into
+ *   one transcript (mirrors company_review_replies.html's
+ *   loadHeyreachActivity()). Lookup also no longer stops at the first doc
+ *   MATCH — it keeps trying tiers until one actually yields a non-empty
+ *   transcript, since a matched heyreach_inbox/linkedinMessages doc can be a
+ *   metadata-only stub with no messages.
  */
 (function () {
     'use strict';
@@ -650,6 +667,48 @@
     const INBOX_URL_FIELDS = ['leadProfileUrl', 'linkedin_url', 'leadLinkedInUrl', 'lead_linkedin_url'];
     const LINKEDIN_MESSAGES_URL_FIELDS = ['linkedInUrl', 'profileUrl', 'linkedin_url'];
 
+    // ── heyreach_activity (HeyReach webhook event stream) ────────────────
+    // Confirmed against production data: some BDRs/campaigns have their
+    // ENTIRE two-way conversation recorded only as a stream of webhook events
+    // in heyreach_activity — heyreach_inbox has zero docs for them at all
+    // (their inbox sync hadn't caught up / doesn't cover that LinkedIn seat
+    // yet). Each MESSAGE_REPLY_RECEIVED / EVERY_MESSAGE_REPLY_RECEIVED event
+    // embeds a growing rawData.recent_messages array, so merging every
+    // matching doc's messages and de-duplicating recovers the full thread —
+    // same source company_review_replies.html's loadHeyreachActivity() reads.
+    function _extractWebhookTranscript(docs) {
+        const seen = new Set();
+        const msgs = [];
+        for (const d of docs) {
+            const recent = (d.rawData && Array.isArray(d.rawData.recent_messages)) ? d.rawData.recent_messages : [];
+            for (const m of recent) {
+                const text = String(m.message || '').trim();
+                if (!text) continue;
+                const at = _tsToDate(m.creation_time);
+                const key = `${text}|${at ? at.getTime() : ''}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                msgs.push({ sender: m.is_reply ? 'contact' : 'bdr', text, at });
+            }
+        }
+        if (msgs.length > 1 && msgs.every(m => m.at)) msgs.sort((a, b) => a.at - b.at);
+        return msgs;
+    }
+
+    async function _findByActivityWebhook(contactLiUrl) {
+        if (!contactLiUrl) return null;
+        const { collection, getDocs, query, where } = fx();
+        try {
+            const snap = await getDocs(query(collection(dbi(), 'heyreach_activity'), where('leadProfileUrl', '==', contactLiUrl)));
+            const docs = (snap.docs || []).map(d => d.data());
+            if (docs.length === 0) return null;
+            const transcript = _extractWebhookTranscript(docs);
+            return transcript.length > 0 ? transcript : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
     async function _queryOneByField(collectionName, field, value) {
         if (!value) return null;
         const { collection, getDocs, query, where, limit } = fx();
@@ -803,28 +862,50 @@
     }
 
     // Core lookup: structured transcript ([{ sender, text, at }]) or null.
+    // Tries every tier in order and keeps going if an earlier tier matches a
+    // doc but that doc turns out to carry no actual message text (e.g. a
+    // heyreach_inbox stub with only metadata) — a "match" isn't good enough,
+    // only a non-empty transcript stops the search.
     async function _findTranscriptForContact(bdrEmail, contactLiUrl, contactFirstName, contactLastName) {
         try {
-            let data =
-                (await _findByUrlExact('heyreach_inbox', INBOX_URL_FIELDS, contactLiUrl)) ||
-                (await _findByUrlExact('linkedinMessages', LINKEDIN_MESSAGES_URL_FIELDS, contactLiUrl)) ||
-                (await _findByNameExact(contactFirstName, contactLastName));
+            let transcript = null, via = null;
 
-            let via = data ? 'exact match' : null;
-
-            if (!data && bdrEmail && contactLiUrl) {
-                const all = await _fetchInboxDocsForBdr(bdrEmail);
-                data = all.find(d => _sameLead(d.leadProfileUrl, contactLiUrl)) || null;
-                if (data) via = 'BDR-alias local match';
+            if (!transcript) {
+                const data =
+                    (await _findByUrlExact('heyreach_inbox', INBOX_URL_FIELDS, contactLiUrl)) ||
+                    (await _findByUrlExact('linkedinMessages', LINKEDIN_MESSAGES_URL_FIELDS, contactLiUrl)) ||
+                    (await _findByNameExact(contactFirstName, contactLastName));
+                if (data) {
+                    const t = _extractTranscript(data);
+                    if (t.length > 0) { transcript = t; via = 'exact match'; }
+                }
             }
 
-            if (!data) {
+            // Some BDRs/campaigns never get synced into heyreach_inbox at
+            // all — their whole thread lives in the heyreach_activity
+            // webhook stream instead. See _findByActivityWebhook above.
+            if (!transcript) {
+                const t = await _findByActivityWebhook(contactLiUrl);
+                if (t) { transcript = t; via = 'webhook activity stream'; }
+            }
+
+            // Last resort: this BDR's alias-expanded inbox, matched locally
+            // by URL slug — covers stored casing no exact-match query reaches.
+            if (!transcript && bdrEmail && contactLiUrl) {
+                const all = await _fetchInboxDocsForBdr(bdrEmail);
+                const data = all.find(d => _sameLead(d.leadProfileUrl, contactLiUrl)) || null;
+                if (data) {
+                    const t = _extractTranscript(data);
+                    if (t.length > 0) { transcript = t; via = 'BDR-alias local match'; }
+                }
+            }
+
+            if (!transcript) {
                 console.log(`🔎 [ConferenceScheduling] No conversation found for ${contactLiUrl || '(no URL)'} / ${contactFirstName || ''} ${contactLastName || ''} (bdr: ${bdrEmail || '—'})`);
                 return null;
             }
-            const transcript = _extractTranscript(data);
             console.log(`🔎 [ConferenceScheduling] Conversation found for ${contactLiUrl || `${contactFirstName || ''} ${contactLastName || ''}`} via ${via}: ${transcript.length} message(s)`);
-            return transcript.length > 0 ? transcript : null;
+            return transcript;
         } catch (e) {
             console.warn('⚠️ [ConferenceScheduling] Conversation lookup failed:', e.message);
             return null;
