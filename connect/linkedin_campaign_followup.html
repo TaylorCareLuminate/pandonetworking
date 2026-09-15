@@ -1084,15 +1084,13 @@ window.startScan = async function() {
         console.log(`📊 heyreach_inbox: ${totalInboxDocs} unique docs, ${msgSentSet.size} contacts have BDR messages`);
         if (scanCancelled) return done();
 
-        setProgress(55, 'Loading connect_activity (system outreach allowlist)…');
+        setProgress(55, 'Loading connect_activity and connect_queue…');
 
         // ── Step 2b: Load connect_activity ─────────────────────────────────
-        // connect_activity records every contact pushed from the PandoConnect
-        // system (connection requests AND follow-up messages).
-        // We use it for TWO purposes:
-        //   (a) ALLOWLIST — only contacts in connect_activity came from our system
-        //   (b) MSG CHECK — records with via='quick_message_campaign' or
-        //       actionType containing 'message' mean a message was already sent
+        // Outreach records from PandoConnect. Used for:
+        //   (a) ALLOWLIST — only system-originated contacts (not organic LinkedIn connections)
+        //   (b) MSG CHECK — quick-message / message-campaign sends already went out
+        //   (c) Fallback intended-message text when the connect_queue doc is gone
         const activityEmailFields2 = ['bdrEmail', 'account_email', 'accountEmail'];
         const activitySnaps2 = await Promise.allSettled(
             emailsToQuery.flatMap(email =>
@@ -1107,71 +1105,36 @@ window.startScan = async function() {
 
         const systemContactUrlsSet = new Set(); // allowlist: came from PandoConnect
         const seenActivityIds      = new Set();
-        // msgSentSet already has inbox-derived entries; add quick-message sends here
         activitySnaps2.forEach(res => {
             if (res.status !== 'fulfilled' || !res.value) return;
             res.value.forEach(d => {
                 if (seenActivityIds.has(d.id)) return;
                 seenActivityIds.add(d.id);
                 const data = d.data();
-                const url  = normUrl(
-                    data.contactLinkedInUrl || data.prospect_li_url ||
-                    data.linkedInUrl        || data.linkedinUrl     || ''
-                );
+                const url  = normUrl(extractLinkedInUrl(data));
                 if (!url) return;
 
-                // Add to system allowlist regardless of action type
-                systemContactUrlsSet.add(url);
+                // Profile-search noise is not outreach — don't let it gate the allowlist.
+                const activityType = (data.activityType || '').toLowerCase();
+                if (activityType !== 'search') systemContactUrlsSet.add(url);
 
-                // Add to "already messaged" set only for message-type sends
-                // (quick message campaign, direct message, NOT plain connect pushes)
                 const via        = (data.via        || '').toLowerCase();
                 const actionType = (data.actionType || '').toLowerCase();
                 const isMessage  = via.includes('quick_message') ||
                                    via.includes('message_campaign') ||
-                                   actionType.includes('message');
+                                   actionType.includes('message') ||
+                                   activityType === 'message';
                 if (isMessage) msgSentSet.add(url);
             });
         });
 
-        console.log(`📊 connect_activity: ${seenActivityIds.size} unique docs, ${systemContactUrlsSet.size} system contact URLs, msgSentSet now ${msgSentSet.size}`);
+        console.log(`📊 connect_activity: ${seenActivityIds.size} unique docs, ${systemContactUrlsSet.size} outreach URLs, msgSentSet now ${msgSentSet.size}`);
 
-        setProgress(68, 'Filtering to system-originated connections…');
-
-        // ── Apply allowlist: keep only contacts touched by our system ────────
-        // If connect_activity has records, restrict to those.
-        // If empty (e.g. new BDR with no history), show all connections.
-        const useAllowlist = systemContactUrlsSet.size > 0;
-        if (useAllowlist) {
-            for (const url of [...connectionsMap.keys()]) {
-                if (!systemContactUrlsSet.has(url)) connectionsMap.delete(url);
-            }
-        }
-        console.log(`📊 After allowlist filter: ${connectionsMap.size} connections (allowlist ${useAllowlist ? 'applied' : 'skipped — no connect_activity data'})`);
-
-        setProgress(72, 'Finding connections without messages…');
-
-        // Connections without a sent message
-        const noMsgUrls    = [...connectionsMap.keys()].filter(url => !msgSentSet.has(url));
-        const noMsgUrlsSet = new Set(noMsgUrls);
-        updateStat('statAccepted', connectionsMap.size);
-        updateStat('statNoMsg', noMsgUrls.length);
-
-        // Swap acceptedMap → connectionsMap for downstream steps
-        const acceptedMap = connectionsMap;
-
-        if (noMsgUrls.length === 0) {
-            setProgress(100, connectionsMap.size === 0
-                ? 'No connections found — check that heyreach_contacts is synced for this BDR'
-                : 'All connections already have messages — nothing to follow up!');
-            showContactList();
-            return done();
-        }
-
-        // ── Step 3: Find intended messages in connect_queue ─────────────────
-        setProgress(75, `Checking connect_queue for ${noMsgUrls.length} contacts without messages…`);
-
-        // Load connect_queue for this BDR (try all known email fields)
+        // ── Step 2c: Load connect_queue (allowlist + intended messages) ─────
+        // Must run BEFORE the allowlist. Queue docs store the URL as prospect_li_url
+        // (often without www), which the old field list never read — so intended
+        // messages never matched even when the allowlist didn't wipe the list.
+        setProgress(62, 'Loading connect_queue (intended messages)…');
         const queueFields = ['accountEmail', 'bdrEmail', 'uploadedByEmail', 'account_email'];
         const queueMap    = new Map(); // normUrl → best queue record
 
@@ -1194,11 +1157,10 @@ window.startScan = async function() {
                 if (seenQueueIds.has(d.id)) return;
                 seenQueueIds.add(d.id);
                 const data = d.data();
-                const url  = normUrl(
-                    data.linkedInUrl   || data.linkedin_url ||
-                    data.profileUrl    || data.leadProfileUrl || ''
-                );
-                if (!url || !noMsgUrlsSet.has(url)) return;
+                const url  = normUrl(extractLinkedInUrl(data));
+                if (!url) return;
+
+                systemContactUrlsSet.add(url);
 
                 const msg = (data.message_to_contact || data.generated_message || data.messageContent || '').trim();
                 if (!msg) return;
@@ -1214,20 +1176,68 @@ window.startScan = async function() {
             });
         });
 
-        console.log(`📊 connect_queue: ${seenQueueIds.size} unique records, ${queueMap.size} matched to no-message contacts`);
+        console.log(`📊 connect_queue: ${seenQueueIds.size} unique records, ${queueMap.size} with message text, allowlist now ${systemContactUrlsSet.size}`);
+        if (systemContactUrlsSet.size > 0) {
+            console.log('   sample system keys:', [...systemContactUrlsSet].slice(0, 5));
+        }
+
+        setProgress(68, 'Filtering to system-originated connections…');
+
+        // ── Apply allowlist: keep only contacts touched by our system ────────
+        // If we have outreach/queue URLs, restrict to those. If that intersection
+        // is empty, the URL formats still don't match — skip rather than showing
+        // nothing (the previous bug: 707 connections → 0 after allowlist).
+        const beforeAllowlist = connectionsMap.size;
+        let useAllowlist = systemContactUrlsSet.size > 0;
+        if (useAllowlist) {
+            let overlap = 0;
+            for (const url of connectionsMap.keys()) {
+                if (systemContactUrlsSet.has(url)) overlap++;
+            }
+            console.log(`📊 Allowlist overlap: ${overlap} of ${beforeAllowlist} connections match ${systemContactUrlsSet.size} system URLs`);
+            if (overlap === 0) {
+                console.warn('⚠️ Allowlist overlap is 0 after canonical URL matching — skipping allowlist so results are not wiped.');
+                useAllowlist = false;
+            } else {
+                for (const url of [...connectionsMap.keys()]) {
+                    if (!systemContactUrlsSet.has(url)) connectionsMap.delete(url);
+                }
+            }
+        }
+        console.log(`📊 After allowlist filter: ${connectionsMap.size} connections (allowlist ${useAllowlist ? 'applied' : 'skipped'})`);
+
+        setProgress(72, 'Finding connections without messages…');
+
+        // Connections without a sent message
+        const noMsgUrls    = [...connectionsMap.keys()].filter(url => !msgSentSet.has(url));
+        const noMsgUrlsSet = new Set(noMsgUrls);
+        updateStat('statAccepted', connectionsMap.size);
+        updateStat('statNoMsg', noMsgUrls.length);
+
+        const acceptedMap = connectionsMap;
+
+        if (noMsgUrls.length === 0) {
+            setProgress(100, connectionsMap.size === 0
+                ? 'No connections found — check that heyreach_contacts is synced for this BDR'
+                : 'All connections already have messages — nothing to follow up!');
+            showContactList();
+            return done();
+        }
+
+        // Restrict queueMap to contacts that still need a message (already loaded above)
+        for (const url of [...queueMap.keys()]) {
+            if (!noMsgUrlsSet.has(url)) queueMap.delete(url);
+        }
+        console.log(`📊 connect_queue matched to no-message contacts: ${queueMap.size}`);
 
         // Fallback: pull intended messages from connect_activity itself
-        // (when connect_queue records have been deleted/archived after push,
-        // connect_activity still stores the message_to_contact that was sent)
+        // (when connect_queue records have been deleted/archived after push)
         if (queueMap.size < noMsgUrls.length) {
             activitySnaps2.forEach(res => {
                 if (res.status !== 'fulfilled' || !res.value) return;
                 res.value.forEach(d => {
                     const data = d.data();
-                    const url  = normUrl(
-                        data.contactLinkedInUrl || data.prospect_li_url ||
-                        data.linkedInUrl        || data.linkedinUrl     || ''
-                    );
+                    const url  = normUrl(extractLinkedInUrl(data));
                     if (!url || !noMsgUrlsSet.has(url) || queueMap.has(url)) return;
 
                     const msg = (data.message_to_contact || data.messageContent || data.message || '').trim();
@@ -1236,7 +1246,7 @@ window.startScan = async function() {
                     queueMap.set(url, {
                         intendedMessage:  msg,
                         connect_queue_id: data.connect_queue_id || null,
-                        message_type:     data.message_type || 'connect',
+                        message_type:     data.message_type || data.activityType || 'connect',
                         createdAt:        data.createdAt || data.timestamp || null,
                         source:           'connect_activity'
                     });
