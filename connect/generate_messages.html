@@ -3427,7 +3427,7 @@
                                     <input type="radio" name="fullAiColleagueConnectionStatus" value="accepted" checked
                                         style="accent-color:#0d9488;width:14px;height:14px;cursor:pointer;margin-top:2px;flex-shrink:0;"
                                         onchange="fullAiUpdateColleagueConnectionStatusHelp()">
-                                    <span><strong>Accepted only</strong> — pull contacts who accepted the source BDR's connection request (default)</span>
+                                    <span><strong>Accepted only</strong> — pull contacts who accepted a connection request <em>we sent</em> (Connect/HeyReach), not the source BDR's whole network</span>
                                 </label>
                                 <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;">
                                     <input type="radio" name="fullAiColleagueConnectionStatus" value="reached_out"
@@ -3495,7 +3495,7 @@
                         </div>
 
                         <div class="form-help" style="margin-top:10px; color:#065f46;">
-                            Pulls the top N eligible contacts (prioritising those connected to the most selected BDRs, then most LinkedIn connections), after skipping:
+                            Pulls the top N contacts who accepted a <strong>Connect/HeyReach invite we sent</strong> (not the source BDR's entire LinkedIn network), prioritising those connected to the most selected BDRs, then most LinkedIn connections, after skipping:
                             (1) contacts already connected to this BDR,
                             (2) contacts already in this BDR's prospect list / queue,
                             (3) contacts on any exclusion list,
@@ -16276,7 +16276,7 @@
             if (!help) return;
             help.innerHTML = fullAiGetColleagueConnectionStatusMode() === 'reached_out'
                 ? 'Pulls every contact the source BDR sent a connect request to — <strong>accepted, still pending, or declined</strong>. Useful for having a different BDR try a fresh angle on people who never connected.'
-                : 'Only pulls contacts confirmed as accepted connections (via HeyReach sync/activity).';
+                : 'Only pulls contacts who <strong>accepted a connection request we sent</strong> through Connect/HeyReach — not the source BDR\'s entire LinkedIn network.';
         };
 
         function fullAiGetColleagueCategoryFilters() {
@@ -16316,11 +16316,11 @@
          * as fullAiPullContactsFromWorkspace) so the normal Full AI Generate pipeline can
          * run on them afterward.
          *
-         * @param connectionStatusMode 'accepted' (default) only pulls contacts confirmed as
-         *   accepted connections (via heyreach_contacts/heyreach_activity). 'reached_out' also
-         *   pulls anyone the source BDR simply sent a connect request to via connect_queue,
-         *   regardless of whether they ever accepted — lets a different BDR try a fresh angle
-         *   on people who didn't connect the first time.
+         * @param connectionStatusMode 'accepted' (default) only pulls contacts who accepted
+         *   a connection request we sent (connect_queue / connect_activity / HeyReach
+         *   CONNECTION_REQUEST_ACCEPTED) — not the source BDR's entire LinkedIn network.
+         *   'reached_out' also pulls anyone the source BDR sent a connect request to,
+         *   whether or not they accepted.
          * Returns { moveBatchId, pulled, stats }.
          */
         async function fullAiPullContactsFromColleagues({ bdrEmail, colleagues, count, selectedResponse, hypothesisGroupUrlSet, connectionStatusMode, addLog }) {
@@ -16484,29 +16484,62 @@
                 }
 
                 try {
-                    const cqSnap1 = await fetchFn(q(col(db, 'connect_queue'), wh('account_email', '==', colleagueLinkedInEmail), wh('message_type', '==', 'connect')), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
-                    cqSnap1.forEach(addFromCQ);
-                    if (colleague.primaryEmail !== colleagueLinkedInEmail || connectQueueUrls.size === 0) {
-                        const cqSnap2 = await fetchFn(q(col(db, 'connect_queue'), wh('bdr_primary_email', '==', colleague.primaryEmail), wh('message_type', '==', 'connect')), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
-                        cqSnap2.forEach(addFromCQ);
+                    const cqEmails = [...new Set([colleagueLinkedInEmail, colleague.primaryEmail].filter(Boolean))];
+                    const cqFields = ['account_email', 'bdr_primary_email', 'bdr_email', 'bdr_auth_email', 'accountEmail', 'bdrEmail'];
+                    const cqTypes  = ['connect', 'connection'];
+                    const cqJobs = [];
+                    for (const email of cqEmails) {
+                        for (const field of cqFields) {
+                            for (const msgType of cqTypes) {
+                                cqJobs.push(
+                                    fetchFn(q(col(db, 'connect_queue'), wh(field, '==', email), wh('message_type', '==', msgType)), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 })
+                                        .then(snap => snap.forEach(addFromCQ))
+                                        .catch(() => {})
+                                );
+                            }
+                        }
                     }
-                    if (connectQueueUrls.size === 0) {
-                        const cqSnap4 = await fetchFn(q(col(db, 'connect_queue'), wh('bdr_email', '==', colleague.primaryEmail), wh('message_type', '==', 'connect')), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
-                        cqSnap4.forEach(addFromCQ);
-                    }
-                    if (connectQueueUrls.size === 0) {
-                        const cqSnap5 = await fetchFn(q(col(db, 'connect_queue'), wh('bdr_auth_email', '==', colleague.primaryEmail), wh('message_type', '==', 'connect')), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
-                        cqSnap5.forEach(addFromCQ);
-                    }
+                    await Promise.all(cqJobs);
                 } catch (e) {
                     addLog(`   ⚠️ Could not load connect queue for ${colleague.name || colleague.primaryEmail}: ${e.message}`, 'warning');
                 }
 
-                if (connectQueueUrls.size === 0) {
+                // People we actually invited through Connect / HeyReach — NOT the BDR's whole network.
+                const ourEffortUrls = new Set(connectQueueUrls);
+                try {
+                    const actEmails = [...new Set([colleague.primaryEmail, colleagueLinkedInEmail].filter(Boolean))];
+                    const actFields = ['bdrEmail', 'account_email', 'accountEmail'];
+                    const actJobs = actEmails.flatMap(email =>
+                        actFields.map(field =>
+                            fetchFn(q(col(db, 'connect_activity'), wh(field, '==', email)), { pageSize: 5000, timeoutMs: 60000, maxRetries: 2 })
+                                .then(snap => {
+                                    snap.forEach(d => {
+                                        const data = d.data();
+                                        const activityType = (data.activityType || '').toLowerCase();
+                                        if (activityType === 'search' || activityType === 'message') return;
+                                        const u = normalizeLinkedInUrl(
+                                            data.contactLinkedInUrl || data.prospect_li_url ||
+                                            data.contact_linkedin_url || data.linkedin_url ||
+                                            data.linkedInUrl || data.profileUrl || ''
+                                        );
+                                        if (u) ourEffortUrls.add(u);
+                                    });
+                                })
+                                .catch(() => {})
+                        )
+                    );
+                    await Promise.all(actJobs);
+                } catch (e) {
+                    addLog(`   ⚠️ Could not load connect_activity for ${colleague.name || colleague.primaryEmail}: ${e.message}`, 'warning');
+                }
+
+                if (connectQueueUrls.size === 0 && ourEffortUrls.size === 0) {
                     addLog(reachedOutMode
-                        ? `   ⚠️ No connect_queue "connect" record(s) found for ${colleague.name || colleague.primaryEmail} — nothing to pull for them in "Reached out" mode (it relies entirely on connect_queue).`
-                        : `   ⚠️ No connect_queue "connect" record(s) found for ${colleague.name || colleague.primaryEmail} — will still check for accepted connections via heyreach_contacts/heyreach_activity directly (connect_queue is used for profile-data enrichment only, not as an eligibility gate).`,
+                        ? `   ⚠️ No Connect-system outreach records found for ${colleague.name || colleague.primaryEmail} — nothing to pull for them in "Reached out" mode.`
+                        : `   ⚠️ No Connect-system outreach records found for ${colleague.name || colleague.primaryEmail} — will still check HeyReach acceptance events.`,
                         'warning');
+                } else {
+                    addLog(`   🎯 Connect-system outreach for ${colleague.name || colleague.primaryEmail}: ${ourEffortUrls.size} invited contact(s) (${connectQueueUrls.size} from connect_queue).`, 'info');
                 }
 
                 const colleagueInboxByUrl = new Map();
@@ -16609,19 +16642,14 @@
                 // treated as proof of acceptance.)
                 const colleagueAcceptedUrls = new Set();
 
-                // NOTE: this used to require `connectQueueUrls.has(normUrl)` — i.e. we'd only
-                // treat a connection as eligible if OUR OWN connect_queue also had a "connect"
-                // message record for it. That undercounted badly: comparing against outcomes.html
-                // (which counts accepted connections straight from heyreach_activity/heyreach_contacts,
-                // no connect_queue cross-reference) and HeyReach's own dashboard, a BDR's true accepted
-                // count can be several times larger than what has a matching connect_queue doc —
-                // outreach sent via other flows/imports, or predating connect_queue tracking, was
-                // being silently dropped. connect_queue is now used ONLY as an optional data source
-                // for filling in missing profile fields (firstName/company/etc. below), never as a
-                // hard eligibility requirement.
-                function addCandidate(rawUrl, data) {
+                // Eligible in "accepted" mode only if we generated the invite (connect_queue,
+                // connect_activity connect-push, or a HeyReach CONNECTION_REQUEST_ACCEPTED
+                // event). heyreach_contacts is the BDR's entire LinkedIn network — using it
+                // ungated pulled thousands of organic connections that were never Connect outreach.
+                function addCandidate(rawUrl, data, { fromOurEffortEvent = false } = {}) {
                     const normUrl = normalizeLinkedInUrl(rawUrl);
                     if (!normUrl) return;
+                    if (!reachedOutMode && !fromOurEffortEvent && !ourEffortUrls.has(normUrl)) return;
                     if (existingQueueUrls.has(normUrl) || existingProspectUrls.has(normUrl)) return;
                     if (excludedUrls.has(normUrl) || targetConnectedUrls.has(normUrl)) return;
                     if (!candidateMap.has(normUrl)) {
@@ -16649,19 +16677,20 @@
                 }
 
                 if (heySnap && !heySnap.empty) {
-                    const beforeSize = candidateMap.size;
                     heySnap.forEach(d => {
                         const data = d.data();
                         const rawUrl = data.linkedin_url || data.profileUrl || data.leadProfileUrl || data.linkedInUrl || '';
                         if (!rawUrl) return;
                         const normUrl = normalizeLinkedInUrl(rawUrl);
-                        if (normUrl) colleagueAcceptedUrls.add(normUrl);
+                        // My Network ≠ Connect-created. Only treat as accepted-our-effort
+                        // when this person is someone we invited.
+                        if (normUrl && ourEffortUrls.has(normUrl)) colleagueAcceptedUrls.add(normUrl);
                         addCandidate(rawUrl, data);
                     });
                     const added = [...candidateMap.values()].filter(c => c.colleagues.some(cc => cc.email === colleague.primaryEmail)).length;
                     addLog(added > 0
-                        ? `   ✅ Found ${added} eligible accepted Connect-created prospect(s) for ${colleague.name || colleague.primaryEmail}.`
-                        : `   ℹ️ ${colleague.name || colleague.primaryEmail}: heyreach_contacts loaded but nothing new/eligible matched.`,
+                        ? `   ✅ Found ${added} eligible accepted Connect-created prospect(s) for ${colleague.name || colleague.primaryEmail} (of ${heySnap.size} network contacts).`
+                        : `   ℹ️ ${colleague.name || colleague.primaryEmail}: ${heySnap.size} LinkedIn connection(s) synced, but none were Connect-system invites still eligible to pull.`,
                         added > 0 ? 'success' : 'info');
                 } else {
                     addLog(`   🔄 heyreach_contacts not synced for ${colleague.name || colleague.primaryEmail} — checking connection acceptance events...`, 'info');
@@ -16691,9 +16720,12 @@
                             const rawUrl = data.leadProfileUrl || '';
                             if (!rawUrl) return;
                             const normUrl = normalizeLinkedInUrl(rawUrl);
-                            if (normUrl) colleagueAcceptedUrls.add(normUrl);
+                            if (normUrl) {
+                                ourEffortUrls.add(normUrl);
+                                colleagueAcceptedUrls.add(normUrl);
+                            }
                             const beforeHas = normUrl ? candidateMap.has(normUrl) : false;
-                            addCandidate(rawUrl, data);
+                            addCandidate(rawUrl, data, { fromOurEffortEvent: true });
                             if (!beforeHas && normUrl && candidateMap.has(normUrl)) added++;
                         });
                         if (added > 0) {
@@ -16708,9 +16740,7 @@
 
                 // "Reached out" mode: on top of confirmed-accepted candidates above, also add
                 // EVERY contact this colleague simply sent a connect request to via connect_queue
-                // — accepted, still pending, or declined. addCandidate() no longer requires
-                // connectQueueUrls membership (see note above), so this reuses it directly with
-                // connect_queue's own profile data; it's a no-op for anyone already added.
+                // — accepted, still pending, or declined.
                 if (reachedOutMode && connectQueueProfileMap.size > 0) {
                     connectQueueProfileMap.forEach((cq, normUrl) => {
                         addCandidate(cq.linkedInUrl || normUrl, cq);
@@ -22059,10 +22089,35 @@
                             addSCLog(`   ⚠️ Could not load connect queue for ${colleague.name || colleague.primaryEmail}: ${cqErr.message}`, 'warning');
                         }
 
-                        if (connectQueueUrls.size === 0) {
-                            addSCLog(`   ⚠️ No connect_queue "connect" record(s) found for ${colleague.name || colleague.primaryEmail} — will still check for accepted connections via heyreach_contacts/heyreach_activity directly (connect_queue is used for profile-data enrichment only, not as an eligibility gate).`, 'warning');
+                        const ourEffortUrls = new Set(connectQueueUrls);
+                        try {
+                            const actEmails = [...new Set([colleague.primaryEmail, colleagueLinkedInEmail].filter(Boolean))];
+                            for (const email of actEmails) {
+                                for (const field of ['bdrEmail', 'account_email', 'accountEmail']) {
+                                    try {
+                                        const actSnap = await getDocs(query(collection(db, 'connect_activity'), where(field, '==', email)));
+                                        actSnap.forEach(d => {
+                                            const data = d.data();
+                                            const activityType = (data.activityType || '').toLowerCase();
+                                            if (activityType === 'search' || activityType === 'message') return;
+                                            const u = normalizeLinkedInUrl(
+                                                data.contactLinkedInUrl || data.prospect_li_url ||
+                                                data.contact_linkedin_url || data.linkedin_url ||
+                                                data.linkedInUrl || data.profileUrl || ''
+                                            );
+                                            if (u) ourEffortUrls.add(u);
+                                        });
+                                    } catch (_) { /* field may not be indexed */ }
+                                }
+                            }
+                        } catch (actErr) {
+                            addSCLog(`   ⚠️ Could not load connect_activity for ${colleague.name || colleague.primaryEmail}: ${actErr.message}`, 'warning');
+                        }
+
+                        if (connectQueueUrls.size === 0 && ourEffortUrls.size === 0) {
+                            addSCLog(`   ⚠️ No Connect-system outreach records found for ${colleague.name || colleague.primaryEmail} — will still check HeyReach acceptance events.`, 'warning');
                         } else {
-                            addSCLog(`   Found ${connectQueueUrls.size} connect_queue "connect" record(s) for ${colleague.name || colleague.primaryEmail}.`);
+                            addSCLog(`   🎯 Connect-system outreach: ${ourEffortUrls.size} invited contact(s) (${connectQueueUrls.size} from connect_queue).`);
                         }
 
                         // ── Step 2b: Pre-load heyreach_inbox for category filtering & AI context ─
@@ -22176,18 +22231,14 @@
                          *  Falls back to connectQueueProfileMap for any missing profile fields.
                          *  Stores cached inboxData on each colleague entry for category filtering
                          *  and later AI message generation.
-                         *  NOTE: this used to require `connectQueueUrls.has(normUrl)` — i.e. only
-                         *  treat a connection as eligible if OUR OWN connect_queue also had a
-                         *  "connect" message record for it. That undercounted badly: compared
-                         *  against outcomes.html (which counts accepted connections straight from
-                         *  heyreach_activity/heyreach_contacts, no connect_queue cross-reference)
-                         *  and HeyReach's own dashboard, a BDR's true accepted count can be several
-                         *  times larger than what has a matching connect_queue doc. connect_queue
-                         *  is now used ONLY as an optional source for filling in missing profile
-                         *  fields below, never as a hard eligibility requirement. */
-                        function scAddCandidate(rawUrl, data, added) {
+                         *  Eligible only if we generated the invite (connect_queue, connect_activity
+                         *  connect-push, or a HeyReach CONNECTION_REQUEST_ACCEPTED event). Passing
+                         *  fromOurEffortEvent skips the set check so acceptance events can add
+                         *  themselves. */
+                        function scAddCandidate(rawUrl, data, added, fromOurEffortEvent) {
                             const normUrl = normalizeLinkedInUrl(rawUrl);
                             if (!normUrl) return added;
+                            if (!fromOurEffortEvent && !ourEffortUrls.has(normUrl)) return added;
                             if (existingQueueUrls.has(normUrl) || existingProspectUrls.has(normUrl)) return added;
                             if (!candidateMap.has(normUrl)) {
                                 const cq = connectQueueProfileMap.get(normUrl) || {};
@@ -22225,13 +22276,13 @@
                                 const rawUrl = data.linkedin_url || data.profileUrl || data.leadProfileUrl || data.linkedInUrl || '';
                                 if (!rawUrl) return;
                                 const normUrl = normalizeLinkedInUrl(rawUrl);
-                                if (normUrl) colleagueAcceptedUrls.add(normUrl);
+                                if (normUrl && ourEffortUrls.has(normUrl)) colleagueAcceptedUrls.add(normUrl);
                                 added = scAddCandidate(rawUrl, data, added);
                             });
                             if (added > 0) {
-                                addSCLog(`   ✅ Found ${added} accepted Connect-created prospect(s) for ${colleague.name || colleague.primaryEmail}.`, 'success');
+                                addSCLog(`   ✅ Found ${added} accepted Connect-created prospect(s) for ${colleague.name || colleague.primaryEmail} (of ${heySnap.size} network contacts).`, 'success');
                             } else {
-                                addSCLog(`   ℹ️ ${colleague.name || colleague.primaryEmail}: heyreach_contacts loaded but none matched Connect-system outreach records.`);
+                                addSCLog(`   ℹ️ ${colleague.name || colleague.primaryEmail}: ${heySnap.size} LinkedIn connection(s) synced, but none were Connect-system invites still eligible to pull.`);
                             }
                         } else {
                             addSCLog(`   🔄 heyreach_contacts not synced for ${colleague.name || colleague.primaryEmail} — checking connection acceptance events...`);
@@ -22285,6 +22336,7 @@
                                     const normUrl = normalizeLinkedInUrl(rawUrl);
                                     if (!normUrl || seenActUrls.has(normUrl)) return;
                                     seenActUrls.add(normUrl);
+                                    ourEffortUrls.add(normUrl);
                                     colleagueAcceptedUrls.add(normUrl);
 
                                     // Skip if already in current BDR's queue or prospect list
