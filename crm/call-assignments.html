@@ -669,7 +669,10 @@
             console.error('❌ Dashboard initialization failed:', error);
         });
 
-        // Load campaigns
+        // Load campaigns from both sources.
+        // Phone-only campaigns (created in phone_campaigns.html) live in their own
+        // collection and never appear in `campaigns`, so calls scheduled against them
+        // are invisible unless both collections are merged — same approach as call_manager.html.
         async function loadCampaigns() {
             const campaignSelect = document.getElementById('campaignSelect');
 
@@ -677,31 +680,71 @@
                 console.log('📋 Loading campaigns...');
                 
                 const db = window.clemailDb;
-                const campaignsSnapshot = await window.clemailFirestore.getDocs(
-                    window.clemailFirestore.collection(db, 'campaigns')
-                );
+                const { collection, getDocs } = window.clemailFirestore;
+
+                const [standardResult, phoneResult] = await Promise.allSettled([
+                    getDocs(collection(db, 'campaigns')),
+                    getDocs(collection(db, 'phone_campaigns'))
+                ]);
 
                 const campaigns = [];
-                campaignsSnapshot.forEach(doc => {
-                    const data = doc.data();
-                    campaigns.push({
-                        id: doc.id,
-                        name: data.name || data.campaignName || doc.id,
-                        inactive: data.status && data.status !== 'active'
-                    });
-                });
 
-                campaigns.sort((a, b) => a.name.localeCompare(b.name));
+                if (standardResult.status === 'fulfilled') {
+                    standardResult.value.forEach(doc => {
+                        const data = doc.data();
+                        campaigns.push({
+                            id: doc.id,
+                            name: data.name || data.campaignName || doc.id,
+                            status: data.status || '',
+                            phoneOnly: false
+                        });
+                    });
+                } else {
+                    console.error('❌ Error loading campaigns:', standardResult.reason);
+                }
+
+                if (phoneResult.status === 'fulfilled') {
+                    phoneResult.value.forEach(doc => {
+                        const data = doc.data();
+                        campaigns.push({
+                            id: doc.id,
+                            name: data.campaignName || data.name || doc.id,
+                            status: data.status || '',
+                            phoneOnly: true
+                        });
+                    });
+                } else {
+                    console.error('❌ Error loading phone campaigns:', phoneResult.reason);
+                }
+
+                if (campaigns.length === 0) {
+                    campaignSelect.innerHTML = '<option value="">Failed to load campaigns</option>';
+                    return;
+                }
+
+                // Active campaigns first, then alphabetical
+                campaigns.sort((a, b) => {
+                    const aActive = a.status === 'active' ? 0 : 1;
+                    const bActive = b.status === 'active' ? 0 : 1;
+                    return aActive - bActive || a.name.localeCompare(b.name);
+                });
 
                 campaignSelect.innerHTML = '<option value="">Select Campaign...</option>';
                 campaigns.forEach(campaign => {
+                    const labels = [];
+                    if (campaign.phoneOnly) labels.push('phone');
+                    if (campaign.status && campaign.status !== 'active') labels.push(campaign.status);
+
                     const option = document.createElement('option');
                     option.value = campaign.id;
-                    option.textContent = campaign.inactive ? `${campaign.name} (inactive)` : campaign.name;
+                    option.textContent = labels.length
+                        ? `${campaign.name} (${labels.join(', ')})`
+                        : campaign.name;
                     campaignSelect.appendChild(option);
                 });
 
-                console.log(`✅ Loaded ${campaigns.length} campaigns`);
+                const phoneCount = campaigns.filter(c => c.phoneOnly).length;
+                console.log(`✅ Loaded ${campaigns.length} campaigns (${phoneCount} phone-only)`);
             } catch (error) {
                 console.error('❌ Error loading campaigns:', error);
                 campaignSelect.innerHTML = '<option value="">Failed to load campaigns</option>';
@@ -848,12 +891,19 @@
 
             let html = '';
             unassignedCalls.slice(0, 20).forEach((call, index) => {
+                // Phone-only campaigns store the organization in orgName and have no contact
+                const contactLabel = call.contactName || call.orgName || 'Unknown';
+                const companyLabel = call.companyName
+                    || call.company
+                    || (call.contactName ? call.orgName : '')
+                    || 'No company';
+
                 html += `
                     <div class="call-card">
                         <div class="call-card-header">
                             <div>
-                                <div class="call-contact-name">${index + 1}. ${escapeHtml(call.contactName || 'Unknown')}</div>
-                                <div class="call-company">${escapeHtml(call.companyName || call.company || 'No company')}</div>
+                                <div class="call-contact-name">${index + 1}. ${escapeHtml(contactLabel)}</div>
+                                <div class="call-company">${escapeHtml(companyLabel)}</div>
                             </div>
                         </div>
                         <div class="call-phone">
@@ -904,7 +954,7 @@
 
                                     return `
                                         <div class="agent-call-item">
-                                            <span>${escapeHtml(call.contactName || 'Unknown')}</span>
+                                            <span>${escapeHtml(call.contactName || call.orgName || 'Unknown')}</span>
                                             <span class="expiry-time">${timeLeft === null ? 'No expiry' : timeLeft + 'm left'}</span>
                                         </div>
                                     `;
