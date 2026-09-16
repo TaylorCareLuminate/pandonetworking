@@ -5887,48 +5887,60 @@ Should this contact be deleted or kept? Return JSON with "action" and "reason".`
                     document.getElementById('totalCountSmart').textContent = uniqueOrgs.length + ' orgs';
                     document.getElementById('scannedCountSmart').textContent = '0 orgs';
 
-                    // Evaluate each unique organization
+                    // Evaluate each unique organization — parallel worker pool instead of one-at-a-time
+                    // (was: sequential loop with a 200ms sleep between every org, which made this the
+                    // slowest step by far; matches the ORG_FILTER_CONCURRENCY=3 pattern used elsewhere
+                    // in the app against this same /api/smart-cleanup-organization endpoint)
                     const orgEvaluations = new Map();
-                    for (let i = 0; i < uniqueOrgs.length; i++) {
-                        const org = uniqueOrgs[i];
-                        
-                        try {
-                            const orgRequestBody = {
-                                organization: org,
-                                criteria: orgCriteria,
-                                model: orgFilterModel
-                            };
-                            if (orgPointedTemplates.length > 0) {
-                                orgRequestBody.pointedSearchQueries = orgPointedTemplates.map(
-                                    q => q.replace(/\[organization name\]/gi, org)
-                                );
+                    const ORG_FILTER_CONCURRENCY = 3;
+                    let orgFilterCompleted = 0;
+                    let orgFilterQueueIdx = 0;
+
+                    async function evalOrgFilterWorker() {
+                        while (orgFilterQueueIdx < uniqueOrgs.length) {
+                            const org = uniqueOrgs[orgFilterQueueIdx++];
+
+                            try {
+                                const orgRequestBody = {
+                                    organization: org,
+                                    criteria: orgCriteria,
+                                    model: orgFilterModel
+                                };
+                                if (orgPointedTemplates.length > 0) {
+                                    orgRequestBody.pointedSearchQueries = orgPointedTemplates.map(
+                                        q => q.replace(/\[organization name\]/gi, org)
+                                    );
+                                }
+                                const response = await fetch('https://railwayclemail-production.up.railway.app/api/smart-cleanup-organization', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify(orgRequestBody)
+                                });
+
+                                if (!response.ok) throw new Error(`API error: ${response.statusText}`);
+
+                                const result = await response.json();
+                                orgEvaluations.set(org, result.shouldKeep);
+
+                                console.log(`   ${result.shouldKeep ? '✅ Keep' : '❌ Remove'}: ${org} - ${result.organizationType || 'Unknown type'}`);
+
+                            } catch (error) {
+                                console.error(`   ⚠️ Error evaluating org "${org}":`, error);
+                                orgEvaluations.set(org, true); // Default to keep on error
                             }
-                            const response = await fetch('https://railwayclemail-production.up.railway.app/api/smart-cleanup-organization', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify(orgRequestBody)
-                            });
 
-                            if (!response.ok) throw new Error(`API error: ${response.statusText}`);
-
-                            const result = await response.json();
-                            orgEvaluations.set(org, result.shouldKeep);
-                            
-                            console.log(`   ${result.shouldKeep ? '✅ Keep' : '❌ Remove'}: ${org} - ${result.organizationType || 'Unknown type'}`);
-
-                        } catch (error) {
-                            console.error(`   ⚠️ Error evaluating org "${org}":`, error);
-                            orgEvaluations.set(org, true); // Default to keep on error
+                            // Update progress - show orgs evaluated
+                            orgFilterCompleted++;
+                            document.getElementById('scannedCountSmart').textContent = orgFilterCompleted + ' orgs';
+                            const orgProgress = 50 + Math.round((orgFilterCompleted / uniqueOrgs.length) * 50);
+                            document.getElementById('progressPercentSmart').textContent = orgProgress;
+                            document.getElementById('progressBarSmart').style.width = orgProgress + '%';
                         }
-
-                        // Update progress - show orgs evaluated
-                        document.getElementById('scannedCountSmart').textContent = (i + 1) + ' orgs';
-                        const orgProgress = 50 + Math.round(((i + 1) / uniqueOrgs.length) * 50);
-                        document.getElementById('progressPercentSmart').textContent = orgProgress;
-                        document.getElementById('progressBarSmart').style.width = orgProgress + '%';
-
-                        await new Promise(resolve => setTimeout(resolve, 200));
                     }
+
+                    await Promise.all(
+                        Array.from({ length: Math.min(ORG_FILTER_CONCURRENCY, uniqueOrgs.length) }, () => evalOrgFilterWorker())
+                    );
 
                     // Filter contacts based on organization evaluations
                     contactsToProcess.forEach(contact => {
@@ -6190,37 +6202,51 @@ Should this contact be deleted or kept? Return JSON with "action" and "reason".`
                     document.getElementById('totalCountSmart').textContent = uniqueOrgsForCombined.length + ' orgs';
                     document.getElementById('scannedCountSmart').textContent = '0 orgs';
 
+                    // Parallel worker pool instead of one-at-a-time (was: sequential loop with a
+                    // 150ms sleep between every org, which made org research the slowest part of
+                    // the Combined filter); matches the ORG_FILTER_CONCURRENCY=3 pattern used
+                    // elsewhere in the app against this same /api/smart-cleanup-organization endpoint
                     const orgTypeMap = new Map(); // org name → organizationType string from Brave/Gemini
-                    for (let i = 0; i < uniqueOrgsForCombined.length; i++) {
-                        const org = uniqueOrgsForCombined[i];
-                        try {
-                            const res = await fetch('https://railwayclemail-production.up.railway.app/api/smart-cleanup-organization', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    organization: org,
-                                    criteria: 'Identify and briefly describe the organization type (e.g. hospital, insurance broker, staffing firm, consulting company, etc.). This will be used for a combined title+org evaluation.',
-                                    model: smartCleanupModel
-                                })
-                            });
-                            if (res.ok) {
-                                const data = await res.json();
-                                orgTypeMap.set(org, data.organizationType || org);
-                                console.log(`   🔍 ${org} → ${data.organizationType || 'unknown type'}`);
-                            } else {
+                    const ORG_RESEARCH_CONCURRENCY = 3;
+                    let orgResearchCompleted = 0;
+                    let orgResearchQueueIdx = 0;
+
+                    async function researchOrgWorker() {
+                        while (orgResearchQueueIdx < uniqueOrgsForCombined.length) {
+                            const org = uniqueOrgsForCombined[orgResearchQueueIdx++];
+                            try {
+                                const res = await fetch('https://railwayclemail-production.up.railway.app/api/smart-cleanup-organization', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        organization: org,
+                                        criteria: 'Identify and briefly describe the organization type (e.g. hospital, insurance broker, staffing firm, consulting company, etc.). This will be used for a combined title+org evaluation.',
+                                        model: smartCleanupModel
+                                    })
+                                });
+                                if (res.ok) {
+                                    const data = await res.json();
+                                    orgTypeMap.set(org, data.organizationType || org);
+                                    console.log(`   🔍 ${org} → ${data.organizationType || 'unknown type'}`);
+                                } else {
+                                    orgTypeMap.set(org, org);
+                                }
+                            } catch (e) {
+                                console.warn(`   ⚠️ Org lookup failed for "${org}": ${e.message}`);
                                 orgTypeMap.set(org, org);
                             }
-                        } catch (e) {
-                            console.warn(`   ⚠️ Org lookup failed for "${org}": ${e.message}`);
-                            orgTypeMap.set(org, org);
-                        }
 
-                        document.getElementById('scannedCountSmart').textContent = (i + 1) + ' orgs';
-                        const orgResearchProgress = Math.round(((i + 1) / uniqueOrgsForCombined.length) * 50);
-                        document.getElementById('progressPercentSmart').textContent = orgResearchProgress;
-                        document.getElementById('progressBarSmart').style.width = orgResearchProgress + '%';
-                        await new Promise(resolve => setTimeout(resolve, 150));
+                            orgResearchCompleted++;
+                            document.getElementById('scannedCountSmart').textContent = orgResearchCompleted + ' orgs';
+                            const orgResearchProgress = Math.round((orgResearchCompleted / uniqueOrgsForCombined.length) * 50);
+                            document.getElementById('progressPercentSmart').textContent = orgResearchProgress;
+                            document.getElementById('progressBarSmart').style.width = orgResearchProgress + '%';
+                        }
                     }
+
+                    await Promise.all(
+                        Array.from({ length: Math.min(ORG_RESEARCH_CONCURRENCY, uniqueOrgsForCombined.length) }, () => researchOrgWorker())
+                    );
 
                     // Phase 2 — evaluate every unique (org, title) pair via Maverick (50–100%)
                     document.getElementById('smartProgressText').textContent = 'EVALUATING TITLE + ORG COMBINATIONS (AI)...';
