@@ -456,6 +456,7 @@
             <i class="fas fa-inbox"></i>
             <div>No contacts to show. Load contacts or adjust filters.</div>
         </div>
+        <div id="paginationRow" style="display:flex;align-items:center;gap:.4rem;justify-content:flex-end;margin-top:.75rem"></div>
     </div>
 
 </div>
@@ -690,6 +691,30 @@
     // ── Load contacts ─────────────────────────────────────────────────────────
     const BATCH_SIZE = 20000;
 
+    // prospect_contacts is a shared collection written to by many other tools
+    // (message generation, enrichment, CRM sync, campaign tracking, etc.) and can carry
+    // plenty of fields this page never looks at. Spreading the ENTIRE doc (`...data`)
+    // into allContacts held every one of those extra fields in memory for every
+    // contact — on a large collection that's a major contributor to the tab running
+    // out of memory on "Load All Enriched". Projecting down to just the fields this
+    // page actually reads (see the grep-able list below) cuts the per-contact memory
+    // footprint with zero behavior change.
+    function projectContactFields(data) {
+        return {
+            firstName:            data.firstName            || '',
+            lastName:             data.lastName             || '',
+            company:              data.company              || '',
+            searchedOrganization: data.searchedOrganization || '',
+            experience:           data.experience           || '',
+            title:                data.title                || '',
+            jobTitle:             data.jobTitle              || '',
+            headline:             data.headline              || '',
+            about:                data.about                 || '',
+            linkedInUrl:          data.linkedInUrl           || '',
+            linkedin_url:         data.linkedin_url          || '',
+        };
+    }
+
     function processDocIntoContact(d) {
         const data = d.data();
         const proposed      = computeProposed(data);
@@ -697,7 +722,7 @@
         const retiredCheck  = checkRetired(data);
         return {
             id:             d.id,
-            ...data,
+            ...projectContactFields(data),
             _proposed:      proposed.value,
             _source:        proposed.source,
             _status:        proposed.value !== currentCompany ? 'changed' : 'no-change',
@@ -1033,6 +1058,7 @@
 
     // ── Filters ───────────────────────────────────────────────────────────────
     window.applyFilters = function() {
+        currentPage = 0;
         renderTable();
     };
 
@@ -1045,6 +1071,17 @@
         renderTable();
     }
 
+    // Rendering EVERY matching contact's row HTML into the DOM in one shot is the other
+    // big contributor to "Load All Enriched" running the tab out of memory — a large
+    // collection can mean hundreds of thousands of <tr> elements (each with several
+    // nested nodes: inputs, buttons, badges), and building/parsing that much HTML at
+    // once is exactly the kind of thing that crashes a renderer process. Paginating the
+    // DOM keeps it small no matter how many contacts are loaded — "Apply All Proposed
+    // Changes" / "Delete All Retired" still operate over the full allContacts array,
+    // not just whatever page happens to be visible.
+    const PAGE_SIZE = 300;
+    let currentPage = 0;
+
     function renderTable() {
         const onlyChanges  = document.getElementById('chkOnlyChanges')?.checked;
         const hideSkipped  = document.getElementById('chkHideSkipped')?.checked;
@@ -1053,7 +1090,7 @@
         const sourceFilter = document.getElementById('sourceFilter')?.value || '';
 
         filteredIds = [];
-        const rows = [];
+        const filtered = [];
 
         for (const c of allContacts) {
             if (hideSkipped && c._status === 'skipped')   continue;
@@ -1067,13 +1104,45 @@
                 if (!name.includes(search)) continue;
             }
             filteredIds.push(c.id);
-            rows.push(buildRow(c));
+            filtered.push(c);
         }
 
-        document.getElementById('tableBody').innerHTML = rows.join('');
-        document.getElementById('emptyState').style.display = rows.length === 0 ? 'block' : 'none';
-        document.getElementById('filterCount').textContent  = `Showing ${rows.length} of ${allContacts.length}`;
+        const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+        if (currentPage >= totalPages) currentPage = totalPages - 1;
+        if (currentPage < 0) currentPage = 0;
+        const start = currentPage * PAGE_SIZE;
+        const pageItems = filtered.slice(start, start + PAGE_SIZE);
+
+        document.getElementById('tableBody').innerHTML = pageItems.map(buildRow).join('');
+        document.getElementById('emptyState').style.display = filtered.length === 0 ? 'block' : 'none';
+
+        const rangeStart = filtered.length === 0 ? 0 : start + 1;
+        const rangeEnd    = Math.min(start + pageItems.length, filtered.length);
+        document.getElementById('filterCount').textContent =
+            `Showing ${rangeStart.toLocaleString()}\u2013${rangeEnd.toLocaleString()} of ${filtered.length.toLocaleString()} (${allContacts.length.toLocaleString()} loaded)`;
+
+        renderPagination(totalPages);
     }
+
+    function renderPagination(totalPages) {
+        const el = document.getElementById('paginationRow');
+        if (!el) return;
+        if (totalPages <= 1) { el.innerHTML = ''; return; }
+        const atStart = currentPage === 0;
+        const atEnd   = currentPage >= totalPages - 1;
+        el.innerHTML = `
+            <button class="btn-gray btn-sm" onclick="goToPage(0)" ${atStart ? 'disabled' : ''}><i class="fas fa-angles-left"></i></button>
+            <button class="btn-gray btn-sm" onclick="goToPage(${currentPage - 1})" ${atStart ? 'disabled' : ''}><i class="fas fa-angle-left"></i> Prev</button>
+            <span style="font-size:.82rem;color:var(--gray-600);padding:0 .5rem">Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()}</span>
+            <button class="btn-gray btn-sm" onclick="goToPage(${currentPage + 1})" ${atEnd ? 'disabled' : ''}>Next <i class="fas fa-angle-right"></i></button>
+            <button class="btn-gray btn-sm" onclick="goToPage(${totalPages - 1})" ${atEnd ? 'disabled' : ''}><i class="fas fa-angles-right"></i></button>
+        `;
+    }
+
+    window.goToPage = function(n) {
+        currentPage = n;
+        renderTable();
+    };
 
     function renderRow(contact) {
         const existing = document.getElementById(`row-${contact.id}`);
