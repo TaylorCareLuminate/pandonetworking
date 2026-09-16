@@ -8101,6 +8101,53 @@
             });
         }
 
+        // Fetches job titles from prospect_contacts for the given BDR email(s), keyed by
+        // normalized LinkedIn URL (primary) and by "first|last" name (fallback for contacts
+        // with no URL) — used to enrich the per-contact Excel export with a Title column.
+        // Scoped/chunked the same way the rest of the dashboard's Firestore reads are
+        // (30 emails/query cap, one query per possible owner-email field, Promise.all).
+        async function loadContactTitlesForExport(bdrEmails) {
+            const normalizeUrl = url => (url || '').toLowerCase().trim()
+                .replace(/\/$/, '').replace(/^https?:\/\//i, '').replace(/^www\./i, '');
+            const urlToTitle  = new Map();
+            const nameToTitle = new Map();
+            const emails = [...new Set((bdrEmails || []).filter(Boolean).map(e => e.toLowerCase()))];
+            if (!emails.length) return { urlToTitle, nameToTitle };
+            try {
+                const fields = ['account_email', 'userEmail', 'bdrEmail', 'linkedInAccountEmail', 'accountEmail'];
+                const fetches = [];
+                for (const field of fields) {
+                    for (let i = 0; i < emails.length; i += 30) {
+                        const chunk = emails.slice(i, i + 30);
+                        fetches.push(getDocs(query(collection(db, 'prospect_contacts'), where(field, 'in', chunk))).catch(() => null));
+                    }
+                }
+                const results = await Promise.all(fetches);
+                const seen = new Set();
+                results.forEach(snap => {
+                    if (!snap) return;
+                    snap.docs.forEach(d => {
+                        if (seen.has(d.id)) return;
+                        seen.add(d.id);
+                        const data = d.data();
+                        const title = (data.title || '').trim();
+                        if (!title) return;
+                        const url = normalizeUrl(data.linkedInUrl || data.linkedin_url || data.profileUrl || '');
+                        if (url && !urlToTitle.has(url)) urlToTitle.set(url, title);
+                        const first = (data.firstName || data.first_name || '').toLowerCase().trim();
+                        const last  = (data.lastName  || data.last_name  || '').toLowerCase().trim();
+                        if (first && last) {
+                            const key = `${first}|${last}`;
+                            if (!nameToTitle.has(key)) nameToTitle.set(key, title);
+                        }
+                    });
+                });
+            } catch (e) {
+                console.warn('Could not load contact titles for export:', e);
+            }
+            return { urlToTitle, nameToTitle };
+        }
+
         window.exportOrgDashboardExcel = async function() {
             const allRows = window.dashAllOrgsForFilter || [];
             if (!allRows.length) {
@@ -8119,6 +8166,13 @@
                 const exportRows   = _getFilteredRows(); // respects active category/hypothesis filters
                 const trackedRows  = exportRows.filter(r => !r.isOtherRow);
                 const isFiltered   = dashActiveCategoryFilter !== 'all' || !!dashActiveHypothesisFilter;
+
+                // BDR email(s) to scope the job-title lookup to (Team View → every BDR who
+                // tracks at least one exported org; My BDR → just the current BDR).
+                const titleLookupEmails = isTeamView
+                    ? [...new Set(trackedRows.flatMap(r => r.bdrEmails || []))]
+                    : (currentBDR ? [currentBDR] : []);
+                const { urlToTitle, nameToTitle } = await loadContactTitlesForExport(titleLookupEmails);
 
                 const bdrSelect  = document.getElementById('bdrFilter');
                 const bdrLabel   = bdrSelect?.selectedOptions?.[0]?.textContent?.trim() || currentBDR || '';
@@ -8321,6 +8375,7 @@
                     { header: 'Organization',                  key: 'org',      width: 30 },
                     { header: 'Category',                      key: 'category', width: 18 },
                     { header: 'Contact Name',                  key: 'name',     width: 26 },
+                    { header: 'Title',                         key: 'jobTitle', width: 26 },
                     { header: 'LinkedIn',                      key: 'linkedin', width: 12 },
                     { header: 'Contact Company',               key: 'company',  width: 24 },
                     { header: 'Sent',                          key: 'sent',     width: 10 },
@@ -8390,6 +8445,7 @@
                                 peopleMap.set(pKey, {
                                     name: nameOk ? c.name : (c.name || ''),
                                     url: c.rawUrl || c.url || '',
+                                    normUrl: c.url || '',
                                     company: c.company || '',
                                     stages: {},
                                 });
@@ -8398,6 +8454,7 @@
                             if (!p.company && c.company) p.company = c.company;
                             if ((!p.name || p.name === '(Unknown)') && nameOk) p.name = c.name;
                             if (!p.url && (c.rawUrl || c.url)) p.url = c.rawUrl || c.url;
+                            if (!p.normUrl && c.url) p.normUrl = c.url;
                             p.stages[stageKey] = true;
                         });
                     });
@@ -8409,10 +8466,19 @@
 
                     people.forEach(p => {
                         const isTarget = !!(targetNameLc && p.name && p.name.toLowerCase().trim() === targetNameLc);
+                        let title = p.normUrl ? urlToTitle.get(p.normUrl) : undefined;
+                        if (!title) {
+                            const nameParts = (p.name || '').trim().split(/\s+/);
+                            if (nameParts.length >= 2) {
+                                const nameKey = `${nameParts[0].toLowerCase()}|${nameParts.slice(1).join(' ').toLowerCase()}`;
+                                title = nameToTitle.get(nameKey);
+                            }
+                        }
                         const rowObj = {
                             org: orgLabel,
                             category: r.category || '',
                             name: p.name || '(Unknown)',
+                            jobTitle: title || '',
                             company: p.company || '',
                             sent:     p.stages.sent    ? 'Yes' : '',
                             pending:  p.stages.pending ? 'Yes' : '',
