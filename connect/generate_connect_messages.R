@@ -25,11 +25,32 @@ library(httr)
 #   Returns a data frame of results (title, url, description, age, source),
 #   or NULL on failure.
 #   Requires BRAVE_API_KEY to be set as an environment variable.
+#
+#   max_age_days restricts results to content published/modified within the
+#   last N days. Brave's `freshness` param only natively supports pd (1 day),
+#   pw (7 days), pm (31 days), py (365 days), or an explicit custom range in
+#   "YYYY-MM-DDtoYYYY-MM-DD" format — so for any other window (e.g. 60 days /
+#   2 months) we build that custom range dynamically off Sys.Date().
+#   (NOTE: this previously used the literal string "pm6", which is NOT a
+#   valid Brave freshness value and was silently ignored by the API, i.e.
+#   results were NOT actually being restricted to any particular window.)
 # ---------------------------------------------------------------------------
-brave_search <- function(query, count = 10, max_retries = 2) {
+brave_search <- function(query, count = 10, max_retries = 2, max_age_days = 60) {
   api_key <- Sys.getenv("BRAVE_API_KEY")
   if (nchar(api_key) == 0) {
     stop("BRAVE_API_KEY environment variable not set. Set it with: Sys.setenv(BRAVE_API_KEY='your-key')")
+  }
+
+  freshness_value <- if (max_age_days == 1) {
+    "pd"
+  } else if (max_age_days == 7) {
+    "pw"
+  } else if (max_age_days == 31) {
+    "pm"
+  } else if (max_age_days == 365) {
+    "py"
+  } else {
+    paste0(format(Sys.Date() - max_age_days, "%Y-%m-%d"), "to", format(Sys.Date(), "%Y-%m-%d"))
   }
 
   for (attempt in seq_len(max_retries)) {
@@ -44,7 +65,7 @@ brave_search <- function(query, count = 10, max_retries = 2) {
         query = list(
           q                = query,
           count            = count,
-          freshness        = "pm6",    # past 6 months
+          freshness        = freshness_value,  # restricts to last max_age_days days
           text_decorations = "false",
           search_lang      = "en",
           country          = "us"
@@ -74,6 +95,54 @@ brave_search <- function(query, count = 10, max_retries = 2) {
     if (attempt < max_retries) Sys.sleep(2)
   }
   return(NULL)
+}
+
+# ---------------------------------------------------------------------------
+# parse_brave_age_to_days
+#   Brave's `age` field is a human-readable string describing how old the
+#   page/article is (e.g. "3 days ago", "2 weeks ago", "4 months ago",
+#   "1 year ago"). This parses that into an approximate number of days so we
+#   can enforce a hard client-side cutoff as a safety net on top of the
+#   `freshness` request param (defense in depth in case the API's own
+#   freshness detection is imprecise for a given page).
+#   Returns NA_real_ if the string can't be parsed (age unknown).
+# ---------------------------------------------------------------------------
+parse_brave_age_to_days <- function(age_str) {
+  if (is.na(age_str) || nchar(trimws(age_str)) == 0) return(NA_real_)
+
+  age_str <- tolower(trimws(age_str))
+
+  # "Xh", "Xd" style or "X hours/days/weeks/months/years ago"
+  m <- regmatches(age_str, regexec("([0-9]+)\\s*(hour|hr|h|day|d|week|wk|w|month|mo|year|yr|y)", age_str))[[1]]
+
+  if (length(m) < 3) {
+    # Handle bare "yesterday" / "today"
+    if (grepl("today", age_str)) return(0)
+    if (grepl("yesterday", age_str)) return(1)
+    return(NA_real_)
+  }
+
+  qty  <- suppressWarnings(as.numeric(m[2]))
+  unit <- m[3]
+
+  if (is.na(qty)) return(NA_real_)
+
+  days_per_unit <- if (grepl("^h", unit)) {
+    1 / 24
+  } else if (grepl("^(d)", unit)) {
+    1
+  } else if (grepl("^w", unit)) {
+    7
+  } else if (grepl("^mo", unit)) {
+    30.44
+  } else if (grepl("^y", unit)) {
+    365.25
+  } else {
+    NA_real_
+  }
+
+  if (is.na(days_per_unit)) return(NA_real_)
+  qty * days_per_unit
 }
 
 # ---------------------------------------------------------------------------
@@ -1033,6 +1102,62 @@ for (bdr_idx in 1:nrow(selected_bdrs)) {
     }
   }
   
+  # STEP 3: Add HeyReach inbox conversations (BOTH directions — messages the
+  # contact sent us AND messages we sent them) to activity history.
+  # `all_messages` (heyreach_inbox) is the actual LinkedIn conversation
+  # thread per contact, so its `lastMessageAt` reflects whichever side sent
+  # the most recent message. Without this, a contact who recently replied to
+  # us (or whom we messaged outside the connect_queue/connect_activity flow)
+  # would NOT be excluded from new message generation — which was the bug
+  # (e.g. Daniel Goldberg: back-and-forth messages ~20 days prior still got
+  # a new generated message because only our own connect-flow actions were
+  # tracked here, not the actual inbox conversation).
+  cat("  - Adding HeyReach inbox conversations (both directions) to activity history...\n")
+  if (nrow(all_messages) > 0) {
+    bdr_messages <- all_messages[
+      !is.na(all_messages$accountEmail) & (
+        tolower(all_messages$accountEmail) == tolower(bdr_auth_email) |
+        tolower(all_messages$accountEmail) == tolower(bdr_linkedin_email)
+      ),
+    ]
+    
+    cat(sprintf("    Found %d total inbox conversations for this BDR\n", nrow(bdr_messages)))
+    
+    if (nrow(bdr_messages) > 0) {
+      lead_url_col <- if ("leadProfileUrl" %in% names(bdr_messages)) {
+        "leadProfileUrl"
+      } else if ("profileUrl" %in% names(bdr_messages)) {
+        "profileUrl"
+      } else {
+        NULL
+      }
+      
+      if (is.null(lead_url_col)) {
+        cat("    Warning: Could not find leadProfileUrl column on heyreach_inbox — skipping\n")
+      } else {
+        for (i in 1:nrow(bdr_messages)) {
+          msg <- bdr_messages[i, ]
+          contact_url <- normalize_activity_url(msg[[lead_url_col]])
+          
+          if (length(contact_url) == 0 || is.na(contact_url) || contact_url == "") next
+          if (is.null(msg$lastMessagePOSIX) || is.na(msg$lastMessagePOSIX)) next
+          
+          if (is.null(contact_activity_history[[contact_url]])) {
+            contact_activity_history[[contact_url]] <- list()
+          }
+          
+          contact_activity_history[[contact_url]][[length(contact_activity_history[[contact_url]]) + 1]] <- list(
+            type = paste0("inbox_message_", msg$lastMessageSender %||% "unknown"),  # who sent the last message
+            date = msg$lastMessagePOSIX,
+            status = "conversation"
+          )
+        }
+      }
+    }
+  } else {
+    cat("    No heyreach_inbox conversations loaded\n")
+  }
+  
   cat(sprintf("    Built activity history for %d unique contacts\n", length(contact_activity_history)))
   cat(sprintf("    Total activity records: %d\n", sum(sapply(contact_activity_history, length))))
   
@@ -1752,11 +1877,20 @@ Return ONLY the shortened message (under 200 characters). No quotes, no explanat
 
         cat(sprintf("  Searching news for: %s (%d contacts)...\n", org_name, nrow(org_contacts)))
 
-        # Search Brave for recent exciting news about this organization
+        # News must not be tied to anything older than this (2 months)
+        news_max_age_days <- 60
+
+        # Search Brave for recent exciting news about this organization.
+        # freshness is restricted server-side to the last `news_max_age_days`
+        # days (see brave_search()'s max_age_days param).
+        current_year  <- format(Sys.Date(), "%Y")
+        previous_year <- as.character(as.numeric(current_year) - 1)
         brave_results <- tryCatch(
           brave_search(
-            paste0(org_name, " healthcare achievement award accreditation expansion partnership 2024 2025"),
-            count = 10
+            paste0(org_name, " healthcare achievement award accreditation expansion partnership ",
+                   previous_year, " ", current_year),
+            count = 10,
+            max_age_days = news_max_age_days
           ),
           error = function(e) {
             cat(sprintf("    Brave search error: %s\n", e$message))
@@ -1766,6 +1900,24 @@ Return ONLY the shortened message (under 200 characters). No quotes, no explanat
 
         if (is.null(brave_results) || nrow(brave_results) == 0) {
           cat(sprintf("    No search results for %s — skipping\n", org_name))
+          next
+        }
+
+        # Safety net: even with server-side freshness filtering, double-check
+        # each result's reported age and drop anything clearly older than
+        # `news_max_age_days`. Results with an unparseable/missing age are
+        # kept (freshness param already restricted the request), but any
+        # article that explicitly reports itself as too old is dropped.
+        parsed_age_days <- sapply(brave_results$age, parse_brave_age_to_days)
+        too_old <- !is.na(parsed_age_days) & parsed_age_days > news_max_age_days
+        if (any(too_old)) {
+          cat(sprintf("    Dropping %d result(s) older than %d days (news freshness cutoff)\n",
+                      sum(too_old), news_max_age_days))
+          brave_results <- brave_results[!too_old, , drop = FALSE]
+        }
+
+        if (nrow(brave_results) == 0) {
+          cat(sprintf("    No results within %d days for %s — skipping\n", news_max_age_days, org_name))
           next
         }
 
