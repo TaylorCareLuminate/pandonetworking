@@ -5892,15 +5892,22 @@
         // doc. linkedInAccountId, however, is always tied 1:1 to a linkedin_accounts doc whose
         // bdrEmail field IS the canonical email, so it resolves cases the alias map misses.
         let _liAccountIdToCanonicalEmail = null;
+        // Lazily-loaded map of canonical primary email (lowercased) -> BDR display name,
+        // sourced from bdr_leaders. Used so the alert cards and filter dropdown always
+        // refer to the same person the same way, instead of the card showing whatever
+        // raw (often alias) email happened to be on that particular alert.
+        let _liCanonicalEmailToName = null;
         async function _liGetAliasToCanonicalEmailMap() {
             if (_liAliasToCanonicalEmail) return _liAliasToCanonicalEmail;
             if (_liAliasToCanonicalEmailPromise) return _liAliasToCanonicalEmailPromise;
             _liAliasToCanonicalEmailPromise = (async () => {
                 const aliasMap = new Map();
                 const accountIdMap = new Map();
+                const nameMap = new Map();
                 if (!window.clemailFirestore || !window.clemailDb) {
                     _liAliasToCanonicalEmail = aliasMap;
                     _liAccountIdToCanonicalEmail = accountIdMap;
+                    _liCanonicalEmailToName = nameMap;
                     return aliasMap;
                 }
                 try {
@@ -5918,6 +5925,7 @@
                         if (data.linkedInEmail) {
                             aliasMap.set(data.linkedInEmail.toLowerCase(), primary);
                         }
+                        nameMap.set(primary, data.name || primary);
                     });
                     assocSnap.forEach(d => {
                         const data = d.data();
@@ -5932,6 +5940,24 @@
                             accountIdMap.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
                         }
                     });
+                    // bdr_leaders.heyreachAccountId (when set) is the definitive,
+                    // manually-curated account-ownership record — maintained in Manage
+                    // BDRs — so it OVERRIDES whatever linkedin_accounts derived above.
+                    // linkedin_accounts entries can be stale or shared across more than
+                    // one BDR (e.g. a reassigned LinkedIn seat), which silently resolved
+                    // an alert to the WRONG canonical email — the same
+                    // cross-BDR-contamination problem the HR Queue Report works around
+                    // with its identical "bdrLeaderAccountId" override. That wrong
+                    // resolution is why the BDR filter dropdown (built from
+                    // bdr_leaders.primaryEmail) wouldn't match some alerts, and why
+                    // per-team-member scoping hid or leaked alerts inconsistently.
+                    bdrSnap.forEach(d => {
+                        const data = d.data();
+                        const primary = (data.primaryEmail || '').toLowerCase();
+                        if (primary && data.heyreachAccountId) {
+                            accountIdMap.set(String(data.heyreachAccountId), primary);
+                        }
+                    });
                 } catch (err) {
                     console.warn('[LiAlerts] Could not load alias->canonical email map:', err.message);
                 }
@@ -5941,6 +5967,7 @@
                 // instead of racing the fetch again.
                 _liAliasToCanonicalEmail = aliasMap;
                 _liAccountIdToCanonicalEmail = accountIdMap;
+                _liCanonicalEmailToName = nameMap;
                 return aliasMap;
             })();
             try {
@@ -6060,7 +6087,7 @@
                         <div class="li-alert-badges">
                             <span class="li-alert-badge new-badge"><i class="fas fa-circle" style="font-size:0.5em;"></i> New Reply</span>
                             ${lastMsgAgo ? `<span class="li-alert-badge"><i class="fas fa-clock"></i> ${_liEscHtml(lastMsgAgo)}</span>` : ''}
-                            ${alert.bdrEmail ? `<span class="li-alert-badge"><i class="fas fa-user-tie"></i> ${_liEscHtml(alert.bdrEmail)}</span>` : ''}
+                            ${alert.bdrEmail ? `<span class="li-alert-badge" title="${_liEscHtml(_liCanonicalEmailForCard(id, alert.bdrEmail))}"><i class="fas fa-user-tie"></i> ${_liEscHtml(_liBdrDisplayNameForCard(id, alert.bdrEmail))}</span>` : ''}
                             ${detectedAgo ? `<span class="li-alert-badge"><i class="fas fa-bell"></i> Detected ${_liEscHtml(detectedAgo)}</span>` : ''}
                             ${isWrongContact ? `<span class="li-alert-badge wrong-contact-badge"><i class="fas fa-exclamation-triangle"></i> Wrong Contact</span>` : ''}
                             ${fuNow && fuNow.date ? _liBuildFollowUpBadgeHtml(id, fuNow) : `<span id="li-fu-badge-${_liEscHtml(id)}"></span>`}
@@ -6431,6 +6458,18 @@
         function _liCanonicalEmailForCard(id, fallbackEmail) {
             const resolved = id ? _liAlertCanonicalEmail.get(id) : null;
             return resolved || (fallbackEmail || '').toLowerCase();
+        }
+
+        // Display label for a card's BDR badge: the same person should always show the
+        // same way, whether the card's raw bdrEmail happens to be their canonical work
+        // email or one of their LinkedIn-login aliases. Prefers the BDR's name (from
+        // bdr_leaders), then falls back to the resolved canonical email, then finally
+        // the raw bdrEmail if resolution didn't find anything (e.g. an unrecognized
+        // LinkedIn seat with no bdr_leaders record yet).
+        function _liBdrDisplayNameForCard(id, fallbackEmail) {
+            const canonical = _liCanonicalEmailForCard(id, fallbackEmail);
+            const name = _liCanonicalEmailToName && _liCanonicalEmailToName.get(canonical);
+            return name || canonical || fallbackEmail || '';
         }
 
         function _liBuildInsertToolbar(id, bdrEmail) {
@@ -8082,7 +8121,7 @@
                     ${alertItem.leadPosition ? `<div class="li-dismissed-result-title">${_liEscHtml(alertItem.leadPosition)}</div>` : ''}
                     ${alertItem.leadCompany ? `<div class="li-dismissed-result-company"><i class="fas fa-building"></i> ${_liEscHtml(alertItem.leadCompany)}</div>` : ''}
                     <div class="li-dismissed-result-badges">
-                        ${alertItem.bdrEmail ? `<span class="li-alert-badge"><i class="fas fa-user-tie"></i> ${_liEscHtml(alertItem.bdrEmail)}</span>` : ''}
+                        ${alertItem.bdrEmail ? `<span class="li-alert-badge" title="${_liEscHtml(_liCanonicalEmailForCard(id, alertItem.bdrEmail))}"><i class="fas fa-user-tie"></i> ${_liEscHtml(_liBdrDisplayNameForCard(id, alertItem.bdrEmail))}</span>` : ''}
                         ${dismissedAgo ? `<span class="li-alert-badge"><i class="fas fa-check"></i> Dismissed ${_liEscHtml(dismissedAgo)}${alertItem.dismissedBy ? ' by ' + _liEscHtml(alertItem.dismissedBy) : ''}</span>` : ''}
                     </div>
                 </div>

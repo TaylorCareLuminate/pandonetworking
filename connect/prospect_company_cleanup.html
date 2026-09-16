@@ -469,7 +469,7 @@
 
     const {
         collection, doc, getDocs, updateDoc, deleteDoc, writeBatch,
-        query, where, orderBy, limit: fsLimit, startAfter
+        query, where, orderBy, limit: fsLimit, startAfter, getAllDocs
     } = window.clemailFirestoreModule;
 
     // Firestore (and the CLEmail wrapper) allow up to 500 operations per batch commit.
@@ -689,8 +689,6 @@
     }
 
     // ── Load contacts ─────────────────────────────────────────────────────────
-    const BATCH_SIZE = 20000;
-
     // prospect_contacts is a shared collection written to by many other tools
     // (message generation, enrichment, CRM sync, campaign tracking, etc.) and can carry
     // plenty of fields this page never looks at. Spreading the ENTIRE doc (`...data`)
@@ -758,47 +756,39 @@
                 }
 
             } else {
-                // ── Batched pagination for "Load All" ──────────────────────────
-                let lastDoc   = null;
-                let batchNum  = 0;
-                let done      = false;
+                // ── "Load All" — use the wrapper's built-in getAllDocs() pagination ──
+                // The old approach called .get() with an EXPLICIT limit(BATCH_SIZE=20000)
+                // on every page. That's the one thing that defeats the wrapper's own
+                // smart auto-pagination (see clemail-firestore-wrapper.js's Query.get():
+                // any query WITHOUT a limit() already paginates internally in small
+                // 5,000-doc pages with automatic retries) — an explicit limit forces a
+                // single Railway request to fetch + JSON-serialize 20,000 full documents
+                // in one shot, which is exactly what times out at 60s when the backend is
+                // cold or the page is slow. getAllDocs() gives us the same complete
+                // result set via smaller pages, each retried a few times on its own if it
+                // hits a transient timeout, instead of the whole load failing outright.
+                setProgress(0, 'Loading enriched contacts…');
+                let batchesSeen = 0;
+                const result = await getAllDocs(
+                    query(collection(emailDB, 'prospect_contacts'), where('experience', '>', ''), orderBy('experience')),
+                    {
+                        pageSize:   2000,     // small enough per-page to comfortably finish inside the 60s timeout
+                        maxRetries: 3,        // transient timeouts / cold-starts get retried instead of failing the whole load
+                        maxDocs:    2000000,  // safety cap far above any realistic prospect_contacts size
+                        onPage: (total) => {
+                            batchesSeen++;
+                            // Indeterminate-style: pulse between 10-90 while loading. Contacts are
+                            // only turned into row data (processDocIntoContact) once every page has
+                            // been fetched below, so there's nothing to render incrementally here —
+                            // just keep the progress text moving.
+                            setProgress(10 + ((batchesSeen % 8) * 10), `Loaded ${total.toLocaleString()} contacts so far…`);
+                        }
+                    }
+                );
 
-                while (!done) {
-                    batchNum++;
-                    const constraints = [
-                        where('experience', '>', ''),
-                        orderBy('experience'),
-                        fsLimit(BATCH_SIZE),
-                    ];
-                    if (lastDoc) constraints.push(startAfter(lastDoc));
+                result.docs.forEach(d => allContacts.push(processDocIntoContact(d)));
 
-                    setProgress(
-                        // Indeterminate-style: pulse between 10-90 while loading
-                        10 + ((batchNum % 8) * 10),
-                        `Batch ${batchNum} — loaded ${allContacts.length.toLocaleString()} contacts so far…`
-                    );
-
-                    const snap = await getDocs(
-                        query(collection(emailDB, 'prospect_contacts'), ...constraints)
-                    );
-
-                    if (snap.empty) break;
-
-                    const docs = snap.docs;
-                    docs.forEach(d => allContacts.push(processDocIntoContact(d)));
-                    lastDoc = docs[docs.length - 1];
-
-                    // Fewer than a full batch → no more pages
-                    if (docs.length < BATCH_SIZE) done = true;
-
-                    // Update stats live after each batch so the user sees progress
-                    updateStats();
-
-                    // Yield to the browser between batches
-                    await new Promise(r => setTimeout(r, 30));
-                }
-
-                setProgress(100, `Done — loaded ${allContacts.length.toLocaleString()} contacts in ${batchNum} batch${batchNum !== 1 ? 'es' : ''}.`);
+                setProgress(100, `Done — loaded ${allContacts.length.toLocaleString()} contacts.`);
                 showToast(`Loaded all ${allContacts.length.toLocaleString()} enriched contacts.`, 'success');
             }
 
