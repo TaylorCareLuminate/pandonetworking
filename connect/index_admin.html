@@ -7428,6 +7428,51 @@
             }
         }
 
+        // `_liLoadAlerts()` above is a passive read of whatever Railway already has
+        // cached in Firestore — it never asks Railway to actually go look for new
+        // messages. That's fine for a card that doesn't exist yet (Railway's own
+        // internal ~30-min cron eventually creates it), but a lead who replies
+        // AGAIN to a conversation that already has a card showing relies on that
+        // same cron noticing the follow-up and updating the existing alert doc —
+        // which is slower and less reliable than the active rescan the "Scan Now"
+        // button triggers (that endpoint explicitly reports both `newAlerts` and
+        // `updated` — i.e. existing alerts that picked up new messages).
+        //
+        // So the regular auto-poll below now does the same thing "Scan Now" does
+        // (quietly, without the button's alert() popups) before re-reading the
+        // list, so a reply landing on an already-visible card gets folded into
+        // that same card on the very next 5-min cycle instead of waiting on
+        // Railway's own slower/independent cron.
+        async function _liTriggerScan(windowMinutes) {
+            try {
+                const resp = await fetch(`${RAILWAY_BASE}/api/linkedin-reply-alerts/scan`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ windowMinutes })
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                const newCount = data?.results?.newAlerts || 0;
+                const updatedCount = data?.results?.updated || 0;
+                if (newCount || updatedCount) {
+                    console.log(`[LiAlerts] Auto-scan found ${newCount} new + ${updatedCount} updated alert(s)`);
+                }
+            } catch (err) {
+                // Non-fatal — _liLoadAlerts() still runs right after and will show
+                // whatever Railway already had cached from its own last scan.
+                console.warn('[LiAlerts] Auto-scan failed (falling back to cached alerts):', err.message);
+            }
+        }
+
+        // Full regular-update-cycle tick: actively rescan, then reload the list.
+        // The window is a few multiples of the poll interval so a slow tick, a
+        // missed cycle (e.g. laptop asleep), or Railway lag can't let a reply
+        // slip through without ever being scanned for.
+        async function _liPollCycle() {
+            await _liTriggerScan(20);
+            await _liLoadAlerts();
+        }
+
         // Filters a deduped alert list down to whichever BDRs the current viewer
         // is allowed to see (only their own assigned BDRs — unassigned/other
         // people's BDRs are excluded), or returns everything untouched if
@@ -8828,13 +8873,18 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         };
         // ─────────────────────────────────────────────────────────────────────
 
-        // Initial load
-        _liLoadAlerts();
+        // Initial load — actively rescans (see _liPollCycle/_liTriggerScan above)
+        // so the very first render already reflects any reply that came in
+        // since Railway's own last independent scan, not just its stale cache.
+        _liPollCycle();
         populateLiFilterBdrs();
 
-        // Poll every 5 minutes — aligns with Railway's 30-min scan cycle
-        // so new alerts appear within 5 minutes of Railway completing its scan
-        _liPollTimer = setInterval(_liLoadAlerts, LI_POLL_INTERVAL_MS);
+        // Poll every 5 minutes. Each tick triggers a fresh Railway rescan (not
+        // just a cache read) so replies to conversations that already have a
+        // card on screen get picked up and that card updates in place, instead
+        // of only ever refreshing once Railway's own slower internal cron
+        // happens to get around to it.
+        _liPollTimer = setInterval(_liPollCycle, LI_POLL_INTERVAL_MS);
         // ─────────────────────────────────────────────────────────────────────
 
         function normalizeHrQueueUrl(url) {
