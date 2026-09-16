@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en" class="protection-hide">
 <head>
-    <!-- CACHE BUSTER v3.1.0 - Call Assignment Dashboard - Queue monitoring + manual assignment -->
+    <!-- CACHE BUSTER v3.3.0 - Call Assignment Dashboard - Full roster, phone campaigns, resilient panels -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Call Assignment Dashboard - CRM</title>
@@ -513,8 +513,15 @@
                     Call Assignment Dashboard
                 </h1>
                 <p>Real-time monitoring of call queue, assignments, and filters</p>
+                <p style="margin-top: 0.5rem; font-size: 0.875rem;">
+                    This page hands individual calls to agents. To give an agent access to a
+                    campaign, use <a href="../admin/team-members.html" style="color: white; text-decoration: underline;">Agent Campaign Access</a>.
+                </p>
             </div>
             <div class="header-actions">
+                <button class="btn btn-secondary" onclick="window.location.href='../admin/team-members.html'">
+                    <i class="fas fa-user-check"></i> Agent Campaign Access
+                </button>
                 <button class="btn btn-secondary" onclick="window.location.href='call_manager.html'">
                     <i class="fas fa-phone-alt"></i> Call Manager
                 </button>
@@ -563,7 +570,7 @@
                     <label class="filter-label">Number of calls</label>
                     <input type="number" id="assignCount" class="assign-input" value="10" min="1" max="500">
                 </div>
-                <button class="btn btn-assign" id="assignBtn" onclick="assignCalls()" disabled>
+                <button class="btn btn-assign" id="assignBtn" onclick="assignCalls()">
                     <i class="fas fa-paper-plane"></i> Assign Calls
                 </button>
             </div>
@@ -631,7 +638,7 @@
     <script src="../js/clemail-firestore-wrapper.js"></script>
 
     <script>
-        console.log('📊 Call Assignment Dashboard v3.1.0 loading...');
+        console.log('📊 Call Assignment Dashboard v3.3.0 loading...');
 
         let selectedCampaign = null;
         let autoRefreshInterval = null;
@@ -639,6 +646,8 @@
 
         // Cap on how many activity docs we pull per campaign refresh
         const MAX_ACTIVITY_FETCH = 1000;
+        // Cap on the one-time scan that counts open calls per campaign
+        const CAMPAIGN_SCAN_LIMIT = 5000;
         // Firestore allows 500 writes per batch; stay under it
         const BATCH_SIZE = 450;
 
@@ -659,7 +668,8 @@
 
             console.log('✅ Dashboard initialized for user:', currentUserEmail || 'unknown');
 
-            await Promise.all([loadCampaigns(), loadAgents()]);
+            const openCounts = await loadOpenCallCounts();
+            await Promise.all([loadCampaigns(openCounts), loadAgents()]);
 
             // Start auto-refresh if enabled
             if (document.getElementById('autoRefreshToggle').checked) {
@@ -669,39 +679,146 @@
             console.error('❌ Dashboard initialization failed:', error);
         });
 
-        // Load campaigns
-        async function loadCampaigns() {
+        // Count open calls per campaign in one pass. This drives the call counts in the
+        // campaign dropdown, and surfaces campaignIds whose campaign doc is missing —
+        // those calls exist but can never be reached by picking a campaign.
+        async function loadOpenCallCounts() {
+            try {
+                console.log('🔎 Scanning open calls by campaign...');
+
+                const db = window.clemailDb;
+                const { collection, query, where, limit, getDocs } = window.clemailFirestore;
+
+                const snapshot = await getDocs(query(
+                    collection(db, 'phone_activities'),
+                    where('status', 'in', ['pending', 'scheduled']),
+                    limit(CAMPAIGN_SCAN_LIMIT)
+                ));
+
+                const counts = {};
+                const now = new Date();
+
+                snapshot.forEach(doc => {
+                    const data = doc.data();
+                    const id = data.campaignId || '(no campaignId)';
+                    if (!counts[id]) counts[id] = { open: 0, assignable: 0 };
+                    counts[id].open++;
+                    if (isAssignable(data, now)) counts[id].assignable++;
+                });
+
+                const summary = Object.entries(counts)
+                    .sort((a, b) => b[1].open - a[1].open)
+                    .map(([id, c]) => `${id}: ${c.open} open / ${c.assignable} free`);
+                console.log(`✅ Scanned ${snapshot.size} open calls across ${summary.length} campaigns`);
+                console.log('   ' + (summary.join('\n   ') || 'none'));
+
+                return counts;
+            } catch (error) {
+                console.error('❌ Error scanning open calls:', error);
+                return {};
+            }
+        }
+
+        // Load campaigns from both sources.
+        // Phone-only campaigns (created in phone_campaigns.html) live in their own
+        // collection and never appear in `campaigns`, so calls scheduled against them
+        // are invisible unless both collections are merged — same approach as call_manager.html.
+        async function loadCampaigns(openCounts = {}) {
             const campaignSelect = document.getElementById('campaignSelect');
 
             try {
                 console.log('📋 Loading campaigns...');
                 
                 const db = window.clemailDb;
-                const campaignsSnapshot = await window.clemailFirestore.getDocs(
-                    window.clemailFirestore.collection(db, 'campaigns')
-                );
+                const { collection, getDocs } = window.clemailFirestore;
+
+                const [standardResult, phoneResult] = await Promise.allSettled([
+                    getDocs(collection(db, 'campaigns')),
+                    getDocs(collection(db, 'phone_campaigns'))
+                ]);
 
                 const campaigns = [];
-                campaignsSnapshot.forEach(doc => {
-                    const data = doc.data();
+
+                if (standardResult.status === 'fulfilled') {
+                    standardResult.value.forEach(doc => {
+                        const data = doc.data();
+                        campaigns.push({
+                            id: doc.id,
+                            name: data.name || data.campaignName || doc.id,
+                            status: data.status || '',
+                            phoneOnly: false
+                        });
+                    });
+                } else {
+                    console.error('❌ Error loading campaigns:', standardResult.reason);
+                }
+
+                if (phoneResult.status === 'fulfilled') {
+                    phoneResult.value.forEach(doc => {
+                        const data = doc.data();
+                        campaigns.push({
+                            id: doc.id,
+                            name: data.campaignName || data.name || doc.id,
+                            status: data.status || '',
+                            phoneOnly: true
+                        });
+                    });
+                } else {
+                    console.error('❌ Error loading phone campaigns:', phoneResult.reason);
+                }
+
+                // Calls can reference a campaign that no longer exists in either
+                // collection; list those too so their calls stay reachable
+                const knownIds = new Set(campaigns.map(c => c.id));
+                Object.keys(openCounts).forEach(id => {
+                    if (knownIds.has(id)) return;
                     campaigns.push({
-                        id: doc.id,
-                        name: data.name || data.campaignName || doc.id,
-                        inactive: data.status && data.status !== 'active'
+                        id,
+                        name: `⚠️ Unnamed campaign (${id})`,
+                        status: '',
+                        phoneOnly: false
                     });
                 });
 
-                campaigns.sort((a, b) => a.name.localeCompare(b.name));
+                if (campaigns.length === 0) {
+                    campaignSelect.innerHTML = '<option value="">Failed to load campaigns</option>';
+                    return;
+                }
+
+                // Campaigns with calls waiting come first, biggest queue at the top,
+                // then active campaigns, then everything else alphabetically
+                campaigns.sort((a, b) => {
+                    const aOpen = openCounts[a.id]?.open || 0;
+                    const bOpen = openCounts[b.id]?.open || 0;
+                    if (aOpen !== bOpen) return bOpen - aOpen;
+
+                    const aActive = a.status === 'active' ? 0 : 1;
+                    const bActive = b.status === 'active' ? 0 : 1;
+                    return aActive - bActive || a.name.localeCompare(b.name);
+                });
 
                 campaignSelect.innerHTML = '<option value="">Select Campaign...</option>';
                 campaigns.forEach(campaign => {
+                    const labels = [];
+                    if (campaign.phoneOnly) labels.push('phone');
+                    if (campaign.status && campaign.status !== 'active') labels.push(campaign.status);
+
+                    const counts = openCounts[campaign.id];
+                    const callSummary = counts
+                        ? ` — ${counts.open} open, ${counts.assignable} free`
+                        : ' — no open calls';
+
                     const option = document.createElement('option');
                     option.value = campaign.id;
-                    option.textContent = campaign.inactive ? `${campaign.name} (inactive)` : campaign.name;
+                    option.textContent = (labels.length
+                        ? `${campaign.name} (${labels.join(', ')})`
+                        : campaign.name) + callSummary;
                     campaignSelect.appendChild(option);
                 });
 
-                console.log(`✅ Loaded ${campaigns.length} campaigns`);
+                const phoneCount = campaigns.filter(c => c.phoneOnly).length;
+                const withCalls = campaigns.filter(c => openCounts[c.id]).length;
+                console.log(`✅ Loaded ${campaigns.length} campaigns (${phoneCount} phone-only, ${withCalls} with open calls)`);
             } catch (error) {
                 console.error('❌ Error loading campaigns:', error);
                 campaignSelect.innerHTML = '<option value="">Failed to load campaigns</option>';
@@ -720,32 +837,50 @@
                     window.clemailFirestore.collection(db, 'teamMembers')
                 );
 
+                // Every team member with an email is listed, whatever their status —
+                // an admin assigning calls needs the full roster, not just 'active'
                 const agents = [];
+                const skipped = [];
+
                 teamSnapshot.forEach(doc => {
                     const data = doc.data();
-                    const email = data.email || data.emailLower || data.userEmail;
-                    if (!email) return;
-                    if (data.status === 'inactive') return;
+                    const email = data.email
+                        || data.emailLower
+                        || data.userEmail
+                        || data.workEmail
+                        || (doc.id.includes('@') ? doc.id : null);
+
+                    if (!email) {
+                        skipped.push({ id: doc.id, fields: Object.keys(data).join(', ') });
+                        return;
+                    }
 
                     const name = [data.firstName, data.lastName].filter(Boolean).join(' ')
                         || data.displayName
                         || data.name
                         || email;
 
-                    agents.push({ email, name });
+                    agents.push({ email, name, status: data.status || '' });
                 });
 
-                agents.sort((a, b) => a.name.localeCompare(b.name));
+                // Active first, then training, then everyone else; alphabetical within each
+                const statusRank = status => (status === 'active' ? 0 : status === 'training' ? 1 : 2);
+                agents.sort((a, b) => statusRank(a.status) - statusRank(b.status) || a.name.localeCompare(b.name));
 
                 agentSelect.innerHTML = '<option value="">Select Agent...</option>';
                 agents.forEach(agent => {
                     const option = document.createElement('option');
                     option.value = agent.email;
-                    option.textContent = `${agent.name} (${agent.email})`;
+                    option.textContent = agent.status && agent.status !== 'active'
+                        ? `${agent.name} — ${agent.status} (${agent.email})`
+                        : `${agent.name} (${agent.email})`;
                     agentSelect.appendChild(option);
                 });
 
-                console.log(`✅ Loaded ${agents.length} team members`);
+                console.log(`✅ Loaded ${agents.length} of ${teamSnapshot.size} team members`);
+                if (skipped.length > 0) {
+                    console.warn(`⚠️ ${skipped.length} teamMembers docs have no email field and were skipped:`, skipped);
+                }
             } catch (error) {
                 console.error('❌ Error loading team members:', error);
                 agentSelect.innerHTML = '<option value="">Failed to load agents</option>';
@@ -755,7 +890,6 @@
         // Load dashboard data
         async function loadDashboard() {
             selectedCampaign = document.getElementById('campaignSelect').value;
-            document.getElementById('assignBtn').disabled = !selectedCampaign;
 
             if (!selectedCampaign) {
                 console.log('⚠️ No campaign selected');
@@ -848,12 +982,19 @@
 
             let html = '';
             unassignedCalls.slice(0, 20).forEach((call, index) => {
+                // Phone-only campaigns store the organization in orgName and have no contact
+                const contactLabel = call.contactName || call.orgName || 'Unknown';
+                const companyLabel = call.companyName
+                    || call.company
+                    || (call.contactName ? call.orgName : '')
+                    || 'No company';
+
                 html += `
                     <div class="call-card">
                         <div class="call-card-header">
                             <div>
-                                <div class="call-contact-name">${index + 1}. ${escapeHtml(call.contactName || 'Unknown')}</div>
-                                <div class="call-company">${escapeHtml(call.companyName || call.company || 'No company')}</div>
+                                <div class="call-contact-name">${index + 1}. ${escapeHtml(contactLabel)}</div>
+                                <div class="call-company">${escapeHtml(companyLabel)}</div>
                             </div>
                         </div>
                         <div class="call-phone">
@@ -904,7 +1045,7 @@
 
                                     return `
                                         <div class="agent-call-item">
-                                            <span>${escapeHtml(call.contactName || 'Unknown')}</span>
+                                            <span>${escapeHtml(call.contactName || call.orgName || 'Unknown')}</span>
                                             <span class="expiry-time">${timeLeft === null ? 'No expiry' : timeLeft + 'm left'}</span>
                                         </div>
                                     `;
@@ -951,11 +1092,16 @@
 
             try {
                 const now = new Date();
-                const openCalls = await fetchOpenCalls(Math.min(requested * 3, MAX_ACTIVITY_FETCH));
+                // Scan the same window the queue shows. Fetching only a small multiple of
+                // the requested count can come back fully assigned while free calls sit
+                // further down the campaign.
+                const openCalls = await fetchOpenCalls(MAX_ACTIVITY_FETCH);
                 const available = openCalls.filter(call => isAssignable(call, now));
 
+                console.log(`🔎 ${openCalls.length} open calls scanned, ${available.length} assignable`);
+
                 if (available.length === 0) {
-                    showAssignStatus('No unassigned calls available in this campaign. Release some assignments first.', 'error');
+                    showAssignStatus(`No unassigned calls available in this campaign (scanned ${openCalls.length} open calls). Release some assignments first.`, 'error');
                     return;
                 }
 
@@ -997,7 +1143,7 @@
                 console.error('❌ Error assigning calls:', error);
                 showAssignStatus(`Failed to assign calls: ${error.message}`, 'error');
             } finally {
-                assignBtn.disabled = !selectedCampaign;
+                assignBtn.disabled = false;
             }
         }
 
@@ -1060,45 +1206,55 @@
 
             try {
                 const db = window.clemailDb;
+                const { collection, query, where, limit, getDocs } = window.clemailFirestore;
                 const now = new Date();
                 const cooldownThreshold = new Date(now.getTime() - (72 * 60 * 60 * 1000)); // 72 hours ago
 
-                // Get completed calls, then keep the ones inside the 72-hour cooldown.
-                // completedAt is stored as an ISO string on some docs and a Timestamp on
-                // others, so the window is applied client-side rather than in the query.
-                const completedSnapshot = await window.clemailFirestore.getDocs(
-                    window.clemailFirestore.query(
-                        window.clemailFirestore.collection(db, 'phone_activities'),
-                        window.clemailFirestore.where('campaignId', '==', selectedCampaign),
-                        window.clemailFirestore.where('status', '==', 'completed'),
-                        window.clemailFirestore.limit(MAX_ACTIVITY_FETCH)
-                    )
-                );
+                // Each count is fetched independently so one failing query (a missing
+                // collection, a missing index) leaves the other reasons readable
+                const [completedResult, declinedResult, flaggedResult] = await Promise.allSettled([
+                    getDocs(query(
+                        collection(db, 'phone_activities'),
+                        where('campaignId', '==', selectedCampaign),
+                        where('status', '==', 'completed'),
+                        limit(MAX_ACTIVITY_FETCH)
+                    )),
+                    getDocs(query(
+                        collection(db, 'phone_activities'),
+                        where('campaignId', '==', selectedCampaign),
+                        where('outcome', 'in', ['declined', 'not-interested', 'do-not-call']),
+                        limit(MAX_ACTIVITY_FETCH)
+                    )),
+                    getDocs(query(
+                        collection(db, 'flaggedContacts'),
+                        where('campaignId', '==', selectedCampaign),
+                        limit(MAX_ACTIVITY_FETCH)
+                    ))
+                ]);
 
+                // completedAt is an ISO string on some docs and a Timestamp on others,
+                // so the 72-hour window is applied here rather than in the query
                 let inCooldownCount = 0;
-                completedSnapshot.forEach(doc => {
-                    const completedAt = window.toDate(doc.data().completedAt);
-                    if (completedAt && completedAt >= cooldownThreshold) inCooldownCount++;
-                });
+                if (completedResult.status === 'fulfilled') {
+                    completedResult.value.forEach(doc => {
+                        const completedAt = window.toDate(doc.data().completedAt);
+                        if (completedAt && completedAt >= cooldownThreshold) inCooldownCount++;
+                    });
+                } else {
+                    console.warn('⚠️ Cooldown count unavailable:', completedResult.reason);
+                }
 
-                // Get declined contacts
-                const declinedSnapshot = await window.clemailFirestore.getDocs(
-                    window.clemailFirestore.query(
-                        window.clemailFirestore.collection(db, 'phone_activities'),
-                        window.clemailFirestore.where('campaignId', '==', selectedCampaign),
-                        window.clemailFirestore.where('outcome', 'in', ['declined', 'not-interested', 'do-not-call'])
-                    )
-                );
+                const declinedCount = declinedResult.status === 'fulfilled' ? declinedResult.value.size : 0;
+                if (declinedResult.status === 'rejected') {
+                    console.warn('⚠️ Declined count unavailable:', declinedResult.reason);
+                }
 
-                // Get flagged contacts
-                const flaggedSnapshot = await window.clemailFirestore.getDocs(
-                    window.clemailFirestore.query(
-                        window.clemailFirestore.collection(db, 'flaggedContacts'),
-                        window.clemailFirestore.where('campaignId', '==', selectedCampaign)
-                    )
-                );
+                const flaggedCount = flaggedResult.status === 'fulfilled' ? flaggedResult.value.size : 0;
+                if (flaggedResult.status === 'rejected') {
+                    console.warn('⚠️ Flagged count unavailable:', flaggedResult.reason);
+                }
 
-                const totalFiltered = inCooldownCount + declinedSnapshot.size + flaggedSnapshot.size;
+                const totalFiltered = inCooldownCount + declinedCount + flaggedCount;
                 document.getElementById('filteredCount').textContent = totalFiltered;
 
                 let html = '';
@@ -1114,24 +1270,24 @@
                     `;
                 }
 
-                if (declinedSnapshot.size > 0) {
+                if (declinedCount > 0) {
                     html += `
                         <div class="filter-reason declined">
                             <div class="filter-reason-title">
                                 <i class="fas fa-ban"></i> Declined
                             </div>
-                            <div class="filter-reason-count">${declinedSnapshot.size} contacts filtered</div>
+                            <div class="filter-reason-count">${declinedCount} contacts filtered</div>
                         </div>
                     `;
                 }
 
-                if (flaggedSnapshot.size > 0) {
+                if (flaggedCount > 0) {
                     html += `
                         <div class="filter-reason flagged">
                             <div class="filter-reason-title">
                                 <i class="fas fa-flag"></i> Flagged for Review
                             </div>
-                            <div class="filter-reason-count">${flaggedSnapshot.size} contacts filtered</div>
+                            <div class="filter-reason-count">${flaggedCount} contacts filtered</div>
                         </div>
                     `;
                 }
