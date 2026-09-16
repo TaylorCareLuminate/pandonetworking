@@ -3650,6 +3650,7 @@
                                 <div class="form-help" style="margin-top: 4px;">Given each contact's title/company/location and every variation's AI Selection Criteria, this model picks one variation per contact. Falls back to Random Selection Share % if the AI call fails or doesn't confidently match any variation.</div>
                             </div>
                         </div>
+                        <div id="fullAiCreationInstrStatus" style="display:none; margin-top:10px; padding:10px 12px; border-radius:8px; font-size:13px; line-height:1.45;"></div>
                     </div>
 
                     <div class="form-help" style="margin-top: 4px;">Use <strong>Import Batch</strong> to target a specific scan/import run, <strong>Move Batch</strong> for contacts moved from another BDR, or <strong>Group Batch</strong> for custom groups created in Prospect Cleanup. Multiple filters apply simultaneously.</div>
@@ -15123,30 +15124,72 @@
                 if (badge)    badge.textContent = '';
                 fullAiSelectedGroupCreationInstructions = '';
                 populateFullAiVariationSelect(null);
+                updateFullAiCreationInstructionsStatus(null);
                 return;
             }
 
             editor.style.display = 'block';
 
-            // Fast path: use the already-loaded groups cache (populated by "Load Groups")
+            // Start from the "Load Groups" cache, then overlay a live Firestore read so
+            // Message Creation Instructions saved after the cache was built still show up.
             let group = _allHypothesisGroupsCache?.find(g => g.id === groupId) || null;
-            if (!group) {
-                try {
-                    const snap = await getDoc(doc(db, 'hypothesis_groups', groupId));
-                    if (snap.exists || snap.exists?.()) group = { id: groupId, ...snap.data() };
-                } catch (e) {
-                    console.warn('populateFullAiOpusPromptEditor fetch error:', e.message);
+            try {
+                const snap = await getDoc(doc(db, 'hypothesis_groups', groupId));
+                if (snapExists(snap)) {
+                    group = { id: groupId, ...(group || {}), ...snap.data() };
+                    const cached = _allHypothesisGroupsCache?.find(g => g.id === groupId);
+                    if (cached) {
+                        cached.messageCreationInstructions = group.messageCreationInstructions || '';
+                        cached.targetContactInstructions = group.targetContactInstructions || '';
+                        cached.messageReviewInstructions = group.messageReviewInstructions || '';
+                    }
                 }
+            } catch (e) {
+                console.warn('populateFullAiOpusPromptEditor fetch error:', e.message);
             }
             if (targetTA) targetTA.value = group?.targetContactInstructions || '';
             if (msgTA)    msgTA.value    = group?.messageReviewInstructions || '';
             if (badge)    badge.textContent = group?.name ? `— ${group.name}` : '';
             fullAiSelectedGroupCreationInstructions = group?.messageCreationInstructions || '';
+            updateFullAiCreationInstructionsStatus(group);
 
             populateFullAiBdrOpusInstructions(document.getElementById('fullAiBdrSelect')?.value || '');
             populateFullAiVariationSelect(group);
         }
         window.populateFullAiOpusPromptEditor = populateFullAiOpusPromptEditor;
+
+        // Message Creation Instructions are a separate field from Target Contact / Message
+        // Review Instructions. Those review fields can look "complete" on this page while
+        // creation guidance is still empty — which is exactly what the Generate confirm
+        // is checking. Surface the status here so that isn't a surprise.
+        function updateFullAiCreationInstructionsStatus(group) {
+            const el = document.getElementById('fullAiCreationInstrStatus');
+            if (!el) return;
+            if (!group) {
+                el.style.display = 'none';
+                el.innerHTML = '';
+                return;
+            }
+            const creation = (group.messageCreationInstructions || '').trim();
+            const hasReview = !!(group.targetContactInstructions || '').trim() || !!(group.messageReviewInstructions || '').trim();
+            el.style.display = 'block';
+            if (creation) {
+                const preview = creation.length > 220 ? creation.slice(0, 220).trim() + '…' : creation;
+                el.style.background = '#ecfdf5';
+                el.style.border = '1px solid #6ee7b7';
+                el.style.color = '#065f46';
+                el.innerHTML = `<strong><i class="fas fa-check-circle"></i> Message Creation Instructions are set</strong> for ${escHtml(group.name || 'this group')} — Full AI Generate will use them when writing new messages.<div style="margin-top:6px; color:#047857; white-space:pre-wrap;">${escHtml(preview)}</div>`;
+            } else {
+                el.style.background = '#fffbeb';
+                el.style.border = '1px solid #fcd34d';
+                el.style.color = '#92400e';
+                el.innerHTML = `<strong><i class="fas fa-exclamation-triangle"></i> No Message Creation Instructions</strong> on ${escHtml(group.name || 'this group')}` +
+                    (hasReview
+                        ? ' — Target Contact / Message Review Instructions are filled in (those grade messages after they are written). Creation Instructions are a different field and tell Full AI <em>how to write</em> the first draft.'
+                        : '.') +
+                    ` Add them on <a href="analysis_results.html" target="_blank">Connect Success Analysis</a> (“AI Instructions for This Hypothesis Group”) or <a href="hypothesis_target_rules.html" target="_blank">Hypothesis Target Rules</a>. You can still generate using built-in prompts.`;
+            }
+        }
 
         // Populates the Message Variation dropdown from the selected group's messageVariations[]
         // (defined on Connect Hypothesis Documentation's Message Variations tab). Shown whenever
@@ -17728,10 +17771,14 @@
             }
 
             // Message Creation Instructions (company-wide default and/or per-Hypothesis-Group)
-            // steer how Railway writes new messages for Full AI Generate. Neither is editable
-            // on this page — both live on Connect Success Analysis — so just warn if both are
-            // empty rather than silently generating with no extra creation guidance.
+            // steer how Railway writes new messages for Full AI Generate. Re-read from
+            // Firestore here so a stale "Load Groups" cache can't false-warn after the
+            // field was saved on Connect Success Analysis / Hypothesis Target Rules.
+            // Target Contact / Message Review Instructions do NOT count — those are
+            // Opus Review prompts, not first-draft writing guidance.
             let globalCreationInstr = '';
+            let groupCreationInstr = '';
+            const selectedGroupIdForCreation = document.getElementById('fullAiHypothesisSelect')?.value || '';
             try {
                 const globalInstrSnap = await getDoc(doc(db, 'connect_settings', 'global_ai_instructions'));
                 if (snapExists(globalInstrSnap)) {
@@ -17740,9 +17787,26 @@
             } catch (e) {
                 console.warn('Failed to check global Message Creation Instructions:', e.message);
             }
-            const groupCreationInstr = (fullAiSelectedGroupCreationInstructions || '').trim();
+            if (selectedGroupIdForCreation) {
+                try {
+                    const groupInstrSnap = await getDoc(doc(db, 'hypothesis_groups', selectedGroupIdForCreation));
+                    if (snapExists(groupInstrSnap)) {
+                        const gData = groupInstrSnap.data() || {};
+                        groupCreationInstr = (gData.messageCreationInstructions || '').trim();
+                        fullAiSelectedGroupCreationInstructions = groupCreationInstr;
+                        const cachedGroup = _allHypothesisGroupsCache?.find(g => g.id === selectedGroupIdForCreation);
+                        if (cachedGroup) cachedGroup.messageCreationInstructions = groupCreationInstr;
+                        updateFullAiCreationInstructionsStatus({ id: selectedGroupIdForCreation, ...gData });
+                    }
+                } catch (e) {
+                    console.warn('Failed to check group Message Creation Instructions:', e.message);
+                    groupCreationInstr = (fullAiSelectedGroupCreationInstructions || '').trim();
+                }
+            } else {
+                groupCreationInstr = (fullAiSelectedGroupCreationInstructions || '').trim();
+            }
             if (!globalCreationInstr && !groupCreationInstr) {
-                const proceedAnyway = confirm('No Message Creation Instructions are set — neither company-wide nor for the selected Hypothesis Group.\n\nFull AI Generate will still work using its built-in prompts, but won\'t get any extra creation guidance. Manage these on Connect Success Analysis ("Global AI Instructions" / "AI Instructions for This Hypothesis Group").\n\nContinue anyway?');
+                const proceedAnyway = confirm('No Message Creation Instructions are set — neither company-wide nor for the selected Hypothesis Group.\n\nThis is a different field from Target Contact / Message Review Instructions (those grade messages after they are written). Full AI Generate will still work using its built-in prompts, but won\'t get extra writing guidance. Manage these on Connect Success Analysis ("Global AI Instructions" / "AI Instructions for This Hypothesis Group").\n\nContinue anyway?');
                 if (!proceedAnyway) return;
             }
 
@@ -18174,7 +18238,8 @@
                             ...(scanJobId    ? { scanJobId, importBatchStartTime, importBatchEndTime } : {}),
                             ...(moveBatchId  ? { moveBatchId }  : {}),
                             ...(groupBatchId ? { groupBatchId } : {}),
-                            ...(fullAiHypUrlSet && fullAiHypUrlSet.size ? { hypothesisGroupUrls: [...fullAiHypUrlSet], hypothesisGroupName: fullAiHypGroupName, hypothesisGroupId: fullAiHypGroupId } : {})
+                            ...(fullAiHypGroupId ? { hypothesisGroupId: fullAiHypGroupId, hypothesisGroupName: fullAiHypGroupName } : {}),
+                            ...(fullAiHypUrlSet && fullAiHypUrlSet.size ? { hypothesisGroupUrls: [...fullAiHypUrlSet] } : {})
                         })
                     }, { addLog, label: 'Full AI init', retries: 1, delayMs: 5000 });
                 } catch (fetchErr) {
@@ -18192,6 +18257,12 @@
                 if (!initData.success) throw new Error(initData.error || 'Init failed');
 
                 const { bdrContext, stats } = initData;
+                // Init only used to receive hypothesisGroupId when a URL membership list
+                // was also sent. Always stamp the selected group onto bdrContext so About
+                // Me generation can load that group's Message Creation Instructions.
+                if (fullAiHypGroupId && bdrContext && !bdrContext.hypothesisGroupId) {
+                    bdrContext.hypothesisGroupId = fullAiHypGroupId;
+                }
                 let prospectList = initData.prospects || [];
                 addLog(`✅ ${stats.skipSummary}`, 'success');
 
