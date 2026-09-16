@@ -4418,7 +4418,13 @@
                 showDeleteToast('This message can\'t be edited right now — its queue record could not be identified. Please contact your account manager.', true);
                 return;
             }
-            _editMessageContext = { activityId, queueId: item.queueDocId, item };
+            // originalMessage is captured once here (not re-read from item.sentItem.message
+            // later) so the audit trail's oldMessage stays accurate even across a HeyReach
+            // retry, where item.sentItem.message has already been optimistically updated to
+            // the new text after the Firestore write succeeded. heyreachRetryNeeded lets a
+            // second "Save Changes" click (with no further text changes) still re-attempt the
+            // HeyReach push instead of being treated as a no-op and just closing the modal.
+            _editMessageContext = { activityId, queueId: item.queueDocId, item, originalMessage: item.sentItem.message || '', heyreachRetryNeeded: false };
             document.getElementById('editModalContactName').textContent = item.contact.contactName || '';
             const ta = document.getElementById('editMessageTextarea');
             ta.value = item.sentItem.message || '';
@@ -4477,8 +4483,13 @@
                 statusEl.textContent = `Message is over the ${EDIT_MESSAGE_CHAR_LIMIT}-character limit — please shorten it.`;
                 return;
             }
-            const oldMessage = (item.sentItem.message || '').trim();
-            if (newMessage === oldMessage) {
+            // Compare against the message as it was when the modal opened, NOT
+            // item.sentItem.message — that gets optimistically updated to newMessage as soon
+            // as the Firestore write succeeds, even if the HeyReach push then fails. Using it
+            // here would make a same-text "Save Changes" retry click look like a no-op and
+            // just close the modal instead of re-attempting the HeyReach push.
+            const oldMessage = (_editMessageContext.originalMessage || '').trim();
+            if (newMessage === oldMessage && !_editMessageContext.heyreachRetryNeeded) {
                 closeEditMessageModal();
                 return;
             }
@@ -4564,11 +4575,13 @@
 
             if (firebaseOk && heyreachOk) {
                 item.sentItem.message = newMessage;
+                _editMessageContext.heyreachRetryNeeded = false;
                 renderTable();
                 showDeleteToast('<i class="fas fa-check-circle"></i> Message updated.');
                 closeEditMessageModal();
             } else if (firebaseOk && !heyreachOk) {
                 item.sentItem.message = newMessage;
+                _editMessageContext.heyreachRetryNeeded = true;
                 renderTable();
                 statusEl.style.color = 'var(--danger)';
                 statusEl.textContent = `Saved, but pushing to HeyReach failed (${heyreachError || 'unknown error'}). Click "Save Changes" again to retry the push.`;

@@ -456,6 +456,7 @@
             <i class="fas fa-inbox"></i>
             <div>No contacts to show. Load contacts or adjust filters.</div>
         </div>
+        <div id="paginationRow" style="display:flex;align-items:center;gap:.4rem;justify-content:flex-end;margin-top:.75rem"></div>
     </div>
 
 </div>
@@ -468,7 +469,7 @@
 
     const {
         collection, doc, getDocs, updateDoc, deleteDoc, writeBatch,
-        query, where, orderBy, limit: fsLimit, startAfter
+        query, where, orderBy, limit: fsLimit, startAfter, getAllDocs
     } = window.clemailFirestoreModule;
 
     // Firestore (and the CLEmail wrapper) allow up to 500 operations per batch commit.
@@ -604,11 +605,50 @@
         // dateRange text contains "Present"
         const dr = exp.dateRange || exp.caption || '';
         if (/\bpresent\b|\bcurrent\b/i.test(dr)) return true;
+        // Grouped entry (2+ roles at the same company — LinkedIn nests them under one
+        // parent, see extractCompany() below): the "Present"/ongoing marker lives on the
+        // most recent nested role (child[0]), not on the parent company entry itself.
+        // Without this, a contact whose CURRENT job is a grouped entry never gets
+        // detected as "current" at all, so computeProposed() falls through to
+        // exps[0] as a plain "most recent" guess instead of a confirmed current job —
+        // and if exps[0] isn't actually the current entry, the wrong (past) employer
+        // gets proposed.
+        if (Array.isArray(exp.child) && exp.child.length > 0) {
+            return isCurrentPosition(exp.child[0]);
+        }
         return false;
     }
 
+    // Two shapes of experience entry come through here, and BOTH must be handled or
+    // the wrong text (or nothing) ends up in the company field:
+    //   • Flat/dev_fusion shape — companyName/company/organization set directly.
+    //   • Bebity-style nested shape (server-normalized dev_fusion/harvest profiles are
+    //     ALSO cached this way — see extractFreshEmployer() in full_pipeline.html /
+    //     generate_messages.html, which this mirrors):
+    //       - GROUPED entry (2+ roles at the same company): entry.title = COMPANY,
+    //         entry.child[].title = each role's job title. Reading only .subtitle (the
+    //         old behavior here) misses this entirely — a grouped entry's real company
+    //         sits in .title, not .subtitle — so the CURRENT employer for anyone whose
+    //         current job happens to be a grouped entry either came back empty or, if
+    //         .subtitle held unrelated text, showed the wrong organization.
+    //       - SINGLE-role entry: entry.title = JOB TITLE, entry.subtitle =
+    //         "Company · Full-time" — must strip the employment-type suffix or the
+    //         company field ends up polluted with "· Full-time" text, which then fails
+    //         every exact-match org lookup downstream (see computeProposed's note).
     function extractCompany(exp) {
-        return (exp.companyName || exp.company || exp.subtitle || exp.organization || '').trim();
+        if (!exp) return '';
+        if (exp.companyName)  return String(exp.companyName).trim();
+        if (exp.company)      return String(exp.company).trim();
+        if (exp.organization) return String(exp.organization).trim();
+        if (Array.isArray(exp.child) && exp.child.length > 0 && exp.child[0].title) {
+            return (exp.title || '').trim();
+        }
+        if (exp.subtitle) {
+            return String(exp.subtitle)
+                .replace(/\s*·\s*(Full-time|Part-time|Contract|Internship|Freelance|Self-employed|Seasonal|Apprenticeship).*$/i, '')
+                .trim();
+        }
+        return '';
     }
 
     function computeProposed(contact) {
@@ -649,7 +689,29 @@
     }
 
     // ── Load contacts ─────────────────────────────────────────────────────────
-    const BATCH_SIZE = 20000;
+    // prospect_contacts is a shared collection written to by many other tools
+    // (message generation, enrichment, CRM sync, campaign tracking, etc.) and can carry
+    // plenty of fields this page never looks at. Spreading the ENTIRE doc (`...data`)
+    // into allContacts held every one of those extra fields in memory for every
+    // contact — on a large collection that's a major contributor to the tab running
+    // out of memory on "Load All Enriched". Projecting down to just the fields this
+    // page actually reads (see the grep-able list below) cuts the per-contact memory
+    // footprint with zero behavior change.
+    function projectContactFields(data) {
+        return {
+            firstName:            data.firstName            || '',
+            lastName:             data.lastName             || '',
+            company:              data.company              || '',
+            searchedOrganization: data.searchedOrganization || '',
+            experience:           data.experience           || '',
+            title:                data.title                || '',
+            jobTitle:             data.jobTitle              || '',
+            headline:             data.headline              || '',
+            about:                data.about                 || '',
+            linkedInUrl:          data.linkedInUrl           || '',
+            linkedin_url:         data.linkedin_url          || '',
+        };
+    }
 
     function processDocIntoContact(d) {
         const data = d.data();
@@ -658,7 +720,7 @@
         const retiredCheck  = checkRetired(data);
         return {
             id:             d.id,
-            ...data,
+            ...projectContactFields(data),
             _proposed:      proposed.value,
             _source:        proposed.source,
             _status:        proposed.value !== currentCompany ? 'changed' : 'no-change',
@@ -694,47 +756,39 @@
                 }
 
             } else {
-                // ── Batched pagination for "Load All" ──────────────────────────
-                let lastDoc   = null;
-                let batchNum  = 0;
-                let done      = false;
+                // ── "Load All" — use the wrapper's built-in getAllDocs() pagination ──
+                // The old approach called .get() with an EXPLICIT limit(BATCH_SIZE=20000)
+                // on every page. That's the one thing that defeats the wrapper's own
+                // smart auto-pagination (see clemail-firestore-wrapper.js's Query.get():
+                // any query WITHOUT a limit() already paginates internally in small
+                // 5,000-doc pages with automatic retries) — an explicit limit forces a
+                // single Railway request to fetch + JSON-serialize 20,000 full documents
+                // in one shot, which is exactly what times out at 60s when the backend is
+                // cold or the page is slow. getAllDocs() gives us the same complete
+                // result set via smaller pages, each retried a few times on its own if it
+                // hits a transient timeout, instead of the whole load failing outright.
+                setProgress(0, 'Loading enriched contacts…');
+                let batchesSeen = 0;
+                const result = await getAllDocs(
+                    query(collection(emailDB, 'prospect_contacts'), where('experience', '>', ''), orderBy('experience')),
+                    {
+                        pageSize:   2000,     // small enough per-page to comfortably finish inside the 60s timeout
+                        maxRetries: 3,        // transient timeouts / cold-starts get retried instead of failing the whole load
+                        maxDocs:    2000000,  // safety cap far above any realistic prospect_contacts size
+                        onPage: (total) => {
+                            batchesSeen++;
+                            // Indeterminate-style: pulse between 10-90 while loading. Contacts are
+                            // only turned into row data (processDocIntoContact) once every page has
+                            // been fetched below, so there's nothing to render incrementally here —
+                            // just keep the progress text moving.
+                            setProgress(10 + ((batchesSeen % 8) * 10), `Loaded ${total.toLocaleString()} contacts so far…`);
+                        }
+                    }
+                );
 
-                while (!done) {
-                    batchNum++;
-                    const constraints = [
-                        where('experience', '>', ''),
-                        orderBy('experience'),
-                        fsLimit(BATCH_SIZE),
-                    ];
-                    if (lastDoc) constraints.push(startAfter(lastDoc));
+                result.docs.forEach(d => allContacts.push(processDocIntoContact(d)));
 
-                    setProgress(
-                        // Indeterminate-style: pulse between 10-90 while loading
-                        10 + ((batchNum % 8) * 10),
-                        `Batch ${batchNum} — loaded ${allContacts.length.toLocaleString()} contacts so far…`
-                    );
-
-                    const snap = await getDocs(
-                        query(collection(emailDB, 'prospect_contacts'), ...constraints)
-                    );
-
-                    if (snap.empty) break;
-
-                    const docs = snap.docs;
-                    docs.forEach(d => allContacts.push(processDocIntoContact(d)));
-                    lastDoc = docs[docs.length - 1];
-
-                    // Fewer than a full batch → no more pages
-                    if (docs.length < BATCH_SIZE) done = true;
-
-                    // Update stats live after each batch so the user sees progress
-                    updateStats();
-
-                    // Yield to the browser between batches
-                    await new Promise(r => setTimeout(r, 30));
-                }
-
-                setProgress(100, `Done — loaded ${allContacts.length.toLocaleString()} contacts in ${batchNum} batch${batchNum !== 1 ? 'es' : ''}.`);
+                setProgress(100, `Done — loaded ${allContacts.length.toLocaleString()} contacts.`);
                 showToast(`Loaded all ${allContacts.length.toLocaleString()} enriched contacts.`, 'success');
             }
 
@@ -994,6 +1048,7 @@
 
     // ── Filters ───────────────────────────────────────────────────────────────
     window.applyFilters = function() {
+        currentPage = 0;
         renderTable();
     };
 
@@ -1006,6 +1061,17 @@
         renderTable();
     }
 
+    // Rendering EVERY matching contact's row HTML into the DOM in one shot is the other
+    // big contributor to "Load All Enriched" running the tab out of memory — a large
+    // collection can mean hundreds of thousands of <tr> elements (each with several
+    // nested nodes: inputs, buttons, badges), and building/parsing that much HTML at
+    // once is exactly the kind of thing that crashes a renderer process. Paginating the
+    // DOM keeps it small no matter how many contacts are loaded — "Apply All Proposed
+    // Changes" / "Delete All Retired" still operate over the full allContacts array,
+    // not just whatever page happens to be visible.
+    const PAGE_SIZE = 300;
+    let currentPage = 0;
+
     function renderTable() {
         const onlyChanges  = document.getElementById('chkOnlyChanges')?.checked;
         const hideSkipped  = document.getElementById('chkHideSkipped')?.checked;
@@ -1014,7 +1080,7 @@
         const sourceFilter = document.getElementById('sourceFilter')?.value || '';
 
         filteredIds = [];
-        const rows = [];
+        const filtered = [];
 
         for (const c of allContacts) {
             if (hideSkipped && c._status === 'skipped')   continue;
@@ -1028,13 +1094,45 @@
                 if (!name.includes(search)) continue;
             }
             filteredIds.push(c.id);
-            rows.push(buildRow(c));
+            filtered.push(c);
         }
 
-        document.getElementById('tableBody').innerHTML = rows.join('');
-        document.getElementById('emptyState').style.display = rows.length === 0 ? 'block' : 'none';
-        document.getElementById('filterCount').textContent  = `Showing ${rows.length} of ${allContacts.length}`;
+        const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+        if (currentPage >= totalPages) currentPage = totalPages - 1;
+        if (currentPage < 0) currentPage = 0;
+        const start = currentPage * PAGE_SIZE;
+        const pageItems = filtered.slice(start, start + PAGE_SIZE);
+
+        document.getElementById('tableBody').innerHTML = pageItems.map(buildRow).join('');
+        document.getElementById('emptyState').style.display = filtered.length === 0 ? 'block' : 'none';
+
+        const rangeStart = filtered.length === 0 ? 0 : start + 1;
+        const rangeEnd    = Math.min(start + pageItems.length, filtered.length);
+        document.getElementById('filterCount').textContent =
+            `Showing ${rangeStart.toLocaleString()}\u2013${rangeEnd.toLocaleString()} of ${filtered.length.toLocaleString()} (${allContacts.length.toLocaleString()} loaded)`;
+
+        renderPagination(totalPages);
     }
+
+    function renderPagination(totalPages) {
+        const el = document.getElementById('paginationRow');
+        if (!el) return;
+        if (totalPages <= 1) { el.innerHTML = ''; return; }
+        const atStart = currentPage === 0;
+        const atEnd   = currentPage >= totalPages - 1;
+        el.innerHTML = `
+            <button class="btn-gray btn-sm" onclick="goToPage(0)" ${atStart ? 'disabled' : ''}><i class="fas fa-angles-left"></i></button>
+            <button class="btn-gray btn-sm" onclick="goToPage(${currentPage - 1})" ${atStart ? 'disabled' : ''}><i class="fas fa-angle-left"></i> Prev</button>
+            <span style="font-size:.82rem;color:var(--gray-600);padding:0 .5rem">Page ${(currentPage + 1).toLocaleString()} of ${totalPages.toLocaleString()}</span>
+            <button class="btn-gray btn-sm" onclick="goToPage(${currentPage + 1})" ${atEnd ? 'disabled' : ''}>Next <i class="fas fa-angle-right"></i></button>
+            <button class="btn-gray btn-sm" onclick="goToPage(${totalPages - 1})" ${atEnd ? 'disabled' : ''}><i class="fas fa-angles-right"></i></button>
+        `;
+    }
+
+    window.goToPage = function(n) {
+        currentPage = n;
+        renderTable();
+    };
 
     function renderRow(contact) {
         const existing = document.getElementById(`row-${contact.id}`);
@@ -1073,8 +1171,14 @@
             expHtml = toShow.map(e => {
                 const isCurrent = isCurrentPosition(e);
                 const co  = extractCompany(e);
-                const title = (e.title || e.jobTitle || e.position || '').trim();
-                const dr  = (e.dateRange || e.caption || '').trim();
+                // For a grouped entry (e.title is the COMPANY, not a job title — see
+                // extractCompany()), show the most recent nested role's title instead of
+                // repeating the company name here.
+                const isGrouped = Array.isArray(e.child) && e.child.length > 0 && e.child[0].title;
+                const title = isGrouped
+                    ? (e.child[0].title || '').trim()
+                    : (e.title || e.jobTitle || e.position || '').trim();
+                const dr  = (e.dateRange || e.caption || (isGrouped ? (e.child[0].dateRange || e.child[0].caption || '') : '')).trim();
                 return `<div class="exp-item${isCurrent ? ' current' : ''}">
                     <span class="exp-company">${esc(co || '—')}</span>
                     ${title ? `<span class="exp-title"> · ${esc(title)}</span>` : ''}

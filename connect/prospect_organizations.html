@@ -8101,6 +8101,53 @@
             });
         }
 
+        // Fetches job titles from prospect_contacts for the given BDR email(s), keyed by
+        // normalized LinkedIn URL (primary) and by "first|last" name (fallback for contacts
+        // with no URL) — used to enrich the per-contact Excel export with a Title column.
+        // Scoped/chunked the same way the rest of the dashboard's Firestore reads are
+        // (30 emails/query cap, one query per possible owner-email field, Promise.all).
+        async function loadContactTitlesForExport(bdrEmails) {
+            const normalizeUrl = url => (url || '').toLowerCase().trim()
+                .replace(/\/$/, '').replace(/^https?:\/\//i, '').replace(/^www\./i, '');
+            const urlToTitle  = new Map();
+            const nameToTitle = new Map();
+            const emails = [...new Set((bdrEmails || []).filter(Boolean).map(e => e.toLowerCase()))];
+            if (!emails.length) return { urlToTitle, nameToTitle };
+            try {
+                const fields = ['account_email', 'userEmail', 'bdrEmail', 'linkedInAccountEmail', 'accountEmail'];
+                const fetches = [];
+                for (const field of fields) {
+                    for (let i = 0; i < emails.length; i += 30) {
+                        const chunk = emails.slice(i, i + 30);
+                        fetches.push(getDocs(query(collection(db, 'prospect_contacts'), where(field, 'in', chunk))).catch(() => null));
+                    }
+                }
+                const results = await Promise.all(fetches);
+                const seen = new Set();
+                results.forEach(snap => {
+                    if (!snap) return;
+                    snap.docs.forEach(d => {
+                        if (seen.has(d.id)) return;
+                        seen.add(d.id);
+                        const data = d.data();
+                        const title = (data.title || '').trim();
+                        if (!title) return;
+                        const url = normalizeUrl(data.linkedInUrl || data.linkedin_url || data.profileUrl || '');
+                        if (url && !urlToTitle.has(url)) urlToTitle.set(url, title);
+                        const first = (data.firstName || data.first_name || '').toLowerCase().trim();
+                        const last  = (data.lastName  || data.last_name  || '').toLowerCase().trim();
+                        if (first && last) {
+                            const key = `${first}|${last}`;
+                            if (!nameToTitle.has(key)) nameToTitle.set(key, title);
+                        }
+                    });
+                });
+            } catch (e) {
+                console.warn('Could not load contact titles for export:', e);
+            }
+            return { urlToTitle, nameToTitle };
+        }
+
         window.exportOrgDashboardExcel = async function() {
             const allRows = window.dashAllOrgsForFilter || [];
             if (!allRows.length) {
@@ -8119,6 +8166,13 @@
                 const exportRows   = _getFilteredRows(); // respects active category/hypothesis filters
                 const trackedRows  = exportRows.filter(r => !r.isOtherRow);
                 const isFiltered   = dashActiveCategoryFilter !== 'all' || !!dashActiveHypothesisFilter;
+
+                // BDR email(s) to scope the job-title lookup to (Team View → every BDR who
+                // tracks at least one exported org; My BDR → just the current BDR).
+                const titleLookupEmails = isTeamView
+                    ? [...new Set(trackedRows.flatMap(r => r.bdrEmails || []))]
+                    : (currentBDR ? [currentBDR] : []);
+                const { urlToTitle, nameToTitle } = await loadContactTitlesForExport(titleLookupEmails);
 
                 const bdrSelect  = document.getElementById('bdrFilter');
                 const bdrLabel   = bdrSelect?.selectedOptions?.[0]?.textContent?.trim() || currentBDR || '';
@@ -8311,6 +8365,184 @@
                 });
                 ws.getCell(`A${totalsRow.number}`).alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
 
+                // ── Contacts sheet — one row per PERSON, showing their full journey ──
+                // Every contact list (sent/pending/HL connected/already connected/HL
+                // replied/already-connected-replied/scheduled) is merged per-org so a
+                // contact who, say, was sent outreach AND connected AND replied shows up
+                // as a single row with each stage checked off, instead of 3 duplicate rows.
+                const contactsWs = wb.addWorksheet('Contacts');
+                const contactCols = [
+                    { header: 'Organization',                  key: 'org',      width: 30 },
+                    { header: 'Category',                      key: 'category', width: 18 },
+                    { header: 'Contact Name',                  key: 'name',     width: 26 },
+                    { header: 'Title',                         key: 'jobTitle', width: 26 },
+                    { header: 'LinkedIn',                      key: 'linkedin', width: 12 },
+                    { header: 'Contact Company',               key: 'company',  width: 24 },
+                    { header: 'Sent',                          key: 'sent',     width: 10 },
+                    { header: 'Pending',                       key: 'pending',  width: 10 },
+                    { header: 'HL Connected',                  key: 'hlConn',   width: 13 },
+                    { header: 'Already Connected',             key: 'acConn',   width: 16 },
+                    { header: 'HL Engaged (Replied)',          key: 'hlReply',  width: 16 },
+                    { header: 'Already Connected Replied',     key: 'acReply',  width: 19 },
+                    { header: 'Scheduled Meeting',             key: 'sched',    width: 15 },
+                    { header: 'Target Contact',                key: 'isTarget', width: 13 },
+                ];
+                const contactLastCol = colLetter(contactCols.length);
+                contactsWs.views = [{ state: 'frozen', ySplit: 2 }];
+                contactsWs.columns = contactCols.map(c => ({ key: c.key, width: c.width }));
+
+                contactsWs.addRow({ org: `Pando Executive Networking CRM — Per-Contact Detail — ${scopeLabel}${filterNote}  |  Exported ${exportDate}` });
+                contactsWs.mergeCells(`A1:${contactLastCol}1`);
+                const cBannerCell = contactsWs.getCell('A1');
+                cBannerCell.font = { ...baseFont, bold: true, size: 12, color: { argb: 'FF' + C.metaFg } };
+                cBannerCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.metaBg } };
+                cBannerCell.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+                contactsWs.getRow(1).height = 24;
+
+                const contactHeaderValues = {};
+                contactCols.forEach(c => { contactHeaderValues[c.key] = c.header; });
+                contactsWs.addRow(contactHeaderValues);
+                const contactHeaderRow = contactsWs.getRow(2);
+                contactHeaderRow.height = 30;
+                contactHeaderRow.eachCell({ includeEmpty: true }, cell => {
+                    cell.font = { ...baseFont, bold: true, color: { argb: 'FFFFFFFF' } };
+                    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.headerBg } };
+                    cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+                    cell.border = { bottom: { style: 'medium', color: { argb: 'FF' + C.borderCol } } };
+                });
+                contactsWs.autoFilter = { from: { row: 2, column: 1 }, to: { row: 2, column: contactCols.length } };
+
+                // Merge every stage list for a single org's contacts into one map, keyed
+                // by LinkedIn URL (preferred) or normalized name+company as a fallback —
+                // same identity rule used elsewhere on this page (mergeContactLists()).
+                const STAGE_LISTS = [
+                    ['sent',    'sentContacts'],
+                    ['pending', 'pendingContacts'],
+                    ['hlConn',  'hlConnectedContacts'],
+                    ['acConn',  'alreadyConnectedContacts'],
+                    ['hlReply', 'hlRepliedContacts'],
+                    ['acReply', 'otherRepliedContacts'],
+                    ['sched',   'scheduledContacts'],
+                ];
+                const contactKeyOf = c => c.url
+                    ? `url:${c.url}`
+                    : `nc:${(c.name || '').toLowerCase().trim()}|${(c.company || '').toLowerCase().trim()}`;
+
+                let contactRIdx = 0;
+                let totalContactRows = 0;
+                exportRows.forEach(r => {
+                    const orgLabel = r.isOtherRow ? 'Other Organizations (untracked)' : (r.companyName || '');
+                    const targetNameLc = (r.targetContactName || '').toLowerCase().trim();
+                    const peopleMap = new Map(); // key -> { name, url, rawUrl, company, stages:{} }
+
+                    STAGE_LISTS.forEach(([stageKey, listProp]) => {
+                        (r[listProp] || []).forEach(c => {
+                            if (!c) return;
+                            const nameOk = c.name && c.name !== '(Unknown)' && c.name !== '(unknown)';
+                            if (!c.url && !nameOk) return; // unidentifiable — nothing to show
+                            const pKey = contactKeyOf(c);
+                            if (!peopleMap.has(pKey)) {
+                                peopleMap.set(pKey, {
+                                    name: nameOk ? c.name : (c.name || ''),
+                                    url: c.rawUrl || c.url || '',
+                                    normUrl: c.url || '',
+                                    company: c.company || '',
+                                    stages: {},
+                                });
+                            }
+                            const p = peopleMap.get(pKey);
+                            if (!p.company && c.company) p.company = c.company;
+                            if ((!p.name || p.name === '(Unknown)') && nameOk) p.name = c.name;
+                            if (!p.url && (c.rawUrl || c.url)) p.url = c.rawUrl || c.url;
+                            if (!p.normUrl && c.url) p.normUrl = c.url;
+                            p.stages[stageKey] = true;
+                        });
+                    });
+
+                    if (peopleMap.size === 0) return;
+
+                    const people = [...peopleMap.values()].sort((a, b) =>
+                        (a.name || '').localeCompare(b.name || ''));
+
+                    people.forEach(p => {
+                        const isTarget = !!(targetNameLc && p.name && p.name.toLowerCase().trim() === targetNameLc);
+                        let title = p.normUrl ? urlToTitle.get(p.normUrl) : undefined;
+                        if (!title) {
+                            const nameParts = (p.name || '').trim().split(/\s+/);
+                            if (nameParts.length >= 2) {
+                                const nameKey = `${nameParts[0].toLowerCase()}|${nameParts.slice(1).join(' ').toLowerCase()}`;
+                                title = nameToTitle.get(nameKey);
+                            }
+                        }
+                        const rowObj = {
+                            org: orgLabel,
+                            category: r.category || '',
+                            name: p.name || '(Unknown)',
+                            jobTitle: title || '',
+                            company: p.company || '',
+                            sent:     p.stages.sent    ? 'Yes' : '',
+                            pending:  p.stages.pending ? 'Yes' : '',
+                            hlConn:   p.stages.hlConn  ? 'Yes' : '',
+                            acConn:   p.stages.acConn  ? 'Yes' : '',
+                            hlReply:  p.stages.hlReply ? 'Yes' : '',
+                            acReply:  p.stages.acReply ? 'Yes' : '',
+                            sched:    p.stages.sched   ? 'Yes' : '',
+                            isTarget: isTarget ? 'Yes' : '',
+                        };
+                        const cRow = contactsWs.addRow(rowObj);
+                        cRow.height = 18;
+
+                        const altFill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.altRowBg } };
+                        const otherFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.otherRowBg } };
+                        cRow.eachCell({ includeEmpty: true }, cell => {
+                            cell.font = { ...baseFont };
+                            cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: false };
+                            if (r.isOtherRow) cell.fill = otherFill;
+                            else if (contactRIdx % 2 === 1) cell.fill = altFill;
+                        });
+
+                        // LinkedIn as a clickable hyperlink
+                        if (p.url) {
+                            const idx = contactCols.findIndex(c => c.key === 'linkedin') + 1;
+                            const cell = cRow.getCell(idx);
+                            cell.value = { text: 'Open ↗', hyperlink: p.url, tooltip: p.url };
+                            cell.font = { ...baseFont, color: { argb: 'FF1d4ed8' }, underline: true };
+                            cell.alignment = { vertical: 'middle', horizontal: 'center' };
+                        }
+
+                        // Centre + colour-code the Yes/No status columns
+                        ['sent','pending','hlConn','acConn','hlReply','acReply','sched','isTarget'].forEach(key => {
+                            const idx = contactCols.findIndex(c => c.key === key) + 1;
+                            const cell = cRow.getCell(idx);
+                            cell.alignment = { vertical: 'middle', horizontal: 'center' };
+                            if (!rowObj[key]) { cell.font = { ...baseFont, color: { argb: 'FF' + C.zeroFg } }; return; }
+                            if (key === 'hlConn' || key === 'hlReply') {
+                                cell.font = { ...baseFont, bold: true, color: { argb: 'FF' + C.hlFg } };
+                                if (!r.isOtherRow) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.hlBg } };
+                            } else if (key === 'pending') {
+                                cell.font = { ...baseFont, bold: true, color: { argb: 'FF' + C.pendingFg } };
+                                if (!r.isOtherRow) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.pendingBg } };
+                            } else if (key === 'sched') {
+                                cell.font = { ...baseFont, bold: true, color: { argb: 'FF' + C.schedFg } };
+                                if (!r.isOtherRow) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.schedBg } };
+                            } else if (key === 'isTarget') {
+                                cell.font = { ...baseFont, bold: true, color: { argb: 'FF' + C.totalFg } };
+                                if (!r.isOtherRow) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.totalBg } };
+                            } else {
+                                cell.font = { ...baseFont, bold: true, color: { argb: 'FF' + C.metaFg } };
+                            }
+                        });
+
+                        contactRIdx++;
+                        totalContactRows++;
+                    });
+                });
+
+                if (totalContactRows === 0) {
+                    contactsWs.addRow({ org: 'No individual contact records found for the current filter.' });
+                    contactsWs.mergeCells(`A3:${contactLastCol}3`);
+                }
+
                 // ── Summary sheet ──
                 const summaryWs = wb.addWorksheet('Summary');
                 summaryWs.columns = [{ width: 30 }, { width: 44 }];
@@ -8341,6 +8573,8 @@
                 addSummaryRow('Already Connected Replies',   totalsRowObj.acReply);
                 addSummaryRow('Total Replies',                totalsRowObj.totalReply,    { bold: true });
                 addSummaryRow('Scheduled Meetings',           totalsRowObj.sched,          { bold: true });
+                summaryWs.addRow([]);
+                addSummaryRow('Per-Contact Rows (see "Contacts" tab)', totalContactRows);
                 summaryWs.getRow(1).height = 22;
 
                 // ── Download ──
@@ -8358,7 +8592,7 @@
                 document.body.removeChild(a);
                 URL.revokeObjectURL(url);
 
-                console.log(`✅ Org dashboard Excel export complete: ${exportRows.length} rows`);
+                console.log(`✅ Org dashboard Excel export complete: ${exportRows.length} org rows, ${totalContactRows} contact rows`);
             } catch (err) {
                 console.error('❌ Org dashboard Excel export failed:', err);
                 alert('Export failed: ' + err.message);
