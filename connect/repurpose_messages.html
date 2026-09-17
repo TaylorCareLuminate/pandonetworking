@@ -552,31 +552,55 @@ async function loadInProcessForBdr(bdrEmail, count) {
 
     const leads = (json.leads || []).filter(l => !l._excluded).slice(0, count * 3); // over-fetch; many won't have content yet
 
-    // Hydrate live content for any lead missing it (batched, matches in_processes_today.html)
+    // Hydrate live content for any lead missing it (batched, matches in_processes_today.html —
+    // including its 429 retry-with-backoff. HeyReach rate-limits bursts of concurrent per-lead
+    // GetLead calls; without retrying a 429, a large "missing" batch silently comes back with
+    // zero content for nearly everyone, which looks like "no messages ready to review" even
+    // though the leads and their content genuinely exist).
     const apiKey = await getHeyReachApiKeyForBdr(bdrEmail);
     const missing = leads.filter(l => !((l.content || '').trim()));
     if (apiKey && missing.length) {
         log(`Fetching live message content from HeyReach for ${missing.length} lead(s)…`, 'info');
         const BATCH = 3;
+        const BATCH_PAUSE_MS = 500;
+        let rateLimited = 0, failed = 0;
+
+        async function fetchLeadWithRetry(rawUrl, maxRetries = 3) {
+            for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                const r = await fetch(`${BACKEND}/proxy/heyreach/leads/getlead`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+                    body: JSON.stringify({ profileUrl: rawUrl })
+                });
+                if (r.status !== 429) return r;
+                if (attempt === maxRetries) return r;
+                const retryAfterHeader = parseFloat(r.headers.get('Retry-After'));
+                const waitMs = !isNaN(retryAfterHeader) ? retryAfterHeader * 1000 : 1000 * Math.pow(2, attempt);
+                rateLimited++;
+                console.warn(`[Repurpose] 429 rate-limited on ${rawUrl}, retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+                await new Promise(res => setTimeout(res, waitMs));
+            }
+        }
+
         for (let i = 0; i < missing.length; i += BATCH) {
             const batch = missing.slice(i, i + BATCH);
             await Promise.all(batch.map(async lead => {
                 try {
                     const rawUrl = lead.rawUrl.startsWith('http') ? lead.rawUrl : `https://www.linkedin.com/${lead.rawUrl}`;
-                    const r = await fetch(`${BACKEND}/proxy/heyreach/leads/getlead`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
-                        body: JSON.stringify({ profileUrl: rawUrl })
-                    });
-                    if (!r.ok) return;
+                    const r = await fetchLeadWithRetry(rawUrl);
+                    if (!r || !r.ok) { failed++; return; }
                     const data = await r.json();
                     const liveLead = (data && typeof data.lead === 'object') ? data.lead : data;
                     const liveContent = extractHeyReachContent(data) || extractHeyReachContent(liveLead);
                     if (liveContent) lead.content = liveContent;
-                } catch (_) { /* best-effort */ }
+                } catch (_) { failed++; /* best-effort */ }
             }));
-            await new Promise(r => setTimeout(r, 400));
+            await new Promise(r => setTimeout(r, BATCH_PAUSE_MS));
         }
+
+        log(`HeyReach content fetch done — ${missing.filter(l => (l.content||'').trim()).length}/${missing.length} got content` +
+            `${failed ? `, ${failed} failed` : ''}${rateLimited ? `, ${rateLimited} rate-limit retries` : ''}.`,
+            missing.some(l => (l.content||'').trim()) ? 'info' : 'warn');
     }
 
     const withContent = leads.filter(l => (l.content || '').trim()).slice(0, count);
