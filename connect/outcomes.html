@@ -2234,14 +2234,43 @@
             let sentItems = [];
             const seenIds = new Set();
 
-            const collectItems = (snap) => {
+            // Resolve the company this group belongs to (same rule loadGroupsForOutcomes
+            // uses to bucket it in the dropdown: the FIRST assigned BDR's company via
+            // bdr_leaders.customerId). Used below to sanity-check "stamped" records — a
+            // hypothesisGroupId match alone isn't proof a record belongs to this group's
+            // company; mis-stamps from another BDR/company happen in practice (see
+            // full_pipeline.html's Data Repair / "Scan for Problems" tool, which exists
+            // specifically to find and fix connect_queue docs whose hypothesisGroupId
+            // doesn't match what actually generated them).
+            const firstBdrRecord = bdrEmailArr.length
+                ? allBdrs.find(b => (b.primaryEmail || '').toLowerCase() === (bdrEmailArr[0] || '').toLowerCase())
+                : null;
+            const groupCompany = firstBdrRecord?._company || null;
+
+            const collectItems = (snap, opts) => {
+                const requireCompanyMatch = !!(opts && opts.requireCompanyMatch);
+                let rejectedForCompany = 0;
                 snap.forEach(d => {
                     if (seenIds.has(d.id)) return;
-                    seenIds.add(d.id);
                     const data = d.data();
+                    if (requireCompanyMatch && groupCompany) {
+                        const email = (data.account_email || '').toLowerCase();
+                        // Only accept a bare stamp match for a sender we can positively
+                        // tie to this group's company. Senders already found via the
+                        // per-BDR account_email queries below are already in seenIds by
+                        // the time this runs, so this only ever rejects EXTRA records
+                        // this group's assigned BDRs never sent — i.e. exactly the
+                        // "activity not sent by these BDRs for this company" case.
+                        if (email && !companyBdrEmailSet.has(email)) {
+                            rejectedForCompany++;
+                            return;
+                        }
+                    }
+                    seenIds.add(d.id);
                     // Include pushed records; also include records without the field for batch-queried items
                     sentItems.push({ id: d.id, ...data });
                 });
+                return rejectedForCompany;
             };
 
             // connect_queue's account_email is the BDR's LinkedIn LOGIN email, which
@@ -2254,6 +2283,17 @@
                 const alias = linkedInEmailAssociations.get(lower);
                 return alias && alias !== lower ? [e, alias] : [e];
             }))];
+
+            // Every BDR email (login + primary) that legitimately belongs to this
+            // group's company — used to validate stamp-only matches above. Falls back
+            // to just bdrQueryEmails when the company can't be resolved (fail open
+            // rather than dropping data we can't actually disprove).
+            const companyBdrEmailSet = new Set([
+                ...bdrQueryEmails.map(e => (e || '').toLowerCase()),
+                ...(groupCompany
+                    ? allBdrs.filter(b => b._company === groupCompany).map(b => (b.primaryEmail || '').toLowerCase())
+                    : [])
+            ]);
 
             if (hasBdrs) {
                 // Load all connect_queue records for each BDR
@@ -2275,13 +2315,22 @@
                 // Fast Connect Review / the Variation Batcher at assignment time), and
                 // this catches senders the alias table doesn't know about — without it,
                 // a group whose real senders' LinkedIn emails aren't in
-                // linkedin_email_associations analyzes as 0 sent.
+                // linkedin_email_associations analyzes as 0 sent. BUT a stamp match alone
+                // isn't proof of ownership — require the sender to be a BDR at this
+                // group's company (collectItems' requireCompanyMatch) so a mis-stamped
+                // record from an unrelated BDR/company can't leak into these totals.
                 try {
                     const stampSnap = await getDocs(query(
                         collection(emailDB, 'connect_queue'),
                         where('hypothesisGroupId', '==', group.id)
                     ));
-                    collectItems(stampSnap);
+                    const rejected = collectItems(stampSnap, { requireCompanyMatch: true });
+                    if (rejected > 0) {
+                        flagDataIssue('Group outreach (connect_queue)',
+                            `${rejected} record(s) stamped with this group's ID were excluded — sent by a BDR not associated with ` +
+                            `${groupCompany ? `"${groupCompany}"` : 'this group\'s company'}. Likely a mis-tagged record from another BDR/company; ` +
+                            `check full_pipeline.html's Data Repair tool.`);
+                    }
                 } catch(e) { flagDataIssue('Group outreach (connect_queue)', `Stamp query failed — some group-assigned outreach may be missing: ${e.message}`); }
 
                 // Filter to pushed records
@@ -2293,6 +2342,8 @@
                         // An explicit stamp always counts as belonging to the group —
                         // don't let URL/batch narrowing drop records that were assigned
                         // deliberately (their contact may not be in the tagged list yet).
+                        // Note: stamp-only records already passed the company check in
+                        // collectItems() above, so trusting the stamp here is safe.
                         if (m.hypothesisGroupId === group.id) return true;
                         if (hasBatches && m.source_batch_id && targetBatchSet.has(m.source_batch_id)) return true;
                         if (hasUrls) {
