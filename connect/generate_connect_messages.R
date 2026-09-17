@@ -603,9 +603,21 @@ all_messages$lastMessagePOSIX <- tryCatch({
 all_messages$lastMessageDate <- as.Date(all_messages$lastMessagePOSIX)
 all_messages$recentMessage <- ifelse(!is.na(all_messages$lastMessageDate) & Sys.Date() - all_messages$lastMessageDate <= 45, 1, 0)
 
-# Map LinkedIn accounts to emails
+# Map LinkedIn accounts to emails (fallback only — see note below).
+# NOTE: heyreach_inbox documents already carry their OWN account-identifying
+# email directly (stored as accountEmail / linkedInAccountEmail / bdrEmail —
+# all aliases of the same value, per heyreach_inbox_service.js::storeConversation).
+# We must NOT merge a same-named "accountEmail" column from heyreach_contacts
+# on top of that: merge() silently renames BOTH to "accountEmail.x"/"accountEmail.y"
+# when the non-key column names collide, which means `all_messages$accountEmail`
+# stops existing entirely after the merge (this was a latent bug — nothing
+# downstream depended on it until now). So the joined column is kept under a
+# distinct name and used only as a fallback if the inbox doc's own email
+# fields are unpopulated (e.g. HeyReach didn't return an emailAddress for
+# that LinkedIn account).
 account_email_map <- all_contacts[!duplicated(all_contacts$linkedInAccountId), 
                                    c("linkedInAccountId", "accountEmail")]
+names(account_email_map)[names(account_email_map) == "accountEmail"] <- "contactsAccountEmail"
 all_messages <- merge(all_messages, account_email_map, by = "linkedInAccountId", all.x = TRUE)
 
 cat(sprintf("Loaded %d contacts and %d messages\n", nrow(all_contacts), nrow(all_messages)))
@@ -1113,13 +1125,35 @@ for (bdr_idx in 1:nrow(selected_bdrs)) {
   # a new generated message because only our own connect-flow actions were
   # tracked here, not the actual inbox conversation).
   cat("  - Adding HeyReach inbox conversations (both directions) to activity history...\n")
+  bdr_messages <- all_messages[0, ]  # safe default so later steps can always reference it
+  lead_url_col <- NULL
   if (nrow(all_messages) > 0) {
-    bdr_messages <- all_messages[
-      !is.na(all_messages$accountEmail) & (
-        tolower(all_messages$accountEmail) == tolower(bdr_auth_email) |
-        tolower(all_messages$accountEmail) == tolower(bdr_linkedin_email)
-      ),
-    ]
+    # heyreach_inbox documents identify their LinkedIn account via several
+    # possible field names depending on which sync path wrote them
+    # (accountEmail / linkedInAccountEmail / bdrEmail are aliases of the same
+    # value written by heyreach_inbox_service.js; contactsAccountEmail is our
+    # own fallback joined from heyreach_contacts; uploadedByEmail covers older
+    # docs). Match this BDR if ANY of these fields matches — mirrors the
+    # multi-field matching used by fast_connect_review.html.
+    email_match_cols <- intersect(
+      c("accountEmail", "linkedInAccountEmail", "bdrEmail", "contactsAccountEmail", "uploadedByEmail"),
+      names(all_messages)
+    )
+    
+    if (length(email_match_cols) == 0) {
+      cat("    Warning: No account-email columns found on heyreach_inbox — cannot match BDR\n")
+      bdr_messages <- all_messages[0, ]
+    } else {
+      is_bdr_match <- rep(FALSE, nrow(all_messages))
+      for (col in email_match_cols) {
+        col_vals <- tolower(trimws(as.character(all_messages[[col]])))
+        is_bdr_match <- is_bdr_match | (
+          !is.na(col_vals) & col_vals != "" &
+          (col_vals == tolower(bdr_auth_email) | col_vals == tolower(bdr_linkedin_email))
+        )
+      }
+      bdr_messages <- all_messages[is_bdr_match, ]
+    }
     
     cat(sprintf("    Found %d total inbox conversations for this BDR\n", nrow(bdr_messages)))
     
@@ -1185,6 +1219,152 @@ for (bdr_idx in 1:nrow(selected_bdrs)) {
   }
   
   # --------------------------------------------------------------------------
+  # Build "last message type sent" per contact from connect_queue, so we can
+  # avoid generating the same KIND of message twice in a row (e.g. two
+  # Post Reply messages back to back, or two Organization Complement / news
+  # messages back to back). This is keyed by contact URL and shared across
+  # the Current Contacts, Prospects, and Organization Complement pipelines
+  # below, since a prospect in particular can receive either kind.
+  # --------------------------------------------------------------------------
+  cat("  - Building last-message-type history from connect_queue...\n")
+  contact_last_message_type <- list()  # normalized contact URL -> list(type=, date=)
+  
+  if (nrow(connect_queue) > 0) {
+    get_col_or_na <- function(df, col) {
+      if (col %in% names(df)) df[[col]] else rep(NA_character_, nrow(df))
+    }
+    q_account_email     <- get_col_or_na(connect_queue, "account_email")
+    q_accountEmail      <- get_col_or_na(connect_queue, "accountEmail")
+    q_bdr_auth_email    <- get_col_or_na(connect_queue, "bdr_auth_email")
+    
+    email_matches <- function(vals) {
+      !is.na(vals) & (tolower(vals) == tolower(bdr_auth_email) | tolower(vals) == tolower(bdr_linkedin_email))
+    }
+    
+    is_this_bdr <- email_matches(q_account_email) | email_matches(q_accountEmail) | email_matches(q_bdr_auth_email)
+    not_deleted <- is.na(connect_queue$deleted) | connect_queue$deleted != TRUE
+    
+    bdr_queue_history <- connect_queue[is_this_bdr & not_deleted, ]
+    cat(sprintf("    Found %d past queue messages for this BDR\n", nrow(bdr_queue_history)))
+    
+    if (nrow(bdr_queue_history) > 0 && "prospect_li_url" %in% names(bdr_queue_history)) {
+      has_source_col <- "source" %in% names(bdr_queue_history)
+      has_uploaded_date_col <- "uploaded_date" %in% names(bdr_queue_history)
+      
+      for (i in seq_len(nrow(bdr_queue_history))) {
+        row <- bdr_queue_history[i, ]
+        contact_url <- normalize_activity_url(row$prospect_li_url)
+        if (length(contact_url) == 0 || is.na(contact_url) || contact_url == "") next
+        
+        # Only rows with an explicit `source` tag can be classified — older
+        # rows predating this feature don't carry one and are skipped rather
+        # than guessed at (message_type alone doesn't distinguish Post Reply
+        # from Organization Complement, since both currently use "connect").
+        msg_source <- if (has_source_col) trimws(as.character(row$source)) else ""
+        if (is.na(msg_source) || msg_source == "") next
+        
+        msg_date <- if (has_uploaded_date_col && !is.na(row$uploaded_date)) {
+          tryCatch(
+            as.POSIXct(as.character(row$uploaded_date), format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+            error = function(e) NA
+          )
+        } else {
+          NA
+        }
+        if (is.na(msg_date)) next
+        
+        existing <- contact_last_message_type[[contact_url]]
+        if (is.null(existing) || msg_date > existing$date) {
+          contact_last_message_type[[contact_url]] <- list(type = msg_source, date = msg_date)
+        }
+      }
+    }
+  }
+  
+  cat(sprintf("    Built last-message-type history for %d unique contacts\n", length(contact_last_message_type)))
+  
+  # Returns the `source` (e.g. "Post Reply", "Organization Complement") of
+  # the most recent classified message sent to this contact, or NA if none.
+  get_last_message_type <- function(contact_url) {
+    norm_url <- normalize_activity_url(contact_url)
+    if (norm_url == "") return(NA_character_)
+    entry <- contact_last_message_type[[norm_url]]
+    if (is.null(entry)) return(NA_character_)
+    entry$type
+  }
+  
+  # --------------------------------------------------------------------------
+  # AI screening of past conversations: have a low-cost model look at each
+  # contact's most recent HeyReach inbox message and flag anyone who has
+  # CLEARLY already rejected meeting/connecting, or who has CLEARLY already
+  # met with us. Those contacts are held back from message generation this
+  # run — across ALL THREE pipelines (Current Contacts, Prospects,
+  # Organization Complement) — same as the recency-based filters above.
+  # NOTE: this only sees the single most recent message in the thread (the
+  # only conversation text heyreach_inbox stores as a flat field — the full
+  # message-by-message history lives in a nested rawData structure that
+  # isn't reliably flattened by clemail_download), so it's a best-effort
+  # signal, not a full-transcript read. Ambiguous cases default to "send".
+  # --------------------------------------------------------------------------
+  cat("  - AI-screening past conversations (meeting rejected / already met)...\n")
+  contact_conversation_hold <- list()  # normalized contact URL -> TRUE if should hold
+  
+  if (nrow(bdr_messages) > 0 && !is.null(lead_url_col)) {
+    screen_df <- bdr_messages
+    screen_df$normalized_url <- sapply(screen_df[[lead_url_col]], normalize_activity_url)
+    screen_df <- screen_df[
+      !is.na(screen_df$normalized_url) & screen_df$normalized_url != "" &
+      !is.na(screen_df$lastMessage) & trimws(as.character(screen_df$lastMessage)) != "",
+    ]
+    
+    if (nrow(screen_df) > 0) {
+      # One conversation per contact — keep only the most recent if duplicates exist
+      screen_df <- screen_df[order(screen_df$normalized_url, -as.numeric(screen_df$lastMessagePOSIX)), ]
+      screen_df <- screen_df[!duplicated(screen_df$normalized_url), ]
+      
+      cat(sprintf("    Screening %d conversation(s) with a low-cost model...\n", nrow(screen_df)))
+      
+      screen_df$conversation_status <- openrouter_batch_validated(
+        screen_df,
+        "You are screening a LinkedIn conversation between one of our BDRs and a contact, to decide whether it's appropriate to send this contact a NEW outreach message right now.
+
+Most recent message in the conversation:
+Sender: [lastMessageSender] (\"account\" = us, \"lead\" = the contact)
+Message: [lastMessage]
+Total messages exchanged in this conversation so far: [messageCount]
+
+Answer 'hold' ONLY if this message makes it CLEAR that:
+- The contact has explicitly declined, rejected, or expressed disinterest in meeting/connecting (e.g. 'not interested', 'please stop messaging', 'no thanks', 'not right now and don't follow up'), OR
+- A meeting/call has CLEARLY already happened (e.g. 'great meeting you yesterday', 'thanks for the call', 'good chatting with you on the phone')
+
+Otherwise answer 'send'. This includes: casual back-and-forth, a meeting merely being proposed or scheduled (but not yet confirmed as having happened), or anything ambiguous. Default to 'send' when unsure.
+
+Respond with only one word: hold or send.",
+        valid_values = c("send", "hold"),
+        max_tokens = 10,
+        temperature = 0.1
+      )
+      
+      n_hold <- sum(screen_df$conversation_status == "hold")
+      cat(sprintf("    %d contact(s) flagged to hold (meeting rejected or already met)\n", n_hold))
+      
+      for (i in seq_len(nrow(screen_df))) {
+        if (screen_df$conversation_status[i] == "hold") {
+          contact_conversation_hold[[screen_df$normalized_url[i]]] <- TRUE
+        }
+      }
+    }
+  } else {
+    cat("    No inbox conversations available to screen\n")
+  }
+  
+  should_hold_for_conversation <- function(contact_url) {
+    norm_url <- normalize_activity_url(contact_url)
+    if (norm_url == "") return(FALSE)
+    isTRUE(contact_conversation_hold[[norm_url]])
+  }
+  
+  # --------------------------------------------------------------------------
   # 3B: Process CURRENT CONTACTS (existing connections)
   # --------------------------------------------------------------------------
   
@@ -1210,6 +1390,28 @@ for (bdr_idx in 1:nrow(selected_bdrs)) {
         bdr_stats$contacts$after_activity_filter_45d <- length(contact_urls)
         cat(sprintf("  Filtered out %d contacts with activity in past 75 days (before scraping)\n", 
                     pre_filter_count - length(contact_urls)))
+      }
+      
+      # Filter out contacts the AI conversation screen flagged as "hold"
+      # (clearly rejected meeting, or clearly already met) BEFORE scraping
+      if (length(contact_urls) > 0) {
+        pre_hold_filter_count <- length(contact_urls)
+        should_hold <- sapply(contact_urls, should_hold_for_conversation)
+        contact_urls <- contact_urls[!should_hold]
+        cat(sprintf("  Filtered out %d contacts on hold (AI-detected: rejected meeting / already met)\n", 
+                    pre_hold_filter_count - length(contact_urls)))
+      }
+      
+      # Filter out contacts whose most recent message was ALSO a Post Reply
+      # message — avoid two of the same kind of message in a row. Done here
+      # up front (before scraping) rather than after scraping/classification,
+      # since this depends only on message history, not post content.
+      if (length(contact_urls) > 0) {
+        pre_repeat_filter_count <- length(contact_urls)
+        last_type <- sapply(contact_urls, get_last_message_type)
+        contact_urls <- contact_urls[is.na(last_type) | last_type != "Post Reply"]
+        cat(sprintf("  Filtered out %d contacts whose last message was also a Post Reply\n", 
+                    pre_repeat_filter_count - length(contact_urls)))
       }
       
       if (length(contact_urls) == 0) {
@@ -1302,6 +1504,28 @@ Respond with only one word: worthy or none. Here is the post: [text]",
                   }
                 }
                 
+                # Assign each post a specific, explicit reaction angle before
+                # generation. openrouter_batch calls the model once per row,
+                # independently, at a low temperature — so leaving "how to
+                # react" up to the model on every single call just makes it
+                # converge on the same safest phrasing (e.g. "SO TRUE") almost
+                # every time. Pre-sampling a different angle per row is what
+                # actually guarantees variety across a batch, rather than
+                # hoping an isolated per-row instruction like "vary your
+                # reaction" produces it (each call has no memory of the others).
+                reaction_angles_contacts <- c(
+                  "React to one specific number, stat, or detail mentioned in the post.",
+                  "Tie it to a broader pattern you've noticed elsewhere in healthcare, briefly and without claiming personal expertise.",
+                  "Point out the practical 'so what' — why this matters day to day for people doing similar work.",
+                  "Highlight the single most surprising or memorable specific point they made.",
+                  "Give a brief, natural agreement in your own words that names the specific part you agree with (not a generic 'so true')."
+                )
+                reaction_weights_contacts <- c(0.30, 0.25, 0.20, 0.15, 0.10)
+                li_data_contacts$reaction_angle <- sample(
+                  reaction_angles_contacts, size = nrow(li_data_contacts),
+                  replace = TRUE, prob = reaction_weights_contacts
+                )
+
                 # STEP 1: Generate base message
                 cat("  Generating base messages...\n")
                 li_data_contacts$base_message <- openrouter_batch(
@@ -1315,12 +1539,15 @@ Write a short LinkedIn comment (1–3 sentences, max ~45 words) from one healthc
 - Relaxed, appreciative, informal. Natural phrasing; abbreviations OK.
 - Focus 90%+ on THEIR post. Avoid resume talk about me.
 - Start with: 'Just saw your post about ___' (fill the blank concisely).
-- Add one specific reaction/insight tied to the post, then (optionally) a light question or soft close.
+- For your reaction, use this specific angle: [reaction_angle]
+- Then (optionally) add a light question or soft close.
 
 # PROHIBITED
 Salesy language, networking asks, name-dropping (e.g., KLAS, BYU, Texas A&M), or listing achievements.
 Asking a question
 Do not use exclamation marks or em-dashes
+Do not use ALL CAPS for emphasis (e.g. 'SO TRUE', 'THIS')
+Do not use the bare stock phrases 'so true', 'spot on', 'couldn't agree more', 'so real', '100%', or just 'this' as the entire reaction
 
 # INPUTS
 # POST (MOST IMPORTANT - THIS THE FOCUS)
@@ -1469,6 +1696,7 @@ MESSAGE:
                 upload_data_current <- li_data_contacts[, c("profile_input", "text", "final_message", "url")]
                 names(upload_data_current) <- c("prospect_li_url", "post_text", "message_to_contact", "post_url")
                 upload_data_current$message_type <- "message"
+                upload_data_current$source <- "Post Reply"  # tag for last-message-type repeat filter
                 upload_data_current$account_email <- bdr_linkedin_email  # Use LinkedIn email for sending
                 upload_data_current$bdr_auth_email <- bdr_auth_email     # Store auth email for reference
                 upload_data_current$uploaded_date <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ")
@@ -1530,6 +1758,28 @@ MESSAGE:
         bdr_stats$prospects$after_activity_filter_45d <- length(prospect_urls)
         cat(sprintf("  Filtered out %d prospects with activity in past 75 days (before scraping)\n", 
                     pre_filter_count - length(prospect_urls)))
+      }
+      
+      # Filter out prospects the AI conversation screen flagged as "hold"
+      # (clearly rejected meeting, or clearly already met) BEFORE scraping
+      if (length(prospect_urls) > 0) {
+        pre_hold_filter_count <- length(prospect_urls)
+        should_hold <- sapply(prospect_urls, should_hold_for_conversation)
+        prospect_urls <- prospect_urls[!should_hold]
+        cat(sprintf("  Filtered out %d prospects on hold (AI-detected: rejected meeting / already met)\n", 
+                    pre_hold_filter_count - length(prospect_urls)))
+      }
+      
+      # Filter out prospects whose most recent message was ALSO a Post Reply
+      # message — avoid two of the same kind of message in a row. Done here
+      # up front (before scraping) rather than after scraping/classification,
+      # since this depends only on message history, not post content.
+      if (length(prospect_urls) > 0) {
+        pre_repeat_filter_count <- length(prospect_urls)
+        last_type <- sapply(prospect_urls, get_last_message_type)
+        prospect_urls <- prospect_urls[is.na(last_type) | last_type != "Post Reply"]
+        cat(sprintf("  Filtered out %d prospects whose last message was also a Post Reply\n", 
+                    pre_repeat_filter_count - length(prospect_urls)))
       }
       
       if (length(prospect_urls) == 0) {
@@ -1617,6 +1867,24 @@ Respond with only one word: worthy or none. Here is the post: [text]",
                   }
                 }
                 
+                # Assign each post a specific, explicit reaction angle before
+                # generation (same reasoning as the current-contacts pipeline —
+                # see comment there). Guarantees variety across the batch
+                # instead of relying on the model to self-vary across
+                # independent, low-temperature calls.
+                reaction_angles_prospects <- c(
+                  "React to one specific number, stat, or detail mentioned in the post.",
+                  "Tie it to a broader pattern you've noticed elsewhere in healthcare, briefly and without claiming personal expertise.",
+                  "Point out the practical 'so what' — why this matters day to day for people doing similar work.",
+                  "Highlight the single most surprising or memorable specific point they made.",
+                  "Give a brief, natural agreement in your own words that names the specific part you agree with (not a generic 'so true')."
+                )
+                reaction_weights_prospects <- c(0.30, 0.25, 0.20, 0.15, 0.10)
+                li_data_prospects$reaction_angle <- sample(
+                  reaction_angles_prospects, size = nrow(li_data_prospects),
+                  replace = TRUE, prob = reaction_weights_prospects
+                )
+
                 # STEP 1: Generate base connection message (shorter for prospects)
                 cat("  Generating base connection messages...\n")
                 li_data_prospects$base_message <- openrouter_batch(
@@ -1628,7 +1896,7 @@ Write a short LinkedIn connection message (1 concise sentence) from one healthca
 - Relaxed, appreciative, informal. Natural phrasing; abbreviations OK.
 - Focus 90%+ on THEIR post. Avoid resume talk.
 - Start with: 'Just saw your post about ___' (fill the blank concisely).
-- Add one specific reaction/insight tied to the post.
+- For your reaction, use this specific angle: [reaction_angle]
 - Finish with 'Thank you for that post' if thoughtful or 'Congratulations' if it's good news.
 - Do not ask questions.
 - Aim to be brief — around 150 characters is ideal.
@@ -1637,6 +1905,8 @@ Write a short LinkedIn connection message (1 concise sentence) from one healthca
 Salesy language, networking asks, name-dropping, or listing achievements.
 Asking a question
 Do not use exclamation marks or em-dashes
+Do not use ALL CAPS for emphasis (e.g. 'SO TRUE', 'THIS')
+Do not use the bare stock phrases 'so true', 'spot on', 'couldn't agree more', 'so real', '100%', or just 'this' as the entire reaction
 
 # INPUTS
 # POST (MOST IMPORTANT - THIS THE FOCUS)
@@ -1792,6 +2062,7 @@ Return ONLY the shortened message (under 200 characters). No quotes, no explanat
                 upload_data_prospects <- li_data_prospects[, c("profile_input", "text", "final_message", "url")]
                 names(upload_data_prospects) <- c("prospect_li_url", "post_text", "message_to_contact", "post_url")
                 upload_data_prospects$message_type <- "connect"
+                upload_data_prospects$source <- "Post Reply"  # tag for last-message-type repeat filter
                 upload_data_prospects$account_email <- bdr_linkedin_email  # Use LinkedIn email for sending
                 upload_data_prospects$bdr_auth_email <- bdr_auth_email     # Store auth email for reference
                 upload_data_prospects$uploaded_date <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ")
@@ -1874,6 +2145,40 @@ Return ONLY the shortened message (under 200 characters). No quotes, no explanat
         ]
 
         if (nrow(org_contacts) == 0) next
+
+        # Don't send an Organization Complement (news) message to a contact
+        # whose most recent message from us was ALSO an Organization
+        # Complement message — avoid two of the same kind in a row. Only the
+        # remaining contacts at this org (if any) get this round's message.
+        org_contacts$last_message_type <- sapply(org_contacts$linkedInUrl, get_last_message_type)
+        pre_repeat_filter_count <- nrow(org_contacts)
+        org_contacts <- org_contacts[
+          is.na(org_contacts$last_message_type) | org_contacts$last_message_type != "Organization Complement",
+        ]
+        if (pre_repeat_filter_count - nrow(org_contacts) > 0) {
+          cat(sprintf("  Filtered out %d contact(s) at %s whose last message was also Organization Complement\n",
+                      pre_repeat_filter_count - nrow(org_contacts), org_name))
+        }
+
+        if (nrow(org_contacts) == 0) {
+          cat(sprintf("    All contacts at %s already got an Organization Complement message last — skipping\n", org_name))
+          next
+        }
+
+        # Also hold back any contact the AI conversation screen flagged
+        # (clearly rejected meeting, or clearly already met)
+        org_contacts$should_hold <- sapply(org_contacts$linkedInUrl, should_hold_for_conversation)
+        pre_hold_filter_count <- nrow(org_contacts)
+        org_contacts <- org_contacts[!org_contacts$should_hold, ]
+        if (pre_hold_filter_count - nrow(org_contacts) > 0) {
+          cat(sprintf("  Filtered out %d contact(s) at %s on hold (AI-detected: rejected meeting / already met)\n",
+                      pre_hold_filter_count - nrow(org_contacts), org_name))
+        }
+
+        if (nrow(org_contacts) == 0) {
+          cat(sprintf("    All contacts at %s on hold — skipping\n", org_name))
+          next
+        }
 
         cat(sprintf("  Searching news for: %s (%d contacts)...\n", org_name, nrow(org_contacts)))
 
