@@ -297,6 +297,7 @@
 import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
 import {
     extractHeyReachContent,
+    canonicalLinkedInUrl,
 } from '../js/heyreach-live-status.js';
 
 await window.firebaseReady;
@@ -542,6 +543,39 @@ async function getHeyReachApiKeyForBdr(bdrEmail) {
     } catch (e) { console.warn('getHeyReachApiKeyForBdr', e.message); return null; }
 }
 
+// Builds canonicalLinkedInUrl → message content, read straight from connect_queue docs
+// (message_to_contact / customMessage / etc. via extractHeyReachContent) — same approach
+// sent_messages.html uses for "Upcoming Outreach" content. This is the ground-truth copy of
+// what was actually queued for this contact and is free/instant to read, unlike HeyReach's
+// per-lead GetLead API (rate-limited, and can 404 outright for a given profile URL). Queries
+// the same three field variants sent_messages.html does — account_email alone (what the
+// in-process-leads backend checks) misses rows where only bdr_leader_email/bdr_auth_email
+// got set (e.g. the mass_upload / generate_messages paths).
+async function loadQueueContentMapForBdr(bdrEmail) {
+    const linkedInEmail = accountEmailFor(bdrEmail);
+    const emails = Array.from(new Set([bdrEmail, (bdrEmail || '').toLowerCase(), linkedInEmail, (linkedInEmail || '').toLowerCase()].filter(Boolean)));
+    const queueRef = collection(db, 'connect_queue');
+    const fields = ['bdr_leader_email', 'bdr_auth_email', 'account_email'];
+    const jobs = [];
+    emails.forEach(em => fields.forEach(field => jobs.push([field, em])));
+
+    const snaps = await Promise.all(jobs.map(([field, val]) =>
+        getDocs(query(queueRef, where(field, '==', val)))
+            .catch(err => { console.warn(`[Repurpose] connect_queue content lookup [${field}=${val}] failed:`, err.message); return { forEach: () => {} }; })
+    ));
+
+    const contentMap = new Map();
+    snaps.forEach(snap => snap.forEach(d => {
+        const data = d.data();
+        const rawUrl = data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || '';
+        const canonUrl = rawUrl ? canonicalLinkedInUrl(rawUrl) : '';
+        if (!canonUrl || contentMap.has(canonUrl)) return;
+        const content = extractHeyReachContent(data);
+        if (content) contentMap.set(canonUrl, content);
+    }));
+    return contentMap;
+}
+
 async function loadInProcessForBdr(bdrEmail, count) {
     const idToken = await auth.currentUser.getIdToken();
     const res = await fetch(`${BACKEND}/api/bdr/in-process-leads?bdrEmail=${encodeURIComponent(bdrEmail)}`, {
@@ -552,7 +586,20 @@ async function loadInProcessForBdr(bdrEmail, count) {
 
     const leads = (json.leads || []).filter(l => !l._excluded).slice(0, count * 3); // over-fetch; many won't have content yet
 
-    // Hydrate live content for any lead missing it (batched, matches in_processes_today.html —
+    // Primary content source: match against connect_queue by canonical LinkedIn URL BEFORE
+    // ever touching HeyReach's live per-lead API — see loadQueueContentMapForBdr() above.
+    log(`Matching ${leads.length} lead(s) against connect_queue for existing message content…`, 'info');
+    const queueContentMap = await loadQueueContentMapForBdr(bdrEmail);
+    let queueMatched = 0;
+    leads.forEach(l => {
+        if ((l.content || '').trim()) return;
+        const canonUrl = canonicalLinkedInUrl(l.rawUrl || l.url || '');
+        const c = canonUrl && queueContentMap.get(canonUrl);
+        if (c) { l.content = c; queueMatched++; }
+    });
+    if (queueMatched) log(`✅ Found content for ${queueMatched} lead(s) directly from connect_queue.`, 'ok');
+
+    // Hydrate live content for any lead STILL missing it (batched, matches in_processes_today.html —
     // including its 429 retry-with-backoff. HeyReach rate-limits bursts of concurrent per-lead
     // GetLead calls; without retrying a 429, a large "missing" batch silently comes back with
     // zero content for nearly everyone, which looks like "no messages ready to review" even
@@ -604,6 +651,9 @@ async function loadInProcessForBdr(bdrEmail, count) {
     }
 
     const withContent = leads.filter(l => (l.content || '').trim()).slice(0, count);
+    if (leads.length && withContent.length < leads.length) {
+        log(`ℹ️ ${leads.length - withContent.length} of ${leads.length} in-process lead(s) had no recoverable message content (checked connect_queue and HeyReach's live API) and were left out.`, withContent.length ? 'info' : 'warn');
+    }
 
     return withContent.map((l, i) => ({
         id: `ip_${i}_${l.url}`,
