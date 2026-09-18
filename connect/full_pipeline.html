@@ -273,7 +273,7 @@
                     <label style="display: inline-flex; align-items: center; gap: 6px; margin-left: 4px; margin-top: 4px; font-weight: 600; color: var(--gray-600);">
                         <input type="checkbox" id="fpRetryNotFoundUrls" onchange="fpRenderGroupOrgsTable()" style="width: auto;"> Re-search organizations whose LinkedIn URL wasn't found in a previous run
                     </label>
-                    <span style="display: block; margin-left: 24px; font-weight: 400; color: var(--gray-500);">Unchecked (default): organizations already researched with no LinkedIn URL found are skipped instead of being re-searched every run.</span>
+                    <span style="display: block; margin-left: 24px; font-weight: 400; color: var(--gray-500);">Unchecked (default): organizations already researched with no LinkedIn URL found are skipped entirely — no re-research AND no scan job — instead of being re-scanned (and re-billed) every run.</span>
                 </div>
                 <div id="fpScanNameStatus" style="font-size: 12.5px; font-weight: 600; margin-top: 6px;"></div>
                 <div id="fpScanRulesPresetStatus" style="font-size: 12.5px; font-weight: 600; margin-top: 4px;"></div>
@@ -4642,7 +4642,7 @@
                 ? `\n• Each organization will first be classified by AI (${orgTypeConfig.classifierModel}) into one of ${orgTypeConfig.types.length} type(s) (${orgTypeConfig.types.map(t => t.name).join(', ')}), each using its own scan rules`
                 : '';
             const notFoundUrlNote = notFoundUrlCount > 0
-                ? `\n• ${notFoundUrlCount} organization(s) previously had no LinkedIn URL found — ${retryNotFoundUrls ? 'will be RE-SEARCHED because "Re-search..." is checked' : 'will be SKIPPED (not re-searched) — check "Re-search organizations whose LinkedIn URL wasn\'t found" in Step 3 to retry them'}`
+                ? `\n• ${notFoundUrlCount} organization(s) previously had no LinkedIn URL found — ${retryNotFoundUrls ? 'will be RE-SEARCHED because "Re-search..." is checked' : 'will be SKIPPED ENTIRELY (no re-research, no scan job) — check "Re-search organizations whose LinkedIn URL wasn\'t found" in Step 3 to retry them'}`
                 : '';
             if (!confirm(`Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}${dupeNote}${orgTypeNoteForConfirm}${notFoundUrlNote}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules — matches are tagged with this hypothesis group and stay in prospect_contacts (whether or not they end up with a message), while rule-dropped contacts are moved to prospect_contacts_deleted — news is searched once per organization, and messages are generated + Opus reviewed one at a time.`)) return;
 
@@ -4859,7 +4859,7 @@
                 aiCostTracking: 'call_counts_only',
                 aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0, storyMatch: 0 },
                 orgs: [],
-                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, duplicateSkippedOrgs: 0, hypothesisTally: null, noMessageTally: null, postTypeTally: null, messageSourceTally: null,
+                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, duplicateSkippedOrgs: 0, noLinkedInUrlSkippedOrgs: 0, hypothesisTally: null, noMessageTally: null, postTypeTally: null, messageSourceTally: null,
                     // Filled in once at the end of the run — see fpFetchRealApifyCosts(). apifyUsd
                     // above only ever reflected the contact-search (scan) job; realCostBreakdown is
                     // the actual apify_run_ledger total across EVERY Apify call this run triggered
@@ -4890,7 +4890,7 @@
             if (notFoundUrlCount > 0) {
                 addLog(retryNotFoundUrls
                     ? `🔁 Re-searching ${notFoundUrlCount} organization(s) whose LinkedIn URL wasn't found in a previous run (checkbox is on).`
-                    : `⏭️ Skipping LinkedIn URL research for ${notFoundUrlCount} organization(s) already researched with no URL found — check "Re-search..." in Step 3 to retry them.`, 'dim');
+                    : `⏭️ Skipping ${notFoundUrlCount} organization(s) entirely — already researched with no URL found (no re-research, no scan job) — check "Re-search..." in Step 3 to retry them.`, 'dim');
             }
             addLog(`🧠 Models: build = ${buildModel}, Opus review = ${opusModel}`);
             if (fpIsOrgResearchEnabled()) {
@@ -5102,9 +5102,26 @@
                             // and re-billed to Apify/the research API — on every single run. Check
                             // "Re-search organizations whose LinkedIn URL wasn't found" in Step 3 to
                             // explicitly retry them.
+                            //
+                            // IMPORTANT: this ALSO skips submitting the org to the scan job at all.
+                            // The scan's own company-lookup fallback runs the exact same (slow,
+                            // ~60-90s) Gemini/Grok/Bebity pipeline as the research call above, so
+                            // letting it run anyway on every single run for every already-flagged
+                            // org silently defeated the whole point of this skip — the org still
+                            // got fully re-scanned and re-billed, it just skipped one extra call
+                            // first. Orgs that fail research for the FIRST time this run (the
+                            // `else if` below) still get one fallback shot from the scan itself —
+                            // it uses a slightly different pipeline and sometimes succeeds where
+                            // research didn't — but once an org is flagged, it's not retried again
+                            // (by either method) until "Re-search..." is explicitly checked.
                             if (!org.company_linkedin_url && org.linkedin_url_not_found && !retryNotFoundUrls) {
                                 const when = org.linkedin_url_research_failed_at ? new Date(org.linkedin_url_research_failed_at).toLocaleDateString() : 'a previous run';
-                                addLog(`   ⏭️ No LinkedIn URL — already researched (${when}) with nothing found, skipping re-research. The scan will try its own company lookup.`, 'dim');
+                                addLog(`   ⏭️ SKIPPED — no LinkedIn URL, already researched (${when}) with nothing found. No scan submitted, no extra cost. Check "Re-search..." in Step 3 to retry.`, 'dim');
+                                orgReport.error = 'no_linkedin_url';
+                                report.totals.noLinkedInUrlSkippedOrgs = (report.totals.noLinkedInUrlSkippedOrgs || 0) + 1;
+                                report.orgs.push(orgReport);
+                                await saveReport();
+                                continue;
                             } else if (!org.company_linkedin_url) {
                                 addLog(`   🔗 No LinkedIn URL — researching…`);
                                 try {

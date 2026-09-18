@@ -8751,17 +8751,13 @@
             return hasRange ? `Anytime between ${joined}` : joined;
         }
 
-        /** Returns the YYYY-MM-DD date string N business days from today */
-        function itmBusinessDayDateStr(n) {
-            const d = new Date();
-            d.setHours(0, 0, 0, 0);
-            let added = 0;
-            while (added < n) {
-                d.setDate(d.getDate() + 1);
-                if (d.getDay() !== 0 && d.getDay() !== 6) added++;
-            }
-            return d.toISOString().slice(0, 10);
-        }
+        // Always search for the next TARGET_OPEN_DAYS calendar days that actually have open
+        // slots, starting no sooner than MIN_DAYS_OUT days from today. Replaces the old fixed
+        // "N business days out, M-day window" approach, which often came back empty when the
+        // BDR's calendar simply didn't have openings in that one narrow slice.
+        const ITM_MIN_DAYS_OUT = 4;
+        const ITM_TARGET_OPEN_DAYS = 4;
+        const ITM_SEARCH_WINDOW_DAYS = 45; // wide enough net to reliably find 4 open days
 
         /** Returns the YYYY-MM-DD date string N calendar days after a given YYYY-MM-DD date */
         function itmAddCalendarDays(dateStr, n) {
@@ -8849,8 +8845,6 @@
 
             document.getElementById('itmLinkNote').innerHTML = `<i class="fas fa-link"></i> Using calendar: ${escapeHtml(calendarLink)}`;
             document.getElementById('itmDuration').value = '30';
-            document.getElementById('itmStartDay').value = '10';
-            document.getElementById('itmWindowDays').value = '4';
             document.getElementById('itmResults').innerHTML = '';
             document.getElementById('itmInsertBtn').disabled = true;
 
@@ -8884,11 +8878,11 @@
         window.fetchInsertTimesAvailability = async function() {
             const duration   = parseInt(document.getElementById('itmDuration').value) || 30;
             const tz         = document.getElementById('itmTimezone').value;
-            const startDay   = Math.max(0, parseInt(document.getElementById('itmStartDay').value) || 10);
-            const windowDays = Math.max(1, parseInt(document.getElementById('itmWindowDays').value) || 4);
 
-            const rangeStart = itmBusinessDayDateStr(startDay);
-            const rangeEnd   = itmAddCalendarDays(rangeStart, windowDays);
+            // Cast a wide net starting ITM_MIN_DAYS_OUT days from today — we'll trim this
+            // down to just the first ITM_TARGET_OPEN_DAYS open days below.
+            const rangeStart = itmAddCalendarDays(new Date().toISOString().slice(0, 10), ITM_MIN_DAYS_OUT);
+            const rangeEnd   = itmAddCalendarDays(rangeStart, ITM_SEARCH_WINDOW_DAYS);
 
             const resultsEl = document.getElementById('itmResults');
             const fetchBtn  = document.getElementById('itmFetchBtn');
@@ -8915,18 +8909,32 @@
                     throw new Error(data.error || `Request failed with HTTP ${res.status}`);
                 }
 
-                itmSlotData = [];
+                // Group every qualifying slot (8am–5pm local, per itmIsWithinBusinessHours) by
+                // date, then keep only the first ITM_TARGET_OPEN_DAYS distinct dates (in
+                // chronological order) that actually have an open slot — instead of a fixed
+                // date range that can easily land entirely on days with nothing open.
+                const slotsByDate = {};
                 (data.slots || []).forEach(({ date, times }) => {
                     (times || []).forEach(isoTime => {
                         // Only offer times that fall entirely within 8am–5pm local time for the recipient.
                         if (!itmIsWithinBusinessHours(isoTime, tz, duration)) return;
+                        if (!slotsByDate[date]) slotsByDate[date] = [];
+                        slotsByDate[date].push(isoTime);
+                    });
+                });
+
+                const openDates = Object.keys(slotsByDate).sort().slice(0, ITM_TARGET_OPEN_DAYS);
+
+                itmSlotData = [];
+                openDates.forEach(dateKey => {
+                    slotsByDate[dateKey].forEach(isoTime => {
                         const id = `itm-${isoTime.replace(/[^0-9]/g, '')}`;
-                        itmSlotData.push({ isoTime, dateKey: date, id, checked: true });
+                        itmSlotData.push({ isoTime, dateKey, id, checked: true });
                     });
                 });
 
                 if (!itmSlotData.length) {
-                    resultsEl.innerHTML = `<div class="itm-status empty"><i class="fas fa-calendar-times"></i> No available times between 8am–5pm found in that window. Try widening the range.</div>`;
+                    resultsEl.innerHTML = `<div class="itm-status empty"><i class="fas fa-calendar-times"></i> No available times between 8am–5pm found in the next ${ITM_SEARCH_WINDOW_DAYS} days. This calendar link may have no open slots configured.</div>`;
                     return;
                 }
 
@@ -17174,17 +17182,9 @@ Rules:
                         <option value="UTC">UTC</option>
                     </select>
                 </div>
-                <div>
-                    <label>Business Days Out</label>
-                    <input type="number" id="itmStartDay" value="10" min="0" max="60" />
-                </div>
-                <div>
-                    <label>Window (days)</label>
-                    <input type="number" id="itmWindowDays" value="4" min="1" max="30" />
-                </div>
             </div>
             <div style="font-size:0.78rem; color:#9ca3af; margin:-0.5rem 0 0.75rem;">
-                <i class="fas fa-circle-info"></i> Only showing times between 8am–5pm in the timezone above.
+                <i class="fas fa-circle-info"></i> Shows the next 4 open days with times (8am–5pm, at least 4 days out).
             </div>
             <button class="itm-fetch-btn" id="itmFetchBtn" onclick="fetchInsertTimesAvailability()">
                 <i class="fas fa-magnifying-glass"></i> Find Times
