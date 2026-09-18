@@ -697,9 +697,9 @@ async function tryInternetSearch(name, title, company, strategy, job) {
     let contactNews = '';
     try {
         contactNews = await geminiSearch(
-            `Find recent news (last 6 months) about ${name}${company ? `, ${title} at ${company}` : ''}. ` +
+            `Find recent news (last 2 months only — ignore anything older) about ${name}${company ? `, ${title} at ${company}` : ''}. ` +
             `Look for speaking engagements, published articles, awards, interviews, or notable achievements. ` +
-            `Return specific facts only. If nothing found, say "No recent news."`)
+            `Return specific facts only, each with its publication date. If nothing from the last 2 months is found, say "No recent news."`)
         ;
     } catch (err) {
         addJobLog(job, `   → Contact news search error: ${err.message}`, 'warning');
@@ -710,8 +710,8 @@ async function tryInternetSearch(name, title, company, strategy, job) {
     if (company) {
         try {
             companyNews = await geminiSearch(
-                `Find recent news (last 6 months) about "${company}" related to: ${newsTypes}. ` +
-                `Return only factual, specific news items. If nothing found, say "No recent news."`
+                `Find recent news (last 2 months only — ignore anything older) about "${company}" related to: ${newsTypes}. ` +
+                `Return only factual, specific news items, each with its publication date. If nothing from the last 2 months is found, say "No recent news."`
             );
     } catch (err) {
             addJobLog(job, `   → Company news search error: ${err.message}`, 'warning');
@@ -1187,14 +1187,21 @@ const HIRING_PATTERNS = [
 ];
 function isHiringPost(text) { if (!text) return false; return HIRING_PATTERNS.some(re => re.test(text)); }
 
+// Business rule: never mention a post older than 1 year, no matter what window a
+// caller asks for. Callers can request a tighter window via monthsBack.
+const POST_MAX_AGE_DAYS = 365;
+
 async function scrapeLinkedInPosts(liUrl, monthsBack = 3) {
     if (!APIFY_TOKEN) { console.warn('[Full AI] APIFY_TOKEN not set — posts scrape skipped'); return []; }
     const cutoffDate = new Date();
     cutoffDate.setMonth(cutoffDate.getMonth() - monthsBack);
+    // Hard floor: never wider than the 1-year business rule
+    const oneYearAgo = new Date(Date.now() - POST_MAX_AGE_DAYS * 24 * 60 * 60 * 1000);
+    const effectiveCutoff = cutoffDate > oneYearAgo ? cutoffDate : oneYearAgo;
     try {
         const runRes = await axios.post(
             `https://api.apify.com/v2/acts/${APIFY_POSTS_ACTOR}/runs?token=${APIFY_TOKEN}`,
-            { profileUrls: [liUrl], maxPosts: 50, fromDate: cutoffDate.toISOString().split('T')[0] },
+            { profileUrls: [liUrl], maxPosts: 50, fromDate: effectiveCutoff.toISOString().split('T')[0] },
             { headers: { 'Content-Type': 'application/json' }, timeout: 60000 }
         );
         const runId = runRes.data?.data?.id;
@@ -1209,6 +1216,14 @@ async function scrapeLinkedInPosts(liUrl, monthsBack = 3) {
                 return posts
                     .filter(p => p.text || p.content)
                     .filter(p => !isHiringPost(p.text || p.content || ''))
+                    // HARD client-side date cutoff: the actor's fromDate is not guaranteed
+                    // to be honored (and some actors ignore it entirely). Posts with no
+                    // parseable date are dropped too — "unknown age" is as unsafe to
+                    // reference as "known old".
+                    .filter(p => {
+                        const d = new Date(p.date || p.postedAt || '');
+                        return !isNaN(d.getTime()) && d >= effectiveCutoff;
+                    })
                     .map(p => ({ text: p.text || p.content || '', date: p.date || p.postedAt || '' }));
             }
             if (status === 'FAILED' || status === 'ABORTED') break;
