@@ -131,7 +131,8 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Cleanup Jobs', href: 'cleanup_jobs.html', icon: 'fa-chart-line' },
                 { label: 'divider' },
                 // Database Access
-                { label: 'Health System IT Contacts', href: 'all_contacts_database.html', icon: 'fa-database' }
+                { label: 'Health System IT Contacts', href: 'all_contacts_database.html', icon: 'fa-database' },
+                { label: 'AI Database Screener', href: 'contact_ai_screen.html', icon: 'fa-magnifying-glass-chart' }
             ]
         }
     ]
