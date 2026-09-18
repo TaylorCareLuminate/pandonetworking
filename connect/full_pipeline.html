@@ -2331,6 +2331,76 @@
             return keys;
         }
 
+        // ════════════════════════════════════════════════════════════════════
+        // Company-name similarity gate — catches the scan actor resolving an org
+        // to a completely different real company that just happens to share a
+        // word (e.g. "Connetic" -> "Connetic Apparel", "Alaska Startups" ->
+        // "Launch Alaska"). Every contact from a mismatch like that gets
+        // correctly rejected downstream by the Target Contact rules classifier
+        // anyway (wrong industry/title) — but only AFTER paying for a
+        // ruleClassify AI call on each one. Checking this first, using only the
+        // contacts' own scraped `company` field, catches it for free before that
+        // cost is spent. Deliberately conservative: an inconclusive comparison
+        // (org name too generic to judge either side) is treated as NOT a
+        // mismatch, leaving the call to the existing AI rules classifier exactly
+        // as before.
+        // ════════════════════════════════════════════════════════════════════
+        const FP_COMPANY_FILLER_WORDS = new Set([
+            'the', 'and', 'of', 'for', 'a', 'an',
+            'ventures', 'venture', 'capital', 'partners', 'partner', 'fund', 'funds',
+            'angels', 'angel', 'group', 'groups', 'network', 'networks', 'holdings', 'holding',
+            'associates', 'associate', 'management', 'advisors', 'advisor', 'foundation', 'foundations',
+            'accelerator', 'accelerators', 'program', 'programs', 'alliance', 'collaborative', 'club',
+            'guild', 'lab', 'labs', 'hub', 'hubs', 'initiative', 'initiatives', 'center', 'centre',
+            'startup', 'startups', 'investment', 'investments', 'investor', 'investors', 'equity',
+            'seed', 'early', 'stage', 'llc', 'inc', 'incorporated', 'llp', 'lp', 'ltd', 'limited',
+            'corp', 'corporation', 'co', 'company', 'plc', 'pllc', 'pc'
+        ]);
+
+        /** Significant (non-filler, non-legal-suffix) tokens for a company name —
+         *  reuses fpNormOrgName's normalization, then strips generic VC/legal
+         *  filler words that would otherwise swamp the comparison (nearly every
+         *  org in this pipeline has "Ventures", "Capital", "Angels", etc. in its
+         *  name, so those words carry no distinguishing signal). */
+        function fpCompanySignificantTokens(name) {
+            const norm = fpNormOrgName(name);
+            if (!norm) return [];
+            return norm.split(' ').filter(w => w.length > 2 && !FP_COMPANY_FILLER_WORDS.has(w));
+        }
+
+        /** True only when orgName and resolvedName look like DIFFERENT real
+         *  companies — not just different phrasings of the same one. */
+        function fpCompanyNamesLikelyMismatch(orgName, resolvedName) {
+            const a = fpCompanySignificantTokens(orgName);
+            const b = fpCompanySignificantTokens(resolvedName);
+            if (a.length === 0 || b.length === 0) return false; // too generic either side — inconclusive
+            if (a.length === 1 || b.length === 1) {
+                // A single distinguishing word on either side must match exactly —
+                // "Connetic" (1 token) vs "Connetic Apparel" (2 tokens) fails this.
+                return !(a.length === 1 && b.length === 1 && a[0] === b[0]);
+            }
+            const setA = new Set(a), setB = new Set(b);
+            const intersection = [...setA].filter(w => setB.has(w)).length;
+            const union = new Set([...setA, ...setB]).size;
+            const jaccard = union > 0 ? intersection / union : 0;
+            return jaccard < 0.5;
+        }
+
+        /** Most common non-empty scraped `company` value across a batch of
+         *  contacts — i.e. what the scan actor actually resolved this org to,
+         *  independent of whatever LinkedIn URL was stored/looked up for it. */
+        function fpModalContactCompany(contacts) {
+            const counts = new Map();
+            for (const c of (contacts || [])) {
+                const name = String(c.company || '').trim();
+                if (!name) continue;
+                counts.set(name, (counts.get(name) || 0) + 1);
+            }
+            let best = null, bestCount = 0;
+            for (const [name, count] of counts) { if (count > bestCount) { best = name; bestCount = count; } }
+            return best;
+        }
+
         function fpBuildDupeClusters(orgs) {
             const list = orgs || [];
             const parent = list.map((_, i) => i);
@@ -4577,6 +4647,36 @@
             return { byType, totalUsd };
         }
 
+        /** Looks at what's actually happened so far this run and returns a short,
+         *  specific diagnosis of which step is driving the cost when the Step 6
+         *  cost guard trips — instead of always blaming Step 4 rules regardless of
+         *  what actually went wrong. (Traced from a run against "VC groups" where
+         *  57 of 69 organizations failed at Step 3 LinkedIn URL lookup — "No valid
+         *  company LinkedIn URLs found" — and the old hardcoded message pointed at
+         *  Step 4 instead, sending the operator to fix the wrong thing.) */
+        function fpDiagnoseCostGuardCause(report) {
+            const t = report.totals;
+            // Orgs that actually reached a paid scan attempt this run — excludes the
+            // completely-free skips (duplicates, DNC matches, pre-flagged no-URL orgs).
+            const freeSkips = (t.duplicateSkippedOrgs || 0) + (t.noLinkedInUrlSkippedOrgs || 0) + (t.dncSkippedOrgs || 0);
+            const attemptedOrgs = Math.max(0, report.orgs.length - freeSkips);
+            const urlFails = t.urlLookupFailedOrgs || 0;
+            const mismatches = t.companyMismatchOrgs || 0;
+            const matchedPlusDropped = (t.matched || 0) + (t.dropped || 0);
+            const ruleDropRate = matchedPlusDropped > 0 ? (t.dropped || 0) / matchedPlusDropped : 0;
+
+            if (attemptedOrgs > 0 && (urlFails / attemptedOrgs) >= 0.3 && urlFails >= mismatches) {
+                return `Step 3 (LinkedIn company URL lookup) is the bottleneck this run, not Step 4 rules — ${urlFails} of ${attemptedOrgs} scanned organization(s) failed with "No valid company LinkedIn URLs found," and Apify still billed for every one of those failed attempts. Curate or manually assign LinkedIn URLs for these organizations (or drop them from the group) before rerunning — tightening Step 4's Job Title Keywords will not fix this.`;
+            }
+            if (attemptedOrgs > 0 && (mismatches / attemptedOrgs) >= 0.2) {
+                return `The scan is resolving several organizations to the WRONG real company (${mismatches} of ${attemptedOrgs} scanned this run flagged as a company-name mismatch) — every contact from those gets correctly rejected downstream, but only after paying for it. Verify/fix the LinkedIn URLs for the flagged organizations before rerunning.`;
+            }
+            if (matchedPlusDropped >= 5 && ruleDropRate >= 0.7) {
+                return `The Step 4 scan rules are dropping most matched contacts (${t.dropped || 0}/${matchedPlusDropped}, ${Math.round(ruleDropRate * 100)}%) — tighten the Job Title Keywords / functions / seniority (or use AI Fill) and run again.`;
+            }
+            return `No single step clearly dominates yet — ${urlFails} URL-lookup failure(s), ${mismatches} company-name mismatch(es), and ${t.dropped || 0}/${matchedPlusDropped || 0} matched contact(s) dropped by rules, out of ${attemptedOrgs} organization(s) scanned. Check the per-org report below to see where this run's spend is actually concentrated.`;
+        }
+
         // ════════════════════════════════════════════════════════════════════
         // MAIN RUN
         // ════════════════════════════════════════════════════════════════════
@@ -4859,7 +4959,7 @@
                 aiCostTracking: 'call_counts_only',
                 aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0, storyMatch: 0 },
                 orgs: [],
-                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, duplicateSkippedOrgs: 0, noLinkedInUrlSkippedOrgs: 0, hypothesisTally: null, noMessageTally: null, postTypeTally: null, messageSourceTally: null,
+                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, duplicateSkippedOrgs: 0, noLinkedInUrlSkippedOrgs: 0, urlLookupFailedOrgs: 0, companyMismatchOrgs: 0, hypothesisTally: null, noMessageTally: null, postTypeTally: null, messageSourceTally: null,
                     // Filled in once at the end of the run — see fpFetchRealApifyCosts(). apifyUsd
                     // above only ever reflected the contact-search (scan) job; realCostBreakdown is
                     // the actual apify_run_ledger total across EVERY Apify call this run triggered
@@ -5238,6 +5338,24 @@
                             if (scannedContacts.length === 0) {
                                 addLog('   ℹ️ No contacts to work with at this organization — moving on.', 'dim');
                                 orgReport.error = 'no_contacts';
+                                await fpStampScanLabel(org, scanName);
+                                report.orgs.push(orgReport);
+                                await saveReport();
+                                continue;
+                            }
+
+                            // ── Company-name similarity gate ── catches the scan resolving this
+                            // org to a different real company (see fpCompanyNamesLikelyMismatch
+                            // above) BEFORE paying for a ruleClassify AI call on every contact it
+                            // returned — those contacts would just get correctly rejected by the
+                            // rules anyway, so this only saves cost, it never changes the outcome
+                            // for a genuine match.
+                            const resolvedCompanyName = fpModalContactCompany(scannedContacts);
+                            if (resolvedCompanyName && fpCompanyNamesLikelyMismatch(org.company_name, resolvedCompanyName)) {
+                                orgReport.error = 'company_mismatch';
+                                orgReport.companyMismatch = { orgName: org.company_name, resolvedCompanyName, contactsAffected: scannedContacts.length };
+                                report.totals.companyMismatchOrgs = (report.totals.companyMismatchOrgs || 0) + 1;
+                                addLog(`   🚫 Company mismatch: the scan resolved "${org.company_name}" to "${resolvedCompanyName}" — a different company, not just different phrasing. Skipping the rules filter/message generation for these ${scannedContacts.length} contact(s) to avoid wasted AI cost. Verify/fix this org's LinkedIn URL in Prospect Organizations Admin, then re-run.`, 'warning');
                                 await fpStampScanLabel(org, scanName);
                                 report.orgs.push(orgReport);
                                 await saveReport();
@@ -5921,6 +6039,14 @@
                             addLog(`   ❌ Organization failed: ${orgErr.message}`, 'error');
                             if (orgErr.message === 'Stopped by user') { report.orgs.push(orgReport); await saveReport(); throw orgErr; }
 
+                            // Tag scan failures caused by the actor never resolving a company
+                            // LinkedIn URL at all (as opposed to any other failure reason) — this is
+                            // its own cost-guard diagnosis bucket, distinct from "rules dropped
+                            // everything" (see fpDiagnoseCostGuardCause below).
+                            if (/no valid company linkedin url/i.test(orgErr.message)) {
+                                report.totals.urlLookupFailedOrgs = (report.totals.urlLookupFailedOrgs || 0) + 1;
+                            }
+
                             // Circuit breaker: N orgs in a row failing with 401/Unauthorized from
                             // full-ai-init means the session is very likely genuinely dead, not
                             // transient — continuing would silently churn through the rest of the
@@ -5993,7 +6119,7 @@
                                 addLog(`\n🛑 COST SHUT-DOWN: all-in spend is $${allInUsd.toFixed(2)} for ${messagesSoFar} generated message(s)` +
                                     (messagesSoFar > 0 ? ` — $${avgPerMessage.toFixed(2)}/message` : '') +
                                     `, over the $${costPerMessage.toFixed(2)}/message target. Breakdown: contact search $${contactSearchUsd.toFixed(2)} + profile scrapes $${(ledgerBuckets.profileScrape || 0).toFixed(2)} + post scrapes $${(ledgerBuckets.postScrape || 0).toFixed(2)} + other Apify $${(ledgerBuckets.other || 0).toFixed(2)} + AI (estimated) $${aiEstimateSoFar.toFixed(2)}.`, 'error');
-                                addLog(`   The Step 4 scan rules are likely finding too few usable contacts per organization — tighten the Job Title Keywords / functions / seniority (or use AI Fill) and run again.`, 'warning');
+                                addLog(`   ${fpDiagnoseCostGuardCause(report)}`, 'warning');
                                 window.fpStopRequested = true;
                                 break;
                             }
