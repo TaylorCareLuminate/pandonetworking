@@ -124,7 +124,7 @@
 <div class="container">
     <div class="page-header">
         <h1><i class="fas fa-magnifying-glass-chart"></i> AI Database Screener</h1>
-        <p>Scans the entire healthcare contacts database (the same data behind Health System IT Contacts) against any description you type — e.g. "senior IT leadership at hospitals and health systems" — using a cheap AI model from your catalog. A free keyword pre-filter shrinks the pool first, and the cost of the AI pass is estimated <em>before</em> you run it, using live OpenRouter pricing.</p>
+        <p>Scans all contacts — the full system-wide <code>prospect_contacts</code> universe (the same data Open to Work Finder scans) or the healthcare IT directory — against any description you type, e.g. "senior IT leadership at hospitals and health systems", using a cheap AI model from your catalog. A free keyword pre-filter shrinks the pool first, and the cost of the AI pass is estimated <em>before</em> you run it, using live OpenRouter pricing.</p>
         <a href="index.html"><i class="fas fa-arrow-left"></i> Back to Connect Home</a>
     </div>
 
@@ -132,8 +132,12 @@
     <div class="section">
         <div class="section-title"><span class="step-badge">Step 1</span> <i class="fas fa-database"></i> Load the Contacts Database</div>
         <p class="section-help">
-            Reads every collection under the Firebase <code>contacts</code> node (hospital IT, health systems, etc.). This is free — no AI is involved yet.
+            Pick which database to scan, then load it. This is free — no AI is involved yet.
         </p>
+        <div class="radio-row" style="margin-bottom:0.85rem;">
+            <label><input type="radio" name="dataSource" value="prospects" checked> All prospect contacts (system-wide, every BDR &amp; workspace — same universe as Open to Work Finder)</label>
+            <label><input type="radio" name="dataSource" value="directory"> Healthcare IT directory (the Health System IT Contacts database)</label>
+        </div>
         <button class="btn btn-teal" id="btnLoad" onclick="loadDatabase()"><i class="fas fa-download"></i> Load All Contacts</button>
         <div class="totals-grid" id="loadTotals" style="display:none;"></div>
         <div id="loadStatus" style="margin-top:0.75rem;"></div>
@@ -246,37 +250,110 @@
     function chunk(arr, n) { const out = []; for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n)); return out; }
     const tok = chars => Math.ceil(chars / 4); // rough chars→tokens
 
-    function fullName(c) { return `${c.first_name || ''} ${c.last_name || ''}`.trim() || 'Unknown'; }
-    function cTitle(c)   { return c.current_title || ''; }
-    function cCompany(c) { return c.current_company || c.searched_organization_name || ''; }
+    // Field accessors handle both data shapes: the RTDB healthcare directory
+    // (first_name / current_title / experience_paragraph …) and Firestore
+    // prospect_contacts (firstName / title / experience-as-JSON …).
+    function fullName(c) {
+        return `${c.first_name || ''} ${c.last_name || ''}`.trim()
+            || c.fullName || `${c.firstName || ''} ${c.lastName || ''}`.trim() || c.name || 'Unknown';
+    }
+    function cFirstName(c) { return c.first_name || c.firstName || ''; }
+    function cLastName(c)  { return c.last_name || c.lastName || ''; }
+    function cTitle(c)   { return c.current_title || c.title || c.position || ''; }
+    function cCompany(c) { return c.current_company || c.company || c.companyName || c.searched_organization_name || ''; }
     function cHeadline(c){ return c.headline || ''; }
     function cLocation(c){ return c.location || ''; }
+    function cLinkedIn(c){ return c.linkedin_url || c.linkedInUrl || ''; }
+    function cAbout(c)   { return c.summary || c.about || ''; }
     function keywordList(v) { return String(v || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean); }
 
+    // Experience: the directory stores a plain paragraph; prospect_contacts stores
+    // a JSON array of roles (same shape open_to_work_finder.html parses).
+    function parseJsonArray(raw) {
+        if (!raw) return [];
+        if (Array.isArray(raw)) return raw;
+        if (typeof raw === 'string') {
+            try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch { return []; }
+        }
+        return [];
+    }
+    function expIsGrouped(e) { return Array.isArray(e?.child) && e.child.length > 0 && !!e.child[0].title; }
+    function expTitle(e) {
+        if (expIsGrouped(e)) return String(e.child[0].title || '').trim();
+        return String(e?.title || e?.jobTitle || e?.position || '').trim();
+    }
+    function expCompany(e) {
+        let v = e?.companyName || e?.company || e?.organization || '';
+        if (!v) {
+            if (expIsGrouped(e)) v = e?.title || '';
+            else if (e?.subtitle) v = String(e.subtitle).replace(/\s*·\s*(Full-time|Part-time|Contract|Internship|Freelance|Self-employed|Seasonal|Apprenticeship).*$/i, '').trim();
+        }
+        if (v && typeof v === 'object') v = v.name || v.companyName || '';
+        return String(v || '').trim();
+    }
+    function cExperienceText(c) {
+        if (c.experience_paragraph) return String(c.experience_paragraph);
+        const roles = parseJsonArray(c.experience).slice(0, 6)
+            .map(e => [expTitle(e), expCompany(e)].filter(Boolean).join(' @ '))
+            .filter(Boolean);
+        return roles.join('; ');
+    }
+
     // ── STEP 1: Load database ────────────────────────────────────────────────
+    async function loadDirectoryContacts(statusEl) {
+        statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Downloading the contacts node from Firebase…</div>`;
+        const snap = await get(ref(window.database, 'contacts'));
+        if (!snap.exists()) throw new Error('No data found under the "contacts" node.');
+        const data = snap.val();
+        const contacts = [];
+        const perCollection = {};
+        for (const key in data) {
+            const coll = data[key];
+            const items = Array.isArray(coll) ? coll.filter(Boolean) : Object.values(coll || {}).filter(Boolean);
+            perCollection[key] = items.length;
+            items.forEach(c => contacts.push({ _id: contacts.length, _collection: key, ...c }));
+        }
+        return { contacts, perCollection, duplicatesSkipped: 0 };
+    }
+
+    async function loadProspectContacts(statusEl) {
+        // Whole prospect_contacts collection, system-wide (no openToWork filter) —
+        // the wrapper auto-paginates unlimited getDocs() calls in 5,000-doc pages.
+        const db = window.clemailDb;
+        const { collection, getDocs } = window.clemailFirestoreModule;
+        statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Downloading prospect_contacts (paged, large collection — this can take a minute)…</div>`;
+        const snap = await getDocs(collection(db, 'prospect_contacts'), {
+            maxDocs: 500000,
+            onPage: n => { statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Downloaded ${n.toLocaleString()} contacts so far…</div>`; }
+        });
+        const contacts = [];
+        const seen = new Set();
+        let duplicatesSkipped = 0;
+        snap.forEach(d => {
+            const data = d.data();
+            const key = (cLinkedIn(data) || '').toLowerCase().trim() || d.id;
+            if (seen.has(key)) { duplicatesSkipped++; return; } // same person owned by multiple BDRs/workspaces
+            seen.add(key);
+            contacts.push({ _id: contacts.length, _collection: 'prospect_contacts', ...data });
+        });
+        return { contacts, perCollection: {}, duplicatesSkipped };
+    }
+
     window.loadDatabase = async function() {
         const btn = document.getElementById('btnLoad');
         const statusEl = document.getElementById('loadStatus');
+        const source = document.querySelector('input[name="dataSource"]:checked').value;
         btn.disabled = true;
         btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Loading…';
-        statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Downloading the contacts node from Firebase…</div>`;
         try {
-            const snap = await get(ref(window.database, 'contacts'));
-            if (!snap.exists()) throw new Error('No data found under the "contacts" node.');
-            const data = snap.val();
-
-            allContacts = [];
-            const perCollection = {};
-            for (const key in data) {
-                const coll = data[key];
-                const items = Array.isArray(coll) ? coll.filter(Boolean) : Object.values(coll || {}).filter(Boolean);
-                perCollection[key] = items.length;
-                items.forEach(c => allContacts.push({ _id: allContacts.length, _collection: key, ...c }));
-            }
+            const { contacts, perCollection, duplicatesSkipped } = source === 'prospects'
+                ? await loadProspectContacts(statusEl)
+                : await loadDirectoryContacts(statusEl);
+            allContacts = contacts;
             aiResults.clear();
             actualCostUsd = 0;
 
-            const orgSet = new Set(allContacts.map(c => (c.searched_organization_name || c.current_company || '').toLowerCase()).filter(Boolean));
+            const orgSet = new Set(allContacts.map(c => cCompany(c).toLowerCase()).filter(Boolean));
             const collBoxes = Object.entries(perCollection)
                 .sort((a, b) => b[1] - a[1])
                 .map(([k, n]) => `<div class="total-box"><div class="val">${n.toLocaleString()}</div><div class="label">${escHtml(k)}</div></div>`)
@@ -285,9 +362,10 @@
             document.getElementById('loadTotals').innerHTML = `
                 <div class="total-box"><div class="val">${allContacts.length.toLocaleString()}</div><div class="label">Total contacts</div></div>
                 <div class="total-box"><div class="val">${orgSet.size.toLocaleString()}</div><div class="label">Organizations</div></div>
+                ${duplicatesSkipped ? `<div class="total-box"><div class="val">${duplicatesSkipped.toLocaleString()}</div><div class="label">Duplicate copies skipped</div></div>` : ''}
                 ${collBoxes}
             `;
-            statusEl.innerHTML = `<div class="alert alert-success"><i class="fas fa-check-circle"></i> Loaded ${allContacts.length.toLocaleString()} contacts. Set up the pre-filter and AI screen below.</div>`;
+            statusEl.innerHTML = `<div class="alert alert-success"><i class="fas fa-check-circle"></i> Loaded ${allContacts.length.toLocaleString()} contacts${source === 'prospects' ? ' from prospect_contacts (system-wide)' : ''}. Set up the pre-filter and AI screen below.</div>`;
             document.getElementById('filterSection').style.display = 'block';
             document.getElementById('aiSection').style.display = 'block';
             onEstimateInputsChanged();
@@ -309,7 +387,7 @@
             if (inc.length && !inc.some(k => th.includes(k))) return false;
             if (exc.length && exc.some(k => th.includes(k))) return false;
             if (org.length) {
-                const o = `${cCompany(c)} ${c.searched_organization_name || ''} ${c.searched_organization_domain || ''}`.toLowerCase();
+                const o = `${cCompany(c)} ${c.companyName || ''} ${c.searched_organization_name || ''} ${c.searched_organization_domain || ''}`.toLowerCase();
                 if (!org.some(k => o.includes(k))) return false;
             }
             return true;
@@ -328,8 +406,8 @@
             location: cap(cLocation(c), 60)
         };
         if (detail === 'full') {
-            const about = cap(c.summary || c.about || '', 500);
-            const exp   = cap(c.experience_paragraph || '', 900);
+            const about = cap(cAbout(c), 500);
+            const exp   = cap(cExperienceText(c), 900);
             if (about) base.about = about;
             if (exp)   base.experience = exp;
         }
@@ -620,7 +698,7 @@ Respond with ONLY a valid JSON array, one object per contact, IN THE SAME ORDER,
                 <td>${escHtml(cCompany(c))}</td>
                 <td>${escHtml(cLocation(c))}</td>
                 <td style="max-width:340px;">${escHtml(r.reason)}</td>
-                <td>${c.linkedin_url ? `<a href="${escHtml(c.linkedin_url)}" target="_blank" rel="noopener"><i class="fab fa-linkedin"></i></a>` : '—'}</td>
+                <td>${cLinkedIn(c) ? `<a href="${escHtml(cLinkedIn(c))}" target="_blank" rel="noopener"><i class="fab fa-linkedin"></i></a>` : '—'}</td>
             </tr>`;
         }).join('');
         document.getElementById('resCountLabel').textContent =
@@ -640,8 +718,8 @@ Respond with ONLY a valid JSON array, one object per contact, IN THE SAME ORDER,
         rows.forEach(({ c, r }) => {
             lines.push([
                 r.error ? 'error' : (r.match ? 'match' : 'no_match'),
-                r.confidence, c.first_name || '', c.last_name || '', cTitle(c), cCompany(c), cLocation(c),
-                c.linkedin_url || '', c._collection || '', r.reason, r.model || ''
+                r.confidence, cFirstName(c), cLastName(c), cTitle(c), cCompany(c), cLocation(c),
+                cLinkedIn(c), c._collection || '', r.reason, r.model || ''
             ].map(esc).join(','));
         });
         const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
