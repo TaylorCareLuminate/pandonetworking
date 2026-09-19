@@ -292,6 +292,7 @@
         return String(v || '').trim();
     }
     function cExperienceText(c) {
+        if (c._expText) return c._expText; // already condensed at load time
         if (c.experience_paragraph) return String(c.experience_paragraph);
         const roles = parseJsonArray(c.experience).slice(0, 6)
             .map(e => [expTitle(e), expCompany(e)].filter(Boolean).join(' @ '))
@@ -316,26 +317,59 @@
         return { contacts, perCollection, duplicatesSkipped: 0 };
     }
 
+    // prospect_contacts docs are heavy (full experience/education JSON, campaign
+    // fields, message history flags…). Keeping raw docs for the whole collection
+    // crashes the tab with Out of Memory, so each page is immediately boiled down
+    // to just the small fields this screener needs and the raw page is discarded.
+    function trimProspect(data, id) {
+        const t = {
+            _id: id,
+            _collection: 'prospect_contacts',
+            firstName: cFirstName(data),
+            lastName: cLastName(data),
+            fullName: fullName(data),
+            title: cap(cTitle(data), 140),
+            headline: cap(cHeadline(data), 160),
+            company: cap(cCompany(data), 120),
+            location: cap(cLocation(data), 60),
+            linkedInUrl: cLinkedIn(data)
+        };
+        // Same caps "Full profile" mode sends to the AI — nothing usable is lost.
+        const about = cap(cAbout(data), 500);
+        if (about) t.about = about;
+        const exp = cap(cExperienceText(data), 900);
+        if (exp) t._expText = exp;
+        return t;
+    }
+
     async function loadProspectContacts(statusEl) {
-        // Whole prospect_contacts collection, system-wide (no openToWork filter) —
-        // the wrapper auto-paginates unlimited getDocs() calls in 5,000-doc pages.
+        // Whole prospect_contacts collection, system-wide (no openToWork filter),
+        // paged manually so only one raw 5,000-doc page is in memory at a time.
         const db = window.clemailDb;
-        const { collection, getDocs } = window.clemailFirestoreModule;
-        statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Downloading prospect_contacts (paged, large collection — this can take a minute)…</div>`;
-        const snap = await getDocs(collection(db, 'prospect_contacts'), {
-            maxDocs: 500000,
-            onPage: n => { statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Downloaded ${n.toLocaleString()} contacts so far…</div>`; }
-        });
+        const { collection, getDocs, query, limit, startAfter } = window.clemailFirestoreModule;
+        const PAGE = 5000, MAX_DOCS = 500000;
         const contacts = [];
         const seen = new Set();
-        let duplicatesSkipped = 0;
-        snap.forEach(d => {
-            const data = d.data();
-            const key = (cLinkedIn(data) || '').toLowerCase().trim() || d.id;
-            if (seen.has(key)) { duplicatesSkipped++; return; } // same person owned by multiple BDRs/workspaces
-            seen.add(key);
-            contacts.push({ _id: contacts.length, _collection: 'prospect_contacts', ...data });
-        });
+        let duplicatesSkipped = 0, fetched = 0, lastId = null;
+        statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Downloading prospect_contacts (paged, large collection — this can take a few minutes)…</div>`;
+        for (;;) {
+            const constraints = lastId ? [startAfter({ id: lastId }), limit(PAGE)] : [limit(PAGE)];
+            const snap = await getDocs(query(collection(db, 'prospect_contacts'), ...constraints));
+            const docs = snap.docs;
+            if (!docs.length) break;
+            docs.forEach(d => {
+                const data = d.data();
+                const key = (cLinkedIn(data) || '').toLowerCase().trim() || d.id;
+                if (seen.has(key)) { duplicatesSkipped++; return; } // same person owned by multiple BDRs/workspaces
+                seen.add(key);
+                contacts.push(trimProspect(data, contacts.length));
+            });
+            fetched += docs.length;
+            lastId = docs[docs.length - 1].id;
+            statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Downloaded ${fetched.toLocaleString()} contacts (${contacts.length.toLocaleString()} unique) so far…</div>`;
+            if (docs.length < PAGE) break;
+            if (fetched >= MAX_DOCS) { console.warn(`[AI Screener] Stopped at the ${MAX_DOCS.toLocaleString()}-doc safety cap.`); break; }
+        }
         return { contacts, perCollection: {}, duplicatesSkipped };
     }
 
