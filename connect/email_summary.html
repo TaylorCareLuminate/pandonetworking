@@ -835,6 +835,79 @@
             color: var(--gray);
         }
 
+        .bdr-item-activity {
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-top: 0.15rem;
+            display: none;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .bdr-item-activity.shown {
+            display: flex;
+        }
+
+        .bdr-item-activity.meets-threshold {
+            color: #059669;
+        }
+
+        .bdr-item-activity.below-threshold {
+            color: #9ca3af;
+        }
+
+        .bdr-checkbox-wrapper.filtered-out {
+            display: none !important;
+        }
+
+        .activity-filter-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            margin-bottom: 0.75rem;
+            padding: 0.6rem 0.75rem;
+            background: #f0f7ff;
+            border: 1.5px solid #dbeafe;
+            border-radius: 8px;
+        }
+
+        .activity-filter-row label {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.85rem;
+            color: var(--secondary);
+            cursor: pointer;
+            font-weight: 500;
+        }
+
+        .activity-filter-row input[type="checkbox"] {
+            width: 15px;
+            height: 15px;
+            accent-color: var(--primary);
+            cursor: pointer;
+        }
+
+        .activity-filter-row input[type="number"] {
+            width: 65px;
+            padding: 0.35rem 0.5rem;
+            border: 1.5px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            text-align: center;
+        }
+
+        .activity-filter-row input[type="number"]:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        #activityFilterStatus {
+            font-size: 0.8rem;
+            color: var(--gray);
+        }
+
         .bulk-send-status {
             margin-top: 1rem;
         }
@@ -1155,6 +1228,18 @@
                 <i class="fas fa-info-circle"></i>
                 Select BDRs below. Each BDR has its own <strong>Outreach Strategy</strong> field — fill it in to include a highlighted strategy note in that person's email, or leave it blank to skip.
             </div>
+            <div class="activity-filter-row">
+                <button id="loadActivityBtn" class="btn btn-secondary" onclick="loadBdrActivityCounts()" style="padding: 0.45rem 0.9rem; font-size: 0.85rem;">
+                    <i class="fas fa-chart-line"></i> Load Weekly Activity Counts
+                </button>
+                <label for="activityFilterToggle">
+                    <input type="checkbox" id="activityFilterToggle" onchange="onActivityFilterChange()">
+                    Only show BDRs with
+                </label>
+                <input type="number" id="activityThresholdInput" value="50" min="0" onchange="onActivityFilterChange()">
+                <span style="font-size:0.85rem; color:var(--gray);">+ connection requests / messages sent this week</span>
+                <span id="activityFilterStatus"></span>
+            </div>
             <div id="bdrCheckboxList" class="bdr-checkbox-list">
                 <div style="color: var(--gray); font-size: 0.9rem; padding: 0.5rem;">Loading BDR leaders...</div>
             </div>
@@ -1277,6 +1362,9 @@
         let linkedInEmailAssociations = new Map();
         let linkedInAccountIdMapping = new Map();
         let bdrEmailToCustomerIdMapping = new Map();
+        // bdrId -> { connectionRequestsSent, messagesSent, total } for the past 7 days
+        let bdrActivityCounts = new Map();
+        let activityCountsLoaded = false;
         let weeklyData = {
             connectionRequestsSent: 0,
             messagesSent: 0,
@@ -3069,6 +3157,7 @@
                     <div>
                         <div class="bdr-item-name">${bdr.name || 'Unnamed'}</div>
                         <div class="bdr-item-email">${bdr.primaryEmail || 'No email'}${bdr.status !== 'active' ? ' · Inactive' : ''}</div>
+                        <div class="bdr-item-activity" id="activity-${bdr.id}"></div>
                     </div>
                 `;
 
@@ -3100,6 +3189,12 @@
 
             section.classList.remove('hidden');
             updateSelectedCount();
+
+            // Re-apply any previously loaded activity counts / filter to the freshly rendered list
+            if (activityCountsLoaded) {
+                renderActivityBadges();
+                applyActivityFilter();
+            }
         }
 
         function updateSelectedCount() {
@@ -3110,8 +3205,16 @@
             if (sendBtn) sendBtn.disabled = count === 0;
         }
 
+        // Only the checkboxes that are currently visible (not hidden by the activity filter)
+        function getVisibleBdrCheckboxes() {
+            return Array.from(document.querySelectorAll('.bdr-cb')).filter(cb => {
+                const wrapper = cb.closest('.bdr-checkbox-wrapper');
+                return wrapper && !wrapper.classList.contains('filtered-out');
+            });
+        }
+
         window.selectAllBDRs = function() {
-            document.querySelectorAll('.bdr-cb').forEach(cb => {
+            getVisibleBdrCheckboxes().forEach(cb => {
                 cb.checked = true;
                 cb.closest('.bdr-checkbox-item').classList.add('checked');
             });
@@ -3119,11 +3222,221 @@
         };
 
         window.clearAllBDRs = function() {
-            document.querySelectorAll('.bdr-cb').forEach(cb => {
+            getVisibleBdrCheckboxes().forEach(cb => {
                 cb.checked = false;
                 cb.closest('.bdr-checkbox-item').classList.remove('checked');
             });
             updateSelectedCount();
+        };
+
+        // ─── Bulk Send: Filter BDRs by weekly outbound activity ───────────────
+        // Builds lookup indexes so each heyreach_activity event can be attributed
+        // to a BDR in a single pass (same matching rules as loadWeeklyData, but
+        // computed once for ALL BDRs instead of one BDR at a time).
+        function buildBdrMatchIndex() {
+            const accountIdToBdr = new Map();
+            const emailToBdr = new Map();
+
+            bdrLeaders.forEach(bdr => {
+                const primaryEmail = bdr.primaryEmail?.toLowerCase();
+                if (!primaryEmail) return;
+                const linkedInEmail = linkedInEmailAssociations.get(primaryEmail);
+
+                emailToBdr.set(primaryEmail, bdr);
+                if (linkedInEmail) emailToBdr.set(linkedInEmail, bdr);
+
+                linkedInAccountIdMapping.forEach((mappedEmail, accountId) => {
+                    if (mappedEmail === primaryEmail || mappedEmail === linkedInEmail) {
+                        accountIdToBdr.set(accountId, bdr);
+                    }
+                });
+            });
+
+            return { accountIdToBdr, emailToBdr };
+        }
+
+        function findMatchingBdr(data, accountIdToBdr, emailToBdr) {
+            // Method 1 & 3: linkedInAccountId (direct or via mapping)
+            const accountIdStr = data.linkedInAccountId ? String(data.linkedInAccountId) : null;
+            if (accountIdStr && accountIdToBdr.has(accountIdStr)) {
+                return accountIdToBdr.get(accountIdStr);
+            }
+
+            // Method 2: direct bdrEmail field on the event
+            if (data.bdrEmail) {
+                const webhookBdrEmail = data.bdrEmail.toLowerCase();
+                if (emailToBdr.has(webhookBdrEmail)) return emailToBdr.get(webhookBdrEmail);
+            }
+
+            // Method 4: fall back to matching accountName against BDR name
+            if (data.accountName) {
+                const accountNameLower = data.accountName.toLowerCase().trim();
+                for (const bdr of bdrLeaders) {
+                    const bdrNameLower = (bdr.name || '').toLowerCase().trim();
+                    if (!bdrNameLower) continue;
+                    if (accountNameLower === bdrNameLower) return bdr;
+
+                    const bdrNameParts = bdrNameLower.split(/\s+/).filter(p => p.length > 1);
+                    if (bdrNameParts.length >= 2 && bdrNameParts.every(part => accountNameLower.includes(part))) {
+                        return bdr;
+                    }
+
+                    const accountNameParts = accountNameLower.split(/\s+/).filter(p => p.length > 1);
+                    if (bdrNameParts.length >= 2 && accountNameParts.length >= 2) {
+                        const firstNameMatch = bdrNameParts[0] === accountNameParts[0];
+                        const lastNameMatch = bdrNameParts[bdrNameParts.length - 1] === accountNameParts[accountNameParts.length - 1];
+                        if (firstNameMatch && lastNameMatch) return bdr;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        // Fetches heyreach_activity events for the past 7 days ONCE and tallies
+        // connection requests + messages sent per BDR (combined = "activity").
+        window.loadBdrActivityCounts = async function() {
+            const btn = document.getElementById('loadActivityBtn');
+            const statusEl = document.getElementById('activityFilterStatus');
+            if (btn) {
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading activity...';
+            }
+            if (statusEl) statusEl.textContent = '';
+
+            try {
+                const weekAgo = new Date();
+                weekAgo.setDate(weekAgo.getDate() - 7);
+                weekAgo.setHours(0, 0, 0, 0);
+                const weekAgoMs = weekAgo.getTime();
+                const sinceTimestamp = Timestamp.fromDate(weekAgo);
+
+                console.log(`🔍 Loading weekly activity counts for all BDRs since ${weekAgo.toISOString()}...`);
+
+                const activityQuery = query(
+                    collection(emailDB, 'heyreach_activity'),
+                    where('timestamp', '>=', sinceTimestamp),
+                    orderBy('timestamp', 'desc'),
+                    limit(10000)
+                );
+                const snapshot = await getDocs(activityQuery);
+
+                const { accountIdToBdr, emailToBdr } = buildBdrMatchIndex();
+
+                bdrActivityCounts = new Map();
+                bdrLeaders.forEach(bdr => {
+                    bdrActivityCounts.set(bdr.id, { connectionRequestsSent: 0, messagesSent: 0, total: 0 });
+                });
+
+                snapshot.forEach(docSnap => {
+                    const data = docSnap.data();
+                    const isConnectionRequest = data.eventType === 'CONNECTION_REQUEST_SENT';
+                    const isMessage = data.eventType === 'MESSAGE_SENT' || data.eventType === 'INMAIL_SENT';
+                    if (!isConnectionRequest && !isMessage) return;
+
+                    const eventTimestamp = safeToDate(data.timestamp);
+                    if (!eventTimestamp || eventTimestamp.getTime() < weekAgoMs) return;
+
+                    const bdr = findMatchingBdr(data, accountIdToBdr, emailToBdr);
+                    if (!bdr) return;
+
+                    const counts = bdrActivityCounts.get(bdr.id);
+                    if (!counts) return;
+
+                    if (isConnectionRequest) counts.connectionRequestsSent++;
+                    else counts.messagesSent++;
+                    counts.total = counts.connectionRequestsSent + counts.messagesSent;
+                });
+
+                activityCountsLoaded = true;
+                console.log('✅ Weekly activity counts loaded:', Object.fromEntries(
+                    Array.from(bdrActivityCounts.entries()).map(([id, c]) => {
+                        const bdr = bdrLeaders.find(b => b.id === id);
+                        return [bdr?.name || id, c];
+                    })
+                ));
+
+                renderActivityBadges();
+                applyActivityFilter();
+            } catch (error) {
+                console.error('❌ Error loading BDR activity counts:', error);
+                showAlert('Error loading activity counts: ' + error.message, 'danger');
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-sync-alt"></i> Refresh Activity Counts';
+                }
+            }
+        };
+
+        // Writes the "X requests · Y messages this week" badge into each BDR row
+        function renderActivityBadges() {
+            const threshold = getActivityThreshold();
+            bdrActivityCounts.forEach((counts, bdrId) => {
+                const el = document.getElementById(`activity-${bdrId}`);
+                if (!el) return;
+                const meets = counts.total >= threshold;
+                el.classList.add('shown');
+                el.classList.toggle('meets-threshold', meets);
+                el.classList.toggle('below-threshold', !meets);
+                el.innerHTML = `<i class="fas fa-${meets ? 'check-circle' : 'minus-circle'}"></i> ${counts.total} this week ` +
+                    `(${counts.connectionRequestsSent} reqs, ${counts.messagesSent} msgs)`;
+            });
+        }
+
+        function getActivityThreshold() {
+            const input = document.getElementById('activityThresholdInput');
+            const value = parseInt(input?.value, 10);
+            return Number.isFinite(value) && value >= 0 ? value : 50;
+        }
+
+        // Shows/hides BDR rows based on the "Only show BDRs with N+ activity" toggle
+        function applyActivityFilter() {
+            const toggle = document.getElementById('activityFilterToggle');
+            const statusEl = document.getElementById('activityFilterStatus');
+            const filterEnabled = !!toggle?.checked;
+            const threshold = getActivityThreshold();
+
+            let visibleCount = 0;
+            document.querySelectorAll('.bdr-checkbox-wrapper').forEach(wrapper => {
+                const bdrId = wrapper.dataset.bdrId;
+                const counts = bdrActivityCounts.get(bdrId);
+                const meetsThreshold = activityCountsLoaded && counts ? counts.total >= threshold : false;
+                const hide = filterEnabled && activityCountsLoaded && !meetsThreshold;
+                wrapper.classList.toggle('filtered-out', hide);
+                if (!hide) visibleCount++;
+
+                // If a filtered-out BDR was checked, uncheck it so it isn't sent to silently
+                if (hide) {
+                    const cb = wrapper.querySelector('.bdr-cb');
+                    if (cb && cb.checked) {
+                        cb.checked = false;
+                        cb.closest('.bdr-checkbox-item')?.classList.remove('checked');
+                    }
+                }
+            });
+
+            if (statusEl) {
+                if (!activityCountsLoaded) {
+                    statusEl.textContent = filterEnabled ? '(click "Load Weekly Activity Counts" first)' : '';
+                } else if (filterEnabled) {
+                    statusEl.textContent = `Showing ${visibleCount} of ${bdrLeaders.length} BDRs with ${threshold}+ requests/messages this week`;
+                } else {
+                    statusEl.textContent = '';
+                }
+            }
+
+            updateSelectedCount();
+        }
+
+        window.onActivityFilterChange = function() {
+            const toggle = document.getElementById('activityFilterToggle');
+            if (toggle?.checked && !activityCountsLoaded) {
+                // Auto-load counts the first time the filter is turned on
+                loadBdrActivityCounts();
+                return;
+            }
+            applyActivityFilter();
         };
 
         // ─── Bulk Send: Send summary email to a single BDR ────────────────────
