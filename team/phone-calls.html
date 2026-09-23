@@ -6743,70 +6743,60 @@
             return suggestions;
         }
         
+        const PHONE_CLAIM_ENDPOINT = 'https://us-central1-clemail.cloudfunctions.net/claimPhoneCall';
+
+        async function requestPhoneClaim(action, callId, extra = {}) {
+            const user = window.auth?.currentUser;
+            if (!user) throw new Error('You must be signed in to claim a call.');
+
+            const idToken = await user.getIdToken();
+            const response = await fetch(PHONE_CLAIM_ENDPOINT, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${idToken}`
+                },
+                body: JSON.stringify({
+                    action,
+                    callId,
+                    claimantName: currentUser?.displayName || teamMemberData?.name || currentUser?.email,
+                    ...extra
+                })
+            });
+
+            let payload = {};
+            try {
+                payload = await response.json();
+            } catch (_) {
+                // Preserve a useful error if the function returned a non-JSON proxy response.
+            }
+
+            if (!response.ok || !payload.success) {
+                const error = new Error(payload.error || `Unable to ${action} this contact (${response.status}).`);
+                error.code = response.status;
+                throw error;
+            }
+            return payload.data;
+        }
+
         // Claim a call to prevent others from calling it
         async function claimCall(callId) {
+            let serverClaimAcquired = false;
             try {
                 console.log('🔒 Attempting to claim call:', callId);
                 
-                const callRef = doc(db, 'phone_activities', callId);
                 const now = new Date();
-                const claimExpirationTime = 30 * 60 * 1000; // 30 minutes in milliseconds
                 
                 // 🔒 CRITICAL FIX: Check if contact was recently called BEFORE claiming
                 // This prevents race condition where multiple users have the same contact in their queue
                 const cooldownHours = 72;
                 const cooldownStart = new Date(now.getTime() - (cooldownHours * 60 * 60 * 1000));
                 
-                // Use a transaction to atomically check and claim
-                await runTransaction(db, async (transaction) => {
-                    const callDoc = await transaction.get(callRef);
-                    
-                    if (!callDoc.exists) {
-                        throw new Error('Call activity no longer exists');
-                    }
-                    
-                    const callData = callDoc.data();
-                    
-                    // Check if already claimed by someone else
-                    if (callData.claimedBy && callData.claimedBy !== currentUser.email) {
-                        // Check if claim has expired
-                        let claimedTime;
-                        if (typeof callData.claimedAt === 'object' && callData.claimedAt.toDate) {
-                            claimedTime = callData.claimedAt.toDate();
-                        } else if (typeof callData.claimedAt === 'object' && callData.claimedAt.seconds) {
-                            claimedTime = new Date(callData.claimedAt.seconds * 1000);
-                        } else {
-                            claimedTime = new Date(callData.claimedAt);
-                        }
-                        
-                        const timeSinceClaim = now - claimedTime;
-                        if (timeSinceClaim < claimExpirationTime) {
-                            // Claim is still active
-                            throw new Error(`This contact is currently being called by ${callData.claimedByName || callData.claimedBy}. Please try another contact.`);
-                        }
-                        // Claim has expired, we can proceed to claim it
-                        console.log(`🔓 Previous claim expired, claiming for ${currentUser.email}`);
-                    }
-                    
-                    // 🔒 RACE CONDITION FIX: Check if this CONTACT was called recently
-                    // Even if THIS call isn't claimed, the CONTACT might have been called via a different phone_activities record
-                    console.log('🔍 Checking if contact was called recently (within claim transaction)...');
-                    
-                    const contactEmail = callData.contactEmail || callData.email || '';
-                    const phoneNumber = callData.phoneNumber || callData.phone || '';
-                    const outreachSetId = callData.outreachSetId || '';
-                    
-                    // Query for recent completed calls to this contact (do NOT use transaction.get for queries)
-                    // We must do this OUTSIDE the transaction but BEFORE claiming
-                    // So we'll check after transaction completes
-                    
-                    // Claim the call
-                    transaction.update(callRef, {
-                        claimedBy: currentUser.email,
-                        claimedAt: now.toISOString(),
-                        claimedByName: currentUser.displayName || teamMemberData?.name || currentUser.email
-                    });
-                });
+                // The browser wrapper's runTransaction is a read followed by a separate
+                // write. Use the server endpoint so overlapping contacts are claimed in
+                // one real Firestore transaction across phone, outreach ID, and email.
+                await requestPhoneClaim('claim', callId);
+                serverClaimAcquired = true;
                 
                 // 🔒 IMMEDIATE POST-CLAIM CHECK: Verify contact wasn't called while we were claiming
                 // This catches the race condition where another user completed a call during our claim transaction
@@ -6921,13 +6911,10 @@
                     console.error(`   Outcome: ${recentCallInfo.outcome}`);
                     console.error(`   This contact should have been filtered out!`);
                     
-                    // Release the claim we just made
+                    // Release the contact-level claim we just made.
                     try {
-                        await updateDoc(doc(db, 'phone_activities', callId), {
-                            claimedBy: null,
-                            claimedAt: null,
-                            claimedByName: null
-                        });
+                        await requestPhoneClaim('release', callId);
+                        serverClaimAcquired = false;
                         console.log('🔓 Claim released due to recent contact');
                     } catch (releaseError) {
                         console.error('❌ Error releasing claim:', releaseError);
@@ -6945,6 +6932,13 @@
                 console.log('✅ Call claimed successfully by', currentUser.email);
                 console.log('✅ Post-claim verification passed - no recent calls to this contact');
             } catch (error) {
+                if (serverClaimAcquired) {
+                    try {
+                        await requestPhoneClaim('release', callId);
+                    } catch (releaseError) {
+                        console.error('❌ Could not release failed contact claim:', releaseError);
+                    }
+                }
                 console.error('❌ Error claiming call:', error);
                 throw error;
             }
@@ -6954,11 +6948,8 @@
         async function releaseCall(callId) {
             try {
                 console.log('🔓 Releasing call:', callId);
-                await updateDoc(doc(db, 'phone_activities', callId), {
-                    claimedBy: null,
-                    claimedAt: null,
-                    claimedByName: null
-                });
+                await requestPhoneClaim('release', callId);
+                preClaimedCalls.delete(callId);
                 console.log('✅ Call released successfully');
             } catch (error) {
                 console.error('❌ Error releasing call:', error);
@@ -8380,6 +8371,21 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 console.log('⏳ Executing updateDoc...');
                 await updateDoc(doc(db, 'phone_activities', currentCall.id), updateData);
                 console.log('⏳ updateDoc returned successfully');
+
+                // Release the active contact lock only after the completed status is
+                // durable. The claim service also records a 72-hour contact cooldown,
+                // preventing a sibling phone_activities row from being claimed next.
+                try {
+                    await requestPhoneClaim('release', currentCall.id, {
+                        completed: true,
+                        outcome: outcome
+                    });
+                    preClaimedCalls.delete(currentCall.id);
+                } catch (claimReleaseError) {
+                    // The completed activity remains the source of truth and the lock
+                    // expires automatically; do not make a saved outcome look failed.
+                    console.error('⚠️ Outcome saved, but contact claim release failed:', claimReleaseError);
+                }
                 
                 // CRITICAL: Verify the update succeeded
                 console.log('✅ Step 3 COMPLETE: phone_activities document updated successfully!', {
@@ -9999,6 +10005,13 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     claimedAt: null,
                     claimedByName: null
                 });
+
+                try {
+                    await requestPhoneClaim('release', currentCall.id);
+                    preClaimedCalls.delete(currentCall.id);
+                } catch (claimReleaseError) {
+                    console.error('⚠️ Call postponed, but contact claim release failed:', claimReleaseError);
+                }
                 
                 // Save postpone reason to phone_activities (single source of truth)
                 // Removed: No longer reading from outreach_sets
