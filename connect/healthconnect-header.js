@@ -1,10 +1,12 @@
 /**
  * HealthConnect Common Header Component
- * Version: 3.3.0 - Firebase loginUID account resolution
+ * Version: 3.4.0 - Connect page usage tracking
  * 
  * Provides a beautiful, consistent header across all HealthConnect pages
  * with organized dropdown navigation sections.
  * 
+ * Changelog v3.4.0:
+ * - Record authenticated Connect page views to Firestore (pageUsageTracking)
  * Changelog v3.3.0:
  * - Added resolveEffectiveBDREmail() (viewer → loginUID → email fallback)
  * Changelog v3.0.0:
@@ -70,6 +72,7 @@ const HEALTHCONNECT_CONFIG = {
             items: [
                 // Admin Dashboard & Guide
                 { label: 'Admin Dashboard', href: 'index_admin.html', icon: 'fa-tachometer-alt' },
+                { label: 'Page Usage', href: 'page_usage.html', icon: 'fa-chart-simple' },
                 { label: 'Lead Pause Manager', href: 'lead_pause_manager.html', icon: 'fa-circle-pause' },
                 { label: 'Demo: Scheduled Meetings', href: 'demo_review_replies.html', icon: 'fa-calendar-check' },
                 { label: 'Catch Missed Meetings (AI)', href: 'catch_meetings.html', icon: 'fa-magnifying-glass-chart' },
@@ -1384,6 +1387,48 @@ async function updateNavigationItems(user) {
     }
 }
 
+let pageUsageTrackedThisLoad = false;
+
+async function trackConnectPageUsage(user) {
+    if (pageUsageTrackedThisLoad || !user || !user.uid || !window.db) return;
+
+    const pagePath = (window.location.pathname.split('/').pop() || 'index.html').split('?')[0];
+    const dedupeKey = `connectPageUsage:${pagePath}:${user.uid}`;
+    try {
+        const lastTracked = sessionStorage.getItem(dedupeKey);
+        if (lastTracked && (Date.now() - Number(lastTracked)) < 60000) {
+            pageUsageTrackedThisLoad = true;
+            return;
+        }
+    } catch (e) {
+        // sessionStorage may be unavailable
+    }
+
+    pageUsageTrackedThisLoad = true;
+
+    try {
+        const { collection, addDoc, serverTimestamp } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
+        await addDoc(collection(window.db, 'pageUsageTracking'), {
+            pagePath,
+            pageFullPath: window.location.pathname,
+            pageTitle: document.title || pagePath,
+            folder: 'connect',
+            userId: user.uid,
+            userEmail: user.email || 'unknown',
+            timestamp: serverTimestamp(),
+            referrer: document.referrer || 'direct'
+        });
+        try {
+            sessionStorage.setItem(dedupeKey, String(Date.now()));
+        } catch (e) {
+            // ignore
+        }
+    } catch (error) {
+        pageUsageTrackedThisLoad = false;
+        console.warn('📊 Page usage tracking skipped:', error?.message || error);
+    }
+}
+
 // Initialize header
 async function initializeHealthConnectHeader() {
     console.log('🚀 Initializing HealthConnect header...');
@@ -1435,6 +1480,7 @@ async function initializeHealthConnectHeader() {
                     isVerified: window.auth.currentUser.emailVerified
                 };
                 updateHeaderAuthState(authState);
+                trackConnectPageUsage(window.auth.currentUser);
             } else {
                 // Get current auth state from auth.js
                 if (window.getCurrentAuthState) {
@@ -1445,8 +1491,10 @@ async function initializeHealthConnectHeader() {
                         await new Promise(resolve => setTimeout(resolve, 1000));
                         const newAuthState = window.getCurrentAuthState();
                         updateHeaderAuthState(newAuthState);
+                        if (newAuthState.user) trackConnectPageUsage(newAuthState.user);
                     } else {
                         updateHeaderAuthState(authState);
+                        if (authState.user) trackConnectPageUsage(authState.user);
                     }
                 }
             }
@@ -1475,6 +1523,9 @@ async function initializeHealthConnectHeader() {
                     };
                     
                     updateHeaderAuthState(authState);
+                    if (authState.user) {
+                        trackConnectPageUsage(authState.user);
+                    }
                 });
             }
         } else {
