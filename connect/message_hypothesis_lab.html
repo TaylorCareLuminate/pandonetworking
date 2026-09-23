@@ -280,6 +280,16 @@ table.data-tbl tr:hover td { background:#fafbfc; }
                     <option value="999999">All (no cap)</option>
                 </select>
             </div>
+            <div class="form-group" style="flex:0 0 190px;">
+                <label>Parallel requests</label>
+                <select class="form-select" id="testConcurrencySelect" title="How many classification calls run at once. Higher = faster, but more likely to hit the AI provider's rate limit (failed batches are auto-retried).">
+                    <option value="4">4 (conservative)</option>
+                    <option value="8">8</option>
+                    <option value="12" selected>12 (recommended)</option>
+                    <option value="20">20 (fastest)</option>
+                    <option value="30">30 (aggressive)</option>
+                </select>
+            </div>
             <div style="flex:0 0 auto;">
                 <button class="btn btn-primary" id="runTestBtn" onclick="runHypothesisTesting()"><i class="fas fa-vial"></i> Run Classification &amp; Statistical Test</button>
             </div>
@@ -383,13 +393,25 @@ function shuffle(arr) {
     for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
     return a;
 }
-async function runWithConcurrency(items, worker, concurrency, onProgress) {
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+// Runs `worker` over `items` with up to `concurrency` calls in flight at once. At higher
+// concurrency, transient rate-limit/network errors from the AI provider become more likely,
+// so each item gets `retries` extra attempts with exponential backoff before being dropped.
+async function runWithConcurrency(items, worker, concurrency, onProgress, retries = 2) {
     let idx = 0, done = 0;
     async function next() {
         while (idx < items.length) {
             if (_testCancelled) return;
             const i = idx++;
-            try { await worker(items[i], i); } catch (e) { console.warn('[HypLab] batch item failed:', e.message); }
+            for (let attempt = 0; attempt <= retries; attempt++) {
+                if (_testCancelled) break;
+                try { await worker(items[i], i); break; }
+                catch (e) {
+                    if (attempt < retries) { console.warn(`[HypLab] batch item failed (retry ${attempt + 1}/${retries}):`, e.message); await sleep(500 * Math.pow(2, attempt)); }
+                    else console.warn('[HypLab] batch item failed, giving up:', e.message);
+                }
+            }
             done++;
             if (onProgress) onProgress(done, items.length);
         }
@@ -1250,32 +1272,34 @@ window.runHypothesisTesting = async function() {
     document.getElementById('testResultsWrap').innerHTML = '';
 
     const model = val('classifyModelSelect');
-    const BATCH_SIZE = 8, CONCURRENCY = 4;
+    const BATCH_SIZE = 8;
+    const CONCURRENCY = parseInt(val('testConcurrencySelect')) || 12;
     const batches = chunkArr(testSet, BATCH_SIZE);
     let classified = 0;
 
     function updateProgress(done, totalBatches) {
         const pct = Math.round((done / totalBatches) * 100);
         document.getElementById('testProgressBar').style.width = `${pct}%`;
-        document.getElementById('testProgressText').textContent = `${classified} / ${testSet.length} messages classified (batch ${done}/${totalBatches})`;
+        document.getElementById('testProgressText').textContent = `${classified} / ${testSet.length} messages classified (batch ${done}/${totalBatches}, ${CONCURRENCY} in parallel)`;
     }
 
     await runWithConcurrency(batches, async (batch) => {
         if (_testCancelled) return;
         const prompt = buildClassifyPrompt(batch, hypotheses);
         const maxTok = Math.max(700, batch.length * hypotheses.length * 18);
-        let raw;
-        try { raw = await callAi(prompt, model, { temperature: 0, maxTokens: maxTok }); }
-        catch (e) { console.warn('[HypLab] classify batch failed:', e.message); return; }
+        // Let a failure here throw — runWithConcurrency retries transient errors (e.g. the AI
+        // provider rate-limiting a burst of parallel requests) with backoff before giving up.
+        const raw = await callAi(prompt, model, { temperature: 0, maxTokens: maxTok });
         const results = parseJsonArray(raw);
+        const before = classificationResults.size;
         results.forEach(r => {
             let target = batch.find(m => m._id === r.id);
             if (!target && r.id) target = batch.find(m => String(m._id).includes(String(r.id)) || String(r.id).includes(String(m._id)));
             if (!target || !r.answers) return;
             classificationResults.set(target._id, r.answers);
         });
-        classified += batch.filter(m => classificationResults.has(m._id)).length;
-    }, CONCURRENCY, updateProgress);
+        classified += classificationResults.size - before;
+    }, CONCURRENCY, updateProgress, 2);
 
     computeAllHypothesisStats();
 

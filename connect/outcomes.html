@@ -1278,9 +1278,6 @@
             <button class="selection-tab" id="tabAll" onclick="switchTab('all')">
                 <i class="fas fa-users"></i> Across All BDRs
             </button>
-            <button class="selection-tab" id="tabGroups" onclick="switchTab('groups')" style="color:#C9973D;">
-                <i class="fas fa-flask"></i> Groups
-            </button>
         </div>
 
         <div class="selection-row">
@@ -1342,14 +1339,6 @@
                         <option value="365">Last 12 Months</option>
                     </optgroup>
                     <option value="0">All Time</option>
-                </select>
-            </div>
-
-            <!-- Groups selector (Groups tab only) -->
-            <div class="selection-group" id="groupsSelectorGroup" style="display:none;">
-                <label for="groupSelect"><i class="fas fa-flask" style="color:#C9973D;"></i> Select Group</label>
-                <select id="groupSelect" style="border-color:#c4b5fd;">
-                    <option value="">Loading groups…</option>
                 </select>
             </div>
 
@@ -1424,44 +1413,6 @@
                     <div class="legend-item"><div class="legend-dot" style="background:#C9973D"></div> Scheduled % = of Replied</div>
                     <div class="legend-item"><div class="legend-dot" style="background:#8A6B2E"></div> Fast Prospect = Sent via Fast Prospect Messaging (with or without a note)</div>
                     <div class="legend-item" style="color:#94a3b8;font-style:italic;margin-top:0.25rem;"><i class="fas fa-info-circle" style="margin-right:0.3rem;font-style:normal;"></i>The "All Types" total may be lower than the sum of individual rows — a prospect contacted via more than one message type is counted once per type row but only once in the overall total.</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Message Variation Breakdown (Groups tab only — requires variations defined on the group) -->
-        <div class="card" id="variationBreakdownCard" style="display:none; border-top:4px solid #ea580c;">
-            <div class="card-header">
-                <h3 style="color:#9a3412;">
-                    <i class="fas fa-vial" style="color:#ea580c;"></i> Outcomes by Message Variation
-                </h3>
-                <div style="display:flex;align-items:center;gap:0.9rem;flex-wrap:wrap;">
-                    <div class="card-meta" id="variationBreakdownMeta"></div>
-                    <button id="variationCleanupOpenBtn" onclick="openVariationCleanup()" style="display:none;background:#fff7ed;border:1.5px solid #fdba74;color:#9a3412;font-weight:700;font-size:0.8rem;padding:0.4rem 0.8rem;border-radius:8px;cursor:pointer;white-space:nowrap;">
-                        <i class="fas fa-broom"></i> <span id="variationCleanupOpenBtnLabel">Fix Missing Variations</span>
-                    </button>
-                </div>
-            </div>
-            <div class="card-body">
-                <table class="outcome-table">
-                    <thead>
-                        <tr>
-                            <th>Variation</th>
-                            <th>Connection Sent</th>
-                            <th>Connections Accepted</th>
-                            <th>Replied</th>
-                            <th>Scheduled Meeting</th>
-                            <th title="How many connections need to be sent to produce one scheduled meeting">Connections / Meeting</th>
-                        </tr>
-                    </thead>
-                    <tbody id="variationBreakdownBody"></tbody>
-                </table>
-                <div class="legend">
-                    <div class="legend-item" style="color:#94a3b8;font-style:italic;">
-                        <i class="fas fa-info-circle" style="margin-right:0.3rem;font-style:normal;"></i>
-                        Only messages tagged with a variation in <a href="fast_connect_review.html" target="_blank">Fast Connect Review</a> are attributed here.
-                        Define variations on this group's Message Variations tab in
-                        <a href="connect_hypothesis_documentation.html" target="_blank">Hypothesis Documentation</a>.
-                    </div>
                 </div>
             </div>
         </div>
@@ -1770,8 +1721,9 @@
     let linkedInEmailAssociations = new Map(); // authEmail → linkedInEmail
     let _outcomeGroups       = [];       // all hypothesis_groups docs — shared across tabs
     let _varCleanupState     = null;     // { group, variations, candidates: [{docData, selected, assign}] } — Fix Missing Variations panel
-    let _hypoBreakdownView   = 'overview'; // 'overview' | 'bdr' | 'month'
+    let _hypoBreakdownView   = 'overview'; // 'overview' | 'bdr' | 'month' | 'variation'
     let _hypoLastData        = null;    // cached render data for view switching
+    let _hypoVariationCleanupByGroup = new Map(); // groupId → cleanup state, rebuilt each time the "By Variation" sub-view renders
 
     // Data-completeness tracking for the current analysis run — every query that
     // fails (timeout, backend cold-start, etc.) and gets silently swallowed by a
@@ -1836,7 +1788,7 @@
         }
 
         // Date range / unsent-queue filter only apply to a live query.
-        const hideLiveOnlyControls = currentTab === 'groups' || currentTab === 'all' || isCompanySnapshot;
+        const hideLiveOnlyControls = currentTab === 'all' || isCompanySnapshot;
         document.getElementById('dateRangeGroup').style.display = hideLiveOnlyControls ? 'none' : '';
         const filterUnsentRow = document.getElementById('filterUnsentRow');
         if (filterUnsentRow) filterUnsentRow.style.display = hideLiveOnlyControls ? 'none' : '';
@@ -1847,13 +1799,10 @@
         document.getElementById('tabBdr').classList.toggle('active',     tab === 'bdr');
         document.getElementById('tabCompany').classList.toggle('active', tab === 'company');
         document.getElementById('tabAll').classList.toggle('active',     tab === 'all');
-        document.getElementById('tabGroups').classList.toggle('active',  tab === 'groups');
         document.getElementById('bdrSelectorGroup').style.display      = tab === 'bdr'     ? '' : 'none';
         document.getElementById('companySelectorGroup').style.display   = tab === 'company' ? '' : 'none';
         document.getElementById('allBdrsNote').style.display            = tab === 'all'     ? '' : 'none';
-        document.getElementById('groupsSelectorGroup').style.display    = tab === 'groups'  ? '' : 'none';
         updateCompanyTabControls();
-        if (tab === 'groups') loadGroupsForOutcomes();
         // All BDRs has no controls to configure — load it immediately.
         if (tab === 'all') runAnalysis();
     };
@@ -2114,640 +2063,29 @@
         }
     }
 
-    // ── Hypothesis Groups for Outcomes ────────────────────────────────────
-    window.loadGroupsForOutcomes = async function() {
-        const sel = document.getElementById('groupSelect');
-        if (!sel) return;
-        try {
-            const snap = await getDocs(collection(emailDB, 'hypothesis_groups'));
-            _outcomeGroups = [];
-            snap.forEach(d => {
-                const data = d.data();
-                _outcomeGroups.push({ id: d.id, ...data });
-            });
-            _outcomeGroups.sort((a,b) => (a.name||'').localeCompare(b.name||''));
-
-            if (!_outcomeGroups.length) {
-                sel.innerHTML = '<option value="">No groups found — create one in Hypothesis Documentation</option>';
-            } else {
-                // Bucket each group under its company using allBdrs._company
-                const groupsByCompany = new Map(); // companyName → [group]
-                _outcomeGroups.forEach(g => {
-                    const emails = g.bdrEmails?.length ? g.bdrEmails : (g.bdrEmail ? [g.bdrEmail] : []);
-                    const firstEmail = (emails[0] || '').toLowerCase();
-                    const bdr = firstEmail
-                        ? allBdrs.find(b => (b.primaryEmail||'').toLowerCase() === firstEmail)
-                        : null;
-                    const company = bdr?._company || 'Other';
-                    if (!groupsByCompany.has(company)) groupsByCompany.set(company, []);
-                    groupsByCompany.get(company).push(g);
-                });
-
-                sel.innerHTML = '<option value="">— Select a group —</option>';
-                [...groupsByCompany.keys()].sort().forEach(company => {
-                    const optgrp = document.createElement('optgroup');
-                    optgrp.label = company;
-                    groupsByCompany.get(company).forEach(g => {
-                        const opt = document.createElement('option');
-                        opt.value = g.id;
-                        const contactCount = g._chunked ? (g._totalContactCount || 0) : (g.contactLinkedInUrls || []).length;
-                        const batchCount   = (g.sourceBatchIds || []).length;
-                        const bdrEmails    = g.bdrEmails?.length ? g.bdrEmails : (g.bdrEmail ? [g.bdrEmail] : []);
-                        const bdrPart      = bdrEmails.length ? ` · ${bdrEmails.length} BDR${bdrEmails.length > 1 ? 's' : ''}` : '';
-                        const displayName  = g.name || `(no name — id: ${g.id})`;
-                        opt.textContent = `${displayName} (${contactCount} contacts${batchCount ? `, ${batchCount} batches` : ''}${bdrPart})`;
-                        optgrp.appendChild(opt);
-                    });
-                    sel.appendChild(optgrp);
-                });
-            }
-            console.log('[loadGroupsForOutcomes] loaded', _outcomeGroups.length, 'groups:',
-                _outcomeGroups.map(g => g.name || '(no name)'));
-        } catch(e) {
-            console.warn('loadGroupsForOutcomes error:', e.message);
-            sel.innerHTML = '<option value="">Error loading groups — check console</option>';
-        }
-    };
-
-    async function runGroupsAnalysis() {
-        const groupId = document.getElementById('groupSelect').value;
-        if (!groupId) { showAlert('Please select a hypothesis group.', 'warning'); return; }
-
-        const group = _outcomeGroups.find(g => g.id === groupId);
-        if (!group) { showAlert('Group not found.', 'error'); return; }
-
-        const btn = document.getElementById('analyzeBtn');
-        btn.disabled = true;
-        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing…';
-
-        document.getElementById('alertArea').innerHTML = '';
-        document.getElementById('dataIssuesBanner').style.display = 'none';
-        document.getElementById('resultsSection').style.display = 'none';
-        document.getElementById('exportBar').style.display = 'none';
-        document.getElementById('loadingPanel').style.display = 'block';
-        document.getElementById('loadingSteps').innerHTML = '';
-
-        // Reset data-completeness tracking for this run
-        _dataLoadIssues = [];
-
-        try {
-            // Support both new bdrEmails[] and legacy single bdrEmail
-            const bdrEmailArr = group.bdrEmails?.length ? group.bdrEmails : (group.bdrEmail ? [group.bdrEmail] : []);
-
-            // For chunked groups, load contact URLs from the flat 'hypothesis_group_chunks'
-            // top-level collection (doc IDs: "{groupId}_{chunkIndex}") before building lookup
-            if (group._chunked && group._chunkCount > 0 && !group._chunksLoaded) {
-                try {
-                    const allUrls = [];
-                    for (let i = 0; i < group._chunkCount; i++) {
-                        const chunkSnap = await getDoc(doc(emailDB, 'hypothesis_group_chunks', `${group.id}_${i}`));
-                        if (chunkSnap && chunkSnap.exists) {
-                            allUrls.push(...(chunkSnap.data().contactLinkedInUrls || []));
-                        }
-                    }
-                    if (allUrls.length > 0) group.contactLinkedInUrls = allUrls;
-                    group._chunksLoaded = true;
-                } catch(e) { console.warn('chunk load for group (runGroupsAnalysis):', group.id, e); }
-            }
-
-            const targetUrlLookup = slugSet(group.contactLinkedInUrls);  // slug + normalised URL keys
-            const targetBatchSet  = new Set(group.sourceBatchIds || []);
-
-            const hasUrls    = (group.contactLinkedInUrls || []).length > 0;
-            const hasBatches = targetBatchSet.size > 0;
-            const hasBdrs    = bdrEmailArr.length > 0;
-
-            // Ensure account mappings are loaded so matchesBdr() can resolve
-            // LinkedIn account IDs → BDR system emails (critical for accepted counts)
-            if (linkedInAccountIdMapping.size === 0) {
-                await loadAccountMappings();
-            }
-
-            if (!hasUrls && !hasBatches && !hasBdrs) {
-                showAlert('This group has no tagged contacts, batch IDs, or assigned BDRs. Add contacts first on the Hypothesis Documentation page.', 'warning');
-                document.getElementById('loadingPanel').style.display = 'none';
-                return;
-            }
-
-            // ── Step 1: Load connect_queue records for the group ─────────────
-            const step1 = setLoadingStep('Loading outreach from connect_queue…', 'active');
-            let sentItems = [];
-            const seenIds = new Set();
-
-            // Resolve the company this group belongs to (same rule loadGroupsForOutcomes
-            // uses to bucket it in the dropdown: the FIRST assigned BDR's company via
-            // bdr_leaders.customerId). Used below to sanity-check "stamped" records — a
-            // hypothesisGroupId match alone isn't proof a record belongs to this group's
-            // company; mis-stamps from another BDR/company happen in practice (see
-            // full_pipeline.html's Data Repair / "Scan for Problems" tool, which exists
-            // specifically to find and fix connect_queue docs whose hypothesisGroupId
-            // doesn't match what actually generated them).
-            const firstBdrRecord = bdrEmailArr.length
-                ? allBdrs.find(b => (b.primaryEmail || '').toLowerCase() === (bdrEmailArr[0] || '').toLowerCase())
-                : null;
-            const groupCompany = firstBdrRecord?._company || null;
-
-            const collectItems = (snap, opts) => {
-                const requireCompanyMatch = !!(opts && opts.requireCompanyMatch);
-                let rejectedForCompany = 0;
-                snap.forEach(d => {
-                    if (seenIds.has(d.id)) return;
-                    const data = d.data();
-                    if (requireCompanyMatch && groupCompany) {
-                        const email = (data.account_email || '').toLowerCase();
-                        // Only accept a bare stamp match for a sender we can positively
-                        // tie to this group's company. Senders already found via the
-                        // per-BDR account_email queries below are already in seenIds by
-                        // the time this runs, so this only ever rejects EXTRA records
-                        // this group's assigned BDRs never sent — i.e. exactly the
-                        // "activity not sent by these BDRs for this company" case.
-                        if (email && !companyBdrEmailSet.has(email)) {
-                            rejectedForCompany++;
-                            return;
-                        }
-                    }
-                    seenIds.add(d.id);
-                    // Include pushed records; also include records without the field for batch-queried items
-                    sentItems.push({ id: d.id, ...data });
-                });
-                return rejectedForCompany;
-            };
-
-            // connect_queue's account_email is the BDR's LinkedIn LOGIN email, which
-            // often differs from the primary email stored in the group's bdrEmails
-            // (e.g. oliver@company vs oayres@gmail.com). Expand each group email with
-            // its linkedin_email_associations alias — same translation the BDR/Company
-            // tabs already apply — or this view silently loads 0 records for such BDRs.
-            const bdrQueryEmails = [...new Set(bdrEmailArr.flatMap(e => {
-                const lower = (e || '').toLowerCase();
-                const alias = linkedInEmailAssociations.get(lower);
-                return alias && alias !== lower ? [e, alias] : [e];
-            }))];
-
-            // Every BDR email (login + primary) that legitimately belongs to this
-            // group's company — used to validate stamp-only matches above. Falls back
-            // to just bdrQueryEmails when the company can't be resolved (fail open
-            // rather than dropping data we can't actually disprove).
-            const companyBdrEmailSet = new Set([
-                ...bdrQueryEmails.map(e => (e || '').toLowerCase()),
-                ...(groupCompany
-                    ? allBdrs.filter(b => b._company === groupCompany).map(b => (b.primaryEmail || '').toLowerCase())
-                    : [])
-            ]);
-
-            if (hasBdrs) {
-                // Load all connect_queue records for each BDR
-                for (const email of bdrQueryEmails) {
-                    try {
-                        const snap = await getDocs(query(
-                            collection(emailDB, 'connect_queue'),
-                            where('account_email', '==', email)
-                        ));
-                        collectItems(snap);
-                    } catch(e) {
-                        flagDataIssue('Group outreach (connect_queue)',
-                            `Query for ${email} failed — that BDR's outreach is missing from this group's totals: ${e.message}`);
-                    }
-                }
-
-                // Also pull every record explicitly stamped with this group's ID,
-                // regardless of account_email. Stamps are ground truth (written by
-                // Fast Connect Review / the Variation Batcher at assignment time), and
-                // this catches senders the alias table doesn't know about — without it,
-                // a group whose real senders' LinkedIn emails aren't in
-                // linkedin_email_associations analyzes as 0 sent. BUT a stamp match alone
-                // isn't proof of ownership — require the sender to be a BDR at this
-                // group's company (collectItems' requireCompanyMatch) so a mis-stamped
-                // record from an unrelated BDR/company can't leak into these totals.
-                try {
-                    const stampSnap = await getDocs(query(
-                        collection(emailDB, 'connect_queue'),
-                        where('hypothesisGroupId', '==', group.id)
-                    ));
-                    const rejected = collectItems(stampSnap, { requireCompanyMatch: true });
-                    if (rejected > 0) {
-                        flagDataIssue('Group outreach (connect_queue)',
-                            `${rejected} record(s) stamped with this group's ID were excluded — sent by a BDR not associated with ` +
-                            `${groupCompany ? `"${groupCompany}"` : 'this group\'s company'}. Likely a mis-tagged record from another BDR/company; ` +
-                            `check full_pipeline.html's Data Repair tool.`);
-                    }
-                } catch(e) { flagDataIssue('Group outreach (connect_queue)', `Stamp query failed — some group-assigned outreach may be missing: ${e.message}`); }
-
-                // Filter to pushed records
-                sentItems = sentItems.filter(m => m.pushed_to_heyreach);
-
-                // If the group has explicit contact/batch targets, narrow to those
-                if (hasUrls || hasBatches) {
-                    const filtered = sentItems.filter(m => {
-                        // An explicit stamp always counts as belonging to the group —
-                        // don't let URL/batch narrowing drop records that were assigned
-                        // deliberately (their contact may not be in the tagged list yet).
-                        // Note: stamp-only records already passed the company check in
-                        // collectItems() above, so trusting the stamp here is safe.
-                        if (m.hypothesisGroupId === group.id) return true;
-                        if (hasBatches && m.source_batch_id && targetBatchSet.has(m.source_batch_id)) return true;
-                        if (hasUrls) {
-                            const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-                            if (raw && urlInSet(raw, targetUrlLookup)) return true;
-                        }
-                        return false;
-                    });
-
-                    if (filtered.length > 0) {
-                        sentItems = filtered;
-                    } else {
-                        // URL/batch matching found nothing — fall back to all BDR outreach with a notice
-                        document.getElementById('alertArea').innerHTML = `
-                            <div class="alert alert-warning" style="margin-bottom:1rem;">
-                                <i class="fas fa-exclamation-triangle"></i>
-                                <strong>Note:</strong> No outreach records exactly matched the ${(group.contactLinkedInUrls||[]).length} tagged contacts in this group.
-                                Showing <strong>all outreach</strong> for the assigned BDR${bdrEmailArr.length > 1 ? 's' : ''} instead.
-                                To see group-specific data, tag batches from
-                                <a href="fast_connect_review.html" target="_blank">Fast Connect Review</a>
-                                or verify that contact URLs are consistent.
-                            </div>`;
-                    }
-                }
-            } else {
-                // No BDRs assigned — query by batch IDs directly (plus explicit stamps)
-                try {
-                    const stampSnap = await getDocs(query(
-                        collection(emailDB, 'connect_queue'),
-                        where('hypothesisGroupId', '==', group.id)
-                    ));
-                    collectItems(stampSnap);
-                } catch(e) { flagDataIssue('Group outreach (connect_queue)', `Stamp query failed — some group-assigned outreach may be missing: ${e.message}`); }
-                if (hasBatches) {
-                    const batchArr = [...targetBatchSet];
-                    for (let i = 0; i < batchArr.length; i += 10) {
-                        const chunk = batchArr.slice(i, i + 10);
-                        try {
-                            const snap = await getDocs(query(
-                                collection(emailDB, 'connect_queue'),
-                                where('source_batch_id', 'in', chunk)
-                            ));
-                            collectItems(snap);
-                        } catch(e) { flagDataIssue('Group outreach (connect_queue)', `Batch query failed — some group-assigned outreach may be missing: ${e.message}`); }
-                    }
-                } else if (hasUrls && !sentItems.length) {
-                    // URL-only group with no BDRs and no stamped records — we can't
-                    // query by 9k URLs efficiently; warn user
-                    showAlert('This group has tagged contacts but no assigned BDRs. Assign BDRs on the Hypothesis Documentation page to enable outcomes analysis.', 'warning');
-                    document.getElementById('loadingPanel').style.display = 'none';
-                    return;
-                }
-                // Stamp / batch queries can include drafts that were never pushed
-                sentItems = sentItems.filter(m => m.pushed_to_heyreach);
-            }
-
-            updateLoadingStep(step1, `${sentItems.length} outreach records loaded (${[...new Set(sentItems.map(m => m.account_email).filter(Boolean))].length} BDR${bdrEmailArr.length !== 1 ? 's' : ''})`, 'done');
-
-            // Accepted/replied/scheduled data (heyreach_activity, heyreach_inbox,
-            // activity_tracking) is keyed by account_email — the LinkedIn LOGIN email.
-            // Query with the alias-expanded group emails PLUS every account_email
-            // actually observed on the loaded messages (covers stamp-discovered senders
-            // the alias table doesn't know about). Passing raw group bdrEmails here
-            // returned 0 inbox docs for groups like Florida Employers, so Replied /
-            // Scheduled showed 0 across every variation while Sent/Accepted looked fine
-            // (acceptances are matched via HeyReach account IDs, not emails).
-            const funnelEmails = [...new Set([
-                ...bdrQueryEmails.map(e => (e || '').toLowerCase()),
-                ...sentItems.map(m => (m.account_email || '').toLowerCase())
-            ].filter(Boolean))];
-            const hasFunnelEmails = funnelEmails.length > 0;
-
-            // ── Step 1b: Filter out connections still in the HeyReach queue ──
-            // Same toggle + rule as BDR/Company: unsent (in-queue) messages must
-            // not enter the Sent denominator — including Outcomes by Message Variation.
-            const filterUnsent = document.getElementById('filterUnsentToggle')?.checked !== false;
-            if (filterUnsent && hasFunnelEmails) {
-                const step1b = setLoadingStep('Checking HeyReach queue status…', 'active');
-                const actuallySentUrls = await loadActuallySentConnections(funnelEmails);
-                if (actuallySentUrls.size > 0) {
-                    const beforeCount = sentItems.length;
-                    const filtered = filterInQueueItems(sentItems, actuallySentUrls);
-                    sentItems = filtered.items;
-                    console.log('[Groups Analysis] Queue filter — pushed:', beforeCount,
-                        '| removed (in-queue, ≤30d, no webhook):', filtered.removedCount,
-                        '| kept:', sentItems.length,
-                        '| actuallySentUrls:', actuallySentUrls.size);
-                    updateLoadingStep(step1b,
-                        `${actuallySentUrls.size} confirmed sent by HeyReach` +
-                        (filtered.removedCount > 0 ? ` · ${filtered.removedCount} still-in-queue removed` : ' · no in-queue connections found'),
-                        'done');
-                } else {
-                    updateLoadingStep(step1b,
-                        'No CONNECTION_REQUEST_SENT webhook events found — cannot filter queue. Showing all pushed connections.',
-                        'done');
-                }
-            }
-
-            // ── Step 2: Load HeyReach acceptance events ───────────────────────
-            const step2 = setLoadingStep('Loading connection acceptances from HeyReach…', 'active');
-            const acceptedMap = hasFunnelEmails
-                ? await loadAcceptedConnections(funnelEmails, 0)   // 0 = all time
-                : new Map();
-            updateLoadingStep(step2, `${acceptedMap.size} accepted connections found`, 'done');
-
-            // ── Step 3: Load HeyReach inbox replies ───────────────────────────
-            const step3 = setLoadingStep('Loading inbox replies…', 'active');
-            const { repliedUrls: repliedUrlSet, inboxConversations, bdrReplyMessages, conversationsByUrl: convsByUrl1 } = hasFunnelEmails
-                ? await loadInboxReplies(funnelEmails, null, null)
-                : { repliedUrls: new Set(), inboxConversations: [], bdrReplyMessages: [], conversationsByUrl: new Map() };
-            _grouperConversationsByUrl = convsByUrl1 || new Map();
-            updateLoadingStep(step3, `${repliedUrlSet.size} contacts replied`, 'done');
-
-            // ── Step 4: Load scheduled meetings ───────────────────────────────
-            const step4 = setLoadingStep('Loading scheduled meetings…', 'active');
-            const rawScheduledUrls = hasFunnelEmails
-                ? await loadScheduledMeetings(funnelEmails, inboxConversations, null, null)
-                : new Set();
-            updateLoadingStep(step4, `${rawScheduledUrls.size} scheduled meeting records found`, 'done');
-
-            document.getElementById('loadingPanel').style.display = 'none';
-
-            // ── Compute funnel ────────────────────────────────────────────────
-            const sentSlugSet = new Set();   // slug-keyed for cross-source matching
-            const sentNormSet = new Set();   // normalised URL fallback
-
-            sentItems.forEach(m => {
-                const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-                const slug = liSlug(raw);
-                const norm = normalizeUrl(raw);
-                if (slug) sentSlugSet.add(slug);
-                if (norm) sentNormSet.add(norm);
-            });
-
-            const inSentSet = (url) => {
-                const slug = liSlug(url);
-                if (slug && sentSlugSet.has(slug)) return true;
-                const norm = normalizeUrl(url);
-                return norm ? sentNormSet.has(norm) : false;
-            };
-
-            // Scheduled: meeting URLs from activity_tracking / inbox / overrides,
-            // filtered to contacts present in this group's outreach
-            const scheduledUrlSet = new Set(
-                [...rawScheduledUrls].filter(u => inSentSet(u))
-            );
-
-            // Accepted: HeyReach activity filtered to contacts present in our outreach
-            const acceptedUrlSet = new Set(
-                [...acceptedMap.keys()].filter(u => inSentSet(u))
-            );
-
-            // Replied: heyreach_inbox filtered to contacts present in our outreach
-            const repliedFiltered = new Set(
-                [...repliedUrlSet].filter(u => inSentSet(u))
-            );
-
-            const funnel = {
-                sent:      sentSlugSet.size || sentNormSet.size,
-                accepted:  acceptedUrlSet.size,
-                replied:   repliedFiltered.size,
-                scheduled: scheduledUrlSet.size,
-                records:   sentItems.length
-            };
-
-            // Store for AI grouper
-            _grouperSentItems     = sentItems;
-            _grouperAcceptedUrls  = acceptedMap;
-            _grouperRepliedUrls   = repliedFiltered;
-            _grouperScheduledUrls = scheduledUrlSet;
-
-            renderGroupsOutcomesSummary(group, sentItems, funnel, bdrEmailArr);
-            renderVariationBreakdown(group, sentItems, acceptedUrlSet, repliedFiltered, scheduledUrlSet);
-            showAiGrouperPanel();
-            renderDataIssuesBanner();
-            document.getElementById('resultsSection').style.display = 'block';
-            document.getElementById('exportBar').style.display = 'flex';
-
-        } catch(e) {
-            console.error('[Groups Analysis]', e);
-            showAlert('Error running groups analysis: ' + e.message, 'error');
-            document.getElementById('loadingPanel').style.display = 'none';
-        } finally {
-            btn.disabled = false;
-            btn.innerHTML = '<i class="fas fa-chart-bar"></i> Analyze';
-        }
-    }
-
-    function renderGroupsOutcomesSummary(group, sentItems, funnel, bdrEmailArr) {
-        const accPct   = pct(funnel.accepted,  funnel.sent);
-        const repPct   = pct(funnel.replied,   funnel.sent);   // reply rate vs sent (not vs accepted)
-        const schedPct = pct(funnel.scheduled, funnel.sent);
-
-        // Populate the summary grid
-        const summaryEl = document.getElementById('summaryGrid');
-        if (summaryEl) {
-            summaryEl.innerHTML = `
-                <div class="summary-card sent">
-                    <div class="summary-card-icon"><i class="fas fa-paper-plane"></i></div>
-                    <div class="summary-card-label">Contacts Reached</div>
-                    <div class="summary-card-value">${funnel.sent.toLocaleString()}</div>
-                    <div class="summary-card-pct" style="color:var(--gray-500);font-size:0.85rem;">${funnel.records} records</div>
-                </div>
-                <div class="summary-card accepted">
-                    <div class="summary-card-icon"><i class="fas fa-user-check"></i></div>
-                    <div class="summary-card-label">Accepted</div>
-                    <div class="summary-card-value">${funnel.accepted.toLocaleString()}</div>
-                    <div class="summary-card-pct" style="color:var(--success);">${fmtPct(accPct)}</div>
-                </div>
-                <div class="summary-card replied">
-                    <div class="summary-card-icon"><i class="fas fa-reply"></i></div>
-                    <div class="summary-card-label">Replied</div>
-                    <div class="summary-card-value">${funnel.replied.toLocaleString()}</div>
-                    <div class="summary-card-pct" style="color:var(--warning);">${fmtPct(repPct)}</div>
-                </div>
-                <div class="summary-card scheduled">
-                    <div class="summary-card-icon"><i class="fas fa-calendar-check"></i></div>
-                    <div class="summary-card-label">Meetings</div>
-                    <div class="summary-card-value">${funnel.scheduled.toLocaleString()}</div>
-                    <div class="summary-card-pct" style="color:var(--accent);">${fmtPct(schedPct)}</div>
-                </div>`;
-        }
-
-        // Update funnel meta label
-        const color = group.color || '#C9973D';
-        const funnelMeta = document.getElementById('funnelMeta');
-        if (funnelMeta) {
-            const bdrNames = (bdrEmailArr || []).map(e => {
-                const found = (_outcomeGroups || []).flatMap ? null : null; // placeholder
-                return e; // show email if name not available
-            }).join(', ');
-            funnelMeta.innerHTML = `
-                <span style="display:inline-flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
-                    <span style="width:10px;height:10px;border-radius:50%;background:${color};display:inline-block;flex-shrink:0;"></span>
-                    Group: <strong>${escHtml(group.name || '')}</strong>
-                    &nbsp;·&nbsp; ${(group.contactLinkedInUrls||[]).length} tagged contacts
-                    ${(group.sourceBatchIds||[]).length ? ` &nbsp;·&nbsp; ${group.sourceBatchIds.length} batch IDs` : ''}
-                    ${bdrEmailArr?.length ? ` &nbsp;·&nbsp; BDRs: ${escHtml(bdrEmailArr.join(', '))}` : ''}
-                </span>`;
-        }
-
-        // Build per-message-type breakdown
-        const typeMap = new Map(); // type → { sentUrls: Set, count: number }
-        sentItems.forEach(m => {
-            const type = classifyMessageType(m);
-            if (!typeMap.has(type)) typeMap.set(type, { sentUrls: new Set(), count: 0 });
-            const entry = typeMap.get(type);
-            entry.count++;
-            const raw  = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-            const key  = liSlug(raw) || normalizeUrl(raw);
-            if (key) entry.sentUrls.add(key);
-        });
-
-        const TYPE_DISPLAY = {
-            connect:       'Connection Request', post:          'Post Reply',
-            org_news:      'Org News',           contact_news:  'Contact News',
-            story_search:  'Story Search',       profile:       'Profile Msg',
-            complement:    'Org Complement',     fast_prospect: 'Fast Prospect',
-            about_me_connect: 'Common Ground',   news:          'Internet/News',
-            recovered_post:'Recovered Post',     other:         'Other'
-        };
-
-        const cpm = (funnel.scheduled > 0 && funnel.sent > 0)
-            ? Math.round(funnel.sent / funnel.scheduled) : null;
-
-        const funnelBody = document.getElementById('funnelTableBody');
-        if (funnelBody) {
-            const typeRows = [...typeMap.entries()]
-                .sort((a, b) => b[1].sentUrls.size - a[1].sentUrls.size)
-                .map(([type, info]) => {
-                    const label = TYPE_DISPLAY[type] || type;
-                    const typeSent = info.sentUrls.size;
-                    return `<tr>
-                        <td>${label}</td>
-                        <td>${typeSent.toLocaleString()}</td>
-                        <td>—</td><td>—</td><td>—</td><td>—</td>
-                    </tr>`;
-                }).join('');
-
-            funnelBody.innerHTML = `
-                <tr style="background:#f5f3ff;font-weight:700;">
-                    <td><strong style="color:#5b21b6;">All Types (Group)</strong></td>
-                    <td>${funnel.sent.toLocaleString()}</td>
-                    <td>${funnel.accepted.toLocaleString()}${accPct !== null ? ` <small style="color:#10b981;">(${accPct}%)</small>` : ''}</td>
-                    <td>${funnel.replied.toLocaleString()}${repPct !== null ? ` <small style="color:#f59e0b;">(${repPct}%)</small>` : ''}</td>
-                    <td>${funnel.scheduled.toLocaleString()}${schedPct !== null ? ` <small style="color:#C9973D;">(${schedPct}%)</small>` : ''}</td>
-                    <td>${cpm !== null ? `${cpm} per mtg` : '—'}</td>
-                </tr>
-                ${typeRows}`;
-        }
-
-        // Show the funnel card, hide BDR breakdown
-        document.getElementById('funnelCard').style.display = '';
-        document.getElementById('bdrBreakdownCard').style.display = 'none';
-        document.getElementById('profileBreakoutCard').style.display = 'none';
-        document.getElementById('complementBreakoutCard').style.display = 'none';
-        document.getElementById('editedBreakoutCard').style.display = 'none';
-        document.getElementById('hypothesisBreakdownCard').style.display = 'none';
-
-        // Show hypothesis info card
-        showGroupInfoCard(group, bdrEmailArr);
-    }
-
-    function showGroupInfoCard(group, bdrEmailArr) {
-        let infoCard = document.getElementById('groupInfoCard');
-        if (!infoCard) {
-            infoCard = document.createElement('div');
-            infoCard.id = 'groupInfoCard';
-            infoCard.className = 'card';
-            infoCard.style.cssText = 'border-top: 4px solid #C9973D; margin-bottom: 2rem;';
-            const resultsSection = document.getElementById('resultsSection');
-            if (resultsSection) resultsSection.prepend(infoCard);
-        }
-        const color = group.color || '#C9973D';
-        const prompts = (group.sourcePrompts || []).filter(p => p.prompt);
-        const resolvedBdrs = bdrEmailArr || (group.bdrEmails?.length ? group.bdrEmails : (group.bdrEmail ? [group.bdrEmail] : []));
-        infoCard.innerHTML = `
-            <div class="card-header" style="border-bottom: 2px solid #ede9fe;">
-                <h3 style="color:#5b21b6; display:flex; align-items:center; gap:0.5rem;">
-                    <span style="width:14px;height:14px;border-radius:50%;background:${color};display:inline-block;"></span>
-                    <i class="fas fa-flask" style="color:#C9973D;"></i>
-                    ${escHtml(group.name || 'Unnamed Group')}
-                </h3>
-                <a href="connect_hypothesis_documentation.html" target="_blank"
-                   style="font-size:0.82rem; color:#7c3aed; font-weight:600; display:inline-flex; align-items:center; gap:0.3rem; text-decoration:none;">
-                   <i class="fas fa-external-link-alt"></i> Edit Group
-                </a>
-            </div>
-            <div class="card-body" style="padding:1.5rem;">
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:1.5rem; flex-wrap:wrap;">
-                    <div>
-                        ${group.description ? `
-                        <div style="margin-bottom:1rem;">
-                            <div style="font-size:0.8rem;font-weight:700;color:var(--gray-500);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.35rem;">Hypothesis</div>
-                            <div style="font-size:0.88rem;color:var(--gray-700);line-height:1.6;background:#f5f3ff;padding:0.75rem;border-radius:8px;border-left:3px solid #C9973D;">${escHtml(group.description)}</div>
-                        </div>` : ''}
-                        ${group.contactSource ? `
-                        <div>
-                            <div style="font-size:0.8rem;font-weight:700;color:var(--gray-500);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.35rem;">Contact Source</div>
-                            <div style="font-size:0.85rem;color:var(--gray-600);line-height:1.6;">${escHtml(group.contactSource)}</div>
-                        </div>` : ''}
-                    </div>
-                    <div>
-                        <div style="font-size:0.8rem;font-weight:700;color:var(--gray-500);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.5rem;">Coverage</div>
-                        <div style="display:flex;flex-direction:column;gap:0.4rem;">
-                            ${resolvedBdrs.length ? `
-                            <div style="font-size:0.85rem;color:var(--gray-700);">
-                                <i class="fas fa-users" style="color:#C9973D;width:16px;"></i>
-                                <strong>BDRs:</strong> ${escHtml(resolvedBdrs.join(', '))}
-                            </div>` : ''}
-                            <div style="font-size:0.85rem;color:var(--gray-700);">
-                                <i class="fas fa-address-card" style="color:#C9973D;width:16px;"></i>
-                                <strong>${(group.contactLinkedInUrls||[]).length.toLocaleString()}</strong> tagged contacts
-                            </div>
-                            <div style="font-size:0.85rem;color:var(--gray-700);">
-                                <i class="fas fa-stream" style="color:#0F2D4D;width:16px;"></i>
-                                <strong>${(group.sourceBatchIds||[]).length}</strong> tagged batch${(group.sourceBatchIds||[]).length !== 1 ? 'es' : ''}
-                            </div>
-                            ${group.workspaceName ? `
-                            <div style="font-size:0.85rem;color:var(--gray-700);">
-                                <i class="fas fa-folder" style="color:#10b981;width:16px;"></i>
-                                Workspace: <strong>${escHtml(group.workspaceName)}</strong>
-                            </div>` : ''}
-                        </div>
-                        ${prompts.length ? `
-                        <div style="margin-top:1rem;">
-                            <div style="font-size:0.8rem;font-weight:700;color:var(--gray-500);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.5rem;">Source Prompts (${prompts.length})</div>
-                            ${prompts.map(p => `
-                            <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:0.5rem 0.75rem;margin-bottom:0.4rem;font-size:0.82rem;">
-                                <div style="font-weight:700;color:#374151;margin-bottom:0.2rem;">${escHtml(p.label || 'Prompt')}</div>
-                                <div style="color:#6b7280;line-height:1.5;max-height:60px;overflow:hidden;">${escHtml(p.prompt.substring(0, 200))}${p.prompt.length > 200 ? '…' : ''}</div>
-                            </div>`).join('')}
-                        </div>` : ''}
-                    </div>
-                </div>
-            </div>`;
-    }
-
-    // ── Message Variation Breakdown (Groups tab) ──────────────────────────
-    // Attributes the group's funnel to each message variation, based on the
+    // ── Message Variation Breakdown (shared by every group in the By BDR /
+    // By Company "Outcomes by Hypothesis Group" → "By Variation" sub-view) ──
+    // Attributes one group's funnel to each message variation defined on it, based on the
     // hypothesisVariationId/hypothesisVariationLabel fields stamped onto connect_queue
     // docs by Fast Connect Review when a reviewer assigns a variation to a message.
-    function renderVariationBreakdown(group, sentItems, acceptedUrlSet, repliedUrlSet, scheduledUrlSet) {
-        const card = document.getElementById('variationBreakdownCard');
-        const body = document.getElementById('variationBreakdownBody');
-        const meta = document.getElementById('variationBreakdownMeta');
-        if (!card || !body) return;
-
+    // Pure computation — returns data only; callers own rendering + cleanup-state wiring.
+    function computeGroupVariationRows(group, groupItems, acceptedUrlSet, repliedUrlSet, scheduledUrlSet) {
         const variations = group.messageVariations || [];
-        if (!variations.length) { card.style.display = 'none'; return; }
+        if (!variations.length) return { variations, rows: [], cleanupCandidates: [] };
 
         // Plain-string diagnostics (survive console copy/paste, unlike logged objects):
-        // exactly why the variation card shows what it shows.
-        const stampedItems = sentItems.filter(m => m.hypothesisVariationId);
+        // exactly why the variation table shows what it shows.
+        const stampedItems = groupItems.filter(m => m.hypothesisVariationId);
         const knownVarIds = new Set(variations.map(v => v.id));
         const unknownStamps = [...new Set(stampedItems.map(m => m.hypothesisVariationId))].filter(id => !knownVarIds.has(id));
-        console.log(`[VariationBreakdown] Group "${group.name}": ${sentItems.length} sent item(s) in view; ${stampedItems.length} carry a hypothesisVariationId; ${variations.length} variation(s) defined on the group.`);
+        console.log(`[VariationBreakdown] Group "${group.name}": ${groupItems.length} sent item(s) in view; ${stampedItems.length} carry a hypothesisVariationId; ${variations.length} variation(s) defined on the group.`);
         if (unknownStamps.length) console.warn(`[VariationBreakdown] ${unknownStamps.length} stamped variation id(s) don't match any variation defined on this group: ${JSON.stringify(unknownStamps)} — these land in "No variation". (Were variations edited/recreated after stamping?)`);
 
         // Map every sent contact's normalised/slug URL → the variation id stamped on their
         // connect_queue doc (if any), so accepted/replied/scheduled URLs (which come from other
         // collections without the variation field) can be attributed back to a variation.
         const urlToVariation = new Map();
-        sentItems.forEach(m => {
+        groupItems.forEach(m => {
             const vId = m.hypothesisVariationId;
             if (!vId) return;
             const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
@@ -2770,7 +2108,7 @@
             return counts.get(id);
         };
 
-        sentItems.forEach(m => {
+        groupItems.forEach(m => {
             const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
             const key = liSlug(raw) || normalizeUrl(raw);
             if (!key) return;
@@ -2792,62 +2130,19 @@
                 sent: noneC.sentUrls.size, accepted: noneC.accepted, replied: noneC.replied, scheduled: noneC.scheduled });
         }
 
-        if (!rows.length) { card.style.display = 'none'; return; }
-
         // ── Cleanup candidates: every sent connect_queue doc with no hypothesisVariationId,
-        // or one that doesn't match any variation currently defined on this group. Stashed on
-        // module state so the "Fix Missing Variations" panel can edit them without re-querying.
-        const cleanupCandidates = sentItems.filter(m => !m.hypothesisVariationId || !knownVarIds.has(m.hypothesisVariationId));
-        _varCleanupState = {
-            group, variations,
-            acceptedUrlSet, repliedUrlSet, scheduledUrlSet,
-            candidates: cleanupCandidates.map(m => ({
-                docData: m,
-                selected: true,
-                assign: '' // variation id chosen in the panel; '' = leave alone
-            }))
-        };
-        const openBtn = document.getElementById('variationCleanupOpenBtn');
-        const openBtnLabel = document.getElementById('variationCleanupOpenBtnLabel');
-        if (openBtn) {
-            if (cleanupCandidates.length) {
-                openBtn.style.display = '';
-                openBtnLabel.textContent = `Fix ${cleanupCandidates.length.toLocaleString()} Missing Variation${cleanupCandidates.length !== 1 ? 's' : ''}`;
-            } else {
-                openBtn.style.display = 'none';
-                document.getElementById('variationCleanupCard').style.display = 'none';
-            }
-        }
+        // or one that doesn't match any variation currently defined on this group. Handed back
+        // so the caller can wire up a "Fix Missing Variations" panel without re-querying.
+        const cleanupCandidates = groupItems.filter(m => !m.hypothesisVariationId || !knownVarIds.has(m.hypothesisVariationId));
 
-        meta.textContent = `${variations.length} variation${variations.length !== 1 ? 's' : ''} defined · assigned in Fast Connect Review, or automatically by Full AI Generate / Full Pipeline`;
-
-        body.innerHTML = rows.map(r => {
-            const accPct   = pct(r.accepted,  r.sent);
-            const repPct   = pct(r.replied,   r.sent);
-            const schedPct = pct(r.scheduled, r.sent);
-            const cpm = (r.scheduled > 0 && r.sent > 0) ? Math.round(r.sent / r.scheduled) : null;
-            return `<tr>
-                <td>
-                    <span style="display:inline-flex;align-items:center;gap:0.45rem;">
-                        <span style="width:10px;height:10px;border-radius:50%;background:${r.color};display:inline-block;flex-shrink:0;"></span>
-                        ${escHtml(r.label)}
-                    </span>
-                </td>
-                <td>${r.sent.toLocaleString()}</td>
-                <td>${r.accepted.toLocaleString()}${accPct !== null ? ` <small style="color:#10b981;">(${accPct}%)</small>` : ''}</td>
-                <td>${r.replied.toLocaleString()}${repPct !== null ? ` <small style="color:#f59e0b;">(${repPct}%)</small>` : ''}</td>
-                <td>${r.scheduled.toLocaleString()}${schedPct !== null ? ` <small style="color:#C9973D;">(${schedPct}%)</small>` : ''}</td>
-                <td>${cpm !== null ? `${cpm} per mtg` : '—'}</td>
-            </tr>`;
-        }).join('');
-
-        card.style.display = '';
+        return { variations, rows, cleanupCandidates };
     }
 
     // ── Message Variation Cleanup panel ───────────────────────────────────
     // Lets an admin backfill hypothesisVariationId on connect_queue docs that were already
     // sent but never got a variation stamped (or got stamped with a since-deleted/renamed
-    // variation id) — see _varCleanupState, populated by renderVariationBreakdown() above.
+    // variation id) — see _varCleanupState, populated per-group by openHypoGroupVariationCleanup()
+    // below (using computeGroupVariationRows() above to find the candidates).
     // This only edits reporting fields on the existing doc; nothing is re-sent.
     function _varCleanupMsgLabel(m) {
         const first = m.contactFirstName || m.contact_first_name || m.prospect_first_name || '';
@@ -2988,10 +2283,11 @@
         btn.innerHTML = '<i class="fas fa-save"></i> Save Changes';
 
         // c.docData mutations above are in-place edits to the same objects held in
-        // _grouperSentItems (renderVariationBreakdown's sentItems), so re-running it recomputes
-        // both the funnel table and a fresh (now-shorter) cleanup candidate list with no re-fetch.
-        renderVariationBreakdown(st.group, _grouperSentItems, st.acceptedUrlSet, st.repliedUrlSet, st.scheduledUrlSet);
-        if (_varCleanupState && _varCleanupState.candidates.length) {
+        // _hypoLastData.sentItems, so re-rendering the "By Variation" sub-view recomputes both
+        // the funnel table and a fresh (now-shorter) cleanup candidate list with no re-fetch.
+        renderHypoViewContent();
+        st.candidates = st.candidates.filter(c => !(c.selected && c.assign)); // drop just-saved rows from this panel
+        if (st.candidates.length) {
             document.getElementById('variationCleanupCard').style.display = '';
             renderVariationCleanupPanel();
         } else {
@@ -3024,7 +2320,7 @@
 
         // For chunked groups, load contact URLs from subcollection chunks.
         // _chunksLoaded flag prevents redundant re-fetches across analysis runs,
-        // even if loadGroupsForOutcomes() already populated _outcomeGroups without chunks.
+        // even if ensureOutcomeGroupsLoaded() already populated _outcomeGroups without chunks.
         for (const group of relevantGroups) {
             if (group._chunked && group._chunkCount > 0 && !group._chunksLoaded) {
                 try {
@@ -3126,6 +2422,9 @@
             <button class="hypo-view-tab" id="hypoTabMonth" onclick="switchHypoView('month')">
                 <i class="fas fa-calendar-alt"></i> By Month
             </button>
+            <button class="hypo-view-tab" id="hypoTabVariation" onclick="switchHypoView('variation')" style="color:#9a3412;">
+                <i class="fas fa-vial"></i> By Variation
+            </button>
         </div>
         <div id="hypoViewContent"></div>
         ${unassignedSent > 0 ? `
@@ -3142,7 +2441,7 @@
     // ── Hypothesis Breakdown View Switcher ─────────────────────────────────
     window.switchHypoView = function(view) {
         _hypoBreakdownView = view;
-        ['overview', 'bdr', 'month'].forEach(v => {
+        ['overview', 'bdr', 'month', 'variation'].forEach(v => {
             const id = 'hypoTab' + v.charAt(0).toUpperCase() + v.slice(1);
             const btn = document.getElementById(id);
             if (btn) btn.classList.toggle('active', v === view);
@@ -3153,9 +2452,10 @@
     function renderHypoViewContent() {
         const el = document.getElementById('hypoViewContent');
         if (!el || !_hypoLastData) return;
-        if (_hypoBreakdownView === 'bdr')        el.innerHTML = renderHypoBdrTable();
-        else if (_hypoBreakdownView === 'month') el.innerHTML = renderHypoMonthTable();
-        else                                     el.innerHTML = renderHypoOverviewTable();
+        if (_hypoBreakdownView === 'bdr')            el.innerHTML = renderHypoBdrTable();
+        else if (_hypoBreakdownView === 'month')     el.innerHTML = renderHypoMonthTable();
+        else if (_hypoBreakdownView === 'variation') el.innerHTML = renderHypoVariationTable();
+        else                                         el.innerHTML = renderHypoOverviewTable();
     }
 
     // ── Shared: metric cell HTML helper ───────────────────────────────────
@@ -3436,6 +2736,146 @@
         </table></div>`;
     }
 
+    // Given a group's own sent items, filter global accepted/replied/scheduled url
+    // collections down to just the ones belonging to that group's contacts — the same
+    // "is this URL one of ours" check funnelFromItems() uses, but returning the filtered
+    // URL sets themselves (not just counts) so computeGroupVariationRows() can attribute
+    // each one back to a specific message variation.
+    function filterEventSetsToGroup(groupItems, acceptedUrls, repliedUrls, scheduledUrls) {
+        const sentSlugs = new Set(), sentNorms = new Set();
+        groupItems.forEach(m => {
+            const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
+            const s = liSlug(raw);       if (s) sentSlugs.add(s);
+            const n = normalizeUrl(raw); if (n) sentNorms.add(n);
+        });
+        const inGroup = u => {
+            const s = liSlug(u);       if (s && sentSlugs.has(s)) return true;
+            const n = normalizeUrl(u); return n ? sentNorms.has(n) : false;
+        };
+        return {
+            acceptedUrlSet:  new Set([...(acceptedUrls?.keys?.() || [])].filter(inGroup)),
+            repliedUrlSet:   new Set([...repliedUrls].filter(inGroup)),
+            scheduledUrlSet: new Set([...scheduledUrls].filter(inGroup)),
+        };
+    }
+
+    // ── By Variation Table — replaces the old standalone "Groups" tab. Shows every
+    // relevant group's message-variation breakdown right inside the By BDR / By Company
+    // view, so switching tabs is no longer required to see variation-level results. ──
+    function renderHypoVariationTable() {
+        const { rows, sentItems, acceptedUrls, repliedUrls, scheduledUrls } = _hypoLastData;
+        _hypoVariationCleanupByGroup = new Map(); // rebuilt fresh on every render
+
+        const sections = rows.map(({ g, f, color }) => {
+            const groupItems = getGroupSentItems(g, sentItems);
+            const variations = g.messageVariations || [];
+
+            const groupHdrOpen = `<tr class="hypo-group-hdr">
+                <td colspan="2">
+                    <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+                        <span style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0;display:inline-block;"></span>
+                        <span>${escHtml(g.name || '(unnamed)')}</span>`;
+
+            if (!variations.length) {
+                return groupHdrOpen + `
+                        <span style="font-size:0.78rem;font-weight:400;color:#9ca3af;margin-left:0.3rem;">no variations defined</span>
+                    </div>
+                </td>
+                ${hypoSentCell(f.sent)}
+                <td colspan="4" style="font-size:0.82rem;color:#9ca3af;font-style:italic;text-align:left !important;">
+                    <a href="connect_hypothesis_documentation.html" target="_blank" style="color:#7c3aed;font-weight:600;font-style:normal;">Define message variations</a> on this group to see a breakdown here.
+                </td>
+            </tr>`;
+            }
+
+            const { acceptedUrlSet, repliedUrlSet, scheduledUrlSet } = filterEventSetsToGroup(groupItems, acceptedUrls, repliedUrls, scheduledUrls);
+            const { rows: varRows, cleanupCandidates } = computeGroupVariationRows(g, groupItems, acceptedUrlSet, repliedUrlSet, scheduledUrlSet);
+
+            if (cleanupCandidates.length) {
+                _hypoVariationCleanupByGroup.set(g.id, {
+                    group: g, variations,
+                    acceptedUrlSet, repliedUrlSet, scheduledUrlSet,
+                    candidates: cleanupCandidates.map(m => ({ docData: m, selected: true, assign: '' }))
+                });
+            }
+
+            const accPctG   = f.sent     ? Math.round((f.accepted  / f.sent)     * 100) : null;
+            const repPctG   = f.accepted ? Math.round((f.replied   / f.accepted) * 100) : null;
+            const schedPctG = f.replied  ? Math.round((f.scheduled / f.replied)  * 100) : null;
+
+            const groupHdr = groupHdrOpen + `
+                        <span style="font-size:0.78rem;font-weight:400;color:#6b7280;margin-left:0.3rem;">${variations.length} variation${variations.length !== 1 ? 's' : ''} defined</span>
+                        ${cleanupCandidates.length ? `<button onclick="openHypoGroupVariationCleanup('${g.id}')" style="background:#fff7ed;border:1.5px solid #fdba74;color:#9a3412;font-weight:700;font-size:0.72rem;padding:0.25rem 0.6rem;border-radius:7px;cursor:pointer;white-space:nowrap;">
+                            <i class="fas fa-broom"></i> Fix ${cleanupCandidates.length.toLocaleString()} Missing
+                        </button>` : ''}
+                    </div>
+                </td>
+                ${hypoSentCell(f.sent)}
+                ${hypoMetricCell(f.accepted, accPctG,   'bar-accepted')}
+                ${hypoMetricCell(f.replied,  repPctG,   'bar-replied')}
+                ${hypoMetricCell(f.scheduled,schedPctG, 'bar-scheduled')}
+                ${hypoEffCell(f.sent, f.scheduled)}
+            </tr>`;
+
+            if (!varRows.length) {
+                return groupHdr + `<tr class="hypo-sub-row">
+                    <td colspan="7" style="padding-left:2.5rem;color:#9ca3af;font-style:italic;font-size:0.82rem;text-align:left !important;">No sent connections in this view carry a variation stamp yet.</td>
+                </tr>`;
+            }
+
+            const subRows = varRows.map(r => {
+                const accPct   = pct(r.accepted,  r.sent);
+                const repPct   = pct(r.replied,   r.sent);
+                const schedPct = pct(r.scheduled, r.sent);
+                return `<tr class="hypo-sub-row">
+                    <td colspan="2" style="padding-left:2.5rem;">
+                        <div style="display:flex;align-items:center;gap:0.5rem;">
+                            <span style="width:9px;height:9px;border-radius:50%;background:${r.color};flex-shrink:0;display:inline-block;"></span>
+                            <span style="font-size:0.9rem;color:#374151;">${escHtml(r.label)}</span>
+                        </div>
+                    </td>
+                    ${hypoSentCell(r.sent)}
+                    ${hypoMetricCell(r.accepted, accPct,   'bar-accepted')}
+                    ${hypoMetricCell(r.replied,  repPct,   'bar-replied')}
+                    ${hypoMetricCell(r.scheduled,schedPct, 'bar-scheduled')}
+                    ${hypoEffCell(r.sent, r.scheduled)}
+                </tr>`;
+            }).join('');
+
+            return groupHdr + subRows;
+        }).join('');
+
+        return `<div style="overflow-x:auto;">
+        <table class="outcome-table" style="margin:0;">
+            <thead><tr>
+                <th style="min-width:260px;" colspan="2">Hypothesis Group / Variation</th>
+                <th>Connection Sent</th>
+                <th>Connections Accepted</th>
+                <th>Replied</th>
+                <th>Scheduled Meeting</th>
+                <th title="Connections needed per scheduled meeting">Connections / Meeting</th>
+            </tr></thead>
+            <tbody>${sections || '<tr><td colspan="7" style="text-align:center;padding:2rem;color:#9ca3af;">No variation data available</td></tr>'}</tbody>
+        </table></div>
+        <div class="legend" style="padding:0.75rem 1.5rem;">
+            <div class="legend-item" style="color:#94a3b8;font-style:italic;">
+                <i class="fas fa-info-circle" style="margin-right:0.3rem;font-style:normal;"></i>
+                Only messages tagged with a variation in <a href="fast_connect_review.html" target="_blank">Fast Connect Review</a> are attributed to a specific variation row —
+                everything else lands in "No Variation Assigned." Define variations per group on the Message Variations tab in
+                <a href="connect_hypothesis_documentation.html" target="_blank">Hypothesis Documentation</a>.
+            </div>
+        </div>`;
+    }
+
+    // Opens the "Fix Missing / Unmatched Variations" panel scoped to one group's
+    // cleanup candidates, computed by the most recent renderHypoVariationTable() call.
+    window.openHypoGroupVariationCleanup = function(groupId) {
+        const st = _hypoVariationCleanupByGroup.get(groupId);
+        if (!st) return;
+        _varCleanupState = st;
+        openVariationCleanup();
+    };
+
     // ── Date range helper ─────────────────────────────────────────────────
     function computeDateRange(value) {
         const now = new Date();
@@ -3471,8 +2911,6 @@
 
     // ── Main Analysis ─────────────────────────────────────────────────────
     window.runAnalysis = async function() {
-        // Intercept for Groups tab
-        if (currentTab === 'groups') { await runGroupsAnalysis(); return; }
         // Intercept for "Across All BDRs" — read the precomputed weekly analysis
         // snapshot (same source analysis_results.html reads) instead of live-
         // querying connect_queue/heyreach_activity/heyreach_inbox/etc. for every
@@ -3506,7 +2944,6 @@
         document.getElementById('complementBreakoutCard').style.display = 'none';
         document.getElementById('editedBreakoutCard').style.display = 'none';
         document.getElementById('hypothesisBreakdownCard').style.display = 'none';
-        document.getElementById('variationBreakdownCard').style.display = 'none';
         document.getElementById('loadingPanel').style.display = 'block';
         document.getElementById('loadingSteps').innerHTML = '';
 
@@ -5643,7 +5080,6 @@
         document.getElementById('complementBreakoutCard').style.display = 'none';
         document.getElementById('editedBreakoutCard').style.display = 'none';
         document.getElementById('recentConnectionsCard').style.display = 'none';
-        document.getElementById('variationBreakdownCard').style.display = 'none';
     }
 
     function showAlert(msg, type) {
@@ -5894,7 +5330,6 @@
         document.getElementById('profileBreakoutCard').style.display = 'none';
         document.getElementById('complementBreakoutCard').style.display = 'none';
         document.getElementById('editedBreakoutCard').style.display = 'none';
-        document.getElementById('variationBreakdownCard').style.display = 'none';
         document.getElementById('loadingPanel').style.display = 'block';
         document.getElementById('loadingSteps').innerHTML = '';
         const s1 = setLoadingStep('Loading latest weekly analysis snapshot…', 'active');
@@ -5965,7 +5400,6 @@
         document.getElementById('complementBreakoutCard').style.display = 'none';
         document.getElementById('editedBreakoutCard').style.display = 'none';
         document.getElementById('hypothesisBreakdownCard').style.display = 'none';
-        document.getElementById('variationBreakdownCard').style.display = 'none';
         document.getElementById('loadingPanel').style.display = 'block';
         document.getElementById('loadingSteps').innerHTML = '';
         const s1 = setLoadingStep('Loading latest weekly analysis snapshot…', 'active');
@@ -6791,10 +6225,6 @@
         const hypoBody       = document.getElementById('hypothesisBreakdownBody')?.innerHTML || '';
         const hypoMeta       = document.getElementById('hypothesisBreakdownMeta')?.textContent || '';
 
-        const groupVisible   = document.getElementById('groupInfoCard') !== null &&
-                               document.getElementById('groupInfoCard')?.style.display !== 'none';
-        const groupInfoHtml  = document.getElementById('groupInfoCard')?.innerHTML || '';
-
         const profileVisible = document.getElementById('profileBreakoutCard')?.style.display !== 'none';
         const profileHead    = document.getElementById('profileBreakoutCard')?.querySelector('thead')?.outerHTML || '';
         const profileBody    = document.getElementById('profileBreakoutCard')?.querySelector('tbody')?.innerHTML || '';
@@ -6888,14 +6318,6 @@
 
 <!-- KPI Summary cards — extract numbers from DOM text -->
 <div class="kpi-grid" id="pdfKpiGrid"></div>
-
-${groupVisible ? `<div class="pdf-section" style="border:1.5px solid #ede9fe;border-radius:8px;padding:12px;margin-bottom:18px;">
-    <div class="pdf-section-title" style="color:#5b21b6;border-color:#ddd6fe;">
-        <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#C9973D;"></span>
-        Hypothesis Group Details
-    </div>
-    ${stripIcons(groupInfoHtml)}
-</div>` : ''}
 
 ${funnelVisible && funnelBody ? fmtSection(
     `Outcomes by Message Type <span class="section-badge">${escHtml(meta)}</span>`,
