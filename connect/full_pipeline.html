@@ -1519,31 +1519,82 @@
         // nothing to actually check against — even though the earlier target-rule
         // classification pass does see the full profile.
         //
-        // Two shapes flow through here, and BOTH must be handled or experience silently
-        // disappears for most messages:
-        //   1) processProfileData()'s output (used by the Profile Message fallback) —
-        //      experienceParagraph/educationParagraph are newline-joined STRINGS.
-        //   2) full-ai-generate-single's response profileData (used by the main Post
-        //      Reply / About Me / Internet Search save path — the common case) —
-        //      experiences/education are already ARRAYS of formatted strings, under
-        //      different field names. Missing this second shape is exactly why Opus only
-        //      ever saw headline: pd.experienceParagraph was always undefined here, so
-        //      profile.experience never got set for the vast majority of messages.
-        function buildOpusProfilePayload(pd) {
-            if (!pd) return null;
+        // Profile data arrives in several shapes. In particular, experiences[] is often
+        // an array of OBJECTS; String(object) produced "[object Object]", so Opus effectively
+        // saw only the headline and could wrongly exclude leaders with descriptive headlines.
+        function buildOpusProfilePayload(...sources) {
+            const validSources = sources.filter(s => s && typeof s === 'object');
+            if (!validSources.length) return null;
+
             const profile = {};
-            if (pd.headline) profile.headline = pd.headline;
-            if (pd.about)    profile.about    = String(pd.about);
-            if (pd.experienceParagraph) {
-                profile.experience = String(pd.experienceParagraph).split('\n').map(s => s.trim()).filter(Boolean);
-            } else if (Array.isArray(pd.experiences) && pd.experiences.length) {
-                profile.experience = pd.experiences.filter(Boolean).map(s => String(s).trim());
+            const experience = [];
+            const education = [];
+            const seen = new Set();
+
+            const addLine = (bucket, value) => {
+                if (value == null) return;
+                if (Array.isArray(value)) {
+                    value.forEach(v => addLine(bucket, v));
+                    return;
+                }
+                if (typeof value === 'object') {
+                    const parts = [
+                        value.title, value.jobTitle, value.position, value.role,
+                        value.companyName, value.company, value.organization,
+                        value.subtitle, value.caption, value.dateRange, value.duration,
+                        value.text, value.meta
+                    ].filter(v => typeof v === 'string' && v.trim());
+                    if (parts.length) addLine(bucket, parts.join(' | '));
+                    ['child', 'children', 'positions', 'roles'].forEach(k => addLine(bucket, value[k]));
+                    return;
+                }
+
+                const text = String(value).trim();
+                if (!text) return;
+                if (/^[\[{]/.test(text)) {
+                    try {
+                        addLine(bucket, JSON.parse(text));
+                        return;
+                    } catch (_) { /* ordinary text beginning with a bracket */ }
+                }
+                text.split('\n').map(s => s.trim()).filter(Boolean).forEach(line => {
+                    const key = `${bucket === experience ? 'exp' : 'edu'}:${line.toLowerCase()}`;
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        bucket.push(line);
+                    }
+                });
+            };
+
+            for (const src of validSources) {
+                if (!profile.headline && src.headline) profile.headline = String(src.headline);
+                if (!profile.about && src.about) profile.about = String(src.about);
             }
-            if (pd.educationParagraph) {
-                profile.education = String(pd.educationParagraph).split('\n').map(s => s.trim()).filter(Boolean);
-            } else if (Array.isArray(pd.education) && pd.education.length) {
-                profile.education = pd.education.filter(Boolean).map(s => String(s).trim());
+
+            // Put a confirmed role ahead of the free-form headline so exclusion decisions
+            // evaluate the actual position first.
+            for (const src of validSources) {
+                const title = src.currentTitle || src.jobTitle || src.contactTitle || src.prospectTitle || src.title || '';
+                const company = src.currentCompany || src.companyName || src.contactCompany || src.prospectCompany || src.company || src.organization || '';
+                if (title) {
+                    addLine(experience, `CURRENT ROLE: ${title}${company ? ` at ${company}` : ''}`);
+                    break;
+                }
             }
+
+            for (const src of validSources) {
+                addLine(experience, src.experienceParagraph);
+                addLine(experience, src.experiences);
+                addLine(experience, src.experience);
+                addLine(experience, src.EXPERIENCE);
+                addLine(education, src.educationParagraph);
+                addLine(education, src.educations);
+                addLine(education, src.education);
+                addLine(education, src.EDUCATION);
+            }
+
+            if (experience.length) profile.experience = experience;
+            if (education.length) profile.education = education;
             return Object.keys(profile).length ? profile : null;
         }
 
@@ -5789,7 +5840,10 @@
                                                             bdrOpusInstructions: bdrOpusInstr,
                                                             excludeMode: opusExcludeMode,
                                                             opusModel,
-                                                            profile: buildOpusProfilePayload(pProfile),
+                                                            profile: buildOpusProfilePayload(pProfile, fallbackProfileData, {
+                                                                currentTitle: singleData.prospectTitle || prospect.title || '',
+                                                                currentCompany: singleData.prospectCompany || prospect.company || ''
+                                                            }),
                                                             addLog
                                                         });
                                                         if (rPM) {
@@ -5941,7 +5995,10 @@
                                                 bdrOpusInstructions: bdrOpusInstr,
                                                 excludeMode: opusExcludeMode,
                                                 opusModel,
-                                                profile: buildOpusProfilePayload(pd),
+                                                profile: buildOpusProfilePayload(pd, existingProfileData, {
+                                                    currentTitle: singleData.prospectTitle || prospect.title || '',
+                                                    currentCompany: singleData.prospectCompany || prospect.company || ''
+                                                }),
                                                 addLog
                                             });
                                             if (r) {

@@ -1507,18 +1507,50 @@ function renderInProcessList() {
             </div>
             <div class="mc-textpair">
                 <div><div class="mc-col-label">Original</div><textarea readonly>${escapeHtml(it.originalText)}</textarea></div>
-                <div><div class="mc-col-label">Current / Suggested</div><textarea onblur="updateInProcessText(${i}, this.value)" ${it.applied ? 'disabled' : ''}>${escapeHtml(it.currentText)}</textarea></div>
+                <div>
+                    <div class="mc-col-label">Current / Suggested · ${it.currentText.length}/199 characters</div>
+                    <textarea maxlength="199" onblur="updateInProcessText(${i}, this.value)" ${it.applied ? 'disabled' : ''}>${escapeHtml(it.currentText)}</textarea>
+                </div>
             </div>
         </div>`).join('');
 }
 window.toggleInProcessSelect = function(i, checked) { if (inProcessItems[i]) inProcessItems[i].selected = checked; };
-window.updateInProcessText = function(i, value) { if (inProcessItems[i]) inProcessItems[i].currentText = value; };
+
+const IN_PROCESS_REWRITE_MAX_CHARS = 199; // Strictly under LinkedIn's 200-character limit.
+function enforceInProcessRewriteRules(value) {
+    let text = String(value || '')
+        .replace(/\u2014/g, ',')       // em dash
+        .replace(/\s+,/g, ',')
+        .replace(/,\s*,+/g, ',')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+
+    if (text.length >= 200) {
+        const hardCut = text.slice(0, IN_PROCESS_REWRITE_MAX_CHARS);
+        const lastSpace = hardCut.lastIndexOf(' ');
+        text = (lastSpace >= 160 ? hardCut.slice(0, lastSpace) : hardCut)
+            .trim()
+            .replace(/[\s,;:\-]+$/g, '');
+    }
+    return text;
+}
+
+window.updateInProcessText = function(i, value) {
+    if (!inProcessItems[i]) return;
+    inProcessItems[i].currentText = enforceInProcessRewriteRules(value);
+    renderInProcessList();
+};
 
 function buildRewritePrompt(batch, working, hurting) {
     const workingList = working.map(w => `- ${w.hypothesis.title}: ${w.hypothesis.description}`).join('\n') || '(none)';
     const hurtingList = hurting.map(h => `- ${h.hypothesis.title}: ${h.hypothesis.description}`).join('\n') || '(none)';
     const msgList = batch.map(it => `[id="${it.id}"] "${it.originalText}"`).join('\n\n');
-    return `You are rewriting LinkedIn outreach messages to align with proven best practices, while preserving all personalization (contact name, company, specific references) and the original length / character limit as closely as possible.
+    return `You are rewriting LinkedIn outreach messages to align with proven best practices, while preserving all personalization (contact name, company, and specific references).
+
+STRICT REQUIREMENTS FOR EVERY rewrittenMessage:
+- It MUST be fewer than 200 characters total, including spaces (199 characters maximum). Count carefully.
+- NEVER use an em dash (the character \u2014). Use a comma, period, colon, or separate sentence instead.
+- Return a complete, natural-sounding message. Do not cut off a sentence.
 
 WORKING PRINCIPLES TO INCORPORATE where the message is currently missing them:
 ${workingList}
@@ -1526,7 +1558,7 @@ ${workingList}
 PATTERNS TO AVOID — remove or soften these where the message currently does them:
 ${hurtingList}
 
-Only change what's needed to apply the above. Keep names, specific references, tone, and length as close to the original as possible.
+Only change what's needed to apply the above. Keep names, specific references, and tone as close to the original as possible while obeying both strict requirements.
 
 Messages to rewrite (${batch.length} total):
 ${msgList}
@@ -1555,7 +1587,7 @@ window.suggestRewrites = async function() {
         results.forEach(r => {
             const target = batch.find(it => it.id === r.id) || batch.find(it => String(it.id).includes(String(r.id || '')));
             if (!target || !r.rewrittenMessage) return;
-            target.currentText = r.rewrittenMessage;
+            target.currentText = enforceInProcessRewriteRules(r.rewrittenMessage);
             target.rewriteReason = r.changesSummary || '';
             target.selected = true;
         });
@@ -1570,8 +1602,19 @@ window.suggestRewrites = async function() {
 };
 
 window.applySelectedRewrites = async function() {
+    // Enforce the hard delivery constraints again at the write boundary, including
+    // for suggestions a user manually edited after AI generation.
+    inProcessItems.forEach(it => {
+        if (!it.applied) it.currentText = enforceInProcessRewriteRules(it.currentText);
+    });
     const toApply = inProcessItems.filter(it => it.selected && !it.applied && it.currentText !== it.originalText);
     if (!toApply.length) { showAlert('No selected, changed messages to apply.', 'warning'); return; }
+    const invalid = toApply.filter(it => it.currentText.length >= 200 || it.currentText.includes('\u2014'));
+    if (invalid.length) {
+        showAlert(`${invalid.length} message(s) still violate the under-200/no-em-dash rules and were not applied.`, 'danger');
+        renderInProcessList();
+        return;
+    }
     if (!confirm(`Apply ${toApply.length} rewritten message(s) back to the queue? This updates connect_queue directly.`)) return;
 
     const btn = document.getElementById('applyRewritesBtn');
