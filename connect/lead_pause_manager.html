@@ -170,7 +170,7 @@
         <div class="icon-wrap"><i class="fas fa-circle-pause"></i></div>
         <div>
             <h1>Lead Pause Manager</h1>
-            <p>Starts from the same “still in queue” calculation as the BDR Dashboard, then adds every lead HeyReach still has going through (pending start <em>or</em> mid-sequence). Pause (stop) or unpause some or all — by BDR, campaign, uploaded list, or AI scan.</p>
+            <p>Starts from the same “still in queue” calculation as the BDR Dashboard, then adds every lead HeyReach still has going through (pending start <em>or</em> mid-sequence). Pause (stop) some or all — by BDR, campaign, uploaded list, or AI scan. Leads already paused in HeyReach load into the list below so you can unpause them.</p>
         </div>
     </div>
 
@@ -217,7 +217,7 @@
         <div class="stat amber"><div class="v" id="stMessage">0</div><div class="l">Message</div></div>
         <div class="stat green"><div class="v" id="stShown">0</div><div class="l">Matching Filters</div></div>
         <div class="stat slate"><div class="v" id="stSelected">0</div><div class="l">Selected</div></div>
-        <div class="stat red"><div class="v" id="stPausedSession">0</div><div class="l">Paused This Session</div></div>
+        <div class="stat red"><div class="v" id="stPausedSession">0</div><div class="l">Currently Paused</div></div>
     </div>
 
     <!-- Filters -->
@@ -279,7 +279,7 @@
         <button class="btn btn-ghost" onclick="clearSelection()">
             <i class="fas fa-xmark"></i> Clear
         </button>
-        <span class="note">Pause = HeyReach "Stop Lead in Campaign" for that lead's own campaign — the rest of the campaign keeps going. Paused leads move to the "Paused This Session" list below, where you can unpause (re-enroll) them if needed.</span>
+        <span class="note">Pause = HeyReach "Stop Lead in Campaign" for that lead's own campaign — the rest of the campaign keeps going. Paused leads move to Currently Paused below, where you can unpause (re-enroll) them.</span>
         <div class="progress-wrap" id="bulkProg" style="flex-basis:100%;">
             <div class="progress-track"><div class="progress-fill" id="bulkProgFill"></div></div>
             <div class="progress-label" id="bulkProgLabel" style="color:#cbd5e1;"></div>
@@ -311,7 +311,7 @@
         <div class="empty" id="emptyMsg" style="display:none;">No leads match the current filters.</div>
     </div>
 
-    <!-- Paused-this-session bulk bar -->
+    <!-- Currently paused bulk bar -->
     <div class="bulkbar paused" id="pausedBulkbar">
         <span class="count"><span id="pausedBulkCount">0</span> paused lead(s) selected</span>
         <button class="btn btn-green" id="unpauseBtn" onclick="bulkUnpause()">
@@ -327,10 +327,10 @@
         </div>
     </div>
 
-    <!-- Paused this session table -->
+    <!-- Currently paused table (HeyReach paused + paused this session) -->
     <div class="table-card" id="pausedTableCard" style="display:none;">
         <div class="thdr">
-            <h3><i class="fas fa-circle-pause"></i> Paused This Session</h3>
+            <h3><i class="fas fa-circle-pause"></i> Currently Paused</h3>
             <button class="btn btn-ghost" onclick="clearAllPaused()"><i class="fas fa-broom"></i> Clear list</button>
         </div>
         <div class="table-scroll">
@@ -456,7 +456,7 @@ async function hrFetch(apiKey, path, body) {
 let _bdrLeaderDocs = [];        // full bdr_leaders docs {email,name,customerId,status,heyreachAccountId,heyreachCampaigns}
 let _customerNameById = new Map();
 let _leads = [];                // in-process rows currently loaded
-let _pausedSession = [];        // leads paused during this session (available to unpause)
+let _pausedSession = [];        // currently paused in HeyReach, plus any paused this session (available to unpause)
 let _kindOn = new Set(['connect', 'message']);
 let _statusOn = new Set();           // enabled HR status chips; empty = all
 let _hrApiKeyCache = new Map();      // lowerEmail -> apiKey (or null)
@@ -542,10 +542,29 @@ async function getHeyReachApiKeyForBdr(bdrAuthEmail) {
     return apiKey;
 }
 
+function isPausedCampaignStatus(campaignStatus) {
+    const s = String(campaignStatus || '').toUpperCase().replace(/[\s_-]/g, '_');
+    return s === 'PAUSED' || s === 'STOPPED' || s === 'MANUALLY_STOPPED';
+}
+function extractLeadMessage(lead) {
+    const bags = [lead, lead?.linkedInUserProfile, lead?.leadProfile, lead?.lead].filter(Boolean);
+    for (const bag of bags) {
+        const fields = bag.customUserFields || bag.customFields || bag.customVariables;
+        if (Array.isArray(fields)) {
+            const hit = fields.find(f => String(f.name || f.Name || f.key || '').toLowerCase() === 'content');
+            const val = hit && (hit.value || hit.Value || hit.content);
+            if (val) return String(val).trim();
+        } else if (fields && typeof fields === 'object' && fields.content) {
+            return String(fields.content).trim();
+        }
+    }
+    return '';
+}
 function campaignStatusLabel(campaignStatus, isAlreadySent, isTerminal) {
     const s = String(campaignStatus || '').toUpperCase().replace(/[\s_-]/g, '_');
+    if (isPausedCampaignStatus(s)) return 'Paused';
     if (isTerminal || s === 'FINISHED' || s === 'FAILED' || s === 'COMPLETED') return 'Finished';
-    if (s === 'STOPPED' || s === 'MANUALLY_STOPPED' || s === 'CANCELED' || s === 'CANCELLED') return 'Stopped';
+    if (s === 'CANCELED' || s === 'CANCELLED') return 'Stopped';
     if (s === 'EXCLUDED') return 'Excluded';
     if (s === 'IN_PROGRESS' || s === 'INPROGRESS' || s === 'ACTIVE') return 'InProgress';
     if (s === 'PENDING') return 'Pending';
@@ -553,12 +572,12 @@ function campaignStatusLabel(campaignStatus, isAlreadySent, isTerminal) {
     return s || 'Pending';
 }
 function isGoingThrough(verdict) {
-    if (!verdict || verdict.isTerminal) return false;
+    if (!verdict || verdict.isPaused || verdict.isTerminal) return false;
     const label = verdict.hrStatus || '';
-    return !['Finished', 'Stopped', 'Excluded'].includes(label);
+    return !['Finished', 'Stopped', 'Excluded', 'Paused'].includes(label);
 }
 function pillClass(status) {
-    return { InProgress: 'inprogress', Pending: 'pending', InSequence: 'sequence', QueueOnly: 'queueonly', Finished: 'queueonly', Stopped: 'queueonly' }[status] || 'queueonly';
+    return { InProgress: 'inprogress', Pending: 'pending', InSequence: 'sequence', QueueOnly: 'queueonly', Finished: 'queueonly', Stopped: 'queueonly', Paused: 'queueonly' }[status] || 'queueonly';
 }
 
 async function fetchLiveCampaignStatusMap(apiKey, campaignId) {
@@ -591,10 +610,12 @@ async function fetchLiveCampaignStatusMap(apiKey, campaignId) {
                     || campaignStatus === 'MANUALLY_STOPPED' || campaignStatus === 'EXCLUDED'
                     || (errCode != null && errCode !== 0 && String(errCode) !== '0' && String(errCode).toUpperCase() !== 'NONE');
                 const isAlreadySent = hrLooksAlreadySent(connectionStatus) || hrLooksAlreadySent(messageStatus);
+                const isPaused = isPausedCampaignStatus(campaignStatus);
                 const hrStatus = campaignStatusLabel(campaignStatus, isAlreadySent, isTerminal);
                 map.set(u, {
                     alreadySent: isAlreadySent || isTerminal,
-                    isAlreadySent, isTerminal, campaignStatus, connectionStatus, messageStatus, hrStatus,
+                    isAlreadySent, isTerminal, isPaused, campaignStatus, connectionStatus, messageStatus, hrStatus,
+                    messageContent: extractLeadMessage(l),
                     rawUrl,
                     firstName: prof.firstName || prof.first_name || l.firstName || '',
                     lastName:  prof.lastName  || prof.last_name  || l.lastName  || '',
@@ -843,6 +864,7 @@ async function computeInProcessRows(bdrAuthEmail, ctx, opts) {
     let excludedAlreadySent = 0;
     for (const c of deduped) {
         const verdict = combinedLive.get(normalizeUrlForHrLiveMatch(c.url));
+        if (verdict && verdict.isPaused) continue;
         if (verdict && verdict.alreadySent) { excludedAlreadySent++; continue; }
         if (verdict) { confirmedPresent.push(c); continue; }
         needsCheck.push(c);
@@ -886,20 +908,38 @@ async function computeInProcessRows(bdrAuthEmail, ctx, opts) {
     // HeyReach's own "in process" still includes those people (mid-sequence).
     const includeLive = opts.includeLive !== false;
     const liveRows = [];
-    if (includeLive) {
-        const queueByUrl = new Map();
-        for (const c of deduped) {
-            const u = normalizeUrlForHrLiveMatch(c.url);
-            if (u && !queueByUrl.has(u)) queueByUrl.set(u, c);
-        }
-        const seen = new Set(queueRowsOut.map(r => `${r.campaignId}::${normalizeUrlForHrLiveMatch(r.profileUrl)}`));
+    const pausedRows = [];
+    const queueByUrl = new Map();
+    for (const c of deduped) {
+        const u = normalizeUrlForHrLiveMatch(c.url);
+        if (u && !queueByUrl.has(u)) queueByUrl.set(u, c);
+    }
+    const seen = new Set(queueRowsOut.map(r => `${r.campaignId}::${normalizeUrlForHrLiveMatch(r.profileUrl)}`));
+    {
         for (const [cId, map] of liveByCampaign) {
             const campMeta = campaigns.find(x => String(x.id || x.campaignId) === String(cId)) || {};
             const campType = String(campMeta.type || '').toLowerCase();
             const kind = (campType === 'message' || campType === 'quick_message' || campType === 'msg') ? 'message' : 'connect';
-            let going = 0, terminal = 0;
+            let going = 0, terminal = 0, paused = 0;
             map.forEach((verdict, url) => {
+                if (verdict.isPaused) {
+                    paused++;
+                    const key = `${cId}::${url}`;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    const queued = queueByUrl.get(url);
+                    const row = queued ? buildLeadRow(queued, meta) : buildHrOnlyLeadRow(verdict, url, cId, kind, meta, campMeta);
+                    row.hrStatus = 'Paused';
+                    row.source = queued ? 'both' : 'heyreach';
+                    if (!row.messageContent && verdict.messageContent) row.messageContent = verdict.messageContent;
+                    row.selected = false;
+                    row.rowMsg = null;
+                    row.pausedThisSession = false;
+                    pausedRows.push(row);
+                    return;
+                }
                 if (!isGoingThrough(verdict)) { terminal++; return; }
+                if (!includeLive) return;
                 going++;
                 const key = `${cId}::${url}`;
                 if (seen.has(key)) return;
@@ -914,12 +954,12 @@ async function computeInProcessRows(bdrAuthEmail, ctx, opts) {
                     liveRows.push(buildHrOnlyLeadRow(verdict, url, cId, kind, meta, campMeta));
                 }
             });
-            log(`    campaign ${cId} (${campMeta.name || campMeta.label || '?'}): ${going} going through, ${terminal} finished/failed/stopped`);
+            log(`    campaign ${cId} (${campMeta.name || campMeta.label || '?'}): ${going} going through, ${paused} paused, ${terminal} finished/failed`);
         }
     }
 
-    log(`  ${bdrName}: queue-pending ${queueRowsOut.length} (dropped ${excludedAlreadySent} already-sent by dashboard rules)${includeLive ? `; + ${liveRows.length} still going through in HeyReach` : ''}`);
-    return queueRowsOut.concat(liveRows);
+    log(`  ${bdrName}: queue-pending ${queueRowsOut.length} (dropped ${excludedAlreadySent} already-sent by dashboard rules)${includeLive ? `; + ${liveRows.length} still going through in HeyReach` : ''}; ${pausedRows.length} currently paused`);
+    return { rows: queueRowsOut.concat(liveRows), paused: pausedRows };
 }
 
 function buildLeadRow(c, meta) {
@@ -1011,22 +1051,26 @@ window.runLoad = async function() {
         targets = [...new Set(targets.filter(Boolean))];
         log(`Computing in-process leads for ${targets.length} BDR(s)…`);
 
+        const loadedPaused = [];
         let done = 0;
         for (const bdrEmail of targets) {
             setProg('loadProg', done, targets.length, `BDR ${done + 1}/${targets.length}: ${bdrEmail}`);
             try {
-                const rows = await computeInProcessRows(bdrEmail, ctx, { strict, includeLive });
+                const result = await computeInProcessRows(bdrEmail, ctx, { strict, includeLive });
+                const rows = result.rows || [];
                 _leads.push(...rows);
+                loadedPaused.push(...(result.paused || []));
                 const nc = rows.filter(r => r.kind === 'connect').length;
                 const nm = rows.filter(r => r.kind === 'message').length;
                 const nHr = rows.filter(r => r.source === 'heyreach' || r.source === 'both').length;
                 const nQ  = rows.filter(r => r.source === 'queue' || r.source === 'both').length;
-                log(`  ${bdrEmail}: ${rows.length} total (${nc} connect, ${nm} message; ${nQ} from queue, ${nHr} still in HeyReach)`, rows.length ? 'ok' : 'info');
+                log(`  ${bdrEmail}: ${rows.length} in process (${nc} connect, ${nm} message; ${nQ} from queue, ${nHr} still in HeyReach), ${(result.paused || []).length} paused`, rows.length || (result.paused || []).length ? 'ok' : 'info');
             } catch (e) {
                 log(`  ${bdrEmail}: failed — ${e.message}`, 'error');
             }
             done++;
         }
+        mergeLoadedPaused(loadedPaused);
         setProg('loadProg', targets.length, targets.length, `Done — ${_leads.length} lead(s) loaded`);
         setTimeout(() => hideProg('loadProg'), 1500);
 
@@ -1037,7 +1081,8 @@ window.runLoad = async function() {
         document.getElementById('aiCard').style.display = 'block';
         document.getElementById('tableCard').style.display = 'block';
         document.getElementById('bdrFilterWrap').style.display = targets.length > 1 ? 'flex' : 'none';
-        log(`Loaded ${_leads.length} total in-process lead(s) across ${targets.length} BDR(s).`, 'ok');
+        log(`Loaded ${_leads.length} in-process lead(s) and ${_pausedSession.length} currently paused across ${targets.length} BDR(s).`, 'ok');
+        renderPausedTable();
     } catch (e) {
         log(`Load failed: ${e.message}`, 'error');
         hideProg('loadProg');
@@ -1183,7 +1228,7 @@ async function logAction(lead, action, ok, detail) {
 window.bulkPause = async function() {
     const targets = _leads.filter(l => l.selected);
     if (!targets.length) { alert('Select at least one lead to pause.'); return; }
-    if (!confirm(`Pause (stop) ${targets.length} lead(s) in HeyReach?\n\nOther leads in the same campaigns keep going. Paused leads move to the "Paused This Session" list where you can unpause them if needed.`)) return;
+    if (!confirm(`Pause (stop) ${targets.length} lead(s) in HeyReach?\n\nOther leads in the same campaigns keep going. Paused leads move to Currently Paused, where you can unpause them if needed.`)) return;
 
     document.getElementById('pauseBtn').disabled = true;
     let okCount = 0, errCount = 0;
@@ -1195,7 +1240,7 @@ window.bulkPause = async function() {
         if (ok) {
             okCount++;
             lead.rowMsg = { ok: true, text: 'Paused' };
-            _pausedSession.push({ ...lead, selected: false, rowMsg: null });
+            _pausedSession.push({ ...lead, selected: false, rowMsg: null, pausedThisSession: true });
         } else {
             errCount++;
             const err = data?.error || data?.errorMessage || `HTTP ${status}`;
@@ -1215,7 +1260,18 @@ window.bulkPause = async function() {
     buildFilters(); renderTable(); updateStats(); renderPausedTable();
 };
 
-// ── Paused-this-session table + unpause ─────────────────────────────────
+// ── Currently paused table + unpause ────────────────────────────────────
+function mergeLoadedPaused(loaded) {
+    const fresh = new Map();
+    for (const row of loaded) {
+        if (row && row.uid && !fresh.has(row.uid)) fresh.set(row.uid, row);
+    }
+    // Keep leads paused in this tab if HeyReach has not reflected the stop yet.
+    for (const existing of _pausedSession) {
+        if (existing.pausedThisSession && !fresh.has(existing.uid)) fresh.set(existing.uid, existing);
+    }
+    _pausedSession = [...fresh.values()];
+}
 function renderPausedTable() {
     const card = document.getElementById('pausedTableCard');
     card.style.display = _pausedSession.length ? 'block' : 'none';
@@ -1249,7 +1305,7 @@ window.clearPausedSelection = function() {
     renderPausedTable();
 };
 window.clearAllPaused = function() {
-    if (_pausedSession.length && !confirm('Clear the paused-this-session list? (Does not unpause anyone in HeyReach.)')) return;
+    if (_pausedSession.length && !confirm('Clear the currently-paused list from this page? (Does not unpause anyone in HeyReach.)')) return;
     _pausedSession = [];
     renderPausedTable(); updateStats();
 };
