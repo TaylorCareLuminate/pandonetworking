@@ -419,22 +419,67 @@ async function runWithConcurrency(items, worker, concurrency, onProgress, retrie
     const workers = Array.from({ length: Math.min(concurrency, items.length) }, next);
     await Promise.all(workers);
 }
+// String/escape-aware bracket matching — used so a literal '[' or ']' or '{'/'}' inside a
+// JSON string VALUE (e.g. a quoted phrase from a message, or an unfilled "[FirstName]"
+// template tag) is never mistaken for JSON array/object structure.
+function findMatchingBracket(text, startIdx, openCh, closeCh) {
+    let depth = 0, inString = false, escaped = false;
+    for (let i = startIdx; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (ch === '\\') escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === openCh) depth++;
+        else if (ch === closeCh) { depth--; if (depth === 0) return i; }
+    }
+    return -1;
+}
+
+// Scans a "[{...}, {...}, ..." string — possibly missing its closing bracket because the
+// model's response got cut off at its token limit mid-array — and returns every top-level
+// {...} object that parses on its own, silently dropping only a final incomplete object.
+function salvagePartialJsonObjects(text) {
+    const out = [];
+    let i = text.indexOf('{');
+    while (i !== -1 && i < text.length) {
+        const end = findMatchingBracket(text, i, '{', '}');
+        if (end === -1) break; // remaining object is incomplete (truncated) — stop here
+        try { out.push(JSON.parse(text.slice(i, end + 1))); } catch (e) { /* skip malformed object */ }
+        i = text.indexOf('{', end + 1);
+    }
+    return out;
+}
+
 function parseJsonArray(raw) {
     if (!raw) return [];
     let cleaned = String(raw).trim();
     const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fence) cleaned = fence[1].trim();
     const start = cleaned.indexOf('[');
-    if (start !== -1) {
-        let depth = 0, end = -1;
-        for (let i = start; i < cleaned.length; i++) {
-            if (cleaned[i] === '[') depth++;
-            else if (cleaned[i] === ']') { depth--; if (depth === 0) { end = i; break; } }
+    if (start === -1) return [];
+
+    const end = findMatchingBracket(cleaned, start, '[', ']');
+    const candidate = end !== -1 ? cleaned.slice(start, end + 1) : cleaned.slice(start);
+
+    try {
+        const parsed = JSON.parse(candidate);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+        // Most common cause: the response was truncated at the model's max_tokens limit
+        // before the array closed. Salvage whichever complete objects it already generated
+        // instead of discarding the whole response.
+        const salvaged = salvagePartialJsonObjects(cleaned.slice(start));
+        if (salvaged.length) {
+            console.warn(`[HypLab] AI JSON array was malformed/truncated — salvaged ${salvaged.length} complete item(s) out of what was returned.`);
+            return salvaged;
         }
-        if (end !== -1) cleaned = cleaned.slice(start, end + 1);
+        console.warn('[HypLab] Could not parse AI JSON array:', candidate.slice(0, 400));
+        return [];
     }
-    try { const parsed = JSON.parse(cleaned); return Array.isArray(parsed) ? parsed : []; }
-    catch (e) { console.warn('[HypLab] Could not parse AI JSON array:', cleaned.slice(0, 400)); return []; }
 }
 
 // ── Generic AI call via the existing /api/ai-profile-eval proxy ─────────
@@ -1156,13 +1201,14 @@ YOUR #1 PRIORITY IS CONTENT, NOT MECHANICS. Read every message closely and focus
 
 Only include a hypothesis about generic mechanics (length, number of sentences, number of questions, punctuation, emoji use, formatting) if it is a distant secondary finding — at least 7 of your hypotheses must be about message CONTENT/TOPIC or specific WORD/PHRASE CHOICE, not structure. Rules:
 - Each hypothesis must describe a concrete, objectively observable property of the message text alone — NOT a property of the contact, their title, their company, or their connection count.
-- Prefer hypotheses that quote or name specific words, phrases, or topics you actually observed (e.g. "opens by referencing a specific detail from the prospect's recent LinkedIn post" or "uses the word 'struggling'/'challenge' to name a pain point" or "leads with the BDR's own credential instead of the prospect") over vague style labels like "is personalized" or "is concise".
+- Prefer hypotheses that name specific words, phrases, or topics you actually observed (e.g. "opens by referencing a specific detail from the prospect's recent LinkedIn post" or "uses the word 'struggling'/'challenge' to name a pain point") over vague style labels like "is personalized" or "is concise" — but keep it to at most ONE short example quote per hypothesis, not a list.
+- Keep "description" to ONE concise sentence (max ~25 words) and "classifier_prompt" to ONE short sentence. Be terse everywhere — you have a strict output length budget and it must cover all hypotheses.
 - Each hypothesis must be phrased so a separate, simple AI, given ONLY the message text and no other context, could answer yes/no about it consistently.
 - Propose a mix of "this pattern seems to WORK" and "this pattern seems to HURT" hypotheses if the data supports it.
 - Do NOT hypothesize about connection count, title, or company — those are already controlled for separately in testing.
 
-Respond with ONLY a JSON array, no markdown fences, no other text:
-[{"id":"short_snake_case_id","title":"<=8 word title","category":"content_topic"|"word_choice"|"structure_mechanics","description":"1-2 sentence explanation of the pattern — name the actual words/phrases/topics you observed — and why the examples suggest it matters","classifier_prompt":"A precise, self-contained yes/no instruction about the message text alone, written as an instruction to a simple AI classifier that will receive ONLY this instruction plus the message text","predicted_direction":"works"}]`;
+Respond with ONLY a JSON array, no markdown fences, no other text, no commentary before or after the array:
+[{"id":"short_snake_case_id","title":"<=8 word title","category":"content_topic"|"word_choice"|"structure_mechanics","description":"ONE concise sentence, max ~25 words, naming at most one example word/phrase/topic observed","classifier_prompt":"ONE short, self-contained yes/no instruction about the message text alone, for a simple AI classifier that will receive ONLY this instruction plus the message text","predicted_direction":"works"}]`;
 }
 
 window.generateHypotheses = async function() {
@@ -1171,7 +1217,12 @@ window.generateHypotheses = async function() {
     btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing&hellip;';
     document.getElementById('hypGenStatus').textContent = `Sending ${top50.length} + ${bottom50.length} messages to ${val('hypModelSelect')}&hellip;`;
     try {
-        const raw = await callAi(buildHypothesisPrompt(), val('hypModelSelect'), { temperature: 0.4, maxTokens: 3800 });
+        // maxTokens is generous here — with 8-12 hypotheses, each including a description,
+        // a classifier_prompt, and a title, the response can run long. Too low a cap here
+        // truncates the JSON array mid-object and used to make the whole batch unparseable;
+        // parseJsonArray now salvages complete objects from a truncated response too, but a
+        // higher cap avoids losing hypotheses to truncation in the first place.
+        const raw = await callAi(buildHypothesisPrompt(), val('hypModelSelect'), { temperature: 0.4, maxTokens: 7000 });
         const arr = parseJsonArray(raw);
         if (!arr.length) throw new Error('AI did not return any parseable hypotheses. Try again or a different model.');
         hypotheses = arr.map((h, i) => ({
