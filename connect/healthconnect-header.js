@@ -1,10 +1,13 @@
 /**
  * HealthConnect Common Header Component
- * Version: 3.4.0 - Connect page usage tracking
+ * Version: 3.5.0 - Permission-gated Company Reporting workspace
  * 
  * Provides a beautiful, consistent header across all HealthConnect pages
  * with organized dropdown navigation sections.
  * 
+ * Changelog v3.5.0:
+ * - Added per-BDR Company Reporting navigation access
+ * - Consolidated company results and conversations into one workspace
  * Changelog v3.4.0:
  * - Record authenticated Connect page views to Firestore (pageUsageTracking)
  * Changelog v3.3.0:
@@ -43,10 +46,8 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Harvest Pool', href: 'harvest_pool.html', icon: 'fa-seedling' },
                 { label: 'Prospect Contacts', href: 'prospect_contacts.html', icon: 'fa-address-book' },
                 { label: 'Prospect Organizations', href: 'prospect_organizations.html', icon: 'fa-building' },
-                // Company-level pages (shown conditionally if 2+ BDRs)
-                { label: 'Company Dashboard', href: 'company_results.html', icon: 'fa-building', requiresMultipleBDRs: true },
-                { label: 'Company Conversations', href: 'company_review_replies.html', icon: 'fa-comments', requiresMultipleBDRs: true },
-                { label: 'Company Performance', href: 'company_performance.html', icon: 'fa-chart-bar', requiresMultipleBDRs: true }
+                // Company-level workspace (explicitly enabled per BDR in BDR Settings)
+                { label: 'Company Reporting', href: 'company_reporting.html', icon: 'fa-chart-pie', requiresCompanyReporting: true }
             ]
         },
         {
@@ -263,7 +264,9 @@ async function resolveViewerBDR(userEmail) {
                 return {
                     email: bdr.primaryEmail,
                     name: bdr.name || bdr.primaryEmail,
-                    id: bdrDoc.id
+                    id: bdrDoc.id,
+                    customerId: bdr.customerId || '',
+                    companyReportingEnabled: bdr.companyReportingEnabled === true
                 };
             });
 
@@ -434,6 +437,30 @@ async function resolveEffectiveBDREmail(user) {
     return loginEmail;
 }
 window.resolveEffectiveBDREmail = resolveEffectiveBDREmail;
+
+let _companyReportingAccessCache = null;
+async function hasCompanyReportingAccess(user) {
+    if (!user) return false;
+    if (isAdminUser(user)) return true;
+    if (_companyReportingAccessCache !== null) return _companyReportingAccessCache;
+
+    try {
+        const viewerBDR = await resolveViewerBDR((user.email || '').toLowerCase());
+        if (viewerBDR) {
+            _companyReportingAccessCache = viewerBDR.companyReportingEnabled === true;
+            return _companyReportingAccessCache;
+        }
+
+        const ownBDR = await resolveOwnBDR(user);
+        _companyReportingAccessCache = ownBDR?.companyReportingEnabled === true;
+        return _companyReportingAccessCache;
+    } catch (error) {
+        console.warn('⚠️ Could not resolve Company Reporting access:', error.message);
+        _companyReportingAccessCache = false;
+        return false;
+    }
+}
+window.hasCompanyReportingAccess = hasCompanyReportingAccess;
 
 // Show a banner below the header indicating viewer mode.
 // When the viewer has access to multiple BDR accounts a compact switcher is shown.
@@ -1018,6 +1045,7 @@ function createHeaderHTML(user = null, bdrCount = 1) {
         const hasActivePage = section.items.some(item => {
             if (item.label === 'divider') return false;
             if (item.requiresMultipleBDRs && bdrCount < 2) return false;
+            if (item.requiresCompanyReporting) return false;
             return currentPage === item.href;
         });
         
@@ -1031,6 +1059,8 @@ function createHeaderHTML(user = null, bdrCount = 1) {
             if (item.requiresMultipleBDRs && bdrCount < 2) {
                 return '';
             }
+            // Permission is resolved asynchronously after authentication.
+            if (item.requiresCompanyReporting) return '';
             
             const isActive = currentPage === item.href ? 'active' : '';
             return `
@@ -1322,8 +1352,9 @@ async function updateNavigationItems(user) {
         
         // Check company BDR count (will use cached value if available)
         const bdrCount = await checkCompanyBDRCount(user?.email);
+        const companyReportingAccess = await hasCompanyReportingAccess(user);
         
-        console.log(`📊 Navigation update: BDR count = ${bdrCount}, admin = ${isAdmin}`);
+        console.log(`📊 Navigation update: BDR count = ${bdrCount}, admin = ${isAdmin}, company reporting = ${companyReportingAccess}`);
         
         // Filter sections based on admin status
         const visibleSections = HEALTHCONNECT_CONFIG.navSections.filter(section => {
@@ -1341,6 +1372,9 @@ async function updateNavigationItems(user) {
                 // Skip items that require multiple BDRs if user doesn't have them
                 if (item.requiresMultipleBDRs && bdrCount < 2) {
                     console.log(`⏭️ Skipping "${item.label}" (requires 2+ BDRs, have ${bdrCount})`);
+                    return '';
+                }
+                if (item.requiresCompanyReporting && !companyReportingAccess) {
                     return '';
                 }
                 
