@@ -325,7 +325,7 @@
 
     <div class="info-banner">
         <i class="fas fa-info-circle"></i>
-        This scans the same tracking data (<code>quick_message_campaign_leads</code>) used by the automatic nightly Railway cleanup job. Only contacts added via a Quick Message tool (Mass Messages to Connections, Campaign Follow-up, Fast Batch Review, etc.) are tracked here — contacts added directly in HeyReach won't show up.
+        Scanning first <strong>syncs from HeyReach directly</strong> — it pulls the campaign's real lead list/history and backfills any contact missing from our tracking data (<code>quick_message_campaign_leads</code>), using HeyReach's own "added" date. This catches contacts added outside the usual Quick Message tools (e.g. added straight in the HeyReach dashboard), which previously sat invisible and un-cleaned indefinitely.
     </div>
 
     <!-- Step 1: Setup -->
@@ -358,9 +358,10 @@
             </div>
 
             <button class="btn btn-quick" onclick="scanForOldContacts()" id="scanBtn" style="margin-top:0.5rem;">
-                <i class="fas fa-search"></i> Scan for Old Contacts
+                <i class="fas fa-search"></i> Sync from HeyReach &amp; Scan
             </button>
             <span id="scanSpinner" class="spinner" style="display:none; margin-left:0.75rem; vertical-align:middle;"></span>
+            <div id="scanStatusLine" style="margin-top:0.5rem; font-size:0.82rem; color:var(--gray);"></div>
         </div>
     </div>
 
@@ -549,15 +550,38 @@ window.scanForOldContacts = async function() {
     if (!selectedBDR) { alert('Please select a BDR first.'); return; }
     if (!quickMessageCampaign) { alert('This BDR has no Quick Message campaign linked — nothing to scan.'); return; }
     if (!resolvedCustomerId) { alert('Could not resolve a customerId for this BDR. Check Admin › BDR Leaders.'); return; }
+    if (!quickMessageCampaign.listId) { alert('This campaign has no listId on record — cannot sync from HeyReach. Check Admin › BDR Leaders.'); return; }
 
     const maxAgeDays = parseInt(document.getElementById('maxAgeDays').value) || 40;
 
     const scanBtn = document.getElementById('scanBtn');
+    const statusLine = document.getElementById('scanStatusLine');
     scanBtn.disabled = true;
     document.getElementById('scanSpinner').style.display = 'inline-block';
     document.getElementById('resultsCard').style.display = 'none';
 
     try {
+        // Step 1: sync real HeyReach lead history/list membership into Firestore
+        // tracking first, so contacts added outside our tools aren't invisible.
+        statusLine.textContent = '🔄 Syncing from HeyReach (this can take a bit for large lists)…';
+        const reconcileResp = await fetch(`${RAILWAY_URL}/api/mass-messages/reconcile-campaign`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerId: resolvedCustomerId,
+                campaignId: String(quickMessageCampaign.id),
+                listId: String(quickMessageCampaign.listId)
+            })
+        });
+        const reconcileData = await reconcileResp.json();
+        if (!reconcileResp.ok || !reconcileData.success) throw new Error(reconcileData.error || `Sync failed: HTTP ${reconcileResp.status}`);
+
+        const backfilled = (reconcileData.backfilledActive || 0) + (reconcileData.backfilledAlreadyClean || 0);
+        statusLine.textContent = backfilled > 0
+            ? `✅ Synced ${reconcileData.totalHistoryLeads} lead(s) from HeyReach — found ${backfilled} not previously tracked (${reconcileData.backfilledActive} still in the list, ${reconcileData.backfilledAlreadyClean} already gone). Now scanning for anything older than ${maxAgeDays} days…`
+            : `✅ Synced ${reconcileData.totalHistoryLeads} lead(s) from HeyReach — tracking was already up to date. Now scanning for anything older than ${maxAgeDays} days…`;
+
+        // Step 2: scan the now-up-to-date tracking data for anything past the age cutoff.
         const resp = await fetch(`${RAILWAY_URL}/api/mass-messages/scan-old-leads`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -574,6 +598,7 @@ window.scanForOldContacts = async function() {
         renderResults(maxAgeDays);
     } catch (e) {
         alert('❌ Scan failed: ' + e.message);
+        statusLine.textContent = '❌ ' + e.message;
     } finally {
         scanBtn.disabled = false;
         document.getElementById('scanSpinner').style.display = 'none';
