@@ -1037,6 +1037,27 @@
         // ════════════════════════════════════════════════════════════════════
         // FROM generate_messages.html — enrichment write-back (verbatim)
         // ════════════════════════════════════════════════════════════════════
+        // Parse a LinkedIn connection count into a TRUSTED number, or null when it
+        // can't be trusted (null/''/non-numeric, or 0/negative — a working
+        // professional's real profile never has 0 connections; a 0 is an unread or
+        // hidden count). Handles "500+" (→ 501) and "1,234". Mirrors the server's
+        // fullAiTrustedConnCount so the browser and Railway apply the same rule.
+        function fpTrustedConnCount(raw) {
+            if (raw === null || raw === undefined || raw === '') return null;
+            let n;
+            if (typeof raw === 'number') {
+                n = raw;
+            } else {
+                const s = String(raw).trim();
+                const digits = s.replace(/[^0-9]/g, '');
+                if (!digits) return null;
+                n = parseInt(digits, 10);
+                if (s.includes('+')) n += 1;
+            }
+            if (!Number.isFinite(n) || n <= 0) return null;
+            return n;
+        }
+
         function extractConnectionCount(rawProfile) {
             if (!rawProfile) return null;
             const val = rawProfile.connections
@@ -1907,6 +1928,40 @@
             if ((popup._dncMatches || []).length === 0) popup.remove();
         };
 
+        /** Accepts the backend's found-but-rejected LinkedIn URL candidate for an org
+         *  (Step 3 "use" button): writes it as the org's URL, clears the not-found
+         *  flag so the org is scanned on the next run, and re-renders the table. */
+        window.fpAcceptRejectedCandidate = async function(orgId) {
+            const org = fpGroupOrgs.find(o => o.id === orgId);
+            const url = org && org.linkedin_url_rejected_candidate;
+            if (!org || !url) return;
+            if (!confirm(`Use this LinkedIn URL for "${org.company_name || 'this organization'}"?\n\n${url}${org.linkedin_url_rejected_candidate_name ? `\n(${org.linkedin_url_rejected_candidate_name})` : ''}\n\nThe URL judge rejected it because: ${org.linkedin_url_rejected_candidate_reason || 'no reason given'}.\n\nAccepting clears the "not found" flag so the organization is scanned on the next run.`)) return;
+            try {
+                await updateDoc(doc(db, 'prospect_organizations', orgId), {
+                    company_linkedin_url: url,
+                    linkedin_url_verified: true,
+                    linkedin_url_source: 'human_accepted_candidate',
+                    linkedin_url_match_type: 'exact',
+                    linkedin_url_matched_name: org.linkedin_url_rejected_candidate_name || null,
+                    linkedin_url_researched_at: new Date().toISOString(),
+                    linkedin_url_not_found: false,
+                    linkedin_url_research_failed_at: null,
+                    linkedin_url_rejected_candidate: null,
+                    linkedin_url_rejected_candidate_name: null,
+                    linkedin_url_rejected_candidate_reason: null
+                });
+                Object.assign(org, {
+                    company_linkedin_url: url, linkedin_url_verified: true, linkedin_url_source: 'human_accepted_candidate',
+                    linkedin_url_match_type: 'exact', linkedin_url_not_found: false, linkedin_url_research_failed_at: null,
+                    linkedin_url_rejected_candidate: null, linkedin_url_rejected_candidate_name: null, linkedin_url_rejected_candidate_reason: null
+                });
+                fpRenderGroupOrgsTable();
+                fpUpdateRunButton?.();
+            } catch (e) {
+                alert(`Could not save the URL: ${e.message}`);
+            }
+        };
+
         /** Drops every matched org from THIS run's queue in one go. */
         window.fpDncRemoveAllMatches = function() {
             const popup = document.getElementById('fpDncWarningPopup');
@@ -2718,13 +2773,25 @@
                            </span>`
                         : '—');
                 let urlCell;
+                // Found-but-rejected candidate from the backend's URL judge — offer it for
+                // one-click acceptance so a wrong rejection doesn't leave the org a dead end.
+                const candidate = !o.company_linkedin_url && o.linkedin_url_rejected_candidate ? o.linkedin_url_rejected_candidate : null;
+                const candidateHtml = candidate
+                    ? `<div style="margin-top: 3px; font-size: 11px; color: var(--gray-600);" title="${escHtml(o.linkedin_url_rejected_candidate_reason || 'Rejected by the URL judge')}">
+                           candidate: <a href="${escHtml(candidate)}" target="_blank" style="color: var(--primary);">${escHtml(candidate.replace(/^https?:\/\/(www\.)?linkedin\.com\/company\//, '').replace(/\/$/, '').slice(0, 30))}</a>${o.linkedin_url_rejected_candidate_name ? ` (${escHtml(o.linkedin_url_rejected_candidate_name)})` : ''}
+                           <button type="button" class="btn btn-secondary" style="padding: 0 6px; font-size: 10px; line-height: 16px; margin-left: 4px;" onclick="fpAcceptRejectedCandidate('${escHtml(o.id)}')" title="Use this URL for the organization and clear the not-found flag">use</button>
+                       </div>`
+                    : '';
                 if (o.company_linkedin_url) {
-                    urlCell = `<a href="${escHtml(o.company_linkedin_url)}" target="_blank" style="color: var(--primary); font-size: 12px;">${escHtml(o.company_linkedin_url.replace(/^https?:\/\/(www\.)?/, '').slice(0, 45))}</a>`;
+                    const parentBadge = o.linkedin_url_match_type === 'parent'
+                        ? ` <span class="badge badge-gray" title="No distinct LinkedIn page exists for this org — this is its parent organization's page${o.linkedin_url_matched_name ? ` (${escHtml(o.linkedin_url_matched_name)})` : ''}. Employees are found under the parent.">parent</span>`
+                        : '';
+                    urlCell = `<a href="${escHtml(o.company_linkedin_url)}" target="_blank" style="color: var(--primary); font-size: 12px;">${escHtml(o.company_linkedin_url.replace(/^https?:\/\/(www\.)?/, '').slice(0, 45))}</a>${parentBadge}`;
                 } else if (o.linkedin_url_not_found && !retryNotFound) {
                     const when = o.linkedin_url_research_failed_at ? new Date(o.linkedin_url_research_failed_at).toLocaleDateString() : 'earlier';
-                    urlCell = `<span class="badge badge-gray" title="Researched on ${escHtml(when)}, no LinkedIn URL found — check 'Re-search...' above to retry">not found (${escHtml(when)}) — skipping</span>`;
+                    urlCell = `<span class="badge badge-gray" title="Researched on ${escHtml(when)}, no LinkedIn URL found — check 'Re-search...' above to retry">not found (${escHtml(when)}) — skipping</span>${candidateHtml}`;
                 } else if (o.linkedin_url_not_found && retryNotFound) {
-                    urlCell = `<span class="badge badge-amber" title="Previously not found — will retry because 'Re-search...' is checked">will re-research</span>`;
+                    urlCell = `<span class="badge badge-amber" title="Previously not found — will retry because 'Re-search...' is checked">will re-research</span>${candidateHtml}`;
                 } else {
                     urlCell = '<span class="badge badge-amber">will research</span>';
                 }
@@ -5255,16 +5322,15 @@
                             // explicitly retry them.
                             //
                             // IMPORTANT: this ALSO skips submitting the org to the scan job at all.
-                            // The scan's own company-lookup fallback runs the exact same (slow,
-                            // ~60-90s) Gemini/Grok/Bebity pipeline as the research call above, so
-                            // letting it run anyway on every single run for every already-flagged
-                            // org silently defeated the whole point of this skip — the org still
-                            // got fully re-scanned and re-billed, it just skipped one extra call
-                            // first. Orgs that fail research for the FIRST time this run (the
-                            // `else if` below) still get one fallback shot from the scan itself —
-                            // it uses a slightly different pipeline and sometimes succeeds where
-                            // research didn't — but once an org is flagged, it's not retried again
-                            // (by either method) until "Re-search..." is explicitly checked.
+                            // The scan job's own company lookup is the very same backend function
+                            // (findCompanyLinkedInUrls) as the research call above — same Brave,
+                            // same Apify runs, same judge — so letting the scan "try its own lookup"
+                            // after research just failed only ever re-billed the identical ~60-90s
+                            // pipeline for an identical miss. An org whose research fails (this run
+                            // or a previous one) therefore gets NO scan job until "Re-search..." is
+                            // explicitly checked. The backend keeps the closest found-but-rejected
+                            // candidate URL, which is stored on the org and shown in Step 3 so a
+                            // human can accept it in one click instead of the org being a dead end.
                             if (!org.company_linkedin_url && org.linkedin_url_not_found && !retryNotFoundUrls) {
                                 const when = org.linkedin_url_research_failed_at ? new Date(org.linkedin_url_research_failed_at).toLocaleDateString() : 'a previous run';
                                 addLog(`   ⏭️ SKIPPED — no LinkedIn URL, already researched (${when}) with nothing found. No scan submitted, no extra cost. Check "Re-search..." in Step 3 to retry.`, 'dim');
@@ -5284,34 +5350,75 @@
                                     }], false, 1, 1);
                                     const match = (result.companies || [])[0];
                                     if (match && match.linkedin_url) {
+                                        const matchType = match.match_type === 'parent' ? 'parent' : 'exact';
                                         org.company_linkedin_url = match.linkedin_url;
                                         org.linkedin_url_not_found = false;
+                                        org.linkedin_url_match_type = matchType;
                                         orgReport.linkedinUrl = match.linkedin_url;
+                                        orgReport.linkedinUrlMatchType = matchType;
                                         orgReport.urlResearched = true;
                                         await updateDoc(doc(db, 'prospect_organizations', org.id), {
                                             company_linkedin_url: match.linkedin_url,
                                             linkedin_url_verified: match.verified || false,
+                                            linkedin_url_match_type: matchType,
+                                            linkedin_url_matched_name: match.matched_name || null,
+                                            linkedin_url_source: match.source || null,
+                                            linkedin_url_confidence: match.confidence || null,
                                             linkedin_url_researched_at: new Date().toISOString(),
                                             linkedin_url_not_found: false,
-                                            linkedin_url_research_failed_at: null
+                                            linkedin_url_research_failed_at: null,
+                                            linkedin_url_rejected_candidate: null,
+                                            linkedin_url_rejected_candidate_name: null,
+                                            linkedin_url_rejected_candidate_reason: null
                                         });
-                                        addLog(`   ✅ URL found: ${match.linkedin_url}`, 'success');
+                                        if (matchType === 'parent') {
+                                            addLog(`   ✅ URL found (PARENT organization${match.matched_name ? ` — "${match.matched_name}"` : ''}): ${match.linkedin_url} — no distinct page exists for this org, so its employees will be found under the parent's page.`, 'success');
+                                        } else {
+                                            addLog(`   ✅ URL found: ${match.linkedin_url}${match.matched_name && match.matched_name.toLowerCase() !== (org.company_name || '').toLowerCase() ? ` ("${match.matched_name}")` : ''}`, 'success');
+                                        }
                                     } else {
                                         // Persist so future runs skip re-researching this org by default —
                                         // this is exactly the "keeps re-searching the same not-found orgs"
-                                        // behavior being fixed here.
+                                        // behavior being fixed here. Keep the closest found-but-rejected
+                                        // candidate (if any) so it can be reviewed/accepted from Step 3.
+                                        const rejectedUrl = (match && match.rejected_candidate_url) || null;
                                         org.linkedin_url_not_found = true;
+                                        org.linkedin_url_rejected_candidate = rejectedUrl;
+                                        org.linkedin_url_rejected_candidate_name = (match && match.rejected_candidate_name) || null;
+                                        org.linkedin_url_rejected_candidate_reason = (match && match.rejected_candidate_reason) || null;
                                         orgReport.linkedinUrlNotFound = true;
+                                        orgReport.rejectedCandidateUrl = rejectedUrl;
                                         await updateDoc(doc(db, 'prospect_organizations', org.id), {
                                             linkedin_url_not_found: true,
-                                            linkedin_url_research_failed_at: new Date().toISOString()
+                                            linkedin_url_research_failed_at: new Date().toISOString(),
+                                            linkedin_url_rejected_candidate: rejectedUrl,
+                                            linkedin_url_rejected_candidate_name: org.linkedin_url_rejected_candidate_name,
+                                            linkedin_url_rejected_candidate_reason: org.linkedin_url_rejected_candidate_reason
                                         });
-                                        addLog(`   ⚠️ No LinkedIn URL found — flagged so future runs skip re-researching it by default (check "Re-search..." in Step 3 to retry). The scan will try its own company lookup.`, 'warning');
+                                        if (rejectedUrl) {
+                                            addLog(`   ⚠️ No LinkedIn URL confirmed. Closest candidate was ${rejectedUrl}${org.linkedin_url_rejected_candidate_name ? ` ("${org.linkedin_url_rejected_candidate_name}")` : ''} — rejected: ${org.linkedin_url_rejected_candidate_reason || 'no reason given'}. Review it in Step 3 (click "use" to accept). Flagged so future runs skip it by default.`, 'warning');
+                                        } else {
+                                            addLog(`   ⚠️ No LinkedIn URL found — flagged so future runs skip re-researching it by default (check "Re-search..." in Step 3 to retry).`, 'warning');
+                                        }
+                                        // The scan job would run this exact same lookup again and fail the
+                                        // same way — don't pay for it. Skip the org for this run.
+                                        addLog(`   ⏭️ SKIPPED — no scan submitted (the scan's company lookup is the same pipeline that just came up empty).`, 'dim');
+                                        orgReport.error = 'no_linkedin_url';
+                                        report.totals.noLinkedInUrlSkippedOrgs = (report.totals.noLinkedInUrlSkippedOrgs || 0) + 1;
+                                        report.orgs.push(orgReport);
+                                        await saveReport();
+                                        continue;
                                     }
                                 } catch (e) {
                                     // A transient failure (network/API error) is NOT the same as "genuinely
                                     // not found" — don't flag it, so the next run tries again normally.
-                                    addLog(`   ⚠️ URL research failed: ${e.message} — the scan will try its own company lookup (will retry researching next run, not flagged as not-found).`, 'warning');
+                                    // Still don't submit a scan job: with no URL the job can only re-run
+                                    // the same lookup that just errored.
+                                    addLog(`   ⚠️ URL research failed: ${e.message} — not flagged as not-found (will retry next run). Skipping this org for this run; no scan submitted.`, 'warning');
+                                    orgReport.error = `url_research_error: ${e.message}`;
+                                    report.orgs.push(orgReport);
+                                    await saveReport();
+                                    continue;
                                 }
                             }
 
@@ -5662,19 +5769,21 @@
                                         }
                                     }
 
-                                    // Browser-side connection count check (skip below threshold)
+                                    // Browser-side connection count check (skip below threshold).
+                                    // Only a TRUSTED count can drop a contact: 0 / missing / unparseable
+                                    // means the count wasn't readable (hidden, stub scrape, or an old
+                                    // `?? 0` default) — never "0 connections". Unknown counts pass
+                                    // through; the server does the same (fullAiTrustedConnCount).
                                     if (existingProfileData && connFilterOn) {
                                         const connRaw = existingProfileData.connections;
-                                        if (connRaw != null) {
-                                            const connStr = String(connRaw);
-                                            const connNum = connStr.includes('+')
-                                                ? parseInt(connStr) + 1
-                                                : Number(connStr.replace(/,/g, ''));
-                                            if (!isNaN(connNum) && connNum < connFilterMin) {
-                                                addLog(`   ⛔ Below ${connFilterMin} connections (${connNum}) — skipping`);
-                                                fpTallyNoMessage(orgReport, prospect, 'below connection floor (client-side check)', `${connNum} < ${connFilterMin}`);
-                                                continue;
-                                            }
+                                        const connNum = fpTrustedConnCount(connRaw);
+                                        if (connNum !== null && connNum < connFilterMin) {
+                                            addLog(`   ⛔ Below ${connFilterMin} connections (${connNum}) — skipping`);
+                                            fpTallyNoMessage(orgReport, prospect, 'below connection floor (client-side check)', `${connNum} < ${connFilterMin}`);
+                                            continue;
+                                        }
+                                        if (connNum === null && connRaw != null) {
+                                            addLog(`   ℹ️ Connection count unreadable (${connRaw}) — not dropping on it`, 'dim');
                                         }
                                     }
 
