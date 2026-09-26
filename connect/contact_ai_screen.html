@@ -14,6 +14,7 @@
     <script src="../js/auth.js?v=2.1"></script>
     <script src="../js/folder-protection.js?v=2.1"></script>
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <script src="workspace-routing.js?v=3"></script>
     <script src="../js/ai-model-catalog.js"></script>
 
     <style>
@@ -61,6 +62,8 @@
         .btn-outline { background: white; border: 2px solid var(--border); color: var(--secondary); }
         .btn-outline:hover:not(:disabled) { border-color: var(--gray); }
         .btn-danger { background: var(--danger); color: white; }
+        .btn-green { background: #15803d; color: white; }
+        .btn-green:hover:not(:disabled) { background: #166534; }
         .btn:disabled { opacity: 0.55; cursor: not-allowed; }
 
         .filter-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.9rem; margin-bottom: 0.75rem; }
@@ -117,6 +120,10 @@
         .empty-note { color: var(--gray); font-size: 0.85rem; padding: 0.5rem 0; }
         .radio-row { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-top: 0.5rem; }
         .radio-row label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.84rem; font-weight: 600; cursor: pointer; }
+
+        .save-target { display: flex; flex-direction: column; gap: 1rem; }
+        .save-target input[type="text"], .save-target select { padding: 0.6rem 0.9rem; border: 2px solid var(--border); border-radius: 8px; font-size: 0.88rem; min-width: 340px; max-width: 100%; }
+        .save-target > div > label.field-label { font-size: 0.74rem; font-weight: 700; color: var(--gray); text-transform: uppercase; letter-spacing: 0.03em; display: block; margin-bottom: 6px; }
     </style>
 </head>
 <body>
@@ -207,6 +214,9 @@
     <!-- Results -->
     <div class="section" id="resultsSection" style="display:none;">
         <div class="section-title"><i class="fas fa-list-check"></i> Results</div>
+        <p class="section-help">
+            Check the box next to any contact(s) you want to keep, then use <strong>Step 4</strong> below to save them to a workspace or BDR and/or tag them onto a Hypothesis Group.
+        </p>
         <div class="filter-bar">
             <input type="text" id="resFilterText" placeholder="Search name, title, company…">
             <select id="resFilterVerdict">
@@ -216,14 +226,50 @@
                 <option value="error">Errors</option>
             </select>
             <button class="btn btn-outline" onclick="exportCsv()"><i class="fas fa-file-csv"></i> Export CSV</button>
+            <button class="btn btn-outline" onclick="selectAllFiltered()"><i class="fas fa-check-square"></i> Select All Filtered</button>
+            <button class="btn btn-outline" onclick="clearSelection()"><i class="fas fa-square"></i> Clear Selection</button>
+            <span class="filter-count" id="selCountLabel"></span>
             <span class="filter-count" id="resCountLabel"></span>
         </div>
         <div class="table-scroll">
             <table class="data-table">
-                <thead><tr><th>Verdict</th><th>Conf.</th><th>Name</th><th>Title</th><th>Company</th><th>Location</th><th>AI Reason</th><th>LinkedIn</th></tr></thead>
+                <thead><tr>
+                    <th><input type="checkbox" id="selectAllVisible" onchange="toggleSelectAllVisible(this.checked)"></th>
+                    <th>Verdict</th><th>Conf.</th><th>Name</th><th>Title</th><th>Company</th><th>Location</th><th>AI Reason</th><th>LinkedIn</th>
+                </tr></thead>
                 <tbody id="resTableBody"></tbody>
             </table>
         </div>
+    </div>
+
+    <!-- STEP 4: Save & Tag -->
+    <div class="section" id="saveSection" style="display:none;">
+        <div class="section-title"><span class="step-badge">Step 4</span> <i class="fas fa-folder-plus"></i> Save Selected Contacts to a Workspace or BDR</div>
+        <p class="section-help">
+            Copies each <strong>checked</strong> contact from the Results table above into a workspace or directly onto a BDR's active list — originals are untouched, nothing is moved or deleted, and anyone already present at the destination (matched by LinkedIn URL) is automatically skipped.
+            Optionally tag the same copies onto an existing Hypothesis Group at the same time.
+        </p>
+        <div class="save-target">
+            <div>
+                <label class="field-label">Save destination</label>
+                <div class="radio-row" style="margin-top:0; margin-bottom:0.6rem;">
+                    <label><input type="radio" name="saveDest" value="newWs" checked onchange="onSaveDestChange()"> Create a new workspace</label>
+                    <label><input type="radio" name="saveDest" value="existingWs" onchange="onSaveDestChange()"> Add to an existing workspace</label>
+                    <label><input type="radio" name="saveDest" value="bdr" onchange="onSaveDestChange()"> Add directly to a BDR's list</label>
+                </div>
+                <input type="text" id="newWorkspaceName" placeholder='Workspace name, e.g. "AI Screen — Senior IT Leadership"'>
+                <select id="existingWorkspaceSelect" style="display:none;"><option value="">— Select workspace —</option></select>
+                <select id="bdrTargetSelect" style="display:none;"><option value="">— Select BDR —</option></select>
+            </div>
+            <div>
+                <label class="field-label"><i class="fas fa-flask"></i> Also tag onto a Hypothesis Group (optional)</label>
+                <select id="hypothesisGroupSelect"><option value="">— Don't tag to a hypothesis group —</option></select>
+            </div>
+            <div>
+                <button class="btn btn-green" id="btnSaveSelected" onclick="saveSelectedContacts()"><i class="fas fa-save"></i> Save Selected Contacts</button>
+            </div>
+        </div>
+        <div id="saveStatus" style="margin-top:1rem;"></div>
     </div>
 </div>
 
@@ -233,14 +279,26 @@
 
     await window.firebaseReady;
     const RAILWAY_BASE = 'https://railwayclemail-production.up.railway.app';
+    const db = window.clemailDb;
+    const { collection, doc, getDocs, getDoc, addDoc, setDoc, updateDoc, writeBatch, query, where, Timestamp } = window.clemailFirestoreModule;
+    const WR = window.WorkspaceRouting;
 
     let allContacts = [];              // [{ _id, ...contact }]
     const aiResults = new Map();       // _id -> { match, confidence, reason, model, error }
+    const selectedIds = new Set();     // _id currently checked for Step 4 save
     let catalogModels = [];
     let pricingBySlug = null;          // slug -> { prompt: $/token, completion: $/token }
     let cancelRequested = false;
     let running = false;
     let actualCostUsd = 0;
+    let currentUser = null;
+
+    // ── STEP 4: BDR / workspace / hypothesis group lookups ──────────────────
+    let allBdrs = [];
+    let allWorkspaces = [];
+    let allHypothesisGroups = [];
+    const customerNameMap = new Map();
+    let saveOptionsLoaded = false;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
     function escHtml(s) {
@@ -266,6 +324,9 @@
     function cLinkedIn(c){ return c.linkedin_url || c.linkedInUrl || ''; }
     function cAbout(c)   { return c.summary || c.about || ''; }
     function keywordList(v) { return String(v || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean); }
+    function normalizeUrlKey(url) {
+        return String(url || '').toLowerCase().trim().replace(/\/$/, '').replace(/^https?:\/\//i, '').replace(/^www\./i, '');
+    }
 
     // Experience: the directory stores a plain paragraph; prospect_contacts stores
     // a JSON array of roles (same shape open_to_work_finder.html parses).
@@ -556,6 +617,399 @@ Respond with ONLY a valid JSON array, one object per contact, IN THE SAME ORDER,
         document.getElementById(id).addEventListener('input', onEstimateInputsChanged);
     });
 
+    // ── STEP 4: BDR / workspace / hypothesis group lookups (same conventions as
+    // open_to_work_finder.html and connect_hypothesis_documentation.html) ──────
+    async function loadCustomerNames() {
+        if (customerNameMap.size) return customerNameMap;
+        try {
+            const snap = await getDocs(collection(db, 'customerList'));
+            snap.forEach(d => { const x = d.data(); customerNameMap.set(d.id, x.name || x.shortName || d.id); });
+        } catch (e) { console.warn('loadCustomerNames:', e.message); }
+        return customerNameMap;
+    }
+    async function loadBdrs() {
+        await loadCustomerNames();
+        try {
+            const snap = await getDocs(collection(db, 'bdr_leaders'));
+            allBdrs = [];
+            snap.forEach(d => {
+                const data = d.data();
+                if (data.status === 'inactive') return; // skip inactive BDRs
+                const cid = data.customerId || '';
+                allBdrs.push({
+                    id: d.id, ...data,
+                    _company: customerNameMap.get(cid) || (cid === 'internal' ? 'Internal — Pando Executive Networking' : (cid || 'Other'))
+                });
+            });
+            allBdrs.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        } catch (e) { console.warn('loadBdrs:', e.message); }
+    }
+    async function loadWorkspaces() {
+        try {
+            const snap = await getDocs(collection(db, 'workspaces'));
+            allWorkspaces = [];
+            snap.forEach(d => allWorkspaces.push({ id: d.id, ...d.data() }));
+        } catch (e) { console.warn('loadWorkspaces:', e.message); }
+    }
+    async function loadHypothesisGroups() {
+        try {
+            const snap = await getDocs(collection(db, 'hypothesis_groups'));
+            allHypothesisGroups = [];
+            snap.forEach(d => allHypothesisGroups.push({ id: d.id, ...d.data() }));
+            allHypothesisGroups.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        } catch (e) { console.warn('loadHypothesisGroups:', e.message); }
+    }
+    function bdrCompanyOf(bdr) { return bdr?._company || 'Other'; }
+
+    function populateBdrSelect() {
+        const sel = document.getElementById('bdrTargetSelect');
+        if (!sel) return;
+        sel.innerHTML = `<option value="">— Select BDR —</option>`;
+        const byCompany = new Map();
+        allBdrs.forEach(b => {
+            const c = bdrCompanyOf(b);
+            if (!byCompany.has(c)) byCompany.set(c, []);
+            byCompany.get(c).push(b);
+        });
+        [...byCompany.keys()].sort().forEach(company => {
+            const grp = document.createElement('optgroup');
+            grp.label = company;
+            byCompany.get(company)
+                .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+                .forEach(b => {
+                    const opt = document.createElement('option');
+                    opt.value = b.primaryEmail || b.id;
+                    opt.textContent = `${b.name || b.id} (${b.primaryEmail || b.id})`;
+                    grp.appendChild(opt);
+                });
+            sel.appendChild(grp);
+        });
+    }
+    async function populateExistingWorkspaceSelect() {
+        if (!allWorkspaces.length) await loadWorkspaces();
+        const sel = document.getElementById('existingWorkspaceSelect');
+        sel.innerHTML = `<option value="">— Select workspace —</option>`;
+        if (WR) {
+            const customerMap = await WR.loadCustomerMap(db, { getDocs, collection });
+            WR.appendWorkspaceOptgroups(sel, WR.filterActiveWorkspaces(allWorkspaces), { customerMap });
+        } else {
+            allWorkspaces.forEach(ws => {
+                const opt = document.createElement('option');
+                opt.value = `__ws__:${ws.id}`;
+                opt.textContent = ws.name || ws.id;
+                sel.appendChild(opt);
+            });
+        }
+    }
+    // Hypothesis groups don't carry a "company" field directly — they're associated
+    // via their bdrEmails, so we resolve company through the matching BDR's _company
+    // (same approach connect_hypothesis_documentation.html uses for its company filter).
+    function groupHypothesisGroupsByCompany() {
+        const byEmail = new Map(allBdrs.map(b => [(b.primaryEmail || b.id || '').toLowerCase(), b]));
+        const byCompany = new Map();
+        const unassigned = [];
+        allHypothesisGroups.forEach(g => {
+            const emails = g.bdrEmails?.length ? g.bdrEmails : (g.bdrEmail ? [g.bdrEmail] : []);
+            const bdr = emails.map(e => byEmail.get(String(e).toLowerCase())).find(Boolean);
+            const company = bdr ? bdrCompanyOf(bdr) : null;
+            if (!company) { unassigned.push(g); return; }
+            if (!byCompany.has(company)) byCompany.set(company, []);
+            byCompany.get(company).push(g);
+        });
+        const groups = [...byCompany.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+        unassigned.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        return { groups, unassigned };
+    }
+    function populateHypothesisGroupSelect() {
+        const sel = document.getElementById('hypothesisGroupSelect');
+        if (!sel) return;
+        sel.innerHTML = `<option value="">— Don't tag to a hypothesis group —</option>`;
+        const { groups, unassigned } = groupHypothesisGroupsByCompany();
+        groups.forEach(([company, list]) => {
+            const grp = document.createElement('optgroup');
+            grp.label = `\u{1F3E2} ${company}`;
+            list.forEach(g => {
+                const opt = document.createElement('option');
+                opt.value = g.id;
+                opt.textContent = g.name || g.id;
+                grp.appendChild(opt);
+            });
+            sel.appendChild(grp);
+        });
+        if (unassigned.length) {
+            const grp = document.createElement('optgroup');
+            grp.label = '— Unassigned —';
+            unassigned.forEach(g => {
+                const opt = document.createElement('option');
+                opt.value = g.id;
+                opt.textContent = g.name || g.id;
+                grp.appendChild(opt);
+            });
+            sel.appendChild(grp);
+        }
+    }
+    async function ensureSaveOptionsLoaded() {
+        if (saveOptionsLoaded) return;
+        saveOptionsLoaded = true;
+        await Promise.all([loadBdrs(), loadWorkspaces(), loadHypothesisGroups()]);
+        populateBdrSelect();
+        populateHypothesisGroupSelect();
+    }
+    // Kick off in the background as soon as the module is ready — cheap collections,
+    // so Step 4's dropdowns are already populated by the time results appear.
+    ensureSaveOptionsLoaded().catch(e => console.warn('ensureSaveOptionsLoaded:', e.message));
+
+    window.onSaveDestChange = function() {
+        const mode = document.querySelector('input[name="saveDest"]:checked').value;
+        document.getElementById('newWorkspaceName').style.display = mode === 'newWs' ? '' : 'none';
+        document.getElementById('existingWorkspaceSelect').style.display = mode === 'existingWs' ? '' : 'none';
+        document.getElementById('bdrTargetSelect').style.display = mode === 'bdr' ? '' : 'none';
+        if (mode === 'existingWs') populateExistingWorkspaceSelect();
+    };
+
+    // ── STEP 4: Row selection (checkboxes in the Results table) ─────────────
+    window.toggleRowSelect = function(id, checked) {
+        if (checked) selectedIds.add(id); else selectedIds.delete(id);
+        updateSelCountLabel();
+        const box = document.getElementById('selectAllVisible');
+        if (box) {
+            const visibleIds = getScreenedRows().slice(0, 500).map(({ c }) => c._id);
+            box.checked = visibleIds.length > 0 && visibleIds.every(vid => selectedIds.has(vid));
+        }
+    };
+    window.toggleSelectAllVisible = function(checked) {
+        const rows = getScreenedRows().slice(0, 500);
+        rows.forEach(({ c }) => { if (checked) selectedIds.add(c._id); else selectedIds.delete(c._id); });
+        renderResultsTable();
+    };
+    window.selectAllFiltered = function() {
+        const rows = getScreenedRows();
+        if (!rows.length) { alert('Nothing matches the current filters.'); return; }
+        if (rows.length > 3000 && !confirm(`This will select ${rows.length.toLocaleString()} contacts for saving. Continue?`)) return;
+        rows.forEach(({ c }) => selectedIds.add(c._id));
+        renderResultsTable();
+    };
+    window.clearSelection = function() {
+        selectedIds.clear();
+        renderResultsTable();
+    };
+    function updateSelCountLabel() {
+        const el = document.getElementById('selCountLabel');
+        if (el) el.textContent = `${selectedIds.size.toLocaleString()} selected`;
+    }
+
+    // ── STEP 4: Hypothesis group contact tagging (mirrors the chunked read/write
+    // in connect_hypothesis_documentation.html — groups over the Firestore 1MB doc
+    // limit store their contacts in the flat 'hypothesis_group_chunks' collection) ──
+    const CONTACT_CHUNK_LIMIT = 700 * 1024; // 700 KB per chunk (safe margin)
+    async function readGroupContacts(ref, data) {
+        if (!data._chunked) return { urls: data.contactLinkedInUrls || [], tagged: data.taggedContacts || [] };
+        const gid = ref.id;
+        const count = data._chunkCount || 0;
+        const urls = [], tagged = [];
+        for (let i = 0; i < count; i++) {
+            try {
+                const snap = await getDoc(doc(db, 'hypothesis_group_chunks', `${gid}_${i}`));
+                if (snap.exists) {
+                    const d = snap.data();
+                    urls.push(...(d.contactLinkedInUrls || []));
+                    tagged.push(...(d.taggedContacts || []));
+                }
+            } catch (e) { console.warn(`readGroupContacts chunk ${i}:`, e.message); }
+        }
+        return { urls, tagged };
+    }
+    async function writeGroupContacts(ref, urls, tagged) {
+        const gid = ref.id;
+        const trySize = JSON.stringify({ contactLinkedInUrls: urls, taggedContacts: tagged }).length;
+        if (trySize <= CONTACT_CHUNK_LIMIT) {
+            await updateDoc(ref, {
+                contactLinkedInUrls: urls, taggedContacts: tagged,
+                _chunked: false, _chunkCount: 0, _totalContactCount: null,
+                updatedAt: Timestamp.now()
+            });
+            return;
+        }
+        const chunks = [];
+        let cu = [], ct = [];
+        for (let i = 0; i < urls.length; i++) {
+            cu.push(urls[i]);
+            if (tagged[i]) ct.push(tagged[i]);
+            if (JSON.stringify({ contactLinkedInUrls: cu, taggedContacts: ct }).length >= CONTACT_CHUNK_LIMIT) {
+                cu.pop();
+                if (tagged[i]) ct.pop();
+                chunks.push({ contactLinkedInUrls: [...cu], taggedContacts: [...ct] });
+                cu = [urls[i]];
+                ct = tagged[i] ? [tagged[i]] : [];
+            }
+        }
+        if (cu.length) chunks.push({ contactLinkedInUrls: cu, taggedContacts: ct });
+        for (let i = 0; i < chunks.length; i++) {
+            await setDoc(doc(db, 'hypothesis_group_chunks', `${gid}_${i}`), chunks[i]);
+        }
+        await updateDoc(ref, {
+            contactLinkedInUrls: [], taggedContacts: [],
+            _chunked: true, _chunkCount: chunks.length, _totalContactCount: urls.length,
+            updatedAt: Timestamp.now()
+        });
+    }
+
+    // ── STEP 4: Save selected contacts to a workspace or BDR ─────────────────
+    function buildContactCopy(c, target, workspaceId, workspaceName, hgId, hgName, criteria) {
+        const r = aiResults.get(c._id);
+        const nowIso = new Date().toISOString();
+        return {
+            firstName: cFirstName(c),
+            lastName: cLastName(c),
+            fullName: fullName(c),
+            name: fullName(c),
+            linkedInUrl: cLinkedIn(c),
+            linkedInUrlNormalized: normalizeUrlKey(cLinkedIn(c)),
+            title: cTitle(c),
+            headline: cHeadline(c),
+            position: cTitle(c),
+            company: cCompany(c),
+            companyName: cCompany(c),
+            location: cLocation(c),
+            about: cAbout(c),
+            experience: cExperienceText(c),
+            userEmail: target,
+            bdrEmail: target,
+            workspaceId: workspaceId || null,
+            workspaceName: workspaceName || null,
+            category: 'AI Database Screen Match',
+            connectionStatus: 'not_connected',
+            source: 'contact_ai_screen',
+            sourceCollection: c._collection || '',
+            aiScreen: r ? {
+                model: r.model || '',
+                match: r.match === true,
+                confidence: r.confidence || '',
+                reason: r.reason || '',
+                criteria: criteria || '',
+                screenedAt: nowIso
+            } : null,
+            hypothesisGroupId: hgId || null,
+            hypothesisGroupName: hgName || null,
+            uploadedAt: nowIso,
+            createdAt: nowIso,
+            lastUpdatedAt: nowIso
+        };
+    }
+
+    window.saveSelectedContacts = async function() {
+        if (!selectedIds.size) { alert('No contacts are selected. Check the box(es) next to contacts in the Results table above.'); return; }
+        const mode = document.querySelector('input[name="saveDest"]:checked').value;
+        const hgId = document.getElementById('hypothesisGroupSelect').value;
+        const hg = hgId ? allHypothesisGroups.find(g => g.id === hgId) : null;
+        const criteria = document.getElementById('aiCriteria').value.trim();
+        const statusEl = document.getElementById('saveStatus');
+        const btn = document.getElementById('btnSaveSelected');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i> Saving…';
+        statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Preparing destination…</div>`;
+
+        try {
+            let target, workspaceId = null, workspaceName = null, bdrLabel = '';
+            if (mode === 'newWs') {
+                const name = (document.getElementById('newWorkspaceName').value || '').trim();
+                if (!name) throw new Error('Please name the new workspace.');
+                const docRef = await addDoc(collection(db, 'workspaces'), {
+                    name,
+                    createdBy: currentUser?.email || 'unknown',
+                    createdAt: new Date().toISOString(),
+                    lastActivity: new Date().toISOString(),
+                    description: 'AI Database Screener matches, saved via contact_ai_screen.html.',
+                    sourceTool: 'contact_ai_screen.html'
+                });
+                workspaceId = docRef.id;
+                workspaceName = name;
+                allWorkspaces.push({ id: workspaceId, name: workspaceName });
+                target = `__ws__:${workspaceId}`;
+            } else if (mode === 'existingWs') {
+                const val = document.getElementById('existingWorkspaceSelect').value;
+                if (!val) throw new Error('Please select an existing workspace.');
+                workspaceId = WR ? WR.parseIdFromSentinel(val) : val.replace('__ws__:', '');
+                const wsSnap = await getDoc(doc(db, 'workspaces', workspaceId));
+                workspaceName = wsSnap.exists ? (wsSnap.data().name || workspaceId) : workspaceId;
+                await updateDoc(doc(db, 'workspaces', workspaceId), { lastActivity: new Date().toISOString() });
+                target = `__ws__:${workspaceId}`;
+            } else { // bdr
+                const bdrSel = document.getElementById('bdrTargetSelect');
+                target = bdrSel.value;
+                if (!target) throw new Error('Please select a BDR.');
+                bdrLabel = bdrSel.selectedOptions[0]?.textContent || target;
+            }
+
+            statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Checking for contacts already saved there…</div>`;
+            const existingSnap = await getDocs(query(collection(db, 'prospect_contacts'), where('userEmail', '==', target)));
+            const existingKeys = new Set();
+            existingSnap.forEach(d => {
+                const u = normalizeUrlKey(d.data().linkedInUrl || d.data().linkedin_url);
+                if (u) existingKeys.add(u);
+            });
+
+            const selectedContacts = allContacts.filter(c => selectedIds.has(c._id));
+            const toCopy = selectedContacts.filter(c => {
+                const key = normalizeUrlKey(cLinkedIn(c));
+                return !key || !existingKeys.has(key);
+            });
+            const skipped = selectedContacts.length - toCopy.length;
+
+            statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Copying ${toCopy.length.toLocaleString()} contact(s)…</div>`;
+            const CHUNK = 400;
+            let copied = 0;
+            for (let i = 0; i < toCopy.length; i += CHUNK) {
+                const slice = toCopy.slice(i, i + CHUNK);
+                const batch = writeBatch(db);
+                slice.forEach(c => {
+                    const newRef = doc(collection(db, 'prospect_contacts'));
+                    batch.set(newRef, buildContactCopy(c, target, workspaceId, workspaceName, hg?.id, hg?.name, criteria));
+                });
+                await batch.commit();
+                copied += slice.length;
+                statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Copied ${copied.toLocaleString()} / ${toCopy.length.toLocaleString()}…</div>`;
+            }
+
+            let hgMsg = '';
+            if (hg) {
+                statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Tagging contacts onto hypothesis group "${escHtml(hg.name || hg.id)}"…</div>`;
+                const groupRef = doc(db, 'hypothesis_groups', hg.id);
+                const { urls: existingUrls, tagged: existingTagged } = await readGroupContacts(groupRef, hg);
+                const urlSet = new Set(existingUrls.map(normalizeUrlKey));
+                const newUrls = [], newTagged = [];
+                toCopy.forEach(c => {
+                    const u = cLinkedIn(c);
+                    const key = normalizeUrlKey(u);
+                    if (!u || urlSet.has(key)) return;
+                    urlSet.add(key);
+                    newUrls.push(u);
+                    newTagged.push({ name: fullName(c), linkedInUrl: u, title: cTitle(c), org: cCompany(c), orgLinkedInUrl: '' });
+                });
+                if (newUrls.length) {
+                    await writeGroupContacts(groupRef, [...existingUrls, ...newUrls], [...existingTagged, ...newTagged]);
+                    await updateDoc(groupRef, { contactNames: [...(hg.contactNames || []), ...newTagged.map(t => t.name)] });
+                    hg.contactNames = [...(hg.contactNames || []), ...newTagged.map(t => t.name)];
+                }
+                const alreadyTagged = toCopy.length - newUrls.length;
+                hgMsg = ` and tagged onto hypothesis group "<strong>${escHtml(hg.name || hg.id)}</strong>" (${newUrls.length.toLocaleString()} newly tagged${alreadyTagged ? `, ${alreadyTagged.toLocaleString()} already tagged` : ''})`;
+            }
+
+            const destLabel = mode === 'bdr'
+                ? `BDR "<strong>${escHtml(bdrLabel)}</strong>"`
+                : `workspace "<strong>${escHtml(workspaceName)}</strong>"`;
+            statusEl.innerHTML = `<div class="alert alert-success">
+                <i class="fas fa-check-circle"></i> Copied <strong>${copied.toLocaleString()}</strong> contact(s) into ${destLabel}${skipped ? ` (${skipped.toLocaleString()} already present there, skipped)` : ''}${hgMsg}.
+                <br><span style="font-size:0.82rem;">Open <strong>Contact Search by Keyword</strong> or <strong>Manage Organization Contacts</strong> and pick this ${mode === 'bdr' ? 'BDR' : 'workspace'} to view, message, or reassign these contacts.</span>
+            </div>`;
+        } catch (e) {
+            statusEl.innerHTML = `<div class="alert alert-error"><i class="fas fa-exclamation-circle"></i> ${escHtml(e.message)}</div>`;
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fas fa-save"></i> Save Selected Contacts';
+        }
+    };
+
     // ── AI call (same backend + retry pattern as open_to_work_finder) ────────
     async function callAiProfileEval(prompt, model, maxTokens, { timeoutMs = 90000, maxAttempts = 3 } = {}) {
         let lastErr;
@@ -625,6 +1079,7 @@ Respond with ONLY a valid JSON array, one object per contact, IN THE SAME ORDER,
         progBar.style.width = '0%';
         progLabel.textContent = `Starting — ${pool.length.toLocaleString()} contact(s) in ${batches.length.toLocaleString()} batch(es)…`;
         document.getElementById('resultsSection').style.display = 'block';
+        document.getElementById('saveSection').style.display = 'block';
 
         let done = 0, idx = 0;
         async function worker() {
@@ -725,6 +1180,7 @@ Respond with ONLY a valid JSON array, one object per contact, IN THE SAME ORDER,
                     ? `<span class="verdict-badge verdict-match" title="${escHtml(r.reason)}"><i class="fas fa-check"></i> Match</span>`
                     : `<span class="verdict-badge verdict-no" title="${escHtml(r.reason)}"><i class="fas fa-times"></i> No</span>`);
             return `<tr>
+                <td><input type="checkbox" ${selectedIds.has(c._id) ? 'checked' : ''} onchange="toggleRowSelect(${c._id}, this.checked)"></td>
                 <td>${badge}</td>
                 <td>${r.confidence ? `<span class="conf-pill">${escHtml(r.confidence)}</span>` : '—'}</td>
                 <td>${escHtml(fullName(c))}</td>
@@ -737,7 +1193,12 @@ Respond with ONLY a valid JSON array, one object per contact, IN THE SAME ORDER,
         }).join('');
         document.getElementById('resCountLabel').textContent =
             rows.length > CAP ? `Showing ${CAP.toLocaleString()} of ${rows.length.toLocaleString()} — refine filters` : `${rows.length.toLocaleString()} row${rows.length !== 1 ? 's' : ''}`;
-        document.getElementById('resTableBody').innerHTML = html || `<tr><td colspan="8" class="empty-note">No screened contacts match these filters yet.</td></tr>`;
+        document.getElementById('resTableBody').innerHTML = html || `<tr><td colspan="9" class="empty-note">No screened contacts match these filters yet.</td></tr>`;
+        const visibleIds = shown.map(({ c }) => c._id);
+        const allChecked = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id));
+        const selectAllBox = document.getElementById('selectAllVisible');
+        if (selectAllBox) selectAllBox.checked = allChecked;
+        updateSelCountLabel();
     }
     document.getElementById('resFilterText').addEventListener('input', debounce(renderResultsTable, 200));
     document.getElementById('resFilterVerdict').addEventListener('change', renderResultsTable);
@@ -772,7 +1233,11 @@ Respond with ONLY a valid JSON array, one object per contact, IN THE SAME ORDER,
             const authState = window.getCurrentAuthState?.();
             if (authState?.isLoggedIn) return; // auth.js false-logout protection
             window.location.href = '../login.html';
+            return;
         }
+        currentUser = user;
+        const nameInput = document.getElementById('newWorkspaceName');
+        if (nameInput && !nameInput.value) nameInput.value = `AI Screen Matches — ${new Date().toLocaleDateString()}`;
     });
 </script>
 

@@ -17971,6 +17971,74 @@
                     addLog(`   ⚠️ Client exclusion filter skipped: ${e.message}`, 'warning');
                 }
 
+                // ── DNC (Do Not Contact) filter ─────────────────────────────────────
+                // Drop any pulled prospect whose company matches this BDR's DNC list
+                // BEFORE any message generation happens (fuzzy pre-filter, then AI
+                // confirmation via the same Railway endpoint the queue cleanup tools
+                // use) — must run before the count slice below so a DNC hit doesn't
+                // silently eat one of the `count` slots.
+                try {
+                    const allDncList = await loadDNCList();
+                    const dncCustomerId = getBDRCustomerId(bdrEmail);
+                    const dncList = filterDNCForBDR(allDncList, bdrEmail, dncCustomerId);
+                    if (dncList.length === 0) {
+                        addLog(allDncList.length ? '🚫 DNC filter: no DNC entries apply to this BDR — skipping' : '🚫 DNC filter: DNC list is empty — skipping', 'info');
+                    } else {
+                        const dncCandidates = [];
+                        prospectList.forEach((p, idx) => {
+                            const company = p.company || p.companyName || p.currentCompany || '';
+                            if (!company) return;
+                            const match = isDNCMatch(company, dncList);
+                            if (match) {
+                                dncCandidates.push({
+                                    idx, company,
+                                    dncOrg: match.original_name,
+                                    contactName: [p.firstName, p.lastName].filter(Boolean).join(' ')
+                                });
+                            }
+                        });
+                        if (dncCandidates.length === 0) {
+                            addLog(`🚫 DNC filter: ${dncList.length} DNC entr${dncList.length === 1 ? 'y' : 'ies'} apply to this BDR — none matched the pulled pool of ${prospectList.length}`, 'info');
+                        } else {
+                            addLog(`🚫 DNC fuzzy pre-filter: ${dncCandidates.length} prospect(s) match a DNC organization — confirming with AI…`, 'warning');
+                            let confirmedIdxs = new Set(dncCandidates.map(c => c.idx)); // fail safe: treat all as confirmed unless AI clears them
+                            try {
+                                const dncResp = await fetch('https://railwayclemail-production.up.railway.app/api/dnc/check-matches', {
+                                    method: 'POST',
+                                    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ candidates: dncCandidates.map(c => ({ company: c.company, dncOrg: c.dncOrg, contactName: c.contactName })) }),
+                                    signal: AbortSignal.timeout(30_000)
+                                });
+                                if (dncResp.ok) {
+                                    const dncData = await dncResp.json();
+                                    if (dncData.success && Array.isArray(dncData.confirmed)) {
+                                        if (dncData.fallback) {
+                                            addLog('   ⚠️ DNC AI unavailable — applying fuzzy matches (fail-safe)', 'warning');
+                                        } else {
+                                            const confirmedCompanies = new Set(dncData.confirmed.map(c => (c.company || '').toLowerCase()));
+                                            confirmedIdxs = new Set(dncCandidates.filter(c => confirmedCompanies.has(c.company.toLowerCase())).map(c => c.idx));
+                                            addLog(`   🚫 DNC AI confirmed: ${confirmedIdxs.size} of ${dncCandidates.length} candidate(s) (AI used: ${dncData.used_ai})`, 'info');
+                                        }
+                                    }
+                                } else {
+                                    addLog(`   ⚠️ DNC AI check API returned ${dncResp.status} — applying fuzzy matches (fail-safe)`, 'warning');
+                                }
+                            } catch (dncErr) {
+                                addLog(`   ⚠️ DNC AI check failed — applying fuzzy matches (fail-safe): ${dncErr.message}`, 'warning');
+                            }
+                            if (confirmedIdxs.size > 0) {
+                                const blockedNames = [...new Set(dncCandidates.filter(c => confirmedIdxs.has(c.idx)).map(c => `${c.contactName || 'Unknown'} (${c.company})`))];
+                                addLog(`🚫 DNC: excluding ${confirmedIdxs.size} prospect(s) at DNC organization(s) — ${blockedNames.join(', ')}`, 'warning');
+                                prospectList = prospectList.filter((p, idx) => !confirmedIdxs.has(idx));
+                            } else {
+                                addLog('   ✅ DNC AI check: no true matches confirmed — none excluded', 'success');
+                            }
+                        }
+                    }
+                } catch (e) {
+                    addLog(`   ⚠️ DNC filter skipped: ${e.message}`, 'warning');
+                }
+
                 // Sort by most connections first (enriched profiles prioritised).
                 // For workspace/colleague pulls, prefer the exact order from the pull step
                 // (already sorted most → least) so Railway's shuffle in full-ai-init can't
