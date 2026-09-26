@@ -3444,8 +3444,45 @@
             border: 1px solid var(--gray-200);
             border-left: 5px solid var(--gray-300);
             background: var(--gray-50);
-            transition: all 0.2s;
+            transition: background 0.2s, border-color 0.2s, opacity 0.2s;
         }
+
+        .todo-drag-handle {
+            cursor: grab;
+            color: var(--gray-300);
+            padding: 3px 2px;
+            margin-top: 2px;
+            flex-shrink: 0;
+            font-size: 0.85rem;
+            user-select: none;
+        }
+
+        .todo-drag-handle:hover { color: var(--gray-500); }
+
+        .todo-item.dragging {
+            opacity: 0.35;
+        }
+
+        .todo-item.drag-over-top {
+            box-shadow: inset 0 3px 0 0 var(--primary);
+        }
+
+        .todo-item.drag-over-bottom {
+            box-shadow: inset 0 -3px 0 0 var(--primary);
+        }
+
+        .todo-item-move-btn {
+            background: none;
+            border: none;
+            color: var(--gray-400);
+            cursor: pointer;
+            font-size: 0.85rem;
+            padding: 4px;
+            transition: color 0.2s;
+        }
+
+        .todo-item-move-btn:hover:not(:disabled) { color: var(--primary); }
+        .todo-item-move-btn:disabled { opacity: 0.25; cursor: default; }
 
         .todo-item.type-custom { border-left-color: #8b5cf6; background: rgba(139,92,246,0.06); }
         .todo-item.type-run    { border-left-color: #f59e0b; background: rgba(245,158,11,0.07); }
@@ -3457,6 +3494,26 @@
 
         .todo-item.done .todo-item-text {
             text-decoration: line-through;
+        }
+
+        .todo-item.locked {
+            opacity: 0.5;
+            background: var(--gray-100);
+        }
+
+        .todo-item.locked .todo-item-check {
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+
+        .todo-item-lock-note {
+            font-size: 0.74rem;
+            color: var(--gray-600);
+            font-weight: 600;
+            margin-top: 5px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
         }
 
         .todo-item-check {
@@ -4272,7 +4329,9 @@
                 or click the <i class="fas fa-square-plus"></i> next to any BDR in the dashboard above (or use the picker below)
                 to automatically queue up their next step: <strong>Run New Messages</strong> when fewer than 100 messages
                 are already generated and sitting in the review queues, or <strong>Review &amp; Push Live</strong> when 100+
-                are already there waiting on you.
+                are already there waiting on you. Drag any item by its <i class="fas fa-grip-vertical"></i> handle to
+                reorder, or use <i class="fas fa-angles-up"></i> / <i class="fas fa-angles-down"></i> to jump it straight
+                to the top or bottom.
             </p>
             <div class="todo-legend">
                 <span class="todo-legend-item"><span class="todo-legend-dot todo-color-custom"></span> Custom item</span>
@@ -10344,6 +10403,10 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         const TODO_RUN_THRESHOLD = 100;
         const TODO_TABS = ['immediate', 'longterm'];
         let _todoActiveTab = 'immediate';
+        // Id sequence from the most recent render — lets drag/drop reorder purely
+        // by "this id goes before/after that id" without re-deriving the sort.
+        let _todoLastSortedIds = [];
+        let _todoDragId = null;
 
         function todoStorageKey() {
             const email = (window.auth?.currentUser?.email || 'default').toLowerCase().trim();
@@ -10351,11 +10414,34 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         }
 
         function loadTodoStore() {
+            let store = null;
             try {
                 const raw = JSON.parse(localStorage.getItem(todoStorageKey()) || 'null');
-                if (raw && Array.isArray(raw.immediate) && Array.isArray(raw.longterm)) return raw;
+                if (raw && Array.isArray(raw.immediate) && Array.isArray(raw.longterm)) store = raw;
             } catch (e) { /* fall through to default */ }
-            return { immediate: [], longterm: [] };
+            if (!store) store = { immediate: [], longterm: [] };
+
+            // Backfill `order` (drag-and-drop manual rank) for items saved before
+            // this field existed, using -createdAt so older saved lists keep
+            // rendering "newest first" exactly like before until the user drags
+            // something — new items always get a real order (see todoMinOrder/todoAddItem).
+            let needsSave = false;
+            TODO_TABS.forEach(t => {
+                (store[t] || []).forEach(it => {
+                    if (typeof it.order !== 'number') { it.order = -(it.createdAt || 0); needsSave = true; }
+                });
+            });
+            if (needsSave) saveTodoStore(store);
+            return store;
+        }
+
+        // Smallest/largest current order in a tab, for "move to top"/"move to
+        // bottom"/"new item" placement. Falls back to 0 for an empty tab.
+        function todoMinOrder(items) {
+            return items.length ? Math.min(...items.map(it => it.order || 0)) : 0;
+        }
+        function todoMaxOrder(items) {
+            return items.length ? Math.max(...items.map(it => it.order || 0)) : 0;
         }
 
         function saveTodoStore(store) {
@@ -10403,27 +10489,47 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 return;
             }
 
-            // Undone items first (newest first within each group), done items sink to the bottom.
+            // Undone items first, done items sink to the bottom; within each group,
+            // manual drag order wins (ascending — smaller order = higher up the list).
             const sorted = items.slice().sort((a, b) => {
                 if (!!a.done !== !!b.done) return a.done ? 1 : -1;
-                return (b.createdAt || 0) - (a.createdAt || 0);
+                return (a.order || 0) - (b.order || 0);
             });
 
-            container.innerHTML = sorted.map(item => {
+            // Remember the on-screen id sequence so drag/drop only has to reason
+            // about "before/after this id", not re-derive the sort itself.
+            _todoLastSortedIds = sorted.map(it => it.id);
+
+            container.innerHTML = sorted.map((item, idx) => {
+                const dependsOnItem = item.dependsOn ? items.find(it => it.id === item.dependsOn) : null;
+                const isLocked = !!dependsOnItem && !dependsOnItem.done;
                 const sub = item.bdrName || item.bdrEmail
                     ? `<div class="todo-item-sub">${todoEscape(item.bdrName || '')}${item.bdrName && item.bdrEmail ? ' &middot; ' : ''}${todoEscape(item.bdrEmail || '')}${item.waiting != null ? ` &middot; ${item.waiting.toLocaleString()} msg(s) waiting for review` : ''}</div>`
                     : '';
+                const lockNote = isLocked
+                    ? `<div class="todo-item-lock-note"><i class="fas fa-lock"></i> Unlocks once "${todoEscape(dependsOnItem.text)}" is checked off</div>`
+                    : '';
+                const isTop = idx === 0;
+                const isBottom = idx === sorted.length - 1;
                 return `
-                <div class="todo-item type-${item.type} ${item.done ? 'done' : ''}" data-todo-id="${item.id}">
-                    <input type="checkbox" class="todo-item-check" ${item.done ? 'checked' : ''} data-todo-toggle="${item.id}">
+                <div class="todo-item type-${item.type} ${item.done ? 'done' : ''} ${isLocked ? 'locked' : ''}" data-todo-id="${item.id}" draggable="true">
+                    <div class="todo-drag-handle" title="Drag to reorder"><i class="fas fa-grip-vertical"></i></div>
+                    <input type="checkbox" class="todo-item-check" ${item.done ? 'checked' : ''} ${isLocked ? 'disabled' : ''} data-todo-toggle="${item.id}">
                     <div class="todo-item-body">
                         <div class="todo-item-text">${todoEscape(item.text)}</div>
                         <div class="todo-item-meta">
                             <span class="todo-item-badge type-${item.type}">${todoTypeLabel(item.type)}</span>
                         </div>
                         ${sub}
+                        ${lockNote}
                     </div>
                     <div class="todo-item-actions">
+                        <button type="button" class="todo-item-move-btn" data-todo-top="${item.id}" title="Move to top" ${isTop ? 'disabled' : ''}>
+                            <i class="fas fa-angles-up"></i>
+                        </button>
+                        <button type="button" class="todo-item-move-btn" data-todo-bottom="${item.id}" title="Move to bottom" ${isBottom ? 'disabled' : ''}>
+                            <i class="fas fa-angles-down"></i>
+                        </button>
                         <button type="button" class="todo-item-delete" data-todo-delete="${item.id}" title="Remove">
                             <i class="fas fa-trash"></i>
                         </button>
@@ -10434,6 +10540,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
 
         function todoAddItem(tab, item) {
             const store = loadTodoStore();
+            if (typeof item.order !== 'number') item.order = todoMinOrder(store[tab]) - 1; // new items land on top
             store[tab].push(item);
             saveTodoStore(store);
             renderTodoList();
@@ -10455,26 +10562,88 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
 
         // Adds (or, if already present & not done, just flashes) the BDR's
         // computed next step to the Immediate Work tab.
+        function todoMakeId() {
+            return `t_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        }
+
+        function todoReviewText(bdrName, bdrEmail) {
+            return `Review & push ${bdrName || bdrEmail}'s messages live`;
+        }
+
+        function todoRunText(bdrName, bdrEmail) {
+            return `Run new messages for ${bdrName || bdrEmail}`;
+        }
+
+        // Adds a BDR's next step(s) to the Immediate Work tab.
+        //   - 100+ already waiting for review: just add the single "Review & push
+        //     live" task (nothing more needs to be run first).
+        //   - Fewer than 100 waiting: add BOTH "Run new messages" AND "Review &
+        //     push live" together, with the review task grayed out / locked until
+        //     the run task is checked off.
         function todoAddBdrStep(bdrEmail, bdrName, waiting, triggerEl) {
-            const type = waiting >= TODO_RUN_THRESHOLD ? 'review' : 'run';
+            const needsRunFirst = waiting < TODO_RUN_THRESHOLD;
             const store = loadTodoStore();
-            const already = store.immediate.find(it => it.bdrEmail === bdrEmail && it.type === type && !it.done);
-            if (!already) {
-                const text = type === 'review'
-                    ? `Review & push ${bdrName || bdrEmail}'s messages live`
-                    : `Run new messages for ${bdrName || bdrEmail}`;
-                todoAddItem('immediate', {
-                    id: `t_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-                    type,
-                    text,
-                    bdrEmail,
-                    bdrName: bdrName || '',
-                    waiting: Number(waiting) || 0,
-                    createdAt: Date.now(),
-                    done: false
-                });
-            } else if (_todoActiveTab !== 'immediate') {
-                window.switchTodoTab('immediate');
+            const items = store.immediate;
+            const now = Date.now();
+
+            if (!needsRunFirst) {
+                const alreadyReview = items.find(it => it.bdrEmail === bdrEmail && it.type === 'review' && !it.done);
+                if (!alreadyReview) {
+                    todoAddItem('immediate', {
+                        id: todoMakeId(),
+                        type: 'review',
+                        text: todoReviewText(bdrName, bdrEmail),
+                        bdrEmail,
+                        bdrName: bdrName || '',
+                        waiting: Number(waiting) || 0,
+                        createdAt: now,
+                        done: false
+                    });
+                } else if (_todoActiveTab !== 'immediate') {
+                    window.switchTodoTab('immediate');
+                }
+            } else {
+                // New pairs land at the top; run gets the smaller order so it
+                // renders directly above its locked review item.
+                const topOrder = todoMinOrder(items) - 10;
+                let runItem = items.find(it => it.bdrEmail === bdrEmail && it.type === 'run' && !it.done);
+                if (!runItem) {
+                    runItem = {
+                        id: todoMakeId(),
+                        type: 'run',
+                        text: todoRunText(bdrName, bdrEmail),
+                        bdrEmail,
+                        bdrName: bdrName || '',
+                        waiting: Number(waiting) || 0,
+                        createdAt: now + 1, // sorts just above its linked review item (legacy fallback)
+                        order: topOrder,
+                        done: false
+                    };
+                    items.push(runItem);
+                }
+                const alreadyReview = items.find(it => it.bdrEmail === bdrEmail && it.type === 'review' && !it.done);
+                if (!alreadyReview) {
+                    items.push({
+                        id: todoMakeId(),
+                        type: 'review',
+                        text: todoReviewText(bdrName, bdrEmail),
+                        bdrEmail,
+                        bdrName: bdrName || '',
+                        waiting: Number(waiting) || 0,
+                        createdAt: now,
+                        order: topOrder + 1,
+                        done: false,
+                        dependsOn: runItem.id
+                    });
+                } else if (!alreadyReview.dependsOn) {
+                    // Pre-existing review item from before run/review pairs were
+                    // linked — retroactively lock it to this run item instead of
+                    // creating a duplicate.
+                    alreadyReview.dependsOn = runItem.id;
+                }
+                saveTodoStore(store);
+                renderTodoList();
+                if (_todoActiveTab !== 'immediate') window.switchTodoTab('immediate');
             }
             if (triggerEl) {
                 triggerEl.classList.add('added');
@@ -10515,6 +10684,52 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             return TODO_TABS.find(t => store[t].some(it => it.id === id)) || null;
         }
 
+        // Sends one item all the way to the top or bottom of its (done/undone)
+        // group — the one-click equivalent of dragging it all the way there,
+        // for anyone who'd rather click than drag.
+        function todoMoveToEdge(id, toTop) {
+            const store = loadTodoStore();
+            const tab = todoFindTab(store, id);
+            if (!tab) return;
+            const item = store[tab].find(it => it.id === id);
+            if (!item) return;
+            item.order = toTop ? (todoMinOrder(store[tab]) - 1) : (todoMaxOrder(store[tab]) + 1);
+            saveTodoStore(store);
+            renderTodoList();
+        }
+
+        // Drag-and-drop reorder: moves `draggedId` to sit immediately before or
+        // after `targetId` within whichever tab currently holds it, then rewrites
+        // `order` for every item in that tab as its new sequential position —
+        // simplest way to keep ordering stable and gap-free after repeated drags.
+        function todoReorder(draggedId, targetId, insertAfter) {
+            if (!draggedId || draggedId === targetId) return;
+            const store = loadTodoStore();
+            const tab = todoFindTab(store, draggedId);
+            if (!tab || !store[tab].some(it => it.id === targetId)) return;
+
+            // Reorder based on the last rendered visual sequence (already grouped
+            // undone-before-done) so a drop lands exactly where the user saw it.
+            const idOrder = _todoLastSortedIds.length ? _todoLastSortedIds.slice() : store[tab].map(it => it.id);
+            const from = idOrder.indexOf(draggedId);
+            if (from === -1) return;
+            idOrder.splice(from, 1);
+            let to = idOrder.indexOf(targetId);
+            if (to === -1) return;
+            if (insertAfter) to += 1;
+            idOrder.splice(to, 0, draggedId);
+
+            const byId = new Map(store[tab].map(it => [it.id, it]));
+            idOrder.forEach((id, i) => { const it = byId.get(id); if (it) it.order = i; });
+            saveTodoStore(store);
+            renderTodoList();
+        }
+
+        function todoClearDragIndicators(container) {
+            container.querySelectorAll('.todo-item.drag-over-top, .todo-item.drag-over-bottom')
+                .forEach(el => el.classList.remove('drag-over-top', 'drag-over-bottom'));
+        }
+
         function initTodoList() {
             renderTodoList();
             const input = document.getElementById('todoCustomInput');
@@ -10538,7 +10753,12 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                             saveTodoStore(store);
                             renderTodoList();
                         }
+                        return;
                     }
+                    const topBtn = e.target.closest('[data-todo-top]');
+                    if (topBtn && !topBtn.disabled) { todoMoveToEdge(topBtn.dataset.todoTop, true); return; }
+                    const bottomBtn = e.target.closest('[data-todo-bottom]');
+                    if (bottomBtn && !bottomBtn.disabled) { todoMoveToEdge(bottomBtn.dataset.todoBottom, false); return; }
                 });
                 container.addEventListener('change', (e) => {
                     const chk = e.target.closest('[data-todo-toggle]');
@@ -10553,6 +10773,42 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                             renderTodoList();
                         }
                     }
+                });
+
+                // ── Drag-and-drop reordering ────────────────────────────────────
+                container.addEventListener('dragstart', (e) => {
+                    const itemEl = e.target.closest('.todo-item');
+                    if (!itemEl) return;
+                    _todoDragId = itemEl.dataset.todoId;
+                    e.dataTransfer.effectAllowed = 'move';
+                    try { e.dataTransfer.setData('text/plain', _todoDragId); } catch (err) { /* Safari needs this set, ignore failures elsewhere */ }
+                    setTimeout(() => itemEl.classList.add('dragging'), 0);
+                });
+                container.addEventListener('dragover', (e) => {
+                    if (!_todoDragId) return;
+                    const targetEl = e.target.closest('.todo-item');
+                    if (!targetEl || targetEl.dataset.todoId === _todoDragId) return;
+                    e.preventDefault();
+                    const rect = targetEl.getBoundingClientRect();
+                    const before = (e.clientY - rect.top) < (rect.height / 2);
+                    todoClearDragIndicators(container);
+                    targetEl.classList.add(before ? 'drag-over-top' : 'drag-over-bottom');
+                });
+                container.addEventListener('drop', (e) => {
+                    if (!_todoDragId) return;
+                    const targetEl = e.target.closest('.todo-item');
+                    if (targetEl && targetEl.dataset.todoId !== _todoDragId) {
+                        e.preventDefault();
+                        const rect = targetEl.getBoundingClientRect();
+                        const before = (e.clientY - rect.top) < (rect.height / 2);
+                        todoReorder(_todoDragId, targetEl.dataset.todoId, !before);
+                    }
+                    todoClearDragIndicators(container);
+                });
+                container.addEventListener('dragend', () => {
+                    _todoDragId = null;
+                    container.querySelectorAll('.todo-item.dragging').forEach(el => el.classList.remove('dragging'));
+                    todoClearDragIndicators(container);
                 });
             }
         }
