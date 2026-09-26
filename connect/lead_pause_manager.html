@@ -440,12 +440,35 @@ async function runPool(items, worker, onProgress) {
     return results;
 }
 
-async function hrFetch(apiKey, path, body) {
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// HeyReach enforces a 300 req/min org-wide limit. Bulk pause/unpause here can
+// legitimately burst past that (each unpause = 1+ HeyReach calls, run with
+// CONCURRENCY workers), so retry 429s with backoff instead of failing the lead
+// outright — honor Retry-After when HeyReach sends one, otherwise back off
+// exponentially, and share one cooldown across all in-flight workers so we
+// don't keep hammering the API while it's already telling us to slow down.
+const HR_MAX_429_RETRIES = 6;
+let _hrCooldownUntil = 0;
+async function hrFetch(apiKey, path, body, attempt = 0) {
+    const waitMs = _hrCooldownUntil - Date.now();
+    if (waitMs > 0) await sleep(waitMs);
+
     const res = await fetch(`${BACKEND}${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey || '' },
         body: JSON.stringify(body || {})
     });
+
+    if (res.status === 429 && attempt < HR_MAX_429_RETRIES) {
+        const retryAfterHeader = parseFloat(res.headers.get('Retry-After'));
+        const backoffMs = !isNaN(retryAfterHeader) ? retryAfterHeader * 1000 : 1000 * Math.pow(2, attempt);
+        _hrCooldownUntil = Math.max(_hrCooldownUntil, Date.now() + backoffMs);
+        log(`HeyReach rate limit (429) on ${path} — retrying in ${Math.round(backoffMs / 1000)}s (attempt ${attempt + 1}/${HR_MAX_429_RETRIES})`, 'warn');
+        await sleep(backoffMs);
+        return hrFetch(apiKey, path, body, attempt + 1);
+    }
+
     const text = await res.text();
     let data = null;
     try { data = JSON.parse(text); } catch (e) { /* non-JSON */ }
