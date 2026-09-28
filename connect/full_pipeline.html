@@ -893,6 +893,32 @@
             }
         }
 
+        // full-ai-init is now an async job server-side (POST returns a jobId immediately;
+        // the Firestore filtering work — which used to run inline and could exceed the old
+        // 110s server-side watchdog for large contact pools/hypothesis groups — happens in
+        // the background with no HTTP response attached, so no proxy timeout can hit it).
+        // Poll the shared generation-job endpoint until it's done and return job.results,
+        // which has the same { success, bdrContext, prospects, stats } shape the old
+        // synchronous full-ai-init response had.
+        async function pollFullAiInitJob(token, jobId, addLog, label = 'Full AI init') {
+            while (true) {
+                await new Promise(r => setTimeout(r, 3000));
+                const statusRes = await fetchWithRetry(`${RAILWAY_API}/api/connect/generation-job/${jobId}`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                }, { addLog, label: `${label} status check`, retries: 2, delayMs: 4000 });
+                if (!statusRes.ok) { addLog?.(`   ⏳ ${label} status check got HTTP ${statusRes.status} — retrying...`, 'warning'); continue; }
+                const statusData = await statusRes.json();
+                if (!statusData.success || !statusData.job) { addLog?.(`   ⏳ ${label} status check returned no job — retrying...`, 'warning'); continue; }
+                const job = statusData.job;
+                if (job.status === 'completed') {
+                    if (!job.results) throw new Error(`${label} job completed with no results`);
+                    return job.results;
+                }
+                if (job.status === 'failed') throw new Error(job.error || `${label} job failed`);
+                // otherwise still queued/running — keep polling
+            }
+        }
+
         // ── Robust auth-token refresh, used everywhere a call gets a 401 ──────
         // full_pipeline calls full-ai-init (and the rules/news endpoints) ONCE PER
         // ORGANIZATION — over a run of hundreds/thousands of orgs that's thousands of
@@ -3011,7 +3037,16 @@
                     addLog(`   ⚠️ Backfill: eligibility check failed for ${bdrLabel} (HTTP ${initRes.status}) — skipping backfill for this BDR.`, 'warning');
                     continue;
                 }
-                const initData = await initRes.json();
+                const initJobData = await initRes.json();
+                if (!initJobData.success || !initJobData.jobId) { addLog(`   ⚠️ Backfill: ${initJobData.error || 'eligibility check failed to start'} — skipping backfill for ${bdrLabel}.`, 'warning'); continue; }
+                // full-ai-init is an async job — poll until the filtered/eligible prospect list is ready.
+                let initData;
+                try {
+                    initData = await pollFullAiInitJob(token, initJobData.jobId, addLog, `Backfill eligibility (${bdrLabel})`);
+                } catch (pollErr) {
+                    addLog(`   ⚠️ Backfill: ${pollErr.message} — skipping backfill for ${bdrLabel}.`, 'warning');
+                    continue;
+                }
                 if (!initData.success) { addLog(`   ⚠️ Backfill: ${initData.error || 'eligibility check failed'} — skipping backfill for ${bdrLabel}.`, 'warning'); continue; }
                 const eligibleIds = new Set((initData.prospects || []).map(p => p.id));
                 const eligibleUrls = new Set((initData.prospects || []).map(p => fpNormContactUrlForLimit(p.linkedInUrl)).filter(Boolean));
@@ -6051,7 +6086,12 @@
                                 throw new Error(`full-ai-init failed: ${initRes.status} — ${errText.substring(0, 200)}`);
                             }
                             fpConsecutiveAuthFailures = 0;
-                            const initData = await initRes.json();
+                            const initJobData = await initRes.json();
+                            if (!initJobData.success || !initJobData.jobId) throw new Error(initJobData.error || 'full-ai-init failed to start');
+                            // full-ai-init is an async job — poll until the filtered/eligible prospect list is ready.
+                            // (No more proxy/watchdog timeout risk here, however long a large org's contact
+                            // pool / hypothesis group takes the server to filter.)
+                            const initData = await pollFullAiInitJob(token, initJobData.jobId, addLog, `Full AI init (${org.company_name})`);
                             if (!initData.success) throw new Error(initData.error || 'full-ai-init failed');
                             const { bdrContext, prospects: prospectList, stats } = initData;
                             addLog(`   ✅ ${stats.skipSummary}`, 'success');

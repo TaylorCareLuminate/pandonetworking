@@ -409,6 +409,32 @@
             }
         }
 
+        // full-ai-init is now an async job server-side (POST returns a jobId immediately;
+        // the Firestore filtering work — which used to run inline and could exceed the old
+        // 110s server-side watchdog for large contact pools/hypothesis groups — happens in
+        // the background with no HTTP response attached, so no proxy timeout can hit it).
+        // Poll the shared generation-job endpoint until it's done and return job.results,
+        // which has the same { success, bdrContext, prospects, stats } shape the old
+        // synchronous full-ai-init response had.
+        async function pollFullAiInitJob(token, jobId, addLog, label = 'Full AI init') {
+            while (true) {
+                await sleep(3000);
+                const statusRes = await fetchWithRetry(`${RAILWAY_API}/api/connect/generation-job/${jobId}`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                }, { addLog, label: `${label} status check`, retries: 2, delayMs: 4000 });
+                if (!statusRes.ok) { addLog?.(`   ⏳ ${label} status check got HTTP ${statusRes.status} — retrying...`, 'warning'); continue; }
+                const statusData = await statusRes.json();
+                if (!statusData.success || !statusData.job) { addLog?.(`   ⏳ ${label} status check returned no job — retrying...`, 'warning'); continue; }
+                const job = statusData.job;
+                if (job.status === 'completed') {
+                    if (!job.results) throw new Error(`${label} job completed with no results`);
+                    return job.results;
+                }
+                if (job.status === 'failed') throw new Error(job.error || `${label} job failed`);
+                // otherwise still queued/running — keep polling
+            }
+        }
+
         // ── LinkedIn profile cache (verbatim from full_pipeline.html) ─────
         const PROFILE_CACHE_COLLECTION = 'linkedin_profile_cache';
         const CACHE_FRESH_DAYS  = 90;
@@ -1061,7 +1087,10 @@
                 const errText = await initRes.text().catch(() => '');
                 throw new Error(`full-ai-init failed: ${initRes.status} — ${errText.substring(0, 200)}`);
             }
-            const initData = await initRes.json();
+            const initJobData = await initRes.json();
+            if (!initJobData.success || !initJobData.jobId) throw new Error(initJobData.error || 'full-ai-init failed to start');
+            // full-ai-init is an async job — poll until the filtered/eligible prospect list is ready.
+            const initData = await pollFullAiInitJob(token, initJobData.jobId, addLog, 'Full AI init');
             if (!initData.success) throw new Error(initData.error || 'full-ai-init failed');
             return { initData, token };
         }

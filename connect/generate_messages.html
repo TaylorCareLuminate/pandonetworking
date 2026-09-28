@@ -15401,6 +15401,57 @@
             }
         }
 
+        // full-ai-init used to be a single synchronous request that did all its Firestore
+        // work inline, guarded by a server-side 110s watchdog that self-issued a 504 right
+        // before Railway's ~120s proxy would otherwise drop the socket (which shows up in the
+        // browser as an opaque CORS error). For BDRs with large contact pools / hypothesis
+        // groups, and as the shared connect_exclusions/prospect_exclusions collections keep
+        // growing, that work increasingly exceeded 110s — legitimate slowness, not a crash.
+        //
+        // The server now returns a jobId immediately and does the work in the background
+        // with no HTTP response attached (so no timeout can ever fire on it), and the client
+        // polls the shared generation-job endpoint until it's done. No wall-clock cap here —
+        // once init has been kicked off server-side it will always finish and land in
+        // Firestore, so it's safe (and better for very large groups) to just keep polling.
+        async function pollFullAiInitJob(token, jobId, addLog) {
+            let lastLoggedElapsed = 0;
+            while (true) {
+                await new Promise(r => setTimeout(r, 3000));
+                let statusRes;
+                try {
+                    statusRes = await fetchWithRetry(`https://railwayclemail-production.up.railway.app/api/connect/generation-job/${jobId}`, {
+                        headers: { 'Authorization': `Bearer ${token}` }
+                    }, { addLog, label: 'Full AI init status check', retries: 2, delayMs: 4000 });
+                } catch (err) {
+                    addLog(`   ⏳ Full AI init status check failed (${err.message}) — retrying...`, 'warning');
+                    continue;
+                }
+                if (!statusRes.ok) {
+                    addLog(`   ⏳ Full AI init status check got HTTP ${statusRes.status} — retrying...`, 'warning');
+                    continue;
+                }
+                const statusData = await statusRes.json();
+                if (!statusData.success || !statusData.job) {
+                    addLog(`   ⏳ Full AI init status check returned no job — retrying...`, 'warning');
+                    continue;
+                }
+                const job = statusData.job;
+                const elapsedSec = job.startTime ? Math.round((Date.now() - new Date(job.startTime._seconds ? job.startTime._seconds * 1000 : job.startTime).getTime()) / 1000) : null;
+                if (job.status === 'completed') {
+                    if (!job.results) throw new Error('Full AI init job completed with no results');
+                    return job.results;
+                }
+                if (job.status === 'failed') {
+                    throw new Error(job.error || 'Full AI init job failed');
+                }
+                // Still queued/running — log progress at most once every ~15s so this doesn't spam the log.
+                if (elapsedSec != null && elapsedSec - lastLoggedElapsed >= 15) {
+                    lastLoggedElapsed = elapsedSec;
+                    addLog(`   ⏳ Still loading BDR context and prospects (${elapsedSec}s elapsed)...`, 'info');
+                }
+            }
+        }
+
         // Calls the Railway API for a final AI review batch. All four models (llama, opus,
         // qwen, deepseek) go through the same /api/connect/final-ai-review endpoint, which
         // builds one comprehensive, clearly-labeled prompt (separate BDR / PROSPECT / COMPANY
@@ -17871,9 +17922,13 @@
                     }
                 }
 
-                let initRes;
+                // full-ai-init is now an async job: this call just kicks it off and gets a
+                // jobId back immediately (see server.js), then we poll generation-job/:jobId
+                // until it's done. No more proxy/watchdog timeout risk, however long the
+                // BDR's contact pool / hypothesis group filtering takes server-side.
+                let initJobRes;
                 try {
-                    initRes = await fetchWithRetry('https://railwayclemail-production.up.railway.app/api/connect/full-ai-init', {
+                    initJobRes = await fetchWithRetry('https://railwayclemail-production.up.railway.app/api/connect/full-ai-init', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
                         body: JSON.stringify({
@@ -17886,19 +17941,22 @@
                             ...(fullAiHypGroupId ? { hypothesisGroupId: fullAiHypGroupId, hypothesisGroupName: fullAiHypGroupName } : {}),
                             ...(fullAiHypUrlSet && fullAiHypUrlSet.size ? { hypothesisGroupUrls: [...fullAiHypUrlSet] } : {})
                         })
-                    }, { addLog, label: 'Full AI init', retries: 1, delayMs: 5000 });
+                    }, { addLog, label: 'Full AI init', retries: 2, delayMs: 5000 });
                 } catch (fetchErr) {
                     const msg = String(fetchErr && fetchErr.message || fetchErr);
                     if (/failed to fetch|networkerror|load failed/i.test(msg)) {
-                        throw new Error('Full AI init timed out or was blocked. The console often labels this as a CORS error when Railway takes too long and drops the response (no Access-Control-Allow-Origin on the timeout page). Wait a few seconds and try again.');
+                        throw new Error('Full AI init could not be reached. Wait a few seconds and try again.');
                     }
                     throw fetchErr;
                 }
-                if (!initRes.ok) {
-                    const errText = await initRes.text();
-                    throw new Error(`Failed to load prospects: ${initRes.status} — ${errText.substring(0, 200)}`);
+                if (!initJobRes.ok) {
+                    const errText = await initJobRes.text();
+                    throw new Error(`Failed to start Full AI init: ${initJobRes.status} — ${errText.substring(0, 200)}`);
                 }
-                const initData = await initRes.json();
+                const initJobData = await initJobRes.json();
+                if (!initJobData.success || !initJobData.jobId) throw new Error(initJobData.error || 'Failed to start Full AI init job');
+
+                const initData = await pollFullAiInitJob(token, initJobData.jobId, addLog);
                 if (!initData.success) throw new Error(initData.error || 'Init failed');
 
                 const { bdrContext, stats } = initData;
