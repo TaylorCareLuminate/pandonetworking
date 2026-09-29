@@ -2250,7 +2250,11 @@
                                 accountId: data.heyreach_account_id || data.accountId || null,
                                 // Used to decide whether the 200-char connection-note limit applies
                                 messageType: (data.message_type || '').toLowerCase(),
-                                routedVia: data.routed_via || ''
+                                routedVia: data.routed_via || '',
+                                // Original-case URL + name, needed for a direct HeyReach push (item.contact.profileUrl is lowercased)
+                                liUrl: rawUrl,
+                                firstName: (data.contact_first_name || data.contactFirstName || '').trim(),
+                                lastName: (data.contact_last_name || data.contactLastName || '').trim()
                             });
                         }
                     });
@@ -3398,6 +3402,9 @@
                             item.queueAccountId = queueMeta.accountId;
                             item.queueMessageType = queueMeta.messageType || '';
                             item.queueRoutedVia = queueMeta.routedVia || '';
+                            item.queueLiUrl = queueMeta.liUrl || '';
+                            item.queueFirstName = queueMeta.firstName || '';
+                            item.queueLastName = queueMeta.lastName || '';
                         }
                     }
                 });
@@ -4617,19 +4624,9 @@
             // entirely server-side, so nothing technical is ever sent from this page.
             if (firebaseOk) {
                 statusEl.textContent = 'Saved — pushing the update to HeyReach…';
-                try {
-                    const resp = await fetch(`${BACKEND_API_URL}/api/connect-queue/sync-in-process-to-heyreach`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ queueIds: [queueId] })
-                    });
-                    const j = await resp.json().catch(() => ({}));
-                    const row = j && Array.isArray(j.results) ? j.results[0] : null;
-                    heyreachOk = !!(resp.ok && j.success && row && row.ok);
-                    if (!heyreachOk) heyreachError = (row && row.error) || j.error || `HTTP ${resp.status}`;
-                } catch (err) {
-                    heyreachError = err.message || String(err);
-                }
+                const syncResult = await syncMessageToHeyReach(item, queueId, newMessage);
+                heyreachOk = syncResult.ok;
+                heyreachError = syncResult.error;
             }
 
             // Step 3 — audit trail (best-effort, never blocks the user-facing result).
@@ -4832,6 +4829,82 @@
             }
         }
 
+        // Direct HeyReach update for queue records the server sync refuses (`not_connect_type`):
+        // Quick Message / direct-message records. Sends the new text straight to HeyReach as the
+        // lead's `content` custom field via addleadsv2 — the same call edit_in_process_messages.html,
+        // lead_pause_manager.html and edit_quick_message_in_process.html use — resolving the
+        // campaign / list / account from the BDR's heyreachCampaigns and the API key from the
+        // customer record (getHeyReachApiKey).
+        async function pushDirectToHeyReach(item, newMessage) {
+            try {
+                const bdrEmail = (selectedBdrEmail || window._sentMessagesViewerBDR?.email || window._sentMessagesOwnBDREmail || (currentUser && currentUser.email) || '').toLowerCase();
+                const bdrInfo = bdrLeaders.find(b => (b.primaryEmail || '').toLowerCase() === bdrEmail);
+                const campaigns = (bdrInfo && Array.isArray(bdrInfo.heyreachCampaigns)) ? bdrInfo.heyreachCampaigns : [];
+                const campId = c => String(c.id || c.campaignId || '');
+
+                // Campaign: the one the queue record says it was routed to; otherwise the BDR's Quick Message campaign
+                let camp = item.queueCampaignId ? campaigns.find(c => campId(c) === String(item.queueCampaignId)) : null;
+                if (!camp) {
+                    const isQuickish = item.queueRoutedVia === 'quick_message_campaign' || item.queueMessageType === 'message' || item.type === 'message';
+                    if (isQuickish) camp = campaigns.find(c => String(c.type || '').toLowerCase() === 'quick_message' && campId(c));
+                }
+                if (!camp) return { ok: false, error: 'Could not work out which HeyReach campaign this message is in (no matching campaign on the BDR record).' };
+
+                const listIdNum = parseInt(camp.listId, 10);
+                const accountId = String(camp.accountId || camp.heyreachAccountId || (bdrInfo && bdrInfo.heyreachAccountId) || item.queueAccountId || '').trim();
+                if (isNaN(listIdNum)) return { ok: false, error: `Campaign "${camp.name || campId(camp)}" has no listId (set it in Admin › BDR Leaders).` };
+                if (!accountId) return { ok: false, error: `Campaign "${camp.name || campId(camp)}" has no accountId (set it in Admin › BDR Leaders).` };
+
+                const keyResult = await getHeyReachApiKey(bdrEmail, emailDB);
+                if (!keyResult.success) return { ok: false, error: keyResult.error };
+
+                let url = item.queueLiUrl || item.contact.profileUrl || '';
+                if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+                if (!url) return { ok: false, error: 'No LinkedIn URL for this contact.' };
+                const nameParts = (item.contact.contactName || '').trim().split(/\s+/);
+                const firstName = item.queueFirstName || nameParts[0] || '';
+                const lastName = item.queueLastName || nameParts.slice(1).join(' ') || '';
+
+                const resp = await fetch(`${BACKEND_API_URL}/proxy/heyreach/campaigns/addleadsv2`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': keyResult.apiKey },
+                    body: JSON.stringify({
+                        campaignId: campId(camp),
+                        accountId,
+                        listId: listIdNum,
+                        leads: [{ linkedinUrl: url, firstName, lastName, customVariables: { content: newMessage } }]
+                    })
+                });
+                const j = await resp.json().catch(() => ({}));
+                console.log('[DirectPush] addleadsv2', resp.status, j);
+                if (!resp.ok) return { ok: false, error: j.errorMessage || j.error || j.message || `HTTP ${resp.status}` };
+
+                const added = j.addedLeadsCount || 0, updated = j.updatedLeadsCount || 0, failed = j.failedLeadsCount || 0;
+                const fbAdded = j.meta?.fallbackResults?.added || 0, fbUpd = j.meta?.fallbackResults?.updated || 0;
+                if (failed > 0 && added + updated + fbAdded + fbUpd === 0) return { ok: false, error: 'HeyReach reported the lead update failed.' };
+                if (added + fbAdded > 0 && updated + fbUpd === 0) {
+                    // Never silently create a second lead — the original wasn't found where we expected
+                    return { ok: false, error: 'HeyReach added this as a NEW lead instead of updating the existing one — check the campaign in HeyReach.' };
+                }
+                if (added + updated + fbAdded + fbUpd === 0) console.warn('[DirectPush] HeyReach accepted the request but reported 0 updates — verify in HeyReach.', j);
+                return { ok: true, error: null };
+            } catch (err) {
+                return { ok: false, error: err.message || String(err) };
+            }
+        }
+
+        // Server sync first (handles connection-type records). If the server says the record isn't a
+        // connection-type one (`not_connect_type` — Quick Message / direct messages), update HeyReach directly.
+        async function syncMessageToHeyReach(item, queueId, newMessage) {
+            const r = await bulkSyncToHeyReach(queueId);
+            if (r.ok) return r;
+            if (/not_connect_type/i.test(String(r.error || ''))) {
+                console.log('[SyncMessage] Server sync refused (not_connect_type) — pushing directly to HeyReach.');
+                return await pushDirectToHeyReach(item, newMessage);
+            }
+            return r;
+        }
+
         async function bulkPool(items, concurrency, worker) {
             let idx = 0;
             async function next() {
@@ -4900,7 +4973,7 @@
                 }
 
                 if (firebaseOk) {
-                    const r = await bulkSyncToHeyReach(queueId);
+                    const r = await syncMessageToHeyReach(item, queueId, newMessage);
                     heyreachOk = r.ok; heyreachError = r.error;
                 }
 
@@ -4961,7 +5034,7 @@
             let done = 0, okCount = 0;
             bulkSetProgress(`Retrying 0 / ${pending.length}…`);
             await bulkPool(pending, 3, async entry => {
-                const r = await bulkSyncToHeyReach(entry.queueId);
+                const r = await syncMessageToHeyReach(entry.item, entry.queueId, entry.item.sentItem.message);
                 if (r.ok) okCount++; else { _bulkRetry.push(entry); console.warn('[BulkReplace] retry failed', entry.queueId, r.error); }
                 done++;
                 bulkSetProgress(`Retrying ${done} / ${pending.length}…`);
