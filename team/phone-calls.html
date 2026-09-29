@@ -2630,6 +2630,266 @@
             return false;
         }
 
+        // Companies that already have a meeting booked. Shared by queue loading, the
+        // per-call recheck, and campaign stats, so a meeting booked mid-session (by this
+        // agent or anyone else) takes the rest of that company out of the queue.
+        let scheduledMeetingCompanies = new Set();
+        let scheduledMeetingEmailDomains = new Set();
+        let scheduledMeetingsByCompany = new Map();
+        let scheduledMeetingsLoadedAt = 0;
+        let scheduledMeetingsRefreshPromise = null;
+        let scheduledMeetingRevision = 0;
+        // Meetings booked during this session. Re-applied after every refresh so a
+        // snapshot taken before the write can't put the company back in the queue.
+        const pendingScheduledMeetings = [];
+        const SCHEDULED_MEETINGS_MAX_AGE_MS = 2 * 60 * 1000;
+
+        const GENERIC_EMAIL_DOMAINS = new Set([
+            'gmail.com', 'googlemail.com', 'yahoo.com', 'ymail.com', 'hotmail.com',
+            'outlook.com', 'live.com', 'msn.com', 'aol.com', 'icloud.com', 'me.com',
+            'comcast.net', 'sbcglobal.net', 'att.net', 'verizon.net', 'protonmail.com',
+            'proton.me', 'gmx.com', 'mail.com'
+        ]);
+
+        function normalizeCompanyName(name) {
+            if (!name || typeof name !== 'string') return '';
+            return name.toLowerCase().trim()
+                .replace(/\b(inc|llc|ltd|corp|corporation|company|co|incorporated|limited)\b\.?/gi, '')
+                .replace(/[^a-z0-9]/g, '');
+        }
+
+        function emailDomain(value) {
+            const email = String(value || '').trim().toLowerCase();
+            const at = email.lastIndexOf('@');
+            if (at < 1) return '';
+            const domain = email.slice(at + 1);
+            if (!domain.includes('.') || GENERIC_EMAIL_DOMAINS.has(domain)) return '';
+            return domain;
+        }
+
+        // companyName is often stored as a bare domain ("ini.org") while another record
+        // for the same org has the legal name. Pull a real email-style domain out of those.
+        function domainFromCompanyString(name) {
+            if (!name || typeof name !== 'string') return '';
+            const trimmed = name.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
+            if (!trimmed || trimmed.includes(' ') || !trimmed.includes('.')) return '';
+            if (GENERIC_EMAIL_DOMAINS.has(trimmed)) return '';
+            return trimmed;
+        }
+
+        function companyKeysFromRecord(record) {
+            if (!record) return [];
+            const raw = [
+                record.companyName,
+                record.company,
+                record.contactCompany,
+                record.contact_company,
+                record.contactData?.company_name,
+                record.contactData?.company
+            ];
+            const keys = [];
+            raw.forEach((name) => {
+                if (!name || name === '-') return;
+                const normalized = normalizeCompanyName(name);
+                if (normalized && normalized.length >= 3 && !keys.includes(normalized)) keys.push(normalized);
+            });
+            return keys;
+        }
+
+        function emailDomainsFromRecord(record) {
+            if (!record) return [];
+            const rawEmails = [
+                record.contactEmail,
+                record.email,
+                record.contact_email,
+                record.additionalData?.email,
+                record.contactData?.workemail,
+                record.contactData?.email
+            ];
+            const rawCompanies = [
+                record.companyName,
+                record.company,
+                record.contactCompany,
+                record.contact_company,
+                record.contactData?.company_name,
+                record.contactData?.company
+            ];
+            const domains = [];
+            rawEmails.forEach((value) => {
+                const domain = emailDomain(value);
+                if (domain && !domains.includes(domain)) domains.push(domain);
+            });
+            rawCompanies.forEach((value) => {
+                const domain = domainFromCompanyString(value);
+                if (domain && !domains.includes(domain)) domains.push(domain);
+            });
+            return domains;
+        }
+
+        // "Neurorehabilitation Institute" vs "International Neurorehabilitation Institute".
+        // The shorter name has to be long enough, and most of the longer name, so common
+        // words like "international" or "hospital" don't collapse unrelated companies.
+        function companyNamesLooselyMatch(a, b) {
+            if (!a || !b || a === b) return false;
+            const shorter = a.length <= b.length ? a : b;
+            const longer = a.length <= b.length ? b : a;
+            if (shorter.length < 12) return false;
+            if (shorter.length / longer.length < 0.6) return false;
+            return longer.includes(shorter);
+        }
+
+        function addScheduledMeetingRecord(record, companies, domains, details) {
+            const keys = companyKeysFromRecord(record);
+            const recordDomains = emailDomainsFromRecord(record);
+            if (keys.length === 0 && recordDomains.length === 0) return false;
+            keys.forEach((key) => {
+                companies.add(key);
+                if (!details.has(key)) {
+                    details.set(key, {
+                        originalName: record.companyName || record.contactCompany || record.contact_company || record.company || key,
+                        contactName: record.contactName || record.contact_name || '',
+                        meetingDate: record.additionalData?.date || record.meetingDate || '',
+                        source: record.activity_type === 'meeting_scheduled' ? 'linkedin' : 'phone'
+                    });
+                }
+            });
+            recordDomains.forEach((domain) => domains.add(domain));
+            return true;
+        }
+
+        // Remember a meeting immediately, without waiting for the next refresh.
+        function rememberScheduledMeeting(record) {
+            pendingScheduledMeetings.push(record);
+            const added = addScheduledMeetingRecord(record, scheduledMeetingCompanies, scheduledMeetingEmailDomains, scheduledMeetingsByCompany);
+            if (added) scheduledMeetingRevision++;
+            return added;
+        }
+
+        function companyHasScheduledMeeting(record) {
+            const keys = companyKeysFromRecord(record);
+            for (const key of keys) {
+                if (scheduledMeetingCompanies.has(key)) {
+                    return { match: 'company', key, details: scheduledMeetingsByCompany.get(key) || null };
+                }
+            }
+            const domains = emailDomainsFromRecord(record);
+            for (const domain of domains) {
+                if (scheduledMeetingEmailDomains.has(domain)) {
+                    return { match: 'email-domain', key: domain, details: null };
+                }
+            }
+            const longKeys = keys.filter((key) => key.length >= 12);
+            if (longKeys.length === 0) return null;
+            for (const scheduledKey of scheduledMeetingCompanies) {
+                if (scheduledKey.length < 12) continue;
+                for (const key of longKeys) {
+                    if (companyNamesLooselyMatch(key, scheduledKey)) {
+                        return { match: 'company-similar', key: scheduledKey, details: scheduledMeetingsByCompany.get(scheduledKey) || null };
+                    }
+                }
+            }
+            return null;
+        }
+
+        function purgeScheduledCompaniesFromQueue() {
+            const before = callQueue.length;
+            let removedBeforeIndex = 0;
+            const kept = [];
+            callQueue.forEach((c, i) => {
+                if (companyHasScheduledMeeting(c)) {
+                    if (i < currentCallIndex) removedBeforeIndex++;
+                } else {
+                    kept.push(c);
+                }
+            });
+            callQueue = kept;
+            currentCallIndex -= removedBeforeIndex;
+            if (currentCallIndex < 0) currentCallIndex = 0;
+            // Leave the index past the end when the call we were on was removed and
+            // nothing later in the queue remains. Callers treat that as "no next call"
+            // instead of jumping back to a contact the agent already passed.
+            const removed = before - kept.length;
+            if (removed > 0) {
+                console.log(`🏢 Removed ${removed} queue entr${removed === 1 ? 'y' : 'ies'} for companies that already have a meeting`);
+            }
+            return removed;
+        }
+
+        // Phone meetings live in campaign_call_tracking. LinkedIn/email meetings booked from
+        // review replies live in activity_tracking and never reached this queue before.
+        async function refreshScheduledMeetings({ force = false } = {}) {
+            if (!force && scheduledMeetingsLoadedAt && (Date.now() - scheduledMeetingsLoadedAt) < SCHEDULED_MEETINGS_MAX_AGE_MS) {
+                return;
+            }
+            if (scheduledMeetingsRefreshPromise) return scheduledMeetingsRefreshPromise;
+
+            scheduledMeetingsRefreshPromise = (async () => {
+                const revisionAtStart = scheduledMeetingRevision;
+                const companies = new Set();
+                const domains = new Set();
+                const details = new Map();
+                let phoneCount = 0;
+                let linkedinCount = 0;
+                let phoneOk = false;
+                let linkedinOk = false;
+
+                try {
+                    const meetingsSnapshot = await getDocs(query(
+                        collection(db, 'campaign_call_tracking'),
+                        where('outcome', '==', 'spoke-scheduled-meeting')
+                    ));
+                    meetingsSnapshot.docs.forEach((meetingDoc) => {
+                        if (addScheduledMeetingRecord(meetingDoc.data(), companies, domains, details)) phoneCount++;
+                    });
+                    phoneOk = true;
+                } catch (meetingsError) {
+                    console.error('⚠️ Error loading phone scheduled meetings:', meetingsError);
+                }
+
+                try {
+                    const linkedinSnapshot = await getDocs(query(
+                        collection(db, 'activity_tracking'),
+                        where('activity_type', '==', 'meeting_scheduled')
+                    ));
+                    linkedinSnapshot.docs.forEach((meetingDoc) => {
+                        if (addScheduledMeetingRecord(meetingDoc.data(), companies, domains, details)) linkedinCount++;
+                    });
+                    linkedinOk = true;
+                } catch (linkedinError) {
+                    console.error('⚠️ Error loading LinkedIn scheduled meetings:', linkedinError);
+                }
+
+                if (!phoneOk && !linkedinOk) {
+                    console.warn('⚠️ Scheduled-meeting refresh failed; keeping the previous exclusion list');
+                    return;
+                }
+
+                pendingScheduledMeetings.forEach((record) => {
+                    addScheduledMeetingRecord(record, companies, domains, details);
+                });
+
+                // A meeting recorded while this refresh was in flight must not be wiped out
+                // by a snapshot that was taken before that write.
+                if (!phoneOk || !linkedinOk || scheduledMeetingRevision !== revisionAtStart) {
+                    scheduledMeetingCompanies.forEach((key) => companies.add(key));
+                    scheduledMeetingEmailDomains.forEach((domain) => domains.add(domain));
+                    scheduledMeetingsByCompany.forEach((value, key) => {
+                        if (!details.has(key)) details.set(key, value);
+                    });
+                }
+
+                scheduledMeetingCompanies = companies;
+                scheduledMeetingEmailDomains = domains;
+                scheduledMeetingsByCompany = details;
+                scheduledMeetingsLoadedAt = Date.now();
+                console.log(`📅 Scheduled-meeting exclusion: ${companies.size} companies, ${domains.size} email domains (${phoneCount} phone meetings, ${linkedinCount} LinkedIn meetings)`);
+            })().finally(() => {
+                scheduledMeetingsRefreshPromise = null;
+            });
+
+            return scheduledMeetingsRefreshPromise;
+        }
+
         // Payment rates and qualifying outcomes imported from ../js/payment-config.js
         // PAYMENT_RATES and QUALIFYING_OUTCOMES are now imported at the top of this script
         // To update payment rates, edit js/payment-config.js (SINGLE SOURCE OF TRUTH)
@@ -3654,25 +3914,9 @@
                 });
                 console.log(`⚡ [Campaign Stats] Loaded ${flaggedContactsSet.size} flagged contacts`);
                 
-                // 2. Companies with scheduled meetings (within next 7 days)
-                const futureDate = new Date(today.getTime() + (7 * 24 * 60 * 60 * 1000));
-                const scheduledMeetingsQuery = query(
-                    collection(db, 'emailRequests'),
-                    where('scheduledMeeting', '==', true),
-                    where('meetingDate', '>=', startOfToday.toISOString()),
-                    where('meetingDate', '<=', futureDate.toISOString())
-                );
-                const meetingsSnapshot = await getDocs(scheduledMeetingsQuery);
-                const companiesWithMeetings = new Set();
-                meetingsSnapshot.docs.forEach(doc => {
-                    const data = doc.data();
-                    const companyName = data.company || data.companyName || data.contactCompany;
-                    if (companyName && companyName !== '-') {
-                        const normalized = normalizeCompanyName(companyName);
-                        if (normalized) companiesWithMeetings.add(normalized);
-                    }
-                });
-                console.log(`⚡ [Campaign Stats] Loaded ${companiesWithMeetings.size} companies with meetings`);
+                // 2. Companies with a meeting already booked (phone + LinkedIn)
+                await refreshScheduledMeetings();
+                console.log(`⚡ [Campaign Stats] Loaded ${scheduledMeetingCompanies.size} companies with meetings`);
                 
                 // 3. Bad numbers marked today
                 const contactsWithBadNumbers = new Set();
@@ -3702,12 +3946,8 @@
                     }
                     
                     // COMPANY WITH MEETING FILTER
-                    const contactCompanyName = data.companyName || data.company || data.contactData?.company_name;
-                    if (contactCompanyName && contactCompanyName !== '-') {
-                        const normalizedContactCompany = normalizeCompanyName(contactCompanyName);
-                        if (normalizedContactCompany && companiesWithMeetings.has(normalizedContactCompany)) {
-                            return; // Skip - company has meeting
-                        }
+                    if (companyHasScheduledMeeting(data)) {
+                        return; // Skip - company has meeting
                     }
                     
                     // BAD NUMBER FILTER
@@ -3839,12 +4079,8 @@
                     }
                     
                     // Check if company has meeting
-                    const contactCompanyName = data.companyName || data.company || data.contactData?.company_name;
-                    if (contactCompanyName && contactCompanyName !== '-') {
-                        const normalizedContactCompany = normalizeCompanyName(contactCompanyName);
-                        if (normalizedContactCompany && companiesWithMeetings.has(normalizedContactCompany)) {
-                            return;
-                        }
+                    if (companyHasScheduledMeeting(data)) {
+                        return;
                     }
                     
                     // Check if bad number
@@ -5602,71 +5838,11 @@
                 }
                 
                 // ============ COMPANIES WITH SCHEDULED MEETINGS FILTER ============
-                // OPTIMIZATION: Pre-load companies with active/upcoming meetings (loaded ONCE, O(1) lookups in loop)
-                // This prevents calling other contacts at companies where a meeting is already scheduled
-                console.log('📅 Loading companies with scheduled meetings (optimization: pre-filter)...');
-                
-                const companiesWithMeetings = new Set(); // Store company names (normalized)
-                const meetingsByCompany = new Map(); // Map company -> meeting details for logging
-                
-                // Helper to normalize company names for matching
-                const normalizeCompanyName = (name) => {
-                    if (!name || typeof name !== 'string') return '';
-                    return name.toLowerCase().trim()
-                        .replace(/\b(inc|llc|ltd|corp|corporation|company|co)\b\.?/gi, '')
-                        .replace(/[^a-z0-9]/g, '');
-                };
-                
-                try {
-                    // OPTIMIZATION: Load meetings with scheduled outcome
-                    // Note: We filter by date in-memory to avoid requiring a composite index
-                    const meetingsQuery = query(
-                        collection(db, 'campaign_call_tracking'),
-                        where('outcome', '==', 'spoke-scheduled-meeting')
-                    );
-                    const meetingsSnapshot = await getDocs(meetingsQuery);
-                    
-                    let activeMeetingsCount = 0;
-                    
-                    meetingsSnapshot.docs.forEach((doc) => {
-                        const data = doc.data();
-                        
-                        const companyName = data.companyName || data.contactCompany;
-                        
-                        if (companyName && companyName !== '-') {
-                            const normalizedCompany = normalizeCompanyName(companyName);
-                            
-                            if (normalizedCompany) {
-                                companiesWithMeetings.add(normalizedCompany);
-                                activeMeetingsCount++;
-                                
-                                // Store meeting details for debugging (only first meeting per company)
-                                if (!meetingsByCompany.has(normalizedCompany)) {
-                                    meetingsByCompany.set(normalizedCompany, {
-                                        originalName: companyName,
-                                        contactName: data.contactName,
-                                        meetingDate: data.additionalData?.date || 'Unknown',
-                                        timestamp: data.timestamp
-                                    });
-                                }
-                            }
-                        }
-                    });
-                    
-                    console.log(`📅 Found ${meetingsSnapshot.docs.length} companies with scheduled meetings (${activeMeetingsCount} total meetings)`);
-                    console.log(`   ⚡ Pre-loaded into Set for O(1) lookup speed during call filtering`);
-                    
-                    // Show sample for debugging
-                    if (meetingsSnapshot.docs.length > 0) {
-                        const sampleCompanies = Array.from(meetingsByCompany.entries()).slice(0, 3);
-                        console.log(`   📊 Sample companies:`);
-                        sampleCompanies.forEach(([normalized, details]) => {
-                            console.log(`      "${details.originalName}" → Meeting with ${details.contactName} on ${details.meetingDate}`);
-                        });
-                    }
-                } catch (meetingsError) {
-                    console.error('⚠️ Error loading scheduled meetings:', meetingsError);
-                }
+                // Phone meetings (campaign_call_tracking) and LinkedIn/email meetings
+                // (activity_tracking). Re-checked per call in loadCurrentCall so a meeting
+                // booked after this queue loaded still drops the company.
+                console.log('📅 Loading companies with scheduled meetings...');
+                await refreshScheduledMeetings({ force: true });
                 
                 // ============ DECLINED CONTACTS FILTER ============
                 // Query phone_activities ONLY for contacts that have permanent failures (declined, wrong person, etc.)
@@ -5854,6 +6030,20 @@
                         console.log(`🚫 Removed ${staleDeclinedCallbacks.length} callback(s) for declined contacts from the queue`);
                     }
                 }
+
+                // A callback for a company that already has a meeting is still a call to a
+                // scheduled prospect. Drop those before they get pinned to the front of the queue.
+                if (dueCallbacks.length > 0) {
+                    dueCallbacks = dueCallbacks.filter((cb) => {
+                        const meetingMatch = companyHasScheduledMeeting(cb);
+                        if (meetingMatch) {
+                            console.log(`🏢 Removing callback for ${cb.contactName || cb.orgName || 'Unknown'} - company already has a meeting (${meetingMatch.match}: ${meetingMatch.details?.originalName || meetingMatch.key})`);
+                            callsFilteredCompanyHasMeeting++;
+                            return false;
+                        }
+                        return true;
+                    });
+                }
                 
                 // Combine assigned calls with overdue/unassigned calls
                 const allCallsToProcess = [];
@@ -5912,17 +6102,14 @@
                     }
                     
                     // COMPANY WITH SCHEDULED MEETING FILTER: Skip if company already has a meeting scheduled
-                    // This prevents calling multiple contacts at the same company when meeting is already set
-                    const contactCompanyName = data.companyName || data.company || data.contactData?.company_name;
-                    if (contactCompanyName && contactCompanyName !== '-') {
-                        const normalizedContactCompany = normalizeCompanyName(contactCompanyName);
-                        
-                        if (normalizedContactCompany && companiesWithMeetings.has(normalizedContactCompany)) {
-                            const meetingDetails = meetingsByCompany.get(normalizedContactCompany);
-                            console.log(`🏢 Skipping ${data.contactName || 'Unknown'} at ${contactCompanyName} - company already has meeting scheduled with ${meetingDetails?.contactName} on ${meetingDetails?.meetingDate}`);
-                            callsFilteredCompanyHasMeeting = (callsFilteredCompanyHasMeeting || 0) + 1;
-                            continue;
-                        }
+                    // Matches every stored company-name variant, close name variants, and the
+                    // contact's email domain (so a domain-only companyName still matches).
+                    const meetingMatch = companyHasScheduledMeeting(data);
+                    if (meetingMatch) {
+                        const shownCompany = data.companyName || data.company || data.contactData?.company_name || meetingMatch.key;
+                        console.log(`🏢 Skipping ${data.contactName || 'Unknown'} at ${shownCompany} - company already has a meeting (${meetingMatch.match}: ${meetingMatch.details?.originalName || meetingMatch.key}${meetingMatch.details?.contactName ? `, with ${meetingMatch.details.contactName}` : ''})`);
+                        callsFilteredCompanyHasMeeting++;
+                        continue;
                     }
                     
                     // FLAGGED CONTACTS FILTER: Skip if this contact is currently flagged for review
@@ -7284,6 +7471,24 @@
                 } else {
                     showAlert('No more callable contacts in your queue.', 'info');
                 }
+                return;
+            }
+
+            // SCHEDULED-COMPANY RECHECK: the queue was filtered when it loaded, but another
+            // agent (or this one) may have booked the company since. Refresh at most every
+            // 2 minutes, and skip BEFORE claiming so the call stays available if we were wrong.
+            await refreshScheduledMeetings();
+            if (companyHasScheduledMeeting(currentCall)) {
+                const skippedName = currentCall.contactName || 'Unknown';
+                const skippedCompany = currentCall.companyName || currentCall.company || currentCall.contactData?.company_name || '';
+                console.log(`🏢 Auto-skipping ${skippedName}${skippedCompany ? ` at ${skippedCompany}` : ''} — company already has a meeting`);
+                purgeScheduledCompaniesFromQueue();
+                currentCall = null;
+                if (currentCallIndex >= callQueue.length) {
+                    showAlert('No more callable contacts in your queue.', 'info');
+                    return;
+                }
+                await loadCurrentCall();
                 return;
             }
 
@@ -8987,6 +9192,14 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     ...currentCall,
                     phoneNumber: phoneNumber || currentCall.phoneNumber || currentCall.phone
                 });
+
+                // A meeting books the whole company, not just this contact. Drop every other
+                // queued call at that company before the next call is shown.
+                if (outcome === 'spoke-scheduled-meeting') {
+                    rememberScheduledMeeting(callTrackingData);
+                    rememberScheduledMeeting(currentCall);
+                    purgeScheduledCompaniesFromQueue();
+                }
                 
                 console.log(`📦 AFTER SPLICE: callQueue.length=${callQueue.length}, currentCallIndex=${currentCallIndex}`);
                 if (callQueue.length > currentCallIndex) {
