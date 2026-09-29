@@ -2033,39 +2033,45 @@
             }
         }
 
+        // Firestore `==` queries are case-sensitive, but BDR emails are stored with inconsistent casing
+        // across collections (e.g. bdr_leaders/prospect_contacts/connect_activity have "derek.Moore@…"
+        // while other collections have "derek.moore@…" — see CASE_SENSITIVITY_FIX.md). This page
+        // lowercases the target email everywhere, so a query on the lowercase form silently misses every
+        // record stamped with the original casing. Returns every casing we know of for the given email(s):
+        // as-passed, lowercase, the exact primaryEmail stored on the matching bdr_leaders record, and the
+        // signed-in user's own login email when it is the same address.
+        function emailCaseVariants(...emails) {
+            const out = new Set();
+            emails.filter(Boolean).forEach(e => {
+                const lower = String(e).toLowerCase();
+                out.add(e);
+                out.add(lower);
+                (bdrLeaders || []).forEach(b => {
+                    if (b.primaryEmail && String(b.primaryEmail).toLowerCase() === lower) out.add(b.primaryEmail);
+                });
+                if (currentUser && currentUser.email && currentUser.email.toLowerCase() === lower) out.add(currentUser.email);
+            });
+            return [...out];
+        }
+
         // Load contact names from heyreach_contacts collection
         async function loadContactNames(targetUserEmail, targetLinkedInEmail) {
             try {
                 console.log('👥 Loading contact names from heyreach_contacts...');
                 const contactsRef = collection(emailDB, 'heyreach_contacts');
                 
-                // Try account_email first
-                let contactsQuery = query(
-                    contactsRef,
-                    where('account_email', '==', targetLinkedInEmail || targetUserEmail),
-                    limit(2000) // Reduced from 5000 for faster loading
-                );
-                
-                let snapshot = await getDocs(contactsQuery);
-                
-                // If empty, try accountEmail
-                if (snapshot.empty) {
-                    contactsQuery = query(
-                        contactsRef,
-                        where('accountEmail', '==', targetUserEmail),
-                        limit(2000)
-                    );
-                    snapshot = await getDocs(contactsQuery);
-                }
-                
-                // If still empty, try bdrEmail
-                if (snapshot.empty) {
-                    contactsQuery = query(
-                        contactsRef,
-                        where('bdrEmail', '==', targetUserEmail),
-                        limit(2000)
-                    );
-                    snapshot = await getDocs(contactsQuery);
+                // Try each (field, email casing) combination until one returns rows
+                const accountEmails = emailCaseVariants(targetLinkedInEmail || targetUserEmail);
+                const bdrEmails = emailCaseVariants(targetUserEmail);
+                const attempts = [
+                    ...accountEmails.map(e => ['account_email', e]),
+                    ...bdrEmails.map(e => ['accountEmail', e]),
+                    ...bdrEmails.map(e => ['bdrEmail', e]),
+                ];
+                let snapshot = { empty: true, forEach: () => {} };
+                for (const [field, value] of attempts) {
+                    snapshot = await getDocs(query(contactsRef, where(field, '==', value), limit(2000)));
+                    if (!snapshot.empty) break;
                 }
                 
                 // Build name and company lookup maps by canonical LinkedIn URL
@@ -2166,16 +2172,18 @@
                     return EMPTY_SNAP;
                 });
 
+                // Every query is repeated for each known casing of the email (see emailCaseVariants).
+                const userEmailVariants = emailCaseVariants(targetUserEmail);
+                const linkedEmailVariants = (targetLinkedInEmail && targetLinkedInEmail !== targetUserEmail)
+                    ? emailCaseVariants(targetLinkedInEmail) : [];
                 const queueSnaps = await Promise.all([
                     // bdr_leader_email  (mass_upload path)
-                    safeQuery('bdr_leader_email', withSince(where('bdr_leader_email', '==', targetUserEmail))),
+                    ...userEmailVariants.map(e => safeQuery(`bdr_leader_email=${e}`, withSince(where('bdr_leader_email', '==', e)))),
                     // bdr_auth_email    (generate_messages path)
-                    safeQuery('bdr_auth_email', withSince(where('bdr_auth_email', '==', targetUserEmail))),
+                    ...userEmailVariants.map(e => safeQuery(`bdr_auth_email=${e}`, withSince(where('bdr_auth_email', '==', e)))),
                     // account_email     (same lookup in_processes_today.html uses, both emails)
-                    safeQuery('account_email', withSince(where('account_email', '==', targetUserEmail))),
-                    ...(targetLinkedInEmail && targetLinkedInEmail !== targetUserEmail
-                        ? [safeQuery('account_email(linked)', withSince(where('account_email', '==', targetLinkedInEmail)))]
-                        : []),
+                    ...userEmailVariants.map(e => safeQuery(`account_email=${e}`, withSince(where('account_email', '==', e)))),
+                    ...linkedEmailVariants.map(e => safeQuery(`account_email(linked)=${e}`, withSince(where('account_email', '==', e)))),
                 ]);
 
                 let queueCount = 0;
@@ -2217,11 +2225,11 @@
                 console.log('🏢 Loading company names from prospect_contacts...');
                 const prospectsRef = collection(emailDB, 'prospect_contacts');
 
-                const prospectSnaps = await Promise.all([
-                    getDocs(query(prospectsRef, where('bdrEmail',   '==', targetUserEmail), limit(5000))),
-                    getDocs(query(prospectsRef, where('userEmail',  '==', targetUserEmail), limit(5000))),
-                    getDocs(query(prospectsRef, where('uploadedBy', '==', targetUserEmail), limit(5000))),
-                ]);
+                const prospectSnaps = await Promise.all(emailCaseVariants(targetUserEmail).flatMap(e => [
+                    getDocs(query(prospectsRef, where('bdrEmail',   '==', e), limit(5000))),
+                    getDocs(query(prospectsRef, where('userEmail',  '==', e), limit(5000))),
+                    getDocs(query(prospectsRef, where('uploadedBy', '==', e), limit(5000))),
+                ]));
 
                 let prospectCount = 0;
                 prospectSnaps.forEach(snap => {
@@ -2254,9 +2262,9 @@
             const dnsDeletedAt = new Map(); // normalized name -> deleted_at
             try {
                 const dnsRef = collection(emailDB, 'deleted_prospect_organizations');
-                const dnsQuery = query(dnsRef, where('deleted_by', '==', targetUserEmail));
-                const dnsSnap = await getDocs(dnsQuery);
-                dnsSnap.forEach(doc => {
+                const dnsSnaps = await Promise.all(emailCaseVariants(targetUserEmail).map(e =>
+                    getDocs(query(dnsRef, where('deleted_by', '==', e)))));
+                dnsSnaps.forEach(dnsSnap => dnsSnap.forEach(doc => {
                     const data = doc.data();
                     if (data.company_name) {
                         const norm = data.company_name.toLowerCase().trim();
@@ -2264,7 +2272,7 @@
                         dnsReasons.set(norm, data.delete_reason || 'Removed from prospect list');
                         dnsDeletedAt.set(norm, data.deleted_at || '');
                     }
-                });
+                }));
                 console.log(`🚫 Loaded ${dnsNames.size} Do Not Send organizations for ${targetUserEmail}`);
             } catch (err) {
                 console.warn('⚠️ Could not load Do Not Send list:', err.message);
@@ -2649,10 +2657,12 @@
                 
                 let snapshot;
                 try {
-                    const emails = [targetUserEmail];
-                    if (targetLinkedInEmail && targetLinkedInEmail !== targetUserEmail) {
-                        emails.push(targetLinkedInEmail);
-                    }
+                    // Query every known casing of each email — bdrEmail is stamped with whatever casing the
+                    // pushing flow had (e.g. "derek.Moore@…" from the BDR record vs "derek.moore@…"), and
+                    // Firestore equality is case-sensitive. The client-side filter below lowercases, so
+                    // anything the queries return is still matched correctly.
+                    const emails = emailCaseVariants(targetUserEmail, targetLinkedInEmail);
+                    console.log(`🔍 connect_activity email casings queried: ${emails.join(', ')}`);
                     const actionTypes = ['push_to_heyreach', 'auto_push_to_heyreach'];
 
                     // Run all email×actionType combos in parallel
@@ -5928,8 +5938,8 @@
         // upper bound — the caller filters by "since" date afterward).
         async function fetchSentActivityForBdr(targetEmail, targetLinkedInEmail) {
             const activityRef = collection(emailDB, 'connect_activity');
-            const emails = [targetEmail];
-            if (targetLinkedInEmail && targetLinkedInEmail !== targetEmail) emails.push(targetLinkedInEmail);
+            // All known casings — Firestore equality is case-sensitive (see emailCaseVariants)
+            const emails = emailCaseVariants(targetEmail, targetLinkedInEmail);
             const actionTypes = ['push_to_heyreach', 'auto_push_to_heyreach'];
 
             const queries = [];
