@@ -793,10 +793,14 @@
                         </div>
 
                         <div class="price-line" style="margin-top:0.75rem;border-bottom:none;">
-                            <div class="lbl">Additional discount<small>Optional — stacks with the volume tier</small></div>
+                            <div class="lbl">Additional discount<small>Optional — a % or flat $ amount, on top of the volume tier</small></div>
                             <div style="display:flex;align-items:center;gap:0.6rem;">
                                 <span class="pill sage" id="customDiscountSavings" style="display:none;"></span>
-                                <div class="inp-affix"><input class="inp inp-num" type="number" id="customDiscountPct" value="0" min="0" max="100" step="1" oninput="calculate()" style="width:84px;"><span class="affix">%</span></div>
+                                <div class="seg">
+                                    <input type="radio" name="customDiscountType" id="discTypePct" value="pct" checked onchange="onDiscountTypeChange()"><label for="discTypePct">%</label>
+                                    <input type="radio" name="customDiscountType" id="discTypeUsd" value="usd" onchange="onDiscountTypeChange()"><label for="discTypeUsd">$</label>
+                                </div>
+                                <div class="inp-affix" id="customDiscountWrap"><input class="inp inp-num" type="number" id="customDiscountPct" value="0" min="0" max="100" step="1" oninput="calculate()" style="width:96px;"><span class="affix" id="customDiscountAffix">%</span></div>
                             </div>
                         </div>
 
@@ -832,6 +836,11 @@
                                     <div class="small" id="atRiskTargetHint">Blank = use the projected meetings from the scenario</div>
                                 </div>
                                 <div class="field">
+                                    <label><i class="fas fa-tag"></i>Effective cost per meeting</label>
+                                    <div class="inp-affix pre"><span class="affix">$</span><input class="inp inp-num" type="number" id="atRiskCpm" min="0" step="1" placeholder="auto" oninput="calculate()"></div>
+                                    <div class="small" id="atRiskCpmHint">Blank = month-1 fee ÷ target</div>
+                                </div>
+                                <div class="field" style="grid-column:1 / -1;">
                                     <label><i class="fas fa-scale-balanced"></i>If we come up short</label>
                                     <div class="seg">
                                         <input type="radio" name="atRiskMode" id="atRiskModeFull" value="full" checked onchange="calculate()"><label for="atRiskModeFull">Keep going until target</label>
@@ -844,7 +853,7 @@
                             <div class="atrisk-summary">
                                 <div class="stat-box gold"><div class="v" id="arFee">$0</div><div class="l">Month-1 fee at risk</div></div>
                                 <div class="stat-box"><div class="v" id="arTarget">0</div><div class="l">Meetings to unlock</div></div>
-                                <div class="stat-box"><div class="v" id="arPerMtg">—</div><div class="l">Effective cost / meeting</div></div>
+                                <div class="stat-box"><div class="v" id="arPerMtg">—</div><div class="l" id="arPerMtgLbl">Effective cost / meeting</div></div>
                             </div>
 
                             <div class="eyebrow plain" style="margin-top:1.1rem;margin-bottom:0.25rem;">What the client pays for month 1</div>
@@ -1081,7 +1090,7 @@
         feeRaw: 0, fee: 0, discountPct: 0, volumePct: 0, customPct: 0,
         msgRate: 0, connRate: 0, mtgRate: 0,
         baseNoMtgs: 0, directMtgCost: 0,
-        atRisk: { enabled: false, mode: 'full', target: 0, fee: 0, perMtg: 0, rows: [] }
+        atRisk: { enabled: false, mode: 'full', target: 0, fee: 0, perMtg: 0, cpmOverride: 0, volumeFee: 0, rows: [] }
     };
     let _revenueChart = null;
     let _trendRows = []; // last computed 12-month rows (used by PDF)
@@ -1159,13 +1168,53 @@
         });
         return Math.min(100, Math.max(0, result));
     }
+    function getCustomDiscountType() {
+        return document.querySelector('input[name="customDiscountType"]:checked')?.value === 'usd' ? 'usd' : 'pct';
+    }
     function getCustomDiscount() {
         const raw = parseFloat(document.getElementById('customDiscountPct')?.value);
         if (isNaN(raw) || raw < 0) return 0;
-        return Math.min(100, raw);
+        return getCustomDiscountType() === 'pct' ? Math.min(100, raw) : raw;
     }
-    function getCombinedDiscountPct(totalMessages) {
-        return Math.min(100, getVolumeDiscount(totalMessages) + getCustomDiscount());
+    function setCustomDiscountType(type) {
+        const el = document.getElementById(type === 'usd' ? 'discTypeUsd' : 'discTypePct');
+        if (el) el.checked = true;
+        syncDiscountTypeUI();
+    }
+    function syncDiscountTypeUI() {
+        const usd = getCustomDiscountType() === 'usd';
+        const wrap = document.getElementById('customDiscountWrap');
+        const aff = document.getElementById('customDiscountAffix');
+        const inp = document.getElementById('customDiscountPct');
+        if (wrap) wrap.classList.toggle('pre', usd);
+        if (aff) aff.textContent = usd ? '$' : '%';
+        if (inp) { if (usd) { inp.removeAttribute('max'); inp.step = '50'; } else { inp.max = '100'; inp.step = '1'; } }
+    }
+    function onDiscountTypeChange() { syncDiscountTypeUI(); calculate(); }
+
+    // Applies the volume tier, then the additional discount (% of the raw subtotal, added to the volume %,
+    // or a flat $ amount taken off after the volume discount). Never goes below $0.
+    function applyDiscounts(raw, totalMessages) {
+        const volumePct = getVolumeDiscount(totalMessages);
+        const type = getCustomDiscountType();
+        const val = getCustomDiscount();
+        let customPct = 0, customUsd = 0, fee;
+        if (type === 'pct') {
+            customPct = Math.min(val, Math.max(0, 100 - volumePct));
+            customUsd = raw * customPct / 100;
+            fee = raw * (1 - (volumePct + customPct) / 100);
+        } else {
+            const afterVolume = raw * (1 - volumePct / 100);
+            customUsd = Math.min(val, afterVolume);
+            fee = afterVolume - customUsd;
+        }
+        const totalPct = raw > 0 ? Math.round((1 - fee / raw) * 100) : volumePct;
+        // Short text for "includes X discount" phrases
+        let label = '';
+        if (type === 'pct') label = totalPct > 0 ? `${totalPct}%` : '';
+        else label = [volumePct ? `${volumePct}%` : '', customUsd > 0 ? fmtRound(customUsd) : ''].filter(Boolean).join(' + ');
+        const customLabel = type === 'pct' ? (customPct ? `${customPct}%` : '') : (customUsd > 0 ? fmtRound(customUsd) : '');
+        return { fee, volumePct, customType: type, customPct, customUsd, totalPct, label, customLabel };
     }
     function updateVolumeTierHighlight(totalMessages) {
         let active = VOLUME_TIERS[0];
@@ -2075,13 +2124,15 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         return harvestRows.map((r, i) => {
             const totalMtgs = s.totSch + r.meetings;
             const totalMsgs = s.totSent + r.harvested;
-            const disc = getCombinedDiscountPct(totalMsgs) / 100;
             const raw = s.baseNoMtgs + s.directMtgCost + (r.harvested * s.msgRate) + (r.meetings * s.mtgRate);
-            const fee = raw * (1 - disc);
+            const d = applyDiscounts(raw, totalMsgs);
             const isAtRisk = i === 0 && s.atRisk.enabled;
+            // Month 1 under an at-risk launch bills at the at-risk fee (which honours an edited cost / meeting)
+            const fee = isAtRisk ? s.atRisk.fee : d.fee;
+            const cpm = isAtRisk && s.atRisk.cpmOverride ? s.atRisk.perMtg : (totalMtgs > 0 ? fee / totalMtgs : null);
             return {
                 idx: i, month: getMonthLabel(i), directMtgs: s.totSch, harvestMtgs: r.meetings, harvested: r.harvested,
-                totalMtgs, totalMsgs, fee, cpm: totalMtgs > 0 ? fee / totalMtgs : null, discPct: Math.round(disc * 100), isAtRisk
+                totalMtgs, totalMsgs, fee, cpm, discLabel: d.label, isAtRisk
             };
         });
     }
@@ -2147,7 +2198,7 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
             cumMtgs += r.totalMtgs; cumFee += r.fee; cumMsgs += r.totalMsgs;
             const billing = r.isAtRisk
                 ? `<span class="pill gold">At-risk · ${s.atRisk.mode === 'full' ? `due at ${s.atRisk.target} mtgs` : 'pro-rated'}</span>`
-                : `<span class="small">Volume${r.discPct ? ` · ${r.discPct}% off` : ''}</span>`;
+                : `<span class="small">Volume${r.discLabel ? ` · ${r.discLabel} off` : ''}</span>`;
             tbody.insertAdjacentHTML('beforeend', `
                 <tr class="${r.isAtRisk ? 'month-atrisk' : ''}">
                     <td>${r.month}</td>
@@ -2177,13 +2228,17 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
     // At-Risk Launch Month
     // ═══════════════════════════════════════════════════════════════════════
     const WEEKS_PER_MONTH = 4.33;
-    function computeAtRisk(fee, projectedMtgs) {
+    function computeAtRisk(volumeFee, projectedMtgs) {
         const enabled = !!document.getElementById('atRiskEnabled')?.checked;
         const mode = document.querySelector('input[name="atRiskMode"]:checked')?.value || 'full';
         const overrideRaw = document.getElementById('atRiskTarget')?.value?.trim();
         const override = overrideRaw ? Math.max(1, Math.round(parseFloat(overrideRaw) || 0)) : 0;
         const target = override || Math.max(1, projectedMtgs);
-        const perMtg = target > 0 ? fee / target : 0;
+        // Cost / meeting is editable: when set, month-1 fee = target × rate; otherwise fee ÷ target
+        const cpmRaw = parseFloat(document.getElementById('atRiskCpm')?.value);
+        const cpmOverride = cpmRaw > 0 ? cpmRaw : 0;
+        const fee = cpmOverride ? cpmOverride * target : volumeFee;
+        const perMtg = cpmOverride || (target > 0 ? volumeFee / target : 0);
 
         // Illustrative outcomes at 25 / 50 / 75 / 100 / 125 % of target
         const rows = [0.25, 0.5, 0.75, 1, 1.25].map(p => {
@@ -2205,7 +2260,7 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
             }
             return { pace: p, delivered, share, pays, note, isTarget: p === 1 };
         });
-        return { enabled, mode, target, override, fee, perMtg, rows };
+        return { enabled, mode, target, override, fee, perMtg, cpmOverride, volumeFee, rows };
     }
 
     function renderAtRisk(ar) {
@@ -2229,6 +2284,12 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         document.getElementById('arFee').textContent = fmtRound(ar.fee);
         document.getElementById('arTarget').textContent = ar.target.toLocaleString();
         document.getElementById('arPerMtg').textContent = ar.perMtg ? fmtRound(ar.perMtg) : '—';
+        document.getElementById('arPerMtgLbl').textContent = ar.cpmOverride ? 'Cost / meeting (set)' : 'Cost / meeting (fee ÷ target)';
+        const autoCpm = ar.target > 0 ? ar.volumeFee / ar.target : 0;
+        document.getElementById('atRiskCpm').placeholder = autoCpm ? String(Math.round(autoCpm)) : 'auto';
+        document.getElementById('atRiskCpmHint').textContent = ar.cpmOverride
+            ? `Month-1 fee = ${ar.target} × ${fmtRound(ar.cpmOverride)} (volume pricing would be ${fmtRound(ar.volumeFee)})`
+            : `Blank = volume-pricing fee ÷ target (${fmtRound(autoCpm)})`;
 
         document.getElementById('arTableHead').innerHTML = `
             <tr>
@@ -2295,12 +2356,12 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         });
         const feeRaw = msgRev + connRev + mtgRev;
         const volumePct = getVolumeDiscount(totSent);
-        const customPct = getCustomDiscount();
-        const discountPct = getCombinedDiscountPct(totSent);
-        const mult = 1 - discountPct / 100;
-        const fee = feeRaw * mult;
-        const customEffectivePct = Math.min(customPct, Math.max(0, 100 - volumePct));
-        const customSavings = feeRaw * (customEffectivePct / 100);
+        const disc = applyDiscounts(feeRaw, totSent);
+        const fee = disc.fee;
+        const discountPct = disc.totalPct;
+        const mult = feeRaw > 0 ? fee / feeRaw : 1;
+        const customEffectivePct = disc.customPct;
+        const customSavings = disc.customUsd;
         updateVolumeTierHighlight(totSent);
 
         const savingsTag = document.getElementById('customDiscountSavings');
@@ -2309,7 +2370,8 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
 
         document.getElementById('payActTotal').innerHTML = `${fmtRound(fee)}<small>/ mo</small>`;
         const lines = [`${totSent.toLocaleString()} messages × ${fmtFull(msgRate)} = ${fmtRound(msgRev)} · ${totAcc.toLocaleString()} connections × ${fmtFull(connRate)} = ${fmtRound(connRev)} · ${totSch} meetings × ${fmtFull(mtgRate)} = ${fmtRound(mtgRev)}`];
-        if (discountPct > 0) lines.push(`Subtotal ${fmtRound(feeRaw)} less ${volumePct ? `${volumePct}% volume` : ''}${volumePct && customEffectivePct ? ' + ' : ''}${customEffectivePct ? `${customEffectivePct}% additional` : ''} discount`);
+        const discParts = [volumePct ? `${volumePct}% volume` : '', disc.customLabel ? `${disc.customLabel} additional` : ''].filter(Boolean);
+        if (discParts.length) lines.push(`Subtotal ${fmtRound(feeRaw)} less ${discParts.join(' + ')} discount`);
         document.getElementById('payActBreakdown').innerHTML = lines.map(l => `<span>${l}</span>`).join('');
 
         document.getElementById('svcMsgRate').innerHTML = `${fmtFull(msgRate)}<small> / msg</small>`;
@@ -2318,7 +2380,8 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
 
         // ── Persist state ─────────────────────────────────────────────────
         _state = {
-            rows, totSent, totAcc, totRep, totSch, feeRaw, fee, discountPct, volumePct, customPct: customEffectivePct,
+            rows, totSent, totAcc, totRep, totSch, feeRaw, fee, discountPct, discountLabel: disc.label, volumePct, customPct: customEffectivePct,
+            customUsd: disc.customUsd, customType: disc.customType, customLabel: disc.customLabel,
             msgRate, connRate, mtgRate, baseNoMtgs: msgRev + connRev, directMtgCost: mtgRev,
             atRisk: _state.atRisk
         };
@@ -2326,7 +2389,8 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         renderAtRisk(_state.atRisk);
 
         // ── KPIs + plan strip ─────────────────────────────────────────────
-        const cpm = totSch > 0 ? fee / totSch : null;
+        const arSet = _state.atRisk.enabled && _state.atRisk.cpmOverride;
+        const cpm = arSet ? _state.atRisk.perMtg : (totSch > 0 ? fee / totSch : null);
         document.getElementById('kpiSent').textContent = totSent.toLocaleString();
         document.getElementById('kpiAccepted').textContent = totAcc.toLocaleString();
         document.getElementById('kpiAccPct').textContent = `${fmtPct(totAcc, totSent)} of sent`;
@@ -2335,9 +2399,9 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         document.getElementById('kpiScheduled').textContent = totSch.toLocaleString();
         document.getElementById('kpiSchPct').textContent = `${fmtPct(totSch, totRep)} of replied`;
         document.getElementById('kpiFee').textContent = fmtCompact(fee);
-        document.getElementById('kpiFeeSub').textContent = discountPct > 0 ? `after ${discountPct}% discount` : 'volume pricing, no discount';
+        document.getElementById('kpiFeeSub').textContent = disc.label ? `after ${disc.label} discount` : 'volume pricing, no discount';
         document.getElementById('kpiCpm').textContent = cpm ? fmtRound(cpm) : '—';
-        document.getElementById('kpiCpmSub').textContent = totSent > 0 ? `${fmtFull(fee / totSent)} per connection sent` : 'all-in, this month';
+        document.getElementById('kpiCpmSub').textContent = arSet ? 'month-1 at-risk rate' : totSent > 0 ? `${fmtFull(fee / totSent)} per connection sent` : 'all-in, this month';
         updatePlanStrip();
 
         // ── Results by type ───────────────────────────────────────────────
@@ -2382,7 +2446,7 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         document.getElementById('stripProspect').textContent = name || 'your prospect';
         document.getElementById('stripFee').textContent = fmtCompact(s.fee);
         document.getElementById('stripMeetings').textContent = s.totSch.toLocaleString();
-        document.getElementById('stripCpm').textContent = s.totSch > 0 ? '~' + fmtRound(s.fee / s.totSch) : '—';
+        document.getElementById('stripCpm').textContent = (s.atRisk.enabled && s.atRisk.cpmOverride) ? fmtRound(s.atRisk.perMtg) : (s.totSch > 0 ? '~' + fmtRound(s.fee / s.totSch) : '—');
         const launch = document.getElementById('stripLaunch');
         const sub = document.getElementById('stripLaunchSub');
         if (s.atRisk.enabled) {
@@ -2408,10 +2472,12 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         });
         Object.entries(DEFAULT_COSTS).forEach(([k, v]) => { const inp = document.getElementById(`cost_${k}`); if (inp) inp.value = v.toFixed(2); });
         VOLUME_TIERS.forEach(t => { const inp = document.getElementById(`vtier_${t.id}`); if (inp) inp.value = t.discountPct; });
+        setCustomDiscountType('pct');
         document.getElementById('customDiscountPct').value = '0';
         document.getElementById('atRiskEnabled').checked = false;
         document.getElementById('atRiskModeFull').checked = true;
         document.getElementById('atRiskTarget').value = '';
+        document.getElementById('atRiskCpm').value = '';
         ['harvestRate', 'harvestReplyRate', 'harvestScheduleRate'].forEach((id, i) => { document.getElementById(id).value = [12, 18, 14][i]; });
         calculate();
     }
@@ -2494,7 +2560,7 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         const totalHarvestUnits = focusMeetings ? (harvestRows[harvestRows.length - 1]?.cumulative || 0) : harvestRows.reduce((a, r) => a + r.replied, 0);
         const total12 = directUnit * 12 + totalHarvestUnits;
         const fee12 = trendRows.reduce((a, r) => a + r.fee, 0);
-        const cpm = directUnit > 0 ? s.fee / directUnit : 0;
+        const cpm = (focusMeetings && s.atRisk.enabled && s.atRisk.cpmOverride) ? s.atRisk.perMtg : (directUnit > 0 ? s.fee / directUnit : 0);
 
         // At-risk, expressed in the report's focus unit
         const ar = s.atRisk;
@@ -2682,7 +2748,7 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
             ${typeTable}
             ${showCosts ? PDF.navyBox(`
                 <table style="width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed;"><tr>
-                    <td style="vertical-align:top;padding-right:18px;">${PDF.stat(fmtCompact(s.fee), `<strong style="color:#fff;">monthly investment</strong> on volume pricing${s.discountPct ? ` — includes ${s.discountPct}% discount` : ''}`, { dark: true })}</td>
+                    <td style="vertical-align:top;padding-right:18px;">${PDF.stat(fmtCompact(s.fee), `<strong style="color:#fff;">monthly investment</strong> on volume pricing${s.discountLabel ? ` — includes ${s.discountLabel} discount` : ''}`, { dark: true })}</td>
                     <td style="vertical-align:top;padding:0 18px;border-left:1px solid rgba(255,255,255,0.14);">${PDF.stat(cpm ? '~' + fmtRound(cpm) : '—', `projected <strong style="color:#fff;">cost per ${focusMeetings ? 'meeting' : 'engaged leader'}</strong> in month one`, { dark: true })}</td>
                     <td style="vertical-align:top;padding-left:18px;border-left:1px solid rgba(255,255,255,0.14);">${PDF.stat(ar.enabled ? `<span style="font-size:22px;">At-risk</span>` : `<span style="font-size:22px;">Monthly</span>`, ar.enabled ? `<strong style="color:#fff;">month one is guaranteed</strong> against ${arTarget} ${unit}` : `<strong style="color:#fff;">month-to-month</strong>, no long-term commitment`, { dark: true })}</td>
                 </tr></table>`) : PDF.box(`<div style="${PDF.sans}font-size:11px;color:${PDF.inkSoft};line-height:1.6;">Projections are based on Pando's historical averages for comparable clients and audiences. Actual results vary by market and message mix, and we review them with you every month.</div>`)}
@@ -2736,7 +2802,7 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
                             ${chargeLine('Messages sent', 'Per connection request or follow-up message', `${fmtFull(s.msgRate)}${smallUnit('/ msg')}`)}
                             ${chargeLine('Successful connections', 'Per accepted connection — a new prospect in your network', `${fmtFull(s.connRate)}${smallUnit('/ conn.')}`)}
                             ${chargeLine('Meetings scheduled', 'Per meeting booked on your calendar with a qualified prospect', `${fmtFull(s.mtgRate)}${smallUnit('/ mtg')}`)}
-                            <div style="margin-top:10px;${PDF.sans}font-size:9.5px;color:${PDF.inkSoft};line-height:1.5;background:${PDF.cream};border-radius:4px;padding:8px 10px;"><strong style="color:${PDF.ink};">Volume discounts</strong> apply automatically as monthly message volume grows${s.volumePct ? ` — this plan qualifies for ${s.volumePct}% off` : ''}${s.customPct ? `, plus an additional ${s.customPct}% discount` : ''}.</div>
+                            <div style="margin-top:10px;${PDF.sans}font-size:9.5px;color:${PDF.inkSoft};line-height:1.5;background:${PDF.cream};border-radius:4px;padding:8px 10px;"><strong style="color:${PDF.ink};">Volume discounts</strong> apply automatically as monthly message volume grows${s.volumePct ? ` — this plan qualifies for ${s.volumePct}% off` : ''}${s.customLabel ? `, plus an additional ${s.customLabel} discount` : ''}.</div>
                         </div>
                     </div>
                 </td>
@@ -2789,11 +2855,11 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
                         const rowBg = r.isAtRisk ? `background:${PDF.goldSoft};` : (i % 2 ? `background:#FBFAF7;` : '');
                         const billing = r.isAtRisk
                             ? `<span style="${PDF.sans}font-size:8.5px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#7A6A3F;white-space:nowrap;">At-risk · ${ar.mode === 'full' ? `due at ${arTarget}` : 'pro-rated'}</span>`
-                            : `<span style="color:${PDF.muted};font-size:10px;white-space:nowrap;">Volume${r.discPct ? ` · ${r.discPct}% off` : ''}</span>`;
+                            : `<span style="color:${PDF.muted};font-size:10px;white-space:nowrap;">Volume${r.discLabel ? ` · ${r.discLabel} off` : ''}</span>`;
                         return `<tr style="${rowBg}">
                             ${PDF.td(r.month, 'left', 'font-weight:500;white-space:nowrap;')}${PDF.td(directU, 'right')}${PDF.td(harvestUnits, 'right', `color:${PDF.sage};`)}
                             ${PDF.td(units, 'right', `font-weight:600;background:${r.isAtRisk ? 'transparent' : PDF.sageTint};`)}
-                            ${PDF.td(r.totalMsgs.toLocaleString(), 'right')}${PDF.td(fmtRound(r.fee), 'right', 'font-weight:600;')}${PDF.td(units ? fmtRound(r.fee / units) : '—', 'right')}${PDF.td(billing, 'left', 'white-space:nowrap;')}
+                            ${PDF.td(r.totalMsgs.toLocaleString(), 'right')}${PDF.td(fmtRound(r.fee), 'right', 'font-weight:600;')}${PDF.td(focusMeetings && r.isAtRisk && ar.cpmOverride ? fmtRound(ar.perMtg) : (units ? fmtRound(r.fee / units) : '—'), 'right')}${PDF.td(billing, 'left', 'white-space:nowrap;')}
                         </tr>`;
                     }).join('')}
                     <tr style="background:${PDF.cream};">
@@ -2809,7 +2875,7 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
                 </tbody>
             </table>
             <div style="margin-top:14px;">${PDF.box(`<div style="${PDF.sans}font-size:10px;color:${PDF.inkSoft};line-height:1.6;">
-                <strong style="color:${PDF.ink};">Investment</strong> = (direct + harvest messages) × ${fmtFull(s.msgRate)} + accepted connections × ${fmtFull(s.connRate)} + (direct + harvest meetings) × ${fmtFull(s.mtgRate)}, with volume${s.customPct ? ' and additional' : ''} discounts applied.
+                <strong style="color:${PDF.ink};">Investment</strong> = (direct + harvest messages) × ${fmtFull(s.msgRate)} + accepted connections × ${fmtFull(s.connRate)} + (direct + harvest meetings) × ${fmtFull(s.mtgRate)}, with volume${s.customLabel ? ' and additional' : ''} discounts applied${ar.enabled && ar.cpmOverride && focusMeetings ? `; month one is priced at ${fmtRound(ar.perMtg)} per meeting` : ''}.
                 Harvest follow-ups contact ${harvestRatePct}% of the connection pool each month; ${harvestReplyPct}% reply${focusMeetings ? ` and ${harvestSchPct}% of those book a meeting` : ''}.</div>`, { pad: '11px 15px' })}</div>
             ${pageFoot(7)}`, { pad: '32px 56px 40px' }) : '';
 
@@ -3006,10 +3072,12 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
             customExamples: { ...customExamples },
             types: {}, costs: {}, volumeTiers: {},
             customDiscountPct: getCustomDiscount(),
+            customDiscountType: getCustomDiscountType(),
             atRisk: {
                 enabled: !!document.getElementById('atRiskEnabled')?.checked,
                 mode: document.querySelector('input[name="atRiskMode"]:checked')?.value || 'full',
-                target: document.getElementById('atRiskTarget')?.value?.trim() || ''
+                target: document.getElementById('atRiskTarget')?.value?.trim() || '',
+                cpm: document.getElementById('atRiskCpm')?.value?.trim() || ''
             },
             harvest: { rate: getNum('harvestRate'), replyRate: getNum('harvestReplyRate'), scheduleRate: getNum('harvestScheduleRate') }
         };
@@ -3046,6 +3114,7 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         }
         if (data.costs) Object.entries(data.costs).forEach(([k, v]) => setVal(`cost_${k}`, v));
         if (data.volumeTiers) VOLUME_TIERS.forEach(t => setVal(`vtier_${t.id}`, data.volumeTiers[t.id]));
+        setCustomDiscountType(data.customDiscountType === 'usd' ? 'usd' : 'pct');
         setVal('customDiscountPct', data.customDiscountPct);
         // v2 at-risk launch month; legacy scenarios (atRiskPerMeeting) are ignored
         const ar = data.atRisk || {};
@@ -3054,6 +3123,7 @@ Respond with ONLY the rewritten letter body text, nothing else — no preamble, 
         const modeEl = document.getElementById(ar.mode === 'prorated' ? 'atRiskModeProrated' : 'atRiskModeFull');
         if (modeEl) modeEl.checked = true;
         setVal('atRiskTarget', ar.target ?? '');
+        setVal('atRiskCpm', ar.cpm ?? '');
         if (data.harvest) {
             setVal('harvestRate', data.harvest.rate);
             setVal('harvestReplyRate', data.harvest.replyRate);
