@@ -690,6 +690,15 @@
                 <div id="fpSrcMixBody"><span class="fp-funnel-empty">No messages saved yet this run.</span></div>
             </div>
 
+            <!-- Where to find/recover contacts that scanned in but didn't end up with a message -->
+            <div class="fp-insight-box" style="background:#f8fafc;">
+                <div class="fp-insight-title"><i class="fas fa-user-check" style="color:#059669;"></i> Didn't get a message? These aren't lost.</div>
+                <div style="font-size: 13px; color: var(--gray-600); line-height: 1.6;">
+                    <strong>Dropped by the Target Contact / Exclude Rules</strong> — browse, search, export, and restore them: <a href="rule_dropped_contacts.html" target="_blank">Rule-Dropped Contacts Report</a>.<br>
+                    <strong>Scanned but never reached the rules step</strong> (e.g. a company-name mismatch skipped the whole org) — still sitting untagged in <code>prospect_contacts</code>: <a href="rescue_untagged_contacts.html" target="_blank">Rescue Untagged Scan Contacts</a> — automatic sweep, or switch to its "Browse &amp; Curate Manually" tab to review, export, paste a URL list, or run the AI classifier for suggestions before deciding who to tag.
+                </div>
+            </div>
+
             <div style="display:flex; align-items:center; gap: 12px; margin-bottom: 8px;">
                 <div class="progress-track" style="flex:1;"><div class="progress-fill" id="fpProgressBar"></div></div>
                 <span id="fpProgressLabel" style="font-size: 12.5px; color: var(--gray-600); min-width: 220px;">Waiting…</span>
@@ -881,6 +890,32 @@
                     }
                     throw err;
                 }
+            }
+        }
+
+        // full-ai-init is now an async job server-side (POST returns a jobId immediately;
+        // the Firestore filtering work — which used to run inline and could exceed the old
+        // 110s server-side watchdog for large contact pools/hypothesis groups — happens in
+        // the background with no HTTP response attached, so no proxy timeout can hit it).
+        // Poll the shared generation-job endpoint until it's done and return job.results,
+        // which has the same { success, bdrContext, prospects, stats } shape the old
+        // synchronous full-ai-init response had.
+        async function pollFullAiInitJob(token, jobId, addLog, label = 'Full AI init') {
+            while (true) {
+                await new Promise(r => setTimeout(r, 3000));
+                const statusRes = await fetchWithRetry(`${RAILWAY_API}/api/connect/generation-job/${jobId}`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                }, { addLog, label: `${label} status check`, retries: 2, delayMs: 4000 });
+                if (!statusRes.ok) { addLog?.(`   ⏳ ${label} status check got HTTP ${statusRes.status} — retrying...`, 'warning'); continue; }
+                const statusData = await statusRes.json();
+                if (!statusData.success || !statusData.job) { addLog?.(`   ⏳ ${label} status check returned no job — retrying...`, 'warning'); continue; }
+                const job = statusData.job;
+                if (job.status === 'completed') {
+                    if (!job.results) throw new Error(`${label} job completed with no results`);
+                    return job.results;
+                }
+                if (job.status === 'failed') throw new Error(job.error || `${label} job failed`);
+                // otherwise still queued/running — keep polling
             }
         }
 
@@ -3002,7 +3037,16 @@
                     addLog(`   ⚠️ Backfill: eligibility check failed for ${bdrLabel} (HTTP ${initRes.status}) — skipping backfill for this BDR.`, 'warning');
                     continue;
                 }
-                const initData = await initRes.json();
+                const initJobData = await initRes.json();
+                if (!initJobData.success || !initJobData.jobId) { addLog(`   ⚠️ Backfill: ${initJobData.error || 'eligibility check failed to start'} — skipping backfill for ${bdrLabel}.`, 'warning'); continue; }
+                // full-ai-init is an async job — poll until the filtered/eligible prospect list is ready.
+                let initData;
+                try {
+                    initData = await pollFullAiInitJob(token, initJobData.jobId, addLog, `Backfill eligibility (${bdrLabel})`);
+                } catch (pollErr) {
+                    addLog(`   ⚠️ Backfill: ${pollErr.message} — skipping backfill for ${bdrLabel}.`, 'warning');
+                    continue;
+                }
                 if (!initData.success) { addLog(`   ⚠️ Backfill: ${initData.error || 'eligibility check failed'} — skipping backfill for ${bdrLabel}.`, 'warning'); continue; }
                 const eligibleIds = new Set((initData.prospects || []).map(p => p.id));
                 const eligibleUrls = new Set((initData.prospects || []).map(p => fpNormContactUrlForLimit(p.linkedInUrl)).filter(Boolean));
@@ -6042,7 +6086,12 @@
                                 throw new Error(`full-ai-init failed: ${initRes.status} — ${errText.substring(0, 200)}`);
                             }
                             fpConsecutiveAuthFailures = 0;
-                            const initData = await initRes.json();
+                            const initJobData = await initRes.json();
+                            if (!initJobData.success || !initJobData.jobId) throw new Error(initJobData.error || 'full-ai-init failed to start');
+                            // full-ai-init is an async job — poll until the filtered/eligible prospect list is ready.
+                            // (No more proxy/watchdog timeout risk here, however long a large org's contact
+                            // pool / hypothesis group takes the server to filter.)
+                            const initData = await pollFullAiInitJob(token, initJobData.jobId, addLog, `Full AI init (${org.company_name})`);
                             if (!initData.success) throw new Error(initData.error || 'full-ai-init failed');
                             const { bdrContext, prospects: prospectList, stats } = initData;
                             addLog(`   ✅ ${stats.skipSummary}`, 'success');
