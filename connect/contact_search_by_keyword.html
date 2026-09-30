@@ -788,7 +788,27 @@
         console.log('✅ Auth.js initialized');
 
         const auth = window.auth;
-        
+
+        // Railway backend base — used only for the "Recover from Apify" reconciliation
+        // feature below (job creation/reads still go through the clemailFirestore wrapper).
+        const RAILWAY_API = 'https://railwayclemail-production.up.railway.app';
+        async function apifyRecoverFetch(path, body) {
+            const idToken = await currentUser.getIdToken();
+            const resp = await fetch(`${RAILWAY_API}${path}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${idToken}` },
+                body: JSON.stringify(body || {})
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok || data.success === false) throw new Error(data.error || `HTTP ${resp.status}`);
+            return data;
+        }
+        // Top-level `function` declarations inside a <script type="module"> are module-scoped,
+        // not auto-attached to `window` (unlike classic scripts) — expose explicitly so the
+        // plain (non-module) <script> block further down the page (Profile Search sessions,
+        // which predates this module and can't `import` from it) can call it too.
+        window.apifyRecoverFetch = apifyRecoverFetch;
+
         let currentUser = null;
         let currentBDR = null;
         let currentWorkspaceId   = null;
@@ -1239,6 +1259,26 @@
                 window._jobCache = {};
                 recentJobs.forEach(j => { window._jobCache[j.id] = j; });
 
+                // ── Reconcile reported vs. actual saved counts ───────────────────────
+                // job.results.contacts_saved reflects how many profiles this job *processed*,
+                // but the matching prospect_contacts docs can later get reassigned to a
+                // different job/BDR when a later search rediscovers the same LinkedIn URL
+                // (or a save can be lost to a crash). Look up the real current count per job
+                // so a shortfall is visible, with a one-click way to fix it from Apify.
+                const doneJobs = recentJobs.filter(j => j.status === 'completed' || j.status === 'failed');
+                window._jobActualCounts = window._jobActualCounts || {};
+                await Promise.all(doneJobs.map(async (job) => {
+                    try {
+                        const snap = await getDocs(query(
+                            collection(db, 'prospect_contacts'),
+                            where('sourceJobId', '==', job.id)
+                        ));
+                        window._jobActualCounts[job.id] = snap.size;
+                    } catch (e) {
+                        console.warn(`Could not verify actual count for job ${job.id}:`, e.message);
+                    }
+                }));
+
                 const activeJobs    = recentJobs.filter(j => j.status === 'pending' || j.status === 'running');
                 const completedJobs = recentJobs.filter(j => j.status === 'completed');
                 const failedJobs    = recentJobs.filter(j => j.status === 'failed');
@@ -1272,6 +1312,28 @@
                     </button>`;
                 };
 
+                // Shows the real current prospect_contacts count for this job next to the
+                // self-reported one, and — if they don't match — a button to re-pull this
+                // job's results straight from Apify and re-save any that are missing.
+                const reconcileLine = (job) => {
+                    const reported = job.results?.contacts_saved ?? 0;
+                    const actual   = window._jobActualCounts?.[job.id];
+                    if (actual === undefined || actual >= reported) return '';
+                    return `<div style="margin-top:0.4rem;display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;
+                                background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:5px 9px;">
+                        <span style="font-size:0.78rem;color:#92400e;">
+                            <i class="fas fa-triangle-exclamation"></i>
+                            Only <strong>${actual.toLocaleString()}</strong> of ${reported.toLocaleString()} reported contacts are currently in the database
+                            for this session.
+                        </span>
+                        <button onclick="recoverJobFromApify('${job.id}', this)"
+                            style="background:#f59e0b;color:white;border:none;padding:4px 10px;border-radius:5px;font-size:0.76rem;cursor:pointer;font-weight:600;white-space:nowrap;"
+                            title="Re-fetch this job's results from Apify and re-save any missing contacts">
+                            <i class="fas fa-rotate"></i> Recover from Apify
+                        </button>
+                    </div>`;
+                };
+
                 let html = '<div style="display:flex;flex-direction:column;gap:1rem;">';
 
                 // ── Active / Running ─────────────────────────────────────────
@@ -1298,8 +1360,15 @@
 
                 // ── Completed ───────────────────────────────────────────────
                 if (completedJobs.length > 0) {
+                    const shortfallCount = completedJobs.filter(j => (window._jobActualCounts?.[j.id] ?? Infinity) < (j.results?.contacts_saved ?? 0)).length;
                     html += `<div style="padding:1rem;background:#f0fdf4;border-radius:8px;border-left:4px solid var(--success);">
-                        <h3 style="margin:0 0 0.75rem 0;color:var(--success);"><i class="fas fa-check-circle"></i> Search Sessions (${completedJobs.length})</h3>
+                        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;">
+                            <h3 style="margin:0 0 0.75rem 0;color:var(--success);"><i class="fas fa-check-circle"></i> Search Sessions (${completedJobs.length})</h3>
+                            ${shortfallCount > 0 ? `<button onclick="recoverAllShortfallJobs()" id="btnRecoverAllShortfalls"
+                                style="background:#f59e0b;color:white;border:none;padding:6px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;font-weight:600;white-space:nowrap;margin-bottom:0.5rem;">
+                                <i class="fas fa-rotate"></i> Recover ${shortfallCount} Shortfall Session${shortfallCount !== 1 ? 's' : ''} from Apify
+                            </button>` : ''}
+                        </div>
                         <p style="font-size:0.8rem;color:#555;margin:0 0 0.75rem 0;">Click <strong>Continue</strong> on any session to pick up exactly where it left off.</p>`;
                     completedJobs.forEach(job => {
                         const saved     = job.results?.contacts_saved ?? 0;
@@ -1323,6 +1392,7 @@
                                 </div>
                             </div>
                             <div style="color:#555;font-size:0.875rem;margin-top:0.35rem;">${jobSummaryLine(job)}</div>
+                            ${reconcileLine(job)}
                         </div>`;
                     });
                     html += '</div>';
@@ -1351,6 +1421,7 @@
                             </div>
                             <div style="color:#555;font-size:0.875rem;margin-top:0.35rem;">${jobSummaryLine(job)}</div>
                             ${job.error ? `<div style="font-size:0.78rem;color:#888;margin-top:0.25rem;font-style:italic;">${job.error.substring(0, 150)}</div>` : ''}
+                            ${reconcileLine(job)}
                         </div>`;
                     });
                     html += '</div>';
@@ -1431,6 +1502,67 @@
                 console.error('❌ Error deleting job:', error);
                 alert('❌ Error deleting job: ' + error.message);
             }
+        };
+
+        // Re-fetch a single job's Apify dataset(s) and re-save any contacts that are
+        // missing from prospect_contacts. Safe to run more than once — dedupes on the
+        // backend by linkedInUrlNormalized, so it only ever fills in the gap.
+        window.recoverJobFromApify = async function(jobId, btnEl) {
+            const originalHtml = btnEl?.innerHTML;
+            if (btnEl) {
+                btnEl.disabled = true;
+                btnEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Recovering…';
+            }
+            try {
+                const result = await apifyRecoverFetch('/api/apify-explorer/recover-job', { jobId });
+                if (result.runsMatched === 0) {
+                    alert(`⚠️ No matching Apify runs were found for this session.\n\n${result.message || ''}`);
+                } else {
+                    alert(
+                        `✅ Recovery complete!\n\n` +
+                        `Apify runs checked: ${result.runsMatched}\n` +
+                        `Profiles fetched from Apify: ${result.itemsFetched}\n` +
+                        `Now in database for this session: ${result.totalNowInDatabase}`
+                    );
+                }
+                await loadActiveSearchJobs();
+                if (typeof window.loadProfileSearchJobs === 'function') await window.loadProfileSearchJobs();
+            } catch (error) {
+                console.error('❌ Error recovering job from Apify:', error);
+                alert('❌ Error recovering from Apify: ' + error.message);
+                if (btnEl) { btnEl.disabled = false; btnEl.innerHTML = originalHtml; }
+            }
+        };
+
+        // Bulk-recover every currently-visible completed session whose actual
+        // prospect_contacts count is below what it reported saving.
+        window.recoverAllShortfallJobs = async function() {
+            const shortfallJobs = Object.values(window._jobCache || {}).filter(j =>
+                j.status === 'completed' &&
+                (window._jobActualCounts?.[j.id] ?? Infinity) < (j.results?.contacts_saved ?? 0)
+            );
+            if (shortfallJobs.length === 0) { alert('No shortfall sessions to recover.'); return; }
+            if (!confirm(
+                `Recover ${shortfallJobs.length} session(s) from Apify?\n\n` +
+                `This re-fetches each session's original Apify results and re-saves any contacts ` +
+                `missing from the database. Already-correct sessions are left untouched.\n\n` +
+                `Click OK to start (this may take a minute per session).`
+            )) return;
+
+            const btn = document.getElementById('btnRecoverAllShortfalls');
+            let done = 0, failedCount = 0;
+            for (const job of shortfallJobs) {
+                if (btn) btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Recovering ${done + 1}/${shortfallJobs.length}…`;
+                try {
+                    await apifyRecoverFetch('/api/apify-explorer/recover-job', { jobId: job.id });
+                } catch (e) {
+                    console.error(`Recovery failed for job ${job.id}:`, e.message);
+                    failedCount++;
+                }
+                done++;
+            }
+            alert(`✅ Recovery pass complete.\n\nSessions processed: ${done}\nFailed: ${failedCount}`);
+            await loadActiveSearchJobs();
         };
 
         // ── Submit / Continue keyword search ─────────────────────────────────
@@ -2986,10 +3118,40 @@
                 .map(d => ({ id: d.id, ...d.data() }))
                 .sort((a, b) => new Date(b.submittedAt) - new Date(a.submittedAt));
 
+            window._profileJobCache = {};
+            jobs.forEach(j => { window._profileJobCache[j.id] = j; });
+
+            // Reconcile reported vs. actual saved counts (see loadActiveSearchJobs for why
+            // these can drift — a rediscovery by a different job can reassign a contact's
+            // sourceJobId, or a save can be lost to a crash mid-job).
+            const doneProfileJobs = jobs.filter(j => j.status === 'completed' || j.status === 'failed');
+            window._profileJobActualCounts = window._profileJobActualCounts || {};
+            await Promise.all(doneProfileJobs.map(async (job) => {
+                try {
+                    const actualSnap = await getDocs(query(col(db, 'prospect_contacts'), where('sourceJobId', '==', job.id)));
+                    window._profileJobActualCounts[job.id] = actualSnap.size;
+                } catch (e) {
+                    console.warn(`Could not verify actual count for profile job ${job.id}:`, e.message);
+                }
+            }));
+
             const statusColor = { pending: '#f59e0b', running: '#3b82f6', completed: '#22c55e', failed: '#ef4444' };
             const statusIcon  = { pending: 'clock', running: 'spinner fa-spin', completed: 'check-circle', failed: 'times-circle' };
 
-            container.innerHTML = jobs.map(job => {
+            const shortfallProfileJobs = jobs.filter(j =>
+                j.status === 'completed' &&
+                (window._profileJobActualCounts[j.id] ?? Infinity) < (j.results?.contacts_saved ?? 0)
+            );
+            const bulkRecoverBar = shortfallProfileJobs.length > 0
+                ? `<div style="margin-bottom:0.75rem;">
+                    <button onclick="recoverAllProfileShortfallJobs()" id="btnRecoverAllProfileShortfalls"
+                        style="background:#f59e0b;color:white;border:none;padding:6px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;font-weight:600;">
+                        <i class="fas fa-rotate"></i> Recover ${shortfallProfileJobs.length} Shortfall Session${shortfallProfileJobs.length !== 1 ? 's' : ''} from Apify
+                    </button>
+                   </div>`
+                : '';
+
+            container.innerHTML = bulkRecoverBar + jobs.map(job => {
                 const inp  = job.apifyInput || {};
                 const res  = job.results    || {};
                 const saved = res.contacts_saved || 0;
@@ -3040,6 +3202,21 @@
                     </div>`
                     : '';
 
+                const actualCount = window._profileJobActualCounts?.[job.id];
+                const reconcileBadge = (actualCount !== undefined && actualCount < saved)
+                    ? `<div style="margin-top:6px;display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;
+                            background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:5px 9px;">
+                        <span style="font-size:0.78rem;color:#92400e;">
+                            <i class="fas fa-triangle-exclamation"></i>
+                            Only <strong>${actualCount.toLocaleString()}</strong> of ${saved.toLocaleString()} reported contacts are currently in the database.
+                        </span>
+                        <button onclick="recoverJobFromApify('${job.id}', this)"
+                            style="background:#f59e0b;color:white;border:none;padding:4px 10px;border-radius:5px;font-size:0.76rem;cursor:pointer;font-weight:600;white-space:nowrap;">
+                            <i class="fas fa-rotate"></i> Recover from Apify
+                        </button>
+                    </div>`
+                    : '';
+
                 return `<div style="border:1px solid var(--border);border-radius:10px;padding:1rem;margin-bottom:0.75rem;background:#fff;">
                     <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
                         <span style="color:${color};font-weight:700;font-size:0.85rem;text-transform:uppercase;">
@@ -3064,6 +3241,7 @@
                     </div>
                     ${errMsg}
                     ${earlyEndBadge}
+                    ${reconcileBadge}
                 </div>`;
             }).join('');
 
@@ -3102,6 +3280,41 @@
             console.error('❌ Error resuming profile search job:', err);
             alert('Failed to resume job: ' + err.message);
         }
+    };
+
+    // Bulk-recover every currently-visible completed Profile Search session whose actual
+    // prospect_contacts count is below what it reported saving. Reuses the same
+    // window.recoverJobFromApify() defined in the keyword-search module script above —
+    // it's source-agnostic (the backend endpoint reads job.source to pick the right actor).
+    window.recoverAllProfileShortfallJobs = async function() {
+        const shortfallJobs = Object.values(window._profileJobCache || {}).filter(j =>
+            j.status === 'completed' &&
+            (window._profileJobActualCounts?.[j.id] ?? Infinity) < (j.results?.contacts_saved ?? 0)
+        );
+        if (shortfallJobs.length === 0) { alert('No shortfall sessions to recover.'); return; }
+        if (!confirm(
+            `Recover ${shortfallJobs.length} session(s) from Apify?\n\n` +
+            `This re-fetches each session's original Apify results and re-saves any contacts ` +
+            `missing from the database. Already-correct sessions are left untouched.\n\n` +
+            `Click OK to start (this may take a minute per session).`
+        )) return;
+
+        const btn = document.getElementById('btnRecoverAllProfileShortfalls');
+        let done = 0, failedCount = 0;
+        for (const job of shortfallJobs) {
+            if (btn) btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Recovering ${done + 1}/${shortfallJobs.length}…`;
+            try {
+                // Call the recovery endpoint directly (not window.recoverJobFromApify) so this
+                // bulk pass doesn't pop a confirmation alert after every single session.
+                await window.apifyRecoverFetch('/api/apify-explorer/recover-job', { jobId: job.id });
+            } catch (e) {
+                console.error(`Recovery failed for job ${job.id}:`, e.message);
+                failedCount++;
+            }
+            done++;
+        }
+        alert(`✅ Recovery pass complete.\n\nSessions processed: ${done}\nFailed: ${failedCount}`);
+        loadProfileSearchJobs();
     };
 
     </script>
