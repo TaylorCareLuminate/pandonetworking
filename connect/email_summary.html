@@ -1874,16 +1874,42 @@
                 // Convert queryStartDate to Firestore Timestamp for query (covers full month window)
                 const sinceTimestamp = Timestamp.fromDate(queryStartDate);
                 
-                // Query with date filter to get all events in range (not hit by limit)
-                const activityQuery = query(
-                    collection(emailDB, 'heyreach_activity'),
-                    where('timestamp', '>=', sinceTimestamp),
-                    orderBy('timestamp', 'desc'),
-                    limit(10000)
-                );
+                // FIX: Scope the query to THIS BDR's linkedInAccountId whenever we have one.
+                // The previous org-wide query (all BDRs, orderBy desc, limit 10000) silently
+                // truncated once the whole org produced >10k events in the window — the
+                // oldest days of the week fell off the end, so "Requests Sent / Accepted /
+                // Replies" under-counted versus HeyReach. A per-BDR query returns a few
+                // hundred rows and is fetched without a limit (wrapper paginates), so the
+                // full window is always covered.
+                const ORG_WIDE_LIMIT = 10000;
+                let activityQuery;
+                if (bdrLinkedInAccountId) {
+                    activityQuery = query(
+                        collection(emailDB, 'heyreach_activity'),
+                        where('linkedInAccountId', '==', bdrLinkedInAccountId),
+                        where('timestamp', '>=', sinceTimestamp)
+                    );
+                } else {
+                    // Fallback for BDRs without a HeyReach account mapping: org-wide query,
+                    // matched client-side by bdrEmail / accountName.
+                    activityQuery = query(
+                        collection(emailDB, 'heyreach_activity'),
+                        where('timestamp', '>=', sinceTimestamp),
+                        orderBy('timestamp', 'desc'),
+                        limit(ORG_WIDE_LIMIT)
+                    );
+                }
                 
                 const activitySnapshot = await getDocs(activityQuery);
-                console.log(`📦 Found ${activitySnapshot.docs.length} heyreach_activity events in date range`);
+                console.log(`📦 Found ${activitySnapshot.docs.length} heyreach_activity events in date range${bdrLinkedInAccountId ? ` (scoped to account ${bdrLinkedInAccountId})` : ' (org-wide fallback)'}`);
+                if (!bdrLinkedInAccountId && activitySnapshot.docs.length >= ORG_WIDE_LIMIT) {
+                    console.warn(`   ⚠️ Org-wide query hit the ${ORG_WIDE_LIMIT}-row cap — oldest events in the window were dropped. Counts may be low.`);
+                    showAlert(
+                        `⚠️ Activity query hit its ${ORG_WIDE_LIMIT.toLocaleString()}-event cap because <strong>${bdr.name}</strong> has no HeyReach account mapping. ` +
+                        `Counts for the earliest days of this period may be low.`,
+                        'warning'
+                    );
+                }
                 
                 // Debug: Sample first few to see structure and collect ALL unique linkedInAccountIds
                 const uniqueAccountIds = new Set();
@@ -2136,6 +2162,8 @@
                     console.log(`      ${i+1}. ${detail.leadName} | ${detail.timestamp} | Account: ${detail.accountName} (${detail.linkedInAccountId})`);
                 });
                 
+                // Org-wide diagnostics only make sense on the fallback (unscoped) query
+                if (!bdrLinkedInAccountId) {
                 // Show ALL CONNECTION_REQUEST_SENT/ACCEPTED in the data to find missing ones
                 console.log(`\n   🔍 Checking for MISSING CONNECTION events...`);
                 let missedConnectionSent = [];
@@ -2191,6 +2219,7 @@
                 }
                 console.log(`   📊 Events in range by accountName:`, inRangeByAccount);
                 console.log(`   📊 Events in range by linkedInAccountId:`, inRangeByAccountId);
+                } // end org-wide diagnostics
                 
                 // =====================================================
                 // PART 2b: Dedicated month-to-date query for this BDR
@@ -2633,16 +2662,21 @@
                 ? '<span class="status-indicator active">Active</span>'
                 : '<span class="status-indicator inactive">Inactive</span>';
             
-            // Render connections - compact inline (show ALL)
+            // ── Shared design tokens (email-safe: tables + inline styles only) ──
+            const FONT = "font-family:'Inter',Arial,Helvetica,sans-serif;";
+            const esc = (s) => String(s ?? '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            const avatarHTML = (contact, bg, size = 40) => contact.profilePicture
+                ? `<img src="${contact.profilePicture}" alt="" width="${size}" height="${size}" style="border-radius:50%;display:block;width:${size}px;height:${size}px;border:2px solid #ffffff;" />`
+                : `<div style="width:${size}px;height:${size}px;border-radius:50%;background-color:${bg};color:#ffffff;font-weight:700;font-size:${Math.round(size*0.36)}px;text-align:center;line-height:${size}px;${FONT}">${getInitials(contact.name)}</div>`;
+
+            // Render connections - polished contact rows (show ALL)
             const connectionsHTML = weeklyData.connectionsReceived.length > 0 
-                ? weeklyData.connectionsReceived.map(contact => `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td style="background-color:#f8fafb;border-left:3px solid #10b981;padding:8px 10px;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td width="32" valign="middle" style="padding-right:8px;">${contact.profilePicture ? `<img src="${contact.profilePicture}" alt="" width="32" height="32" style="border-radius:50%;display:block;" />` : `<div style="width:32px;height:32px;border-radius:50%;background-color:#0F2D4D;color:#fff;font-weight:700;font-size:12px;text-align:center;line-height:32px;font-family:Arial,sans-serif;">${getInitials(contact.name)}</div>`}</td><td valign="middle"><div style="font-weight:600;font-size:12px;color:#1a1a1a;font-family:Arial,sans-serif;line-height:1.2;">${contact.name}</div><div style="font-size:10px;color:#666;font-family:Arial,sans-serif;">${contact.title || 'Professional'}${contact.company ? ` · ${contact.company}` : ''}</div></td></tr></table></td></tr></table>`).join('')
-                : `<p style="color:#999;font-size:11px;font-style:italic;margin:4px 0;font-family:Arial,sans-serif;">No new connections ${weekRange.periodLabel}</p>`;
+                ? weeklyData.connectionsReceived.map(contact => `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:8px;"><tr><td bgcolor="#ffffff" style="background-color:#ffffff;border:1px solid #d1fae5;border-left:4px solid #10b981;border-radius:10px;padding:10px 12px;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td width="40" valign="middle" style="padding-right:12px;">${avatarHTML(contact, '#0F2D4D')}</td><td valign="middle"><div style="font-weight:700;font-size:13px;color:#0f172a;${FONT}line-height:1.3;">${esc(contact.name)}</div><div style="font-size:11px;color:#64748b;${FONT}line-height:1.4;margin-top:2px;">${esc(contact.title || 'Professional')}${contact.company ? ` <span style="color:#cbd5e1;">&bull;</span> ${esc(contact.company)}` : ''}</div></td><td width="22" valign="middle" align="right"><span style="display:inline-block;width:22px;height:22px;line-height:22px;border-radius:50%;background-color:#d1fae5;color:#059669;font-size:12px;font-weight:700;text-align:center;${FONT}">&#10003;</span></td></tr></table></td></tr></table>`).join('')
+                : `<p style="color:#94a3b8;font-size:12px;font-style:italic;margin:4px 0;${FONT}">No new connections ${weekRange.periodLabel}</p>`;
             
             // Render replies — show full conversation thread when available
             const renderConversation = (contact) => {
-                const avatar = contact.profilePicture
-                    ? `<img src="${contact.profilePicture}" alt="" width="32" height="32" style="border-radius:50%;display:block;" />`
-                    : `<div style="width:32px;height:32px;border-radius:50%;background-color:#f59e0b;color:#fff;font-weight:700;font-size:12px;text-align:center;line-height:32px;font-family:Arial,sans-serif;">${getInitials(contact.name)}</div>`;
+                const avatar = avatarHTML(contact, '#f59e0b');
 
                 if (contact.messages && contact.messages.length > 0) {
                     // Full conversation thread
@@ -2650,46 +2684,45 @@
                         const msgText = (msg.text || msg.message || msg.content || '').trim();
                         if (!msgText) return '';
                         const isLead = contact.fromLead ? contact.fromLead(msg) : null;
+                        const body = esc(msgText).replace(/\n/g,'<br>');
                         if (isLead === true) {
-                            // Lead's reply — warm amber
-                            return `<div style="background:#fffbeb;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0;padding:7px 10px;margin-bottom:4px;"><div style="font-size:9px;font-weight:700;color:#b45309;text-transform:uppercase;font-family:Arial,sans-serif;margin-bottom:2px;">${contact.name.split(' ')[0]}</div><div style="font-size:12px;color:#1c1917;line-height:1.5;font-family:Arial,sans-serif;">${msgText.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</div></div>`;
+                            // Lead's reply — warm amber bubble
+                            return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td bgcolor="#fffbeb" style="background-color:#fffbeb;border:1px solid #fde68a;border-radius:10px 10px 10px 2px;padding:9px 12px;"><div style="font-size:9px;font-weight:700;color:#b45309;text-transform:uppercase;letter-spacing:0.8px;${FONT}margin-bottom:3px;">${esc(contact.name.split(' ')[0])}</div><div style="font-size:13px;color:#1c1917;line-height:1.55;${FONT}">${body}</div></td></tr></table>`;
                         } else if (isLead === false) {
-                            // BDR's outbound message — light blue
-                            return `<div style="background:#eff6ff;border-left:3px solid #0F2D4D;border-radius:0 6px 6px 0;padding:7px 10px;margin-bottom:4px;"><div style="font-size:9px;font-weight:700;color:#0F2D4D;text-transform:uppercase;font-family:Arial,sans-serif;margin-bottom:2px;">You</div><div style="font-size:12px;color:#1c1917;line-height:1.5;font-family:Arial,sans-serif;">${msgText.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</div></div>`;
+                            // BDR's outbound message — navy-tinted bubble, right-aligned feel
+                            return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td width="12%"></td><td bgcolor="#eef4fb" style="background-color:#eef4fb;border:1px solid #cfe0f3;border-radius:10px 10px 2px 10px;padding:9px 12px;"><div style="font-size:9px;font-weight:700;color:#12314C;text-transform:uppercase;letter-spacing:0.8px;${FONT}margin-bottom:3px;">You</div><div style="font-size:13px;color:#1c1917;line-height:1.55;${FONT}">${body}</div></td></tr></table>`;
                         } else {
                             // Sender unknown — neutral
-                            return `<div style="background:#f8fafc;border-left:3px solid #94a3b8;border-radius:0 6px 6px 0;padding:7px 10px;margin-bottom:4px;"><div style="font-size:12px;color:#1c1917;line-height:1.5;font-family:Arial,sans-serif;">${msgText.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</div></div>`;
+                            return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td bgcolor="#f8fafc" style="background-color:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:9px 12px;"><div style="font-size:13px;color:#1c1917;line-height:1.55;${FONT}">${body}</div></td></tr></table>`;
                         }
                     }).join('');
 
-                    return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:10px;"><tr><td style="background-color:#fffbf5;border-left:3px solid #f59e0b;padding:10px 12px;border-radius:0 8px 8px 0;"><table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:8px;"><tr><td width="32" valign="middle" style="padding-right:8px;">${avatar}</td><td valign="middle"><div style="font-weight:700;font-size:12px;color:#1a1a1a;font-family:Arial,sans-serif;">${contact.name}</div><div style="font-size:10px;color:#666;font-family:Arial,sans-serif;">${contact.title || ''}</div></td></tr></table>${threadBubbles}</td></tr></table>`;
+                    return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:10px;"><tr><td bgcolor="#ffffff" style="background-color:#ffffff;border:1px solid #fde68a;border-left:4px solid #f59e0b;border-radius:10px;padding:12px 14px;"><table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:10px;"><tr><td width="40" valign="middle" style="padding-right:12px;">${avatar}</td><td valign="middle"><div style="font-weight:700;font-size:13px;color:#0f172a;${FONT}">${esc(contact.name)}</div><div style="font-size:11px;color:#64748b;${FONT}margin-top:2px;">${esc(contact.title || '')}</div></td><td align="right" valign="middle"><span style="display:inline-block;background-color:#fef3c7;color:#b45309;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;padding:3px 8px;border-radius:999px;${FONT}">Replied</span></td></tr></table>${threadBubbles}</td></tr></table>`;
                 } else {
                     // Fallback: single message (no full thread available)
-                    return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td style="background-color:#fffbf5;border-left:3px solid #f59e0b;padding:8px 10px;border-radius:0 8px 8px 0;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td width="32" valign="top" style="padding-right:8px;">${avatar}</td><td valign="top"><div style="font-weight:600;font-size:12px;color:#1a1a1a;font-family:Arial,sans-serif;">${contact.name}</div><div style="font-size:10px;color:#666;font-family:Arial,sans-serif;">${contact.title || ''}</div><div style="font-size:11px;color:#555;font-style:italic;font-family:Arial,sans-serif;line-height:1.3;margin-top:3px;">"${truncateText(contact.message, 120)}"</div></td></tr></table></td></tr></table>`;
+                    return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:8px;"><tr><td bgcolor="#ffffff" style="background-color:#ffffff;border:1px solid #fde68a;border-left:4px solid #f59e0b;border-radius:10px;padding:12px 14px;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td width="40" valign="top" style="padding-right:12px;">${avatar}</td><td valign="top"><div style="font-weight:700;font-size:13px;color:#0f172a;${FONT}">${esc(contact.name)}</div><div style="font-size:11px;color:#64748b;${FONT}margin-top:2px;">${esc(contact.title || '')}</div><div style="font-size:12px;color:#44403c;font-style:italic;${FONT}line-height:1.5;margin-top:6px;background-color:#fffbeb;border-radius:8px;padding:8px 10px;">&ldquo;${esc(truncateText(contact.message, 140))}&rdquo;</div></td></tr></table></td></tr></table>`;
                 }
             };
 
             const repliesHTML = weeklyData.repliesReceived.length > 0
                 ? weeklyData.repliesReceived.map(renderConversation).join('')
-                : `<p style="color:#999;font-size:11px;font-style:italic;margin:4px 0;font-family:Arial,sans-serif;">No replies ${weekRange.periodLabel}</p>`;
+                : `<p style="color:#94a3b8;font-size:12px;font-style:italic;margin:4px 0;${FONT}">No replies ${weekRange.periodLabel}</p>`;
             
             // Shared card renderer for meeting-type contacts
-            const renderMeetingContact = (contact, accentColor) => {
-                const avatar = contact.profilePicture
-                    ? `<img src="${contact.profilePicture}" alt="" width="32" height="32" style="border-radius:50%;display:block;" />`
-                    : `<div style="width:32px;height:32px;border-radius:50%;background-color:${accentColor};color:#fff;font-weight:700;font-size:12px;text-align:center;line-height:32px;font-family:Arial,sans-serif;">${getInitials(contact.name)}</div>`;
-                return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td style="background-color:#f8fafc;border-left:3px solid ${accentColor};padding:8px 10px;border-radius:0 8px 8px 0;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td width="32" valign="top" style="padding-right:8px;">${avatar}</td><td valign="top"><div style="font-weight:600;font-size:12px;color:#1a1a1a;font-family:Arial,sans-serif;line-height:1.2;">${contact.name}</div><div style="font-size:10px;color:#666;font-family:Arial,sans-serif;">${contact.title || ''}</div>${contact.message ? `<div style="font-size:11px;color:#555;font-style:italic;font-family:Arial,sans-serif;line-height:1.3;margin-top:2px;">"${truncateText(contact.message, 100)}"</div>` : ''}</td></tr></table></td></tr></table>`;
+            const renderMeetingContact = (contact, accentColor, tintColor, badgeText) => {
+                const avatar = avatarHTML(contact, accentColor);
+                return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:8px;"><tr><td bgcolor="#ffffff" style="background-color:#ffffff;border:1px solid ${tintColor};border-left:4px solid ${accentColor};border-radius:10px;padding:10px 12px;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td width="40" valign="top" style="padding-right:12px;">${avatar}</td><td valign="top"><div style="font-weight:700;font-size:13px;color:#0f172a;${FONT}line-height:1.3;">${esc(contact.name)}</div><div style="font-size:11px;color:#64748b;${FONT}margin-top:2px;">${esc(contact.title || '')}</div>${contact.message ? `<div style="font-size:12px;color:#44403c;font-style:italic;${FONT}line-height:1.5;margin-top:6px;">&ldquo;${esc(truncateText(contact.message, 120))}&rdquo;</div>` : ''}</td><td align="right" valign="top"><span style="display:inline-block;background-color:${tintColor};color:${accentColor};font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;padding:3px 8px;border-radius:999px;white-space:nowrap;${FONT}">${badgeText}</span></td></tr></table></td></tr></table>`;
             };
 
             // Render "interested in meeting" contacts (Response Willing to Meet)
             const interestedHTML = weeklyData.interestedInMeeting.length > 0
-                ? weeklyData.interestedInMeeting.map(c => renderMeetingContact(c, '#0891b2')).join('')
-                : `<p style="color:#999;font-size:11px;font-style:italic;margin:4px 0;font-family:Arial,sans-serif;">No new meeting interest ${weekRange.periodLabel}</p>`;
+                ? weeklyData.interestedInMeeting.map(c => renderMeetingContact(c, '#0891b2', '#cffafe', 'Interested')).join('')
+                : `<p style="color:#94a3b8;font-size:12px;font-style:italic;margin:4px 0;${FONT}">No new meeting interest ${weekRange.periodLabel}</p>`;
 
             // Render "scheduled meetings" contacts (Scheduled)
             const meetingsHTML = weeklyData.meetingRequests.length > 0
-                ? weeklyData.meetingRequests.map(c => renderMeetingContact(c, '#0d3b66')).join('')
-                : `<p style="color:#999;font-size:11px;font-style:italic;margin:4px 0;font-family:Arial,sans-serif;">No meetings scheduled ${weekRange.periodLabel}</p>`;
+                ? weeklyData.meetingRequests.map(c => renderMeetingContact(c, '#0d3b66', '#dbeafe', 'Booked')).join('')
+                : `<p style="color:#94a3b8;font-size:12px;font-style:italic;margin:4px 0;${FONT}">No meetings scheduled ${weekRange.periodLabel}</p>`;
             
             // Dynamic wording based on email type
             const titleText = weekRange.periodTitle === 'Weekly' ? '📈 Weekly LinkedIn Update' : '📊 Daily LinkedIn Update';
@@ -2703,115 +2736,143 @@
             const harvestPoolTitle = isNewPool ? '🌱 Your Harvest Pool is Growing' : `🌱 Harvest Pool — ${poolNow} contacts`;
             const harvestPoolDescription = 'Your <strong>Pando Harvest Pool</strong> is the group of your target LinkedIn connections that have aged 30 days since connection. These leaders are at a high-likelihood for engagement in the future.';
             const weekGrowthLine = poolWeekGrowth > 0
-                ? `<p style="font-size:12px;color:#065f46;margin:6px 0 0;font-family:Arial,sans-serif;"><b>+${poolWeekGrowth}</b> new contacts entered your pool this week.</p>`
+                ? `<p style="font-size:12px;color:#065f46;margin:8px 0 0;${FONT}"><span style="display:inline-block;background-color:#dcfce7;color:#15803d;font-weight:800;padding:2px 8px;border-radius:999px;font-size:12px;">+${poolWeekGrowth}</span> &nbsp;new contacts entered your pool this week.</p>`
                 : (poolNow !== null && poolNow > 0)
-                    ? `<p style="font-size:12px;color:#475569;margin:6px 0 0;font-family:Arial,sans-serif;">No new contacts entered the pool this week — keep building connections!</p>`
-                    : `<p style="font-size:12px;color:#475569;margin:6px 0 0;font-family:Arial,sans-serif;">Connections accepted today will enter your pool in 30 days. Keep reaching out!</p>`;
-            const poolSizeLine = poolNow !== null && poolNow > 0
-                ? `<p style="font-size:13px;color:#1a1a1a;margin:4px 0;font-family:Arial,sans-serif;"><b>Current pool:</b> <span style="color:#15803d;font-weight:800;">${poolNow}</span> harvest-eligible contacts</p>`
+                    ? `<p style="font-size:12px;color:#475569;margin:8px 0 0;${FONT}">No new contacts entered the pool this week &#8212; keep building connections!</p>`
+                    : `<p style="font-size:12px;color:#475569;margin:8px 0 0;${FONT}">Connections accepted today will enter your pool in 30 days. Keep reaching out!</p>`;
+            const poolBigNumber = poolNow !== null && poolNow > 0
+                ? `<td width="88" valign="middle" align="center" style="padding-left:12px;"><div bgcolor="#ffffff" style="background-color:#ffffff;border:1px solid #bbf7d0;border-radius:12px;padding:10px 6px;"><div style="font-size:30px;font-weight:800;color:#15803d;${FONT}line-height:1;">${poolNow}</div><div style="font-size:9px;font-weight:700;color:#166534;text-transform:uppercase;letter-spacing:0.6px;${FONT}margin-top:4px;">In pool</div></div></td>`
                 : '';
-            const harvestPoolHTML = `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:14px;"><tr><td style="background-color:#f0fdf4;border-left:3px solid #15803d;padding:12px 14px;border-radius:0 8px 8px 0;"><div style="font-size:13px;font-weight:700;color:#14532d;font-family:Arial,sans-serif;margin-bottom:6px;">${harvestPoolTitle}</div><p style="font-size:12px;color:#374151;line-height:1.5;margin:0;font-family:Arial,sans-serif;">${harvestPoolDescription}</p>${poolSizeLine}${weekGrowthLine}</td></tr></table>`;
+            const harvestPoolHTML = `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:16px;"><tr><td bgcolor="#f0fdf4" style="background-color:#f0fdf4;border:1px solid #bbf7d0;border-left:4px solid #15803d;border-radius:12px;padding:14px 16px;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td valign="middle"><div style="font-size:14px;font-weight:800;color:#14532d;${FONT}margin-bottom:6px;">${harvestPoolTitle}</div><p style="font-size:12px;color:#374151;line-height:1.55;margin:0;${FONT}">${harvestPoolDescription}</p>${weekGrowthLine}</td>${poolBigNumber}</tr></table></td></tr></table>`;
 
-            // ── Monthly Targets section ───────────────────────────────────────────
+            // ── Monthly Targets section (table-based progress bars: email-safe) ───
             const targetMonthlyConnections = bdr.targetMonthlyConnections || 0;
             const targetMonthlyReplies = bdr.targetMonthlyReplies || 0;
             const targetMonthlyMeetings = bdr.targetMonthlyMeetings || 0;
             const currentMonthName = new Date(selectedMonthYear.year, selectedMonthYear.month, 1).toLocaleString('default', { month: 'long' });
             let monthlyTargetsHTML = '';
             if (targetMonthlyConnections > 0 || targetMonthlyReplies > 0 || targetMonthlyMeetings > 0) {
-                const mtdConnections = monthlyData.connectionsReceived;
-                const mtdReplies     = monthlyData.repliesReceived;
-                const mtdMeetings    = monthlyData.meetingRequests;
-                const connPct = targetMonthlyConnections > 0 ? Math.min(100, Math.round((mtdConnections / targetMonthlyConnections) * 100)) : 0;
-                const repPct  = targetMonthlyReplies > 0     ? Math.min(100, Math.round((mtdReplies    / targetMonthlyReplies)    * 100)) : 0;
-                const meetPct = targetMonthlyMeetings > 0    ? Math.min(100, Math.round((mtdMeetings   / targetMonthlyMeetings)   * 100)) : 0;
-                const connBar = targetMonthlyConnections > 0
-                    ? `<div style="margin-bottom:10px;"><div style="display:flex;justify-content:space-between;font-size:11px;font-family:Arial,sans-serif;color:#374151;margin-bottom:3px;"><span><b>New Connections</b></span><span style="color:#059669;">${mtdConnections} in ${currentMonthName} / ${targetMonthlyConnections} target</span></div><div style="background:#e5e7eb;border-radius:4px;height:8px;"><div style="background:#10b981;border-radius:4px;height:8px;width:${connPct}%;"></div></div></div>`
-                    : '';
-                const repBar = targetMonthlyReplies > 0
-                    ? `<div style="margin-bottom:10px;"><div style="display:flex;justify-content:space-between;font-size:11px;font-family:Arial,sans-serif;color:#374151;margin-bottom:3px;"><span><b>Contact Replies</b></span><span style="color:#d97706;">${mtdReplies} in ${currentMonthName} / ${targetMonthlyReplies} target</span></div><div style="background:#e5e7eb;border-radius:4px;height:8px;"><div style="background:#f59e0b;border-radius:4px;height:8px;width:${repPct}%;"></div></div></div>`
-                    : '';
-                const meetBar = targetMonthlyMeetings > 0
-                    ? `<div><div style="display:flex;justify-content:space-between;font-size:11px;font-family:Arial,sans-serif;color:#374151;margin-bottom:3px;"><span><b>Meetings Booked</b></span><span style="color:#0d3b66;">${mtdMeetings} in ${currentMonthName} / ${targetMonthlyMeetings} target</span></div><div style="background:#e5e7eb;border-radius:4px;height:8px;"><div style="background:#0d3b66;border-radius:4px;height:8px;width:${meetPct}%;"></div></div></div>`
-                    : '';
-                monthlyTargetsHTML = `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:14px;"><tr><td style="background-color:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px 14px;"><div style="font-size:13px;font-weight:700;color:#1a1a1a;font-family:Arial,sans-serif;margin-bottom:10px;">🎯 ${currentMonthName} Targets</div>${connBar}${repBar}${meetBar}</td></tr></table>`;
+                const progressBar = (label, actual, target, color, trackTint, isLast) => {
+                    if (!(target > 0)) return '';
+                    const pct = Math.min(100, Math.round((actual / target) * 100));
+                    const hit = actual >= target;
+                    const fillW = Math.max(pct, 1);
+                    const statusChip = hit
+                        ? `<span style="display:inline-block;background-color:${color};color:#ffffff;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.6px;padding:2px 7px;border-radius:999px;margin-left:6px;${FONT}">Goal hit</span>`
+                        : `<span style="color:#94a3b8;font-size:11px;${FONT}">${pct}%</span>`;
+                    return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:${isLast ? 0 : 12}px;"><tr><td style="padding-bottom:5px;"><table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td style="font-size:12px;font-weight:700;color:#0f172a;${FONT}">${label}</td><td align="right" style="font-size:12px;color:#475569;${FONT}white-space:nowrap;"><b style="color:${color};font-size:14px;">${actual}</b> / ${target} &nbsp;${statusChip}</td></tr></table></td></tr><tr><td><table cellpadding="0" cellspacing="0" border="0" width="100%" bgcolor="${trackTint}" style="background-color:${trackTint};border-radius:999px;"><tr><td width="${fillW}%" height="10" bgcolor="${color}" style="background-color:${color};border-radius:999px;height:10px;font-size:0;line-height:0;">&nbsp;</td>${fillW < 100 ? `<td width="${100 - fillW}%" height="10" style="font-size:0;line-height:0;">&nbsp;</td>` : ''}</tr></table></td></tr></table>`;
+                };
+                const bars = [
+                    progressBar('New Connections', monthlyData.connectionsReceived, targetMonthlyConnections, '#10b981', '#d1fae5', !(targetMonthlyReplies > 0 || targetMonthlyMeetings > 0)),
+                    progressBar('Contact Replies',  monthlyData.repliesReceived,     targetMonthlyReplies,     '#f59e0b', '#fef3c7', !(targetMonthlyMeetings > 0)),
+                    progressBar('Meetings Booked',  monthlyData.meetingRequests,     targetMonthlyMeetings,    '#0d3b66', '#dbeafe', true)
+                ].join('');
+                monthlyTargetsHTML = `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:16px;"><tr><td bgcolor="#ffffff" style="background-color:#ffffff;border:1px solid #e2e8f0;border-radius:12px;padding:16px 18px;"><table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:12px;"><tr><td style="font-size:14px;font-weight:800;color:#12314C;${FONT}">&#127919; ${currentMonthName} Targets</td><td align="right" style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;${FONT}">Month to date</td></tr></table>${bars}</td></tr></table>`;
             }
             
-            // ── Conditional Messages column (hide if 0) ───────────────────────────
+            // ── Stat card builder ─────────────────────────────────────────────────
+            // Big number, colored top accent, soft tinted background. Pure table/inline.
+            const statCard = (value, label, color, tint, width, size = 34) =>
+                `<td width="${width}" valign="top" bgcolor="${tint}" style="background-color:${tint};border-top:4px solid ${color};border-radius:10px;padding:14px 6px 12px;text-align:center;"><div style="font-size:${size}px;font-weight:800;color:${color};${FONT}line-height:1;letter-spacing:-1px;">${value}</div><div style="font-size:9px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.8px;${FONT}margin-top:7px;line-height:1.4;">${label}</div></td>`;
+            const gap = (w) => `<td width="${w}" style="font-size:0;line-height:0;">&nbsp;</td>`;
+
+            // ── Outreach row (Messages hidden if 0) ──────────────────────────────
             const showMessages = weeklyData.messagesSent > 0;
-            const outreachColW = showMessages ? '32%' : '48%';
-            const outreachGapW = showMessages ? '2%' : '4%';
-            const messagesStatCell = showMessages
-                ? `<td width="2%"></td><td width="32%" valign="top" style="padding:12px 8px;background-color:#f5f3ff;text-align:center;border-bottom:3px solid #6366f1;border-radius:4px;"><div style="font-size:30px;font-weight:800;color:#4f46e5;font-family:Arial,sans-serif;line-height:1;">${weeklyData.messagesSent}</div><div style="font-size:9px;font-weight:600;color:#7c3aed;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;line-height:1.4;">Messages to<br>Current Connections</div></td>`
-                : '';
+            const outreachRow = showMessages
+                ? statCard(weeklyData.connectionRequestsSent, 'Requests<br>Sent', '#0F2D4D', '#eef4fb', '32%')
+                    + gap('2%') + statCard(weeklyData.messagesSent, 'Messages to<br>Connections', '#4f46e5', '#f5f3ff', '32%')
+                    + gap('2%') + statCard(weeklyData.postsLiked, 'Posts<br>Liked', '#db2777', '#fdf2f8', '32%')
+                : statCard(weeklyData.connectionRequestsSent, 'Requests<br>Sent', '#0F2D4D', '#eef4fb', '48%')
+                    + gap('4%') + statCard(weeklyData.postsLiked, 'Posts<br>Liked', '#db2777', '#fdf2f8', '48%');
+
+            // ── Results row (4 cols) ─────────────────────────────────────────────
+            const resultsRow =
+                statCard(weeklyData.connectionsReceived.length, 'Connections<br>Accepted', '#059669', '#f0fdf4', '23.5%', 30)
+                + gap('2%') + statCard(weeklyData.repliesReceived.length, 'Replies<br>Received', '#d97706', '#fffbeb', '23.5%', 30)
+                + gap('2%') + statCard(weeklyData.interestedInMeeting.length, 'Interested<br>in Meeting', '#0891b2', '#ecfeff', '23.5%', 30)
+                + gap('2%') + statCard(weeklyData.meetingRequests.length, 'Meetings<br>Scheduled', '#0d3b66', '#eff6ff', '23.5%', 30);
+
+            // ── Hero funnel strip (sent → accepted → replies) ─────────────────────
+            const sent = weeklyData.connectionRequestsSent;
+            const accepted = weeklyData.connectionsReceived.length;
+            const replies = weeklyData.repliesReceived.length;
+            const acceptRate = sent > 0 ? Math.round((accepted / sent) * 100) : null;
+            const funnelCell = (n, label) => `<td align="center" valign="middle" style="padding:0 4px;"><div style="font-size:24px;font-weight:800;color:#ffffff;${FONT}line-height:1;">${n}</div><div style="font-size:9px;font-weight:700;color:#B9A77E;text-transform:uppercase;letter-spacing:1px;${FONT}margin-top:4px;">${label}</div></td>`;
+            const funnelArrow = `<td width="24" align="center" valign="middle" style="color:#94AD82;font-size:18px;${FONT}">&#8594;</td>`;
+            const heroFunnelHTML = `<table cellpadding="0" cellspacing="0" border="0" align="center" style="margin:18px auto 0;"><tr><td bgcolor="#1b4166" style="background-color:#1b4166;border:1px solid #2d5a85;border-radius:12px;padding:12px 18px;"><table cellpadding="0" cellspacing="0" border="0"><tr>${funnelCell(sent, 'Sent')}${funnelArrow}${funnelCell(accepted, 'Accepted')}${funnelArrow}${funnelCell(replies, 'Replies')}${acceptRate !== null ? `<td width="1" style="background-color:#2d5a85;padding:0;"></td><td align="center" valign="middle" style="padding-left:16px;"><div style="font-size:24px;font-weight:800;color:#94AD82;${FONT}line-height:1;">${acceptRate}%</div><div style="font-size:9px;font-weight:700;color:#B9A77E;text-transform:uppercase;letter-spacing:1px;${FONT}margin-top:4px;">Accept rate</div></td>` : ''}</tr></table></td></tr></table>`;
+
+            // ── Section header builder ────────────────────────────────────────────
+            const sectionHeader = (emoji, text, count, color, tint) =>
+                `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:10px;"><tr><td width="34" valign="middle"><div style="width:34px;height:34px;border-radius:10px;background-color:${tint};text-align:center;line-height:34px;font-size:17px;">${emoji}</div></td><td valign="middle" style="padding-left:10px;"><div style="font-size:15px;font-weight:800;color:#0f172a;${FONT}line-height:1.3;">${text}</div></td><td align="right" valign="middle"><span style="display:inline-block;background-color:${color};color:#ffffff;font-size:12px;font-weight:800;min-width:18px;padding:3px 10px;border-radius:999px;${FONT}">${count}</span></td></tr><tr><td colspan="3" style="padding-top:8px;"><div style="height:2px;background-color:${tint};border-radius:2px;"></div></td></tr></table>`;
+            const section = (emoji, text, count, color, tint, bodyHTML) =>
+                `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:22px;"><tr><td>${sectionHeader(emoji, text, count, color, tint)}${bodyHTML}</td></tr></table>`;
+            const plural = (n, one, many) => n === 1 ? one : many;
 
             // ── Outreach Strategy note (read per-BDR textarea) ────────────────
             const strategyText = (document.getElementById(`strategy-${bdr.id}`)?.value || '').trim();
             const strategyHTML = strategyText
-                ? `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:18px;"><tr><td style="background-color:#fffbeb;border-left:4px solid #f59e0b;border-radius:0 8px 8px 0;padding:14px 16px;"><div style="font-size:10px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:1px;font-family:Arial,sans-serif;margin-bottom:8px;">&#128203; Outreach Strategy</div><p style="font-size:13px;color:#1c1917;line-height:1.7;margin:0;font-family:Arial,sans-serif;white-space:pre-wrap;">${strategyText.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</p></td></tr></table>`
+                ? `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:20px;"><tr><td bgcolor="#fffbeb" style="background-color:#fffbeb;border:1px solid #fde68a;border-left:4px solid #f59e0b;border-radius:12px;padding:14px 16px;"><div style="font-size:10px;font-weight:800;color:#92400e;text-transform:uppercase;letter-spacing:1.2px;${FONT}margin-bottom:8px;">&#128203; Outreach Strategy</div><p style="font-size:13px;color:#1c1917;line-height:1.7;margin:0;${FONT}white-space:pre-wrap;">${esc(strategyText)}</p></td></tr></table>`
                 : '';
 
+            const eyebrow = (text) => `<div style="font-size:10px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:1.5px;${FONT}margin-bottom:8px;">${text}</div>`;
+
             emailBody.innerHTML =
-                // ── Header banner ─────────────────────────────────────────────────
-                `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#12314C;"><tr><td style="background:#12314C;border-bottom:2px solid #B9A77E;padding:26px 24px 22px;text-align:center;"><div style="font-size:10px;font-weight:700;color:#94AD82;text-transform:uppercase;letter-spacing:2px;font-family:Arial,sans-serif;margin-bottom:8px;">PandoConnect</div><h1 style="color:#ffffff;font-size:22px;font-weight:800;margin:0 0 8px 0;font-family:Arial,sans-serif;">${titleText}</h1><span style="color:#94AD82;font-size:12px;font-weight:500;font-family:Arial,sans-serif;">${weekRange.display}</span></td></tr></table>`
+                // ── Outer canvas (soft page background so the card "floats") ───────
+                `<table cellpadding="0" cellspacing="0" border="0" width="100%" bgcolor="#EEF2F6" style="background-color:#EEF2F6;"><tr><td align="center" style="padding:18px 10px 24px;">`
+                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="max-width:600px;">`
+                // ── Hero header ───────────────────────────────────────────────────
+                + `<tr><td bgcolor="#12314C" style="background-color:#12314C;background-image:linear-gradient(135deg,#12314C 0%,#1b4166 60%,#24507a 100%);border-radius:16px 16px 0 0;padding:30px 28px 26px;text-align:center;">`
+                + `<div style="font-size:10px;font-weight:800;color:#94AD82;text-transform:uppercase;letter-spacing:3px;${FONT}margin-bottom:12px;">PandoConnect</div>`
+                + `<h1 style="color:#ffffff;font-size:26px;font-weight:800;margin:0 0 10px 0;${FONT}letter-spacing:-0.5px;line-height:1.2;">${titleText}</h1>`
+                + `<span style="display:inline-block;background-color:rgba(255,255,255,0.10);border:1px solid #B9A77E;color:#F6F4EF;font-size:12px;font-weight:600;padding:5px 14px;border-radius:999px;${FONT}">${weekRange.display}</span>`
+                + heroFunnelHTML
+                + `</td></tr>`
+                // ── Gold accent line under hero ──────────────────────────────────
+                + `<tr><td height="4" bgcolor="#B9A77E" style="background-color:#B9A77E;background-image:linear-gradient(90deg,#B9A77E 0%,#94AD82 50%,#B9A77E 100%);font-size:0;line-height:0;">&nbsp;</td></tr>`
                 // ── Main body ──────────────────────────────────────────────────────
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#ffffff;border:1px solid #e0e0e0;border-top:none;"><tr><td style="padding:22px 24px;">`
+                + `<tr><td bgcolor="#ffffff" style="background-color:#ffffff;padding:26px 26px 10px;">`
                 // Greeting
-                + `<p style="font-size:17px;font-weight:700;color:#12314C;margin:0 0 6px 0;font-family:Arial,sans-serif;">Hi ${firstName} &#8212;</p>`
+                + `<p style="font-size:20px;font-weight:800;color:#12314C;margin:0 0 6px 0;${FONT}letter-spacing:-0.3px;">Hi ${esc(firstName)} &#128075;</p>`
+                + `<p style="font-size:14px;color:#475569;line-height:1.6;margin:0 0 18px 0;${FONT}">Here&rsquo;s your LinkedIn roundup for ${periodLabel}. ${sent > 0 || accepted > 0 ? 'Nice work staying active &#8212; the numbers below show what you put out and what came back.' : 'Let&rsquo;s get some momentum going this coming week.'}</p>`
                 // Rebrand notice
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 16px 0;"><tr><td style="background-color:#F6F4EF;border-left:4px solid #4E6E4A;border-radius:0 8px 8px 0;padding:12px 14px;"><p style="font-size:13px;color:#12314C;font-weight:700;margin:0 0 4px 0;font-family:Arial,sans-serif;">HealthLuminate is now Pando Health</p><p style="font-size:12px;color:#475569;margin:0;line-height:1.55;font-family:Arial,sans-serif;">Your HealthLuminate login works for Pando — same account, no new signup needed. You can access all of your content at <a href="https://healthluminate.com" style="color:#4E6E4A;font-weight:600;text-decoration:underline;">HealthLuminate.com</a> or <a href="https://pandonetworking.com" style="color:#4E6E4A;font-weight:600;text-decoration:underline;">pandonetworking.com</a>.</p></td></tr></table>`
-                + `<p style="font-size:14px;color:#555;line-height:1.6;margin:0 0 20px 0;font-family:Arial,sans-serif;">Here is a roundup of your LinkedIn activity ${periodLabel}:</p>`
+                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 22px 0;"><tr><td bgcolor="#F6F4EF" style="background-color:#F6F4EF;border:1px solid #e7e2d6;border-left:4px solid #4E6E4A;border-radius:12px;padding:12px 14px;"><p style="font-size:13px;color:#12314C;font-weight:800;margin:0 0 4px 0;${FONT}">HealthLuminate is now Pando Health</p><p style="font-size:12px;color:#475569;margin:0;line-height:1.55;${FONT}">Your HealthLuminate login works for Pando &#8212; same account, no new signup needed. Access all of your content at <a href="https://healthluminate.com" style="color:#4E6E4A;font-weight:700;text-decoration:underline;">HealthLuminate.com</a> or <a href="https://pandonetworking.com" style="color:#4E6E4A;font-weight:700;text-decoration:underline;">pandonetworking.com</a>.</p></td></tr></table>`
                 // Outreach Strategy callout (only when text is present)
                 + strategyHTML
-                // Rainbow gradient divider
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:18px;"><tr><td style="height:3px;background:linear-gradient(90deg,#0F2D4D 0%,#6366f1 40%,#10b981 70%,#f59e0b 100%);border-radius:2px;"></td></tr></table>`
-                // ── Outreach row label ─────────────────────────────────────────────
-                + `<div style="font-size:9px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;font-family:Arial,sans-serif;margin-bottom:6px;">What you did</div>`
-                // ── Outreach stats row (Messages hidden if 0) ─────────────────────
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr>`
-                + `<td width="${outreachColW}" valign="top" style="padding:12px 8px;background-color:#f0f7ff;text-align:center;border-bottom:3px solid #0F2D4D;border-radius:4px;"><div style="font-size:30px;font-weight:800;color:#0d3b66;font-family:Arial,sans-serif;line-height:1;">${weeklyData.connectionRequestsSent}</div><div style="font-size:9px;font-weight:600;color:#0F2D4D;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;">Requests Sent</div></td>`
-                + messagesStatCell
-                + `<td width="${outreachGapW}"></td><td width="${outreachColW}" valign="top" style="padding:12px 8px;background-color:#fdf2f8;text-align:center;border-bottom:3px solid #ec4899;border-radius:4px;"><div style="font-size:30px;font-weight:800;color:#db2777;font-family:Arial,sans-serif;line-height:1;">${weeklyData.postsLiked}</div><div style="font-size:9px;font-weight:600;color:#db2777;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;">Posts Liked</div></td>`
-                + `</tr></table>`
-                // ── Results row label ──────────────────────────────────────────────
-                + `<div style="font-size:9px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;font-family:Arial,sans-serif;margin-top:14px;margin-bottom:6px;">What came back</div>`
-                // ── Results stats row (4 cols: connections, replies, interested, scheduled)
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:22px;"><tr>`
-                + `<td width="23%" valign="top" style="padding:10px 6px;background-color:#f0fdf4;text-align:center;border-bottom:3px solid #10b981;border-radius:4px;"><div style="font-size:26px;font-weight:800;color:#059669;font-family:Arial,sans-serif;line-height:1;">${weeklyData.connectionsReceived.length}</div><div style="font-size:9px;font-weight:600;color:#059669;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;line-height:1.4;">Connections<br>Accepted</div></td>`
-                + `<td width="2%"></td>`
-                + `<td width="23%" valign="top" style="padding:10px 6px;background-color:#fffbeb;text-align:center;border-bottom:3px solid #f59e0b;border-radius:4px;"><div style="font-size:26px;font-weight:800;color:#d97706;font-family:Arial,sans-serif;line-height:1;">${weeklyData.repliesReceived.length}</div><div style="font-size:9px;font-weight:600;color:#d97706;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;line-height:1.4;">Replies<br>Received</div></td>`
-                + `<td width="2%"></td>`
-                + `<td width="23%" valign="top" style="padding:10px 6px;background-color:#ecfeff;text-align:center;border-bottom:3px solid #0891b2;border-radius:4px;"><div style="font-size:26px;font-weight:800;color:#0891b2;font-family:Arial,sans-serif;line-height:1;">${weeklyData.interestedInMeeting.length}</div><div style="font-size:9px;font-weight:600;color:#0891b2;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;line-height:1.4;">Interested<br>in Meeting</div></td>`
-                + `<td width="2%"></td>`
-                + `<td width="23%" valign="top" style="padding:10px 6px;background-color:#eff6ff;text-align:center;border-bottom:3px solid #0d3b66;border-radius:4px;"><div style="font-size:26px;font-weight:800;color:#0d3b66;font-family:Arial,sans-serif;line-height:1;">${weeklyData.meetingRequests.length}</div><div style="font-size:9px;font-weight:600;color:#0d3b66;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;line-height:1.4;">Meetings<br>Scheduled</div></td>`
-                + `</tr></table>`
+                // ── Outreach stats ────────────────────────────────────────────────
+                + eyebrow('&#128640; What you did')
+                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:18px;"><tr>${outreachRow}</tr></table>`
+                // ── Results stats ─────────────────────────────────────────────────
+                + eyebrow('&#127881; What came back')
+                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:26px;"><tr>${resultsRow}</tr></table>`
                 // ── New Connections section ────────────────────────────────────────
-                + (weeklyData.connectionsReceived.length > 0
-                    ? `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:18px;"><tr><td style="padding-bottom:8px;border-bottom:2px solid #10b981;"><span style="font-size:14px;font-weight:700;color:#059669;font-family:Arial,sans-serif;">🤝 You had ${weeklyData.connectionsReceived.length} ${weeklyData.connectionsReceived.length === 1 ? 'person' : 'people'} accept your connection request${weeklyData.connectionsReceived.length === 1 ? '' : 's'}</span></td></tr><tr><td style="padding-top:10px;">${connectionsHTML}</td></tr></table>`
+                + (accepted > 0
+                    ? section('&#129309;', `${accepted} ${plural(accepted, 'person', 'people')} accepted your connection request`, accepted, '#10b981', '#d1fae5', connectionsHTML)
                     : '')
                 // ── Replies section ────────────────────────────────────────────────
-                + (weeklyData.repliesReceived.length > 0
-                    ? `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:18px;"><tr><td style="padding-bottom:8px;border-bottom:2px solid #f59e0b;"><span style="font-size:14px;font-weight:700;color:#d97706;font-family:Arial,sans-serif;">💬 You had ${weeklyData.repliesReceived.length} ${weeklyData.repliesReceived.length === 1 ? 'person' : 'people'} reply to your connection request${weeklyData.repliesReceived.length === 1 ? '' : 's'}</span></td></tr><tr><td style="padding-top:10px;">${repliesHTML}</td></tr></table>`
+                + (replies > 0
+                    ? section('&#128172;', `${replies} ${plural(replies, 'person', 'people')} replied to you`, replies, '#f59e0b', '#fef3c7', repliesHTML)
                     : '')
                 // ── Interested in Meeting section (Response Willing to Meet) ──────
                 + (weeklyData.interestedInMeeting.length > 0
-                    ? `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:18px;"><tr><td style="padding-bottom:8px;border-bottom:2px solid #0891b2;"><span style="font-size:14px;font-weight:700;color:#0891b2;font-family:Arial,sans-serif;">🤙 ${weeklyData.interestedInMeeting.length} ${weeklyData.interestedInMeeting.length === 1 ? 'person' : 'people'} expressed interest in meeting with you</span></td></tr><tr><td style="padding-top:10px;">${interestedHTML}</td></tr></table>`
+                    ? section('&#129305;', `${weeklyData.interestedInMeeting.length} ${plural(weeklyData.interestedInMeeting.length, 'person', 'people')} expressed interest in meeting`, weeklyData.interestedInMeeting.length, '#0891b2', '#cffafe', interestedHTML)
                     : '')
                 // ── Scheduled Meetings section ─────────────────────────────────────
                 + (weeklyData.meetingRequests.length > 0
-                    ? `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:18px;"><tr><td style="padding-bottom:8px;border-bottom:2px solid #0d3b66;"><span style="font-size:14px;font-weight:700;color:#0d3b66;font-family:Arial,sans-serif;">📅 ${weeklyData.meetingRequests.length} ${weeklyData.meetingRequests.length === 1 ? 'person' : 'people'} scheduled to meet with you</span></td></tr><tr><td style="padding-top:10px;">${meetingsHTML}</td></tr></table>`
+                    ? section('&#128197;', `${weeklyData.meetingRequests.length} ${plural(weeklyData.meetingRequests.length, 'meeting', 'meetings')} on the calendar`, weeklyData.meetingRequests.length, '#0d3b66', '#dbeafe', meetingsHTML)
                     : '')
                 // ── Harvest Pool ───────────────────────────────────────────────────
                 + harvestPoolHTML
                 // ── Monthly Targets ────────────────────────────────────────────────
                 + monthlyTargetsHTML
                 // ── Warm closing ───────────────────────────────────────────────────
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:6px;"><tr><td style="background:linear-gradient(135deg,#f0f7ff,#f0fdf4);border-left:4px solid #0F2D4D;border-radius:0 8px 8px 0;padding:14px 16px;"><p style="font-size:13px;color:#0d3b66;font-weight:700;margin:0 0 4px 0;font-family:Arial,sans-serif;">Keep up the great momentum, ${firstName}! 🚀</p><p style="font-size:12px;color:#475569;margin:0;line-height:1.5;font-family:Arial,sans-serif;">Every conversation opens a new door &#8212; keep connecting, keep growing.</p></td></tr></table>`
+                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:4px;margin-bottom:16px;"><tr><td bgcolor="#12314C" style="background-color:#12314C;background-image:linear-gradient(135deg,#12314C 0%,#1b4166 100%);border-radius:12px;padding:18px 20px;"><p style="font-size:15px;color:#ffffff;font-weight:800;margin:0 0 5px 0;${FONT}">Keep up the momentum, ${esc(firstName)}! &#128640;</p><p style="font-size:12px;color:#c7d2e0;margin:0;line-height:1.55;${FONT}">Every conversation opens a new door &#8212; keep connecting, keep growing.</p></td></tr></table>`
                 // ── Company monthly summary placeholder (filled async by loadAndRenderCompanyDashboard)
                 + `<div id="companyEmailPlaceholder"></div>`
-                + `</td></tr></table>`
+                + `</td></tr>`
                 // ── Footer ─────────────────────────────────────────────────────────
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%"><tr><td style="text-align:center;padding:12px 10px 8px;border-top:1px solid #e2e8f0;"><p style="color:#9ca3af;font-size:10px;margin:0 0 4px 0;font-family:Arial,sans-serif;">Sent by <b style="color:#4E6E4A;">PandoConnect</b> &nbsp;&middot;&nbsp; Powered by <b style="color:#12314C;">Pando</b></p><p style="color:#9ca3af;font-size:10px;margin:0;font-family:Arial,sans-serif;">HealthLuminate is now Pando Health &nbsp;&middot;&nbsp; <a href="https://healthluminate.com" style="color:#4E6E4A;text-decoration:underline;">healthluminate.com</a> &nbsp;|&nbsp; <a href="https://pandonetworking.com" style="color:#4E6E4A;text-decoration:underline;">pandonetworking.com</a></p></td></tr></table>`;
+                + `<tr><td bgcolor="#F8FAFC" style="background-color:#F8FAFC;border-top:1px solid #e2e8f0;border-radius:0 0 16px 16px;text-align:center;padding:16px 20px 18px;"><p style="color:#64748b;font-size:11px;margin:0 0 5px 0;${FONT}">Sent by <b style="color:#4E6E4A;">PandoConnect</b> &nbsp;&middot;&nbsp; Powered by <b style="color:#12314C;">Pando</b></p><p style="color:#94a3b8;font-size:10px;margin:0;${FONT}">HealthLuminate is now Pando Health &nbsp;&middot;&nbsp; <a href="https://healthluminate.com" style="color:#4E6E4A;text-decoration:underline;">healthluminate.com</a> &nbsp;|&nbsp; <a href="https://pandonetworking.com" style="color:#4E6E4A;text-decoration:underline;">pandonetworking.com</a></p></td></tr>`
+                + `</table>`
+                + `</td></tr></table>`;
         }
 
         // Truncate text helper
@@ -2956,33 +3017,32 @@
                 </tr>`).join('');
 
             // ── Inject email-compatible HTML into the placeholder ─────────────
+            const CFONT = "font-family:'Inter',Arial,Helvetica,sans-serif;";
+            const cStat = (value, label, color, tint, width, size = 30) =>
+                `<td width="${width}" valign="top" bgcolor="${tint}" style="background-color:${tint};border-top:4px solid ${color};border-radius:10px;padding:14px 6px 12px;text-align:center;"><div style="font-size:${size}px;font-weight:800;color:${color};${CFONT}line-height:1;letter-spacing:-1px;">${value}</div><div style="font-size:9px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.8px;${CFONT}margin-top:7px;line-height:1.4;">${label}</div></td>`;
+            const cGap = (w) => `<td width="${w}" style="font-size:0;line-height:0;">&nbsp;</td>`;
+            const cEyebrow = (text) => `<div style="font-size:10px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:1.5px;${CFONT}margin-bottom:8px;">${text}</div>`;
+
             placeholder.innerHTML =
-                // Divider
-                `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:22px 0 16px;"><tr><td style="height:3px;background:linear-gradient(90deg,#0F2D4D 0%,#6366f1 40%,#10b981 70%,#f59e0b 100%);border-radius:2px;"></td></tr></table>`
-                // Section header
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:16px;"><tr><td style="background:linear-gradient(135deg,#f0f4ff,#f0f7ff);border-left:4px solid #6366f1;padding:14px 16px;border-radius:0 8px 8px 0;"><div style="font-size:9px;font-weight:700;color:#6366f1;text-transform:uppercase;letter-spacing:1.5px;font-family:Arial,sans-serif;margin-bottom:5px;">&#127970; Company Monthly Summary</div><div style="font-size:15px;font-weight:800;color:#0d3b66;font-family:Arial,sans-serif;margin-bottom:2px;">Outreach Success: All Leaders at ${companyName}</div><div style="font-size:11px;color:#64748b;font-family:Arial,sans-serif;">Month of ${monthLabel}</div></td></tr></table>`
-                // "What they did" label
-                + `<div style="font-size:9px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;font-family:Arial,sans-serif;margin-bottom:6px;">What they did</div>`
-                // Requests + Likes row
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr>`
-                + `<td width="48%" valign="top" style="padding:12px 8px;background-color:#f0f7ff;text-align:center;border-bottom:3px solid #0F2D4D;border-radius:4px;"><div style="font-size:30px;font-weight:800;color:#0d3b66;font-family:Arial,sans-serif;line-height:1;">${totalRequestsSent}</div><div style="font-size:9px;font-weight:600;color:#0F2D4D;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;">Requests Sent</div></td>`
-                + `<td width="4%"></td>`
-                + `<td width="48%" valign="top" style="padding:12px 8px;background-color:#fdf2f8;text-align:center;border-bottom:3px solid #ec4899;border-radius:4px;"><div style="font-size:30px;font-weight:800;color:#db2777;font-family:Arial,sans-serif;line-height:1;">${totalPostsLiked}</div><div style="font-size:9px;font-weight:600;color:#db2777;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;">Posts Liked</div></td>`
-                + `</tr></table>`
-                // "What came back" label
-                + `<div style="font-size:9px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;font-family:Arial,sans-serif;margin-top:14px;margin-bottom:6px;">What came back</div>`
-                // 4-stat row
+                // Section header card
+                `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:6px 0 18px;"><tr><td bgcolor="#eef2ff" style="background-color:#eef2ff;border:1px solid #c7d2fe;border-left:4px solid #6366f1;border-radius:12px;padding:14px 16px;"><div style="font-size:10px;font-weight:800;color:#4f46e5;text-transform:uppercase;letter-spacing:1.5px;${CFONT}margin-bottom:5px;">&#127970; Company Monthly Summary</div><div style="font-size:16px;font-weight:800;color:#12314C;${CFONT}margin-bottom:3px;letter-spacing:-0.2px;">Outreach Success: All Leaders at ${companyName}</div><div style="font-size:11px;color:#64748b;${CFONT}">Month of ${monthLabel}</div></td></tr></table>`
+                // "What they did"
+                + cEyebrow('&#128640; What they did')
                 + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:18px;"><tr>`
-                + `<td width="23%" valign="top" style="padding:10px 6px;background-color:#f0fdf4;text-align:center;border-bottom:3px solid #10b981;border-radius:4px;"><div style="font-size:26px;font-weight:800;color:#059669;font-family:Arial,sans-serif;line-height:1;">${totalConnections}</div><div style="font-size:9px;font-weight:600;color:#059669;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;line-height:1.4;">Connections<br>Accepted</div></td>`
-                + `<td width="2%"></td>`
-                + `<td width="23%" valign="top" style="padding:10px 6px;background-color:#fffbeb;text-align:center;border-bottom:3px solid #f59e0b;border-radius:4px;"><div style="font-size:26px;font-weight:800;color:#d97706;font-family:Arial,sans-serif;line-height:1;">${totalReplies}</div><div style="font-size:9px;font-weight:600;color:#d97706;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;line-height:1.4;">Replies<br>Received</div></td>`
-                + `<td width="2%"></td>`
-                + `<td width="23%" valign="top" style="padding:10px 6px;background-color:#ecfeff;text-align:center;border-bottom:3px solid #0891b2;border-radius:4px;"><div style="font-size:26px;font-weight:800;color:#0891b2;font-family:Arial,sans-serif;line-height:1;">${totalInterested}</div><div style="font-size:9px;font-weight:600;color:#0891b2;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;line-height:1.4;">Interested<br>in Meeting</div></td>`
-                + `<td width="2%"></td>`
-                + `<td width="23%" valign="top" style="padding:10px 6px;background-color:#eff6ff;text-align:center;border-bottom:3px solid #0d3b66;border-radius:4px;"><div style="font-size:26px;font-weight:800;color:#0d3b66;font-family:Arial,sans-serif;line-height:1;">${totalScheduled}</div><div style="font-size:9px;font-weight:600;color:#0d3b66;text-transform:uppercase;font-family:Arial,sans-serif;margin-top:5px;line-height:1.4;">Meetings<br>Scheduled</div></td>`
+                + cStat(totalRequestsSent, 'Requests<br>Sent', '#0F2D4D', '#eef4fb', '48%', 34)
+                + cGap('4%')
+                + cStat(totalPostsLiked, 'Posts<br>Liked', '#db2777', '#fdf2f8', '48%', 34)
+                + `</tr></table>`
+                // "What came back"
+                + cEyebrow('&#127881; What came back')
+                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:18px;"><tr>`
+                + cStat(totalConnections, 'Connections<br>Accepted', '#059669', '#f0fdf4', '23.5%')
+                + cGap('2%') + cStat(totalReplies, 'Replies<br>Received', '#d97706', '#fffbeb', '23.5%')
+                + cGap('2%') + cStat(totalInterested, 'Interested<br>in Meeting', '#0891b2', '#ecfeff', '23.5%')
+                + cGap('2%') + cStat(totalScheduled, 'Meetings<br>Scheduled', '#0d3b66', '#eff6ff', '23.5%')
                 + `</tr></table>`
                 // Individual breakdown table
-                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">`
+                + `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;margin-bottom:16px;">`
                 + `<thead><tr style="background-color:#f8fafc;">`
                 + `<th style="padding:7px 8px;text-align:left;font-size:9px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;font-family:Arial,sans-serif;border-bottom:2px solid #e2e8f0;">BDR Leader</th>`
                 + `<th style="padding:7px 8px;text-align:center;font-size:9px;font-weight:700;color:#0F2D4D;text-transform:uppercase;letter-spacing:0.5px;font-family:Arial,sans-serif;border-bottom:2px solid #e2e8f0;">Req. Sent</th>`
