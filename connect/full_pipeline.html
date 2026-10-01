@@ -21,6 +21,7 @@
     <script src="message-data-archive.js"></script>
     <!-- Shared AI model catalog (managed on ai_models_admin.html) -->
     <script src="../js/ai-model-catalog.js"></script>
+    <script src="variation-performance.js?v=1"></script>
 
     <style>
         :root {
@@ -235,6 +236,10 @@
                         <option value="">— No variation —</option>
                     </select>
                     <div class="form-help" id="fpVariationHelp">This hypothesis group has no message variations defined yet — add some on Connect Hypothesis Documentation's "Message Variations" tab to A/B test different angles.</div>
+                    <div id="fpVariationAutoInfo" style="display:none; margin-top: 8px;">
+                        <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="fpShowVariationSplit()"><i class="fas fa-chart-pie"></i> Show current split</button>
+                        <div id="fpVariationSplitPanel"></div>
+                    </div>
 
                     <!-- Shown only when "AI decides by criteria" is selected — the AI model used to
                          read each contact's profile against every variation's AI Selection Criteria. -->
@@ -2360,20 +2365,26 @@
             block.style.display = 'block';
             const prevVal = sel.value;
             sel.innerHTML = '<option value="">— No variation —</option>' +
+                (variations.length > 1 ? '<option value="__auto__">📈 Auto-optimize by performance (default)</option>' : '') +
                 (variations.length > 1 ? '<option value="__rotate__">🔀 Rotate evenly across all variations</option>' : '') +
                 (variations.length > 1 ? '<option value="__weighted__">🎲 Random selection by share %</option>' : '') +
                 (variations.length > 1 ? '<option value="__ai__">🤖 AI decides by criteria</option>' : '') +
                 variations.map(v => `<option value="${v.id}">${escHtml(v.label || v.id)}</option>`).join('');
-            if (variations.some(v => v.id === prevVal) || ['__rotate__', '__weighted__', '__ai__'].includes(prevVal)) {
+            if (variations.some(v => v.id === prevVal) || ['__auto__', '__rotate__', '__weighted__', '__ai__'].includes(prevVal)) {
                 sel.value = prevVal;
             } else if (variations.length === 1) {
                 // Only one variation defined — default to using it rather than "No variation".
                 sel.value = variations[0].id;
             } else if (variations.length > 1) {
-                // Multiple variations defined — default to rotating evenly across all of them
-                // rather than "No variation", so a fresh group selection actually A/B tests them.
-                sel.value = '__rotate__';
+                // Multiple variations defined — default to auto-optimizing: every variation gets
+                // 100 messages, then the ones getting the best results get the most messages.
+                sel.value = '__auto__';
             }
+            window._fpVariationGroup = group;
+            const autoInfo = document.getElementById('fpVariationAutoInfo');
+            if (autoInfo) autoInfo.style.display = variations.length > 1 ? 'block' : 'none';
+            const splitPanel = document.getElementById('fpVariationSplitPanel');
+            if (splitPanel) splitPanel.innerHTML = '';
             if (help) {
                 help.textContent = variations.length
                     ? `${variations.length} active variation${variations.length !== 1 ? 's' : ''} on this group${stoppedCount ? ` (${stoppedCount} stopped — hidden here, still reported on outcomes.html)` : ''}. When selected, a variation's "AI Prompt / Writing Instructions" is appended to the Message Review Instructions above for that message, and stamped onto it for reporting on outcomes.html.`
@@ -2390,6 +2401,14 @@
             const mode = document.getElementById('fpVariationSelect')?.value || '';
             const modelBlock = document.getElementById('fpVariationAiModelBlock');
             if (modelBlock) modelBlock.style.display = mode === '__ai__' ? 'block' : 'none';
+        };
+
+        // "Show current split" — loads the group's per-variation results and shows the share each
+        // variation would get in Auto-optimize mode right now.
+        window.fpShowVariationSplit = function() {
+            if (window._fpVariationGroup && window.VariationPerformance) {
+                window.VariationPerformance.showSplit(window._fpVariationGroup, document.getElementById('fpVariationSplitPanel'));
+            }
         };
 
         document.getElementById('fpCustomerSelect').addEventListener('change', function() {
@@ -5844,6 +5863,9 @@
 
             // ── Message Variation ── picks (and stamps) a hypothesis-group message variation
             // for each message this run generates:
+            //   '__auto__'    (default) every variation gets 100 messages, then the share of messages
+            //                  each gets follows its results (meetings .5 / replies .35 / connections .15
+            //                  per message sent) — see variation-performance.js
             //   '__rotate__'  cycles evenly through every variation (round-robin, one per message)
             //   '__weighted__' random pick weighted by each variation's Random Selection Share %
             //                  (falls back to a uniform random pick if no shares are set)
@@ -5917,8 +5939,25 @@
                 return fpWeightedRandomVariation();
             }
 
+            // Auto-optimize: results are loaded once up-front; each pick then follows the live split
+            // (a variation that reaches 100 messages mid-run moves from the equal share to the
+            // performance-weighted one automatically).
+            let fpAutoPicker = null;
+            if (fpVariationMode === '__auto__' && fpVariations.length > 1 && window.VariationPerformance) {
+                addLog('📈 Auto-optimize: loading results for this group\'s message variations...', 'info');
+                fpAutoPicker = await window.VariationPerformance.createPicker(group, fpVariations, { log: addLog });
+                const info = window.VariationPerformance.describe(fpAutoPicker.allocation());
+                addLog(`📈 Variation split (${info.phase}):`, 'info');
+                info.lines.forEach(l => addLog(l, 'dim'));
+            }
+
             async function fpNextVariation(prospectArg, pdArg, singleDataArg, orgArg) {
                 if (!fpVariationMode || !fpVariations.length) return null;
+                if (fpVariationMode === '__auto__') {
+                    if (fpAutoPicker) return fpAutoPicker.pick();
+                    // Only one active variation (or helper missing) — nothing to optimize between
+                    return fpVariations.length === 1 ? fpVariations[0] : fpWeightedRandomVariation();
+                }
                 if (fpVariationMode === '__rotate__') {
                     const v = fpVariations[fpVariationCounter % fpVariations.length];
                     fpVariationCounter++;
@@ -5936,7 +5975,8 @@
                 return `${reviewInstr}\n\n${variation.prompt}`;
             }
             if (fpVariationMode) {
-                const modeLabel = fpVariationMode === '__rotate__' ? `rotating evenly across ${fpVariations.length} variation(s)`
+                const modeLabel = fpVariationMode === '__auto__' ? `auto-optimizing by performance across ${fpVariations.length} variation(s)`
+                    : fpVariationMode === '__rotate__' ? `rotating evenly across ${fpVariations.length} variation(s)`
                     : fpVariationMode === '__weighted__' ? `random selection by share % across ${fpVariations.length} variation(s)`
                     : fpVariationMode === '__ai__' ? `AI (${fpVariationAiModel}) deciding per contact from ${fpVariations.length} variation(s)' criteria`
                     : `"${fpVariations.find(v => v.id === fpVariationMode)?.label || fpVariationMode}" applied to every message`;

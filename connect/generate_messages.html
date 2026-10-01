@@ -20,6 +20,7 @@
     <script src="../js/clemail-firestore-wrapper.js"></script>
     <!-- Shared AI Model Catalog (ai_models_admin.html) -->
     <script src="../js/ai-model-catalog.js"></script>
+    <script src="variation-performance.js?v=1"></script>
     <!-- Shared Final AI Review rules store (Firestore-backed, localStorage cache) -->
     <script src="final-ai-review-rules-store.js"></script>
     <!-- Message Generation Data Archive: full research snapshot per generated message, 90-day retention -->
@@ -3614,6 +3615,10 @@
                                 <option value="">— No variation —</option>
                             </select>
                             <div class="form-help" id="fullAiVariationHelp" style="margin-top: 4px;"></div>
+                            <div id="fullAiVariationAutoInfo" style="display:none; margin-top: 8px;">
+                                <button type="button" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="fullAiShowVariationSplit()"><i class="fas fa-chart-pie"></i> Show current split</button>
+                                <div id="fullAiVariationSplitPanel"></div>
+                            </div>
 
                             <!-- Shown only when "AI decides by criteria" is selected — the AI model used to
                                  read each contact's profile against every variation's AI Selection Criteria. -->
@@ -14749,6 +14754,7 @@
                         cached.messageCreationInstructions = group.messageCreationInstructions || '';
                         cached.targetContactInstructions = group.targetContactInstructions || '';
                         cached.messageReviewInstructions = group.messageReviewInstructions || '';
+                        cached.messageVariations = group.messageVariations || [];
                     }
                 }
             } catch (e) {
@@ -14815,11 +14821,23 @@
             block.style.display = 'block';
             const prevVal = sel.value;
             sel.innerHTML = '<option value="">— No variation —</option>' +
+                (variations.length > 1 ? '<option value="__auto__">📈 Auto-optimize by performance (default)</option>' : '') +
                 (variations.length > 1 ? '<option value="__rotate__">🔀 Rotate evenly across all variations</option>' : '') +
                 (variations.length > 1 ? '<option value="__weighted__">🎲 Random selection by share %</option>' : '') +
                 (variations.length > 1 ? '<option value="__ai__">🤖 AI decides by criteria</option>' : '') +
                 variations.map(v => `<option value="${v.id}">${escHtml(v.label || v.id)}</option>`).join('');
-            if (variations.some(v => v.id === prevVal) || ['__rotate__', '__weighted__', '__ai__'].includes(prevVal)) sel.value = prevVal;
+            if (variations.some(v => v.id === prevVal) || ['__auto__', '__rotate__', '__weighted__', '__ai__'].includes(prevVal)) sel.value = prevVal;
+            // Multiple variations → default to auto-optimizing: every variation gets 100 messages,
+            // then the ones getting the best results get the most messages.
+            else if (variations.length > 1) sel.value = '__auto__';
+            // Only one active variation → use it rather than "No variation" (same as Full Pipeline),
+            // so its instructions reach the Opus Review by default.
+            else if (variations.length === 1) sel.value = variations[0].id;
+            window._fullAiVariationGroup = group;
+            const autoInfo = document.getElementById('fullAiVariationAutoInfo');
+            if (autoInfo) autoInfo.style.display = variations.length > 1 ? 'block' : 'none';
+            const splitPanel = document.getElementById('fullAiVariationSplitPanel');
+            if (splitPanel) splitPanel.innerHTML = '';
             if (help) {
                 help.textContent = variations.length
                     ? `${variations.length} active variation${variations.length !== 1 ? 's' : ''} on this group${stoppedCount ? ` (${stoppedCount} stopped — hidden here, still reported on outcomes.html)` : ''}. When selected, a variation's "AI Prompt / Writing Instructions" is appended to the Message Review Instructions above for that message, and stamped onto it for reporting on outcomes.html.`
@@ -14837,6 +14855,14 @@
             const mode = document.getElementById('fullAiVariationSelect')?.value || '';
             const modelBlock = document.getElementById('fullAiVariationAiModelBlock');
             if (modelBlock) modelBlock.style.display = mode === '__ai__' ? 'block' : 'none';
+        };
+
+        // "Show current split" — loads the group's per-variation results and shows the share each
+        // variation would get in Auto-optimize mode right now.
+        window.fullAiShowVariationSplit = function() {
+            if (window._fullAiVariationGroup && window.VariationPerformance) {
+                window.VariationPerformance.showSplit(window._fullAiVariationGroup, document.getElementById('fullAiVariationSplitPanel'));
+            }
         };
 
         // Loads the selected BDR's BDR-Specific Opus Instructions (bdr_leaders.opusReviewInstructions —
@@ -17756,6 +17782,9 @@
 
                 // ── Message Variation ── picks (and stamps) a hypothesis-group message variation
                 // for each message this run generates:
+                //   '__auto__'     (default) every variation gets 100 messages, then the share of messages
+                //                  each gets follows its results (meetings .5 / replies .35 / connections
+                //                  .15 per message sent) — see variation-performance.js
                 //   '__rotate__'   cycles evenly through every variation (round-robin, one per message)
                 //   '__weighted__' random pick weighted by each variation's Random Selection Share %
                 //                  (falls back to a uniform random pick if no shares are set)
@@ -17767,9 +17796,27 @@
                 // outcomes.html can report performance per variation either way. fullAiNextVariation()
                 // is async (the AI mode makes a network call) and awaited by every call site.
                 const fullAiVariationMode = document.getElementById('fullAiVariationSelect')?.value || '';
-                const fullAiGroupForVariations = fullAiHypGroupId
+                // Start from the "Load Groups" cache, then overlay a live read of the group doc —
+                // the same thing populateFullAiOpusPromptEditor does for the dropdown. The cache is
+                // only as fresh as the last page/group load, so without this the run could use a
+                // stale (or empty) messageVariations[] while the dropdown showed the live list:
+                // no variation picked, nothing stamped, and no variation instructions reaching the
+                // Opus Review. The cache entry is updated too so later runs/dropdown stay in sync.
+                let fullAiGroupForVariations = fullAiHypGroupId
                     ? (_allHypothesisGroupsCache?.find(g => g.id === fullAiHypGroupId) || null)
                     : null;
+                if (fullAiHypGroupId) {
+                    try {
+                        const liveSnap = await getDoc(doc(db, 'hypothesis_groups', fullAiHypGroupId));
+                        if (snapExists(liveSnap)) {
+                            const liveData = liveSnap.data() || {};
+                            if (fullAiGroupForVariations) Object.assign(fullAiGroupForVariations, liveData);
+                            else fullAiGroupForVariations = { id: fullAiHypGroupId, ...liveData };
+                        }
+                    } catch (e) {
+                        addLog(`⚠️ Couldn't refresh hypothesis group "${fullAiHypGroupName}" before the run (${e.message}) — using the last loaded copy of its message variations.`, 'warning');
+                    }
+                }
                 // Stopped variations are excluded from every selection mode (pinned, rotate, weighted, AI)
                 const fullAiVariations = (fullAiGroupForVariations?.messageVariations || []).filter(v => !v.inactive);
                 const fullAiVariationAiModel = document.getElementById('fullAiVariationAiModel')?.value || 'anthropic/claude-sonnet-5';
@@ -17829,8 +17876,25 @@
                     return fullAiWeightedRandomVariation();
                 }
 
+                // Auto-optimize: results are loaded once up-front; each pick then follows the live split
+                // (a variation that reaches 100 messages mid-run moves from the equal share to the
+                // performance-weighted one automatically).
+                let fullAiAutoPicker = null;
+                if (fullAiVariationMode === '__auto__' && fullAiVariations.length > 1 && fullAiGroupForVariations && window.VariationPerformance) {
+                    addLog('📈 Auto-optimize: loading results for this group\'s message variations...', 'info');
+                    fullAiAutoPicker = await window.VariationPerformance.createPicker(fullAiGroupForVariations, fullAiVariations, { log: addLog });
+                    const info = window.VariationPerformance.describe(fullAiAutoPicker.allocation());
+                    addLog(`📈 Variation split (${info.phase}):`, 'info');
+                    info.lines.forEach(l => addLog(l, 'dim'));
+                }
+
                 async function fullAiNextVariation(prospectArg, pdArg, singleDataArg) {
                     if (!fullAiVariationMode || !fullAiVariations.length) return null;
+                    if (fullAiVariationMode === '__auto__') {
+                        if (fullAiAutoPicker) return fullAiAutoPicker.pick();
+                        // Only one active variation (or helper missing) — nothing to optimize between
+                        return fullAiVariations.length === 1 ? fullAiVariations[0] : fullAiWeightedRandomVariation();
+                    }
                     if (fullAiVariationMode === '__rotate__') {
                         const v = fullAiVariations[fullAiVariationCounter % fullAiVariations.length];
                         fullAiVariationCounter++;
@@ -17843,16 +17907,27 @@
                 // Appends the chosen variation's "AI Prompt / Writing Instructions" onto the base
                 // Message Review Instructions, per the exact wording used everywhere else this
                 // pattern appears (Connect Hypothesis Documentation / Fast Connect Review).
+                // Labelled the same way Fast Connect Review labels it ("MESSAGE VARIATION INSTRUCTIONS —
+                // <label>") so Opus knows it's the angle THIS message was written with, rather than
+                // an unexplained continuation of the general review instructions.
                 function fullAiReviewInstrFor(variation) {
-                    if (!variation || !variation.prompt) return opusMessageInstr;
-                    return `${opusMessageInstr || ''}\n\n${variation.prompt}`;
+                    const vPrompt = (variation?.prompt || '').trim();
+                    if (!vPrompt) return opusMessageInstr;
+                    return `${opusMessageInstr || ''}\n\nMESSAGE VARIATION INSTRUCTIONS — "${variation.label || variation.id}" (this message was written with this specific angle; apply it on top of the review instructions above):\n${vPrompt}`;
                 }
                 if (fullAiVariationMode) {
-                    const modeLabel = fullAiVariationMode === '__rotate__' ? `rotating evenly across ${fullAiVariations.length} variation(s)`
+                    const modeLabel = fullAiVariationMode === '__auto__' ? `auto-optimizing by performance across ${fullAiVariations.length} variation(s)`
+                        : fullAiVariationMode === '__rotate__' ? `rotating evenly across ${fullAiVariations.length} variation(s)`
                         : fullAiVariationMode === '__weighted__' ? `random selection by share % across ${fullAiVariations.length} variation(s)`
                         : fullAiVariationMode === '__ai__' ? `AI (${fullAiVariationAiModel}) deciding per contact from ${fullAiVariations.length} variation(s)' criteria`
                         : `"${fullAiVariations.find(v => v.id === fullAiVariationMode)?.label || fullAiVariationMode}" applied to every message`;
                     addLog(`🧪 Message Variation: ${modeLabel} for this run`, 'info');
+                    if (!fullAiVariations.length) {
+                        addLog('   ⚠️ A Message Variation mode is selected but this hypothesis group has no active variations — no variation will be stamped or passed to the Opus Review.', 'warning');
+                    } else if (opusReviewEnabled) {
+                        const noPrompt = fullAiVariations.filter(v => !(v.prompt || '').trim()).map(v => v.label || v.id);
+                        if (noPrompt.length) addLog(`   ⚠️ These variations have no AI Prompt / Writing Instructions, so the Opus Review gets nothing extra for them: ${noPrompt.join(', ')}`, 'warning');
+                    }
                 }
 
                 // Called right after each message is saved to connect_queue in the per-prospect
@@ -17861,7 +17936,13 @@
                 // next time it loads, no batching or extra step needed.
                 async function reviewMessageWithOpusIfEnabled(docId, variation, pd, rawProfile = null, roleContext = null) {
                     if (!opusReviewEnabled || !docId) return;
-                    addLog('   🔬 Running Opus Review on this message...', 'info');
+                    if (variation && (variation.prompt || '').trim()) {
+                        addLog(`   🔬 Running Opus Review on this message (with "${variation.label || variation.id}" variation instructions)...`, 'info');
+                    } else if (variation) {
+                        addLog(`   🔬 Running Opus Review on this message ("${variation.label || variation.id}" variation has no AI Prompt / Writing Instructions, so none were added)...`, 'info');
+                    } else {
+                        addLog('   🔬 Running Opus Review on this message (no variation)...', 'info');
+                    }
                     const r = await runFullAiOpusReviewSingle({
                         token, bdrEmail, hypothesisGroupId: fullAiHypGroupId, docId,
                         targetContactInstructions: opusTargetInstr,
