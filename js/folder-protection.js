@@ -1,7 +1,7 @@
 // HealthLuminate Folder Protection System
-// Version: 1.1.0 - Fixed cross-folder navigation race conditions
+// Version: 1.2.0 - Wait for Firebase's initial auth report; IndexedDB-aware session check
 // This utility provides centralized folder access control
-console.log('🔒 Folder protection system loading (v1.1.0 - race condition fix)...');
+console.log('🔒 Folder protection system loading (v1.2.0 - authStateReady)...');
 
 // Helper function to extract domain from email
 function getDomainFromEmail(email) {
@@ -280,7 +280,8 @@ async function protectFolder(folderName, options = {}) {
     allowOnMissing: false,
     customMessage: null,
     requireAuth: true,
-    maxAuthWaitTime: 10000 // Wait up to 10 seconds for auth to be ready
+    maxAuthWaitTime: 10000,       // Wait up to 10 seconds for the Firebase SDK object to exist
+    maxAuthStateWaitTime: 45000   // Wait up to 45 seconds for Firebase's FIRST auth state report
   };
   
   const opts = { ...defaults, ...options };
@@ -304,90 +305,81 @@ async function protectFolder(folderName, options = {}) {
   
   // Check if authentication is required and user is authenticated
   if (opts.requireAuth) {
-    // CRITICAL FIX: Wait for auth.currentUser to be available
-    // Sometimes it takes a moment for Firebase to restore the session from localStorage
-    let authAttempts = 0;
-    const maxAuthAttempts = 20; // 20 attempts * 500ms = 10 seconds max wait
-    
-    while (authAttempts < maxAuthAttempts && (!window.auth || !window.auth.currentUser)) {
-      console.log(`⏳ Waiting for auth to be ready (attempt ${authAttempts + 1}/${maxAuthAttempts})...`);
-      await new Promise(resolve => setTimeout(resolve, 500));
-      authAttempts++;
-      
-      // Check if last known good auth state exists (from auth.js)
-      // This helps during token refresh or cross-tab sync scenarios
-      if (window._authLastActivity) {
-        const timeSinceActivity = Date.now() - window._authLastActivity;
-        if (timeSinceActivity < 60000) { // User was active within last minute
-          console.log(`🛡️ Recent auth activity detected (${Math.round(timeSinceActivity / 1000)}s ago), continuing to wait...`);
-          // Give more time if we know user was recently authenticated
-          if (authAttempts === maxAuthAttempts) {
-            authAttempts = maxAuthAttempts - 5; // Give 5 more attempts
-          }
-        }
+    // Wait for Firebase to report its INITIAL auth state. auth.currentUser is
+    // null until the SDK finishes restoring the saved session (IndexedDB read +
+    // token refresh / accounts:lookup over the network), which normally takes
+    // <1s but can take 30-60s on a bad connection. Polling auth.currentUser and
+    // giving up after N seconds (what v1.1 did) cannot tell "logged out" apart
+    // from "still restoring", and kicked valid users to the login page.
+    let initialStateResolved = false;
+    if (window.auth && window.auth.currentUser) {
+      initialStateResolved = true;
+    } else if (window.authStateReady) {
+      console.log('⏳ Waiting for Firebase to report its initial auth state...');
+      const TIMEOUT = {};
+      const outcome = await Promise.race([
+        window.authStateReady,
+        new Promise(resolve => setTimeout(() => resolve(TIMEOUT), opts.maxAuthStateWaitTime))
+      ]);
+      initialStateResolved = outcome !== TIMEOUT;
+      console.log(initialStateResolved
+        ? `✅ Firebase reported initial auth state (${window.auth?.currentUser ? 'signed in' : 'no user'})`
+        : `⚠️ Firebase has not reported any auth state after ${Math.round(opts.maxAuthStateWaitTime / 1000)}s`);
+    } else {
+      // Older auth.js without authStateReady — legacy short poll
+      for (let i = 0; i < 20 && !(window.auth && window.auth.currentUser); i++) {
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
+      initialStateResolved = !!(window.auth && window.auth.currentUser);
     }
-    
-    // Final auth check after waiting
+
     if (!window.auth || !window.auth.currentUser) {
-      console.log('🔒 User not authenticated after waiting, redirecting to login');
-      
-      // CRITICAL: Before redirecting, check if auth.js's protection system considers
-      // the user still logged in. auth.js has a 12-hour ultra-protection that keeps
-      // currentAuthState.isLoggedIn = true during token refresh cycles, even when
-      // auth.currentUser is temporarily null. We must respect that state to avoid
-      // falsely kicking out valid users mid-session.
+      // auth.js's 12-hour ultra-protection may be holding the user as logged in
+      // across a token-refresh hiccup — respect it.
       const authJsState = window.getCurrentAuthState?.();
       if (authJsState?.isLoggedIn) {
-        console.log('🛡️ Folder protection: auth.js considers user still logged in (token refresh cycle)');
-        console.log('🛡️ Skipping redirect — waiting for auth.currentUser to be restored by auth.js');
-        // Give auth.js additional time to restore auth.currentUser
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        if (window.auth && window.auth.currentUser) {
-          console.log('✅ auth.currentUser restored — continuing with folder access check');
-          // Fall through to the folder access check below
-        } else {
-          // auth.js still says logged in but currentUser still null —
-          // trust auth.js and reveal content rather than kick out a valid user
-          console.log('🛡️ Trusting auth.js protection state — revealing content without redirect');
+        console.log('🛡️ Folder protection: auth.js considers user still logged in (token refresh cycle) — revealing content');
+        unhideProtectedContent();
+        return true;
+      }
+
+      if (!initialStateResolved) {
+        // Firebase never answered. We cannot distinguish "logged out" from "SDK
+        // stalled", so do NOT redirect — a redirect here is exactly how signed-in
+        // users were getting kicked out. Reveal the page; page-level handlers
+        // (and auth.js) take over once Firebase finally responds.
+        console.warn('⚠️ Folder protection: Firebase auth state unresolved — NOT redirecting (cannot tell logged-out from a stalled SDK). Revealing content.');
+        unhideProtectedContent();
+        return true;
+      }
+
+      // Firebase explicitly reported "no user". Last check: is there still a saved
+      // session on this device (IndexedDB since auth.js v1.5, localStorage before)?
+      // If so this is a transient glitch (e.g. restore raced a cross-tab event) and
+      // Firebase will bring the user back — don't kick them out.
+      let persisted = null;
+      if (window.hasPersistedFirebaseUser) {
+        persisted = await window.hasPersistedFirebaseUser();
+      } else {
+        try { persisted = Object.keys(localStorage).some(k => k.startsWith('firebase:authUser')); } catch (_) { persisted = null; }
+      }
+      if (persisted === true) {
+        console.warn('⚠️ Saved Firebase session found but auth.currentUser is null — waiting 3s for restore...');
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        if (!(window.auth && window.auth.currentUser)) {
+          console.log('🛡️ Still restoring — revealing content without redirect');
           unhideProtectedContent();
           return true;
         }
+        console.log('✅ auth.currentUser restored — continuing with folder access check');
       } else {
-        // Double-check: Look at localStorage to see if Firebase auth token exists
-        // This is a last-ditch effort to avoid false logouts
-        const firebaseKeys = Object.keys(localStorage).filter(k => k.startsWith('firebase:authUser'));
-        if (firebaseKeys.length > 0) {
-          console.warn('⚠️ Firebase auth token found in localStorage but auth.currentUser is null');
-          console.warn('⚠️ This may be a race condition. Waiting an additional 2 seconds...');
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          
-          // Check once more — both auth.currentUser and auth.js state
-          if (window.auth && window.auth.currentUser) {
-            console.log('✅ Auth restored after additional wait!');
-            // Continue with normal flow
-          } else if (window.getCurrentAuthState?.()?.isLoggedIn) {
-            console.log('🛡️ Auth.js protection active after additional wait — skipping redirect');
-            unhideProtectedContent();
-            return true;
-          } else {
-            console.error('❌ Auth still not available after extended wait');
-            if (window.redirectToLogin) {
-              window.redirectToLogin(`You must be logged in to access ${folderName}.`);
-            } else {
-              window.location.href = '/login.html';
-            }
-            return false;
-          }
+        console.log('🔒 Firebase reports no user and no saved session exists — redirecting to login');
+        if (window.redirectToLogin) {
+          window.redirectToLogin(`You must be logged in to access ${folderName}.`);
         } else {
-          // No auth token in localStorage, user is truly logged out
-          if (window.redirectToLogin) {
-            window.redirectToLogin(`You must be logged in to access ${folderName}.`);
-          } else {
-            window.location.href = '/login.html';
-          }
-          return false;
+          window.location.href = '/login.html';
         }
+        return false;
       }
     }
     

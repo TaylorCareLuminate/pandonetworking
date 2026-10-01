@@ -1,12 +1,12 @@
 // Version and debug info
-const AUTH_VERSION = '1.5.0-persistence-unify';
+const AUTH_VERSION = '1.6.0-auth-state-ready';
 console.log(`🔄 Auth script loading... (v${AUTH_VERSION})`);
 console.log(`🛡️ 12-hour session protection enabled globally`);
 console.log(`👥 Cross-tab authentication synchronization enabled`);
 console.log(`🔗 Multi-directory Firebase app instance sharing enabled`);
-console.log(`🔧 FIX v1.5: Removed setPersistence(browserLocalPersistence) override - auth.js now uses the`);
-console.log(`   same default persistence (IndexedDB) as /crm pages, so opening a CRM tab and a Connect tab`);
-console.log(`   no longer migrates the session between storage layers and logs one of them out`);
+console.log(`🔧 FIX v1.6: window.authStateReady resolves on Firebase's FIRST auth callback; the SSO bridge and`);
+console.log(`   folder-protection now wait for it instead of reading auth.currentUser (always null right after`);
+console.log(`   init). Persisted-session checks read IndexedDB (where v1.5 moved the session), not localStorage.`);
 
 // Firebase configuration
 const firebaseConfig = {
@@ -64,6 +64,104 @@ window.database = null;
 window.firebaseReady = new Promise((resolve) => {
   window._resolveFirebaseReady = resolve;
 });
+
+// Resolves (with the Firebase user, or null) the FIRST time Firebase reports its
+// auth state. `firebaseReady` resolves as soon as the SDK object exists — at that
+// point auth.currentUser is still null even for a signed-in user, because the SDK
+// restores the persisted session asynchronously (IndexedDB read + token refresh /
+// accounts:lookup over the network, which can take 30s+ on a bad connection).
+// Anything that wants to decide "is this person logged out?" must wait on THIS,
+// not on firebaseReady, or it will mistake a slow restore for a logout.
+window._authStateResolved = false;
+window.authStateReady = new Promise((resolve) => {
+  window._resolveAuthStateReady = (user) => {
+    if (window._authStateResolved) return;
+    window._authStateResolved = true;
+    resolve(user || null);
+  };
+});
+
+// ------------------------------------------------------------
+// Persisted-session detection (IndexedDB-aware)
+// ------------------------------------------------------------
+// Since v1.5 the Firebase session lives in IndexedDB (firebaseLocalStorageDb /
+// firebaseLocalStorage, keys "firebase:authUser:<apiKey>:[DEFAULT]"), NOT in
+// localStorage. Older guards that scan localStorage for "firebase:authUser" now
+// always come back empty and wrongly conclude the user is logged out.
+//
+// window.hasPersistedFirebaseUser() -> Promise<boolean|null>
+//   true  = a saved session exists (Firebase will restore it once it finishes)
+//   false = nothing saved anywhere
+//   null  = could not tell (IndexedDB unavailable / timed out)
+// window._persistedFirebaseUserHint caches the latest answer for sync callers.
+window._persistedFirebaseUserHint = null;
+
+function readPersistedUserFromIndexedDB(timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (val) => { if (!settled) { settled = true; resolve(val); } };
+    try {
+      if (!window.indexedDB) return finish(null);
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      // Open WITHOUT a version so we never upgrade/create Firebase's database.
+      const req = indexedDB.open('firebaseLocalStorageDb');
+      req.onupgradeneeded = (ev) => {
+        // DB didn't exist -> abort so we don't leave an empty DB behind that
+        // Firebase would then have to delete/recreate (which blocks if any tab
+        // holds a connection open).
+        try { ev.target.transaction.abort(); } catch (e) { /* ignore */ }
+        clearTimeout(timer);
+        finish(false);
+      };
+      req.onerror = () => { clearTimeout(timer); finish(req.error?.name === 'AbortError' ? false : null); };
+      req.onblocked = () => { clearTimeout(timer); finish(null); };
+      req.onsuccess = () => {
+        const db = req.result;
+        try {
+          if (!db.objectStoreNames.contains('firebaseLocalStorage')) {
+            db.close(); clearTimeout(timer); return finish(false);
+          }
+          const tx = db.transaction('firebaseLocalStorage', 'readonly');
+          const keysReq = tx.objectStore('firebaseLocalStorage').getAllKeys();
+          keysReq.onsuccess = () => {
+            const keys = keysReq.result || [];
+            const found = keys.some(k => typeof k === 'string' && k.startsWith('firebase:authUser:'));
+            db.close(); clearTimeout(timer); finish(found);
+          };
+          keysReq.onerror = () => { db.close(); clearTimeout(timer); finish(null); };
+        } catch (e) {
+          try { db.close(); } catch (_) { /* ignore */ }
+          clearTimeout(timer); finish(null);
+        }
+      };
+    } catch (e) {
+      finish(null);
+    }
+  });
+}
+
+window.hasPersistedFirebaseUser = async function() {
+  let result = null;
+  try {
+    // localStorage fallback persistence (older sessions / browsers without IDB)
+    if (Object.keys(localStorage).some(k => k.startsWith('firebase:authUser'))) {
+      result = true;
+    }
+  } catch (e) { /* ignore */ }
+  if (result !== true) {
+    const idb = await readPersistedUserFromIndexedDB();
+    if (idb === true) result = true;
+    else if (idb === false && result === null) result = false;
+  }
+  window._persistedFirebaseUserHint = result;
+  return result;
+};
+
+// Prime the hint early so sync guards (isTrulyLoggedOut) have an answer by the
+// time Firebase reports anything.
+window.hasPersistedFirebaseUser().then((hint) => {
+  if (hint !== null) console.log(`💾 Persisted Firebase session on this device: ${hint ? 'yes' : 'no'}`);
+}).catch(() => { /* non-critical */ });
 
 // Wait for header elements to be available (optional - not all pages have these)
 function waitForHeaderElements() {
@@ -575,6 +673,17 @@ async function initializeFirebaseAuth() {
     onAuthStateChanged(auth, async (user) => {
       console.log('🔄 Auth state changed:', user ? `User: ${user.email}` : 'No user');
       
+      // First report from Firebase — from here on auth.currentUser is trustworthy.
+      // Resolve BEFORE any await so dependants (SSO bridge, folder-protection) see it promptly.
+      if (!window._authStateResolved) {
+        window._resolveAuthStateReady(user);
+        if (!user) {
+          // Re-read persistence now that Firebase has had its say, so the cached
+          // hint reflects reality (e.g. a logout in another tab since page load).
+          window.hasPersistedFirebaseUser().catch(() => {});
+        }
+      }
+      
       // Debug: Check auth persistence
       if (!user) {
         console.log('🔍 Auth debug - No user detected. Checking persistence...');
@@ -810,6 +919,26 @@ async function initializeFirebaseAuth() {
       window._resolveFirebaseReady({ app, auth, db });
     }
     
+    // Stall diagnostics: Firebase normally reports its initial auth state within
+    // ~1s. If it hasn't after 10s, say so loudly and explain what that means, so a
+    // "stuck loading / kicked out" report can be traced to the SDK restore rather
+    // than to our own logic.
+    const stallTimer = setTimeout(async () => {
+      if (window._authStateResolved) return;
+      const persisted = await window.hasPersistedFirebaseUser();
+      console.warn('⚠️ Firebase has not reported an auth state after 10s.');
+      if (persisted === true) {
+        console.warn('   A saved session WAS found in IndexedDB, so this is a slow session restore (token refresh /');
+        console.warn('   accounts:lookup to googleapis.com is hanging — network, VPN, proxy or extension?). The SDK');
+        console.warn('   gives up on the network after ~30-60s and keeps the saved user. Nothing should redirect.');
+      } else if (persisted === false) {
+        console.warn('   No saved session found in IndexedDB or localStorage — the SDK itself appears stuck.');
+      } else {
+        console.warn('   IndexedDB could not be read (stalled/blocked) — likely the SDK is stuck on IndexedDB too.');
+      }
+    }, 10000);
+    window.authStateReady.then(() => clearTimeout(stallTimer));
+    
   } catch (error) {
     console.error('❌ Firebase initialization failed:', error);
     currentAuthState.isChecking = false;
@@ -842,13 +971,14 @@ async function initialize() {
 //
 // Returns true ONLY when we are confident the user is genuinely logged out:
 //   - auth.js considers them logged out (isLoggedIn === false)
-//   - No recent good auth state exists (nothing within the 12-hour window)
-//   - No firebase:authUser token is present in localStorage
+//   - Firebase has reported its initial auth state at least once
+//   - No saved session exists in IndexedDB or localStorage
 //
 // Returns false (= do NOT redirect) when any of the following apply:
 //   - auth.js's 12-hour ultra-protection is holding the user as logged in
 //   - auth.currentUser is set on the Firebase auth instance
-//   - A firebase:authUser token is still in localStorage (token mid-refresh)
+//   - Firebase hasn't reported its initial state yet (restore in progress)
+//   - A saved session is still present (token mid-refresh / slow restore)
 window.isTrulyLoggedOut = function() {
   // If auth.js considers the user logged in, trust it — this covers the
   // 12-hour ultra-protection period during token refresh cycles
@@ -864,8 +994,19 @@ window.isTrulyLoggedOut = function() {
     return false;
   }
 
-  // If a Firebase auth token still exists in localStorage, this is likely
-  // a mid-refresh glitch, not a genuine logout
+  // Firebase hasn't reported its initial state yet — auth.currentUser being null
+  // means nothing at this point (session restore still in progress).
+  if (!window._authStateResolved) {
+    console.log('🛡️ [isTrulyLoggedOut] Firebase has not reported initial auth state yet — not a real logout');
+    return false;
+  }
+
+  // If a saved session still exists (IndexedDB since v1.5, localStorage before
+  // that), this is a mid-refresh glitch, not a genuine logout
+  if (window._persistedFirebaseUserHint === true) {
+    console.log('🛡️ [isTrulyLoggedOut] Saved Firebase session found in IndexedDB — likely mid-refresh, not a real logout');
+    return false;
+  }
   try {
     const hasFirebaseToken = Object.keys(localStorage).some(k => k.startsWith('firebase:authUser'));
     if (hasFirebaseToken) {
@@ -1522,6 +1663,27 @@ console.log('📋 Auth script loaded, waiting for initialization...');
     }
   }
 
+  // Wait until Firebase has reported its initial auth state (or give up after
+  // timeoutMs). Returns { resolved, user }. `resolved: false` means Firebase is
+  // still restoring the session and auth.currentUser cannot be trusted.
+  //
+  // Previously this code checked auth.currentUser right after firebaseReady —
+  // which is ALWAYS null at that instant, even for a signed-in user, so every
+  // signed-in visitor was bounced through healthluminate.com once per tab.
+  async function waitForInitialAuthState(timeoutMs) {
+    await window.firebaseReady;
+    if (auth && auth.currentUser) return { resolved: true, user: auth.currentUser };
+    const TIMEOUT = {};
+    const outcome = await Promise.race([
+      window.authStateReady,
+      new Promise(resolve => setTimeout(() => resolve(TIMEOUT), timeoutMs))
+    ]);
+    if (outcome === TIMEOUT) return { resolved: false, user: (auth && auth.currentUser) || null };
+    return { resolved: true, user: (auth && auth.currentUser) || outcome || null };
+  }
+
+  const INITIAL_STATE_WAIT_MS = 20000;
+
   async function consumeReturnedToken() {
     const token = extractSsoToken();
     if (!token) return false;
@@ -1530,7 +1692,9 @@ console.log('📋 Auth script loaded, waiting for initialization...');
     markAttempted();
 
     try {
-      await window.firebaseReady;
+      // Let the local session restore first — if it exists, keep it rather than
+      // replacing it with a custom-token sign-in mid-restore.
+      await waitForInitialAuthState(INITIAL_STATE_WAIT_MS);
       if (auth && !auth.currentUser) {
         const { signInWithCustomToken } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
         await signInWithCustomToken(auth, token);
@@ -1568,10 +1732,21 @@ console.log('📋 Auth script loaded, waiting for initialization...');
       const consumed = await consumeReturnedToken();
       if (consumed) return;
 
-      await window.firebaseReady;
+      const { resolved, user } = await waitForInitialAuthState(INITIAL_STATE_WAIT_MS);
       // Already signed in on this domain — nothing to bridge.
-      if (auth && auth.currentUser) {
+      if (user) {
         console.log('ℹ️ [SSO Bridge] Already signed in on pandonetworking.com, skipping bridge.');
+        return;
+      }
+      if (!resolved) {
+        console.log('ℹ️ [SSO Bridge] Firebase has not reported an auth state yet (slow session restore) — not bouncing to HealthLuminate.');
+        return;
+      }
+      // Firebase says "no user" — but if a saved session exists on this device
+      // the SDK is still going to restore it; don't leave the page.
+      const persisted = await window.hasPersistedFirebaseUser();
+      if (persisted === true) {
+        console.log('ℹ️ [SSO Bridge] Saved Pando session found in IndexedDB — skipping bridge, waiting for restore.');
         return;
       }
       attemptBridge();
