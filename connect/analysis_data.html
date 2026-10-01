@@ -1144,6 +1144,7 @@
             const accountIdMap = await loadAccountIdMapping();
             const connectionDateMap = await loadConnectionDates(allEmailsArr, daysBack, accountIdMap);
             doneStep(s3, `${connectionDateMap.size} connection dates found`);
+            await reconcileSentEvents(allEmailsArr, accountIdMap, sentItems, daysBack);
 
             // ── Step 4: Load scheduled meetings ──
             const s4 = addStep('Loading scheduled meeting records…');
@@ -1664,9 +1665,13 @@
         const emailSet = new Set(emailArr.map(e => e.toLowerCase()));
 
         // Helper: process one heyreach_activity document
+        // Diagnostics: where do acceptance events get dropped?
+        const diag = { events: 0, notOwned: 0, noUrl: 0, noTs: 0, dupUrl: 0, kept: 0 };
+        const unownedAccountIds = new Map(); // linkedInAccountId → count
         function processDoc(d) {
             const data = d.data();
             if (data.eventType !== 'CONNECTION_REQUEST_ACCEPTED') return;
+            diag.events++;
 
             // Confirm ownership via bdrEmail, accountEmail, or linkedInAccountId
             const bdrEmail     = (data.bdrEmail     || '').toLowerCase();
@@ -1676,13 +1681,20 @@
                 const mapped = accountIdMap.get(String(data.linkedInAccountId));
                 if (mapped && emailSet.has(mapped)) owned = true;
             }
-            if (!owned) return;
+            if (!owned) {
+                diag.notOwned++;
+                const k = String(data.linkedInAccountId ?? '(none)');
+                unownedAccountIds.set(k, (unownedAccountIds.get(k) || 0) + 1);
+                return;
+            }
 
             const url = extractActivityUrl(data);
             const ts  = safeToDate(data.timestamp);
-            if (url && ts && !connectionDateMap.has(url)) {
-                connectionDateMap.set(url, ts);
-            }
+            if (!url) { diag.noUrl++; return; }
+            if (!ts)  { diag.noTs++;  return; }
+            if (connectionDateMap.has(url)) { diag.dupUrl++; return; }
+            connectionDateMap.set(url, ts);
+            diag.kept++;
         }
 
         // Primary: global query filtered by eventType — runs immediately while
@@ -1695,6 +1707,12 @@
             ), { maxDocs: 1000000 });
             snap.forEach(processDoc);
             console.log(`loadConnectionDates: ${connectionDateMap.size} connection dates found via global query`);
+            console.log('[ConnDates] acceptance-event breakdown:', JSON.stringify(diag));
+            const topUnowned = [...unownedAccountIds.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15);
+            console.log('[ConnDates] top linkedInAccountIds NOT mapped to a selected BDR (events):', JSON.stringify(topUnowned));
+            if (diag.notOwned > 0) {
+                console.warn(`[ConnDates] ${diag.notOwned} of ${diag.events} acceptance events were skipped because their linkedInAccountId doesn't map to a selected BDR (outdated/unmapped LinkedIn accounts, or BDRs outside the selected scope).`);
+            }
         } catch(e) {
             console.warn('Global heyreach_activity query failed:', e);
             recordLoadIssue(`heyreach_activity (connection dates) FAILED (${e?.message || e}) — connection dates are MISSING`);
@@ -1721,6 +1739,76 @@
         }
 
         return connectionDateMap;
+    }
+
+    // ── Diagnostic: reconcile connect_queue against HeyReach CONNECTION_REQUEST_SENT ──
+    // The dataset is built from connect_queue (pushed_to_heyreach == true). HeyReach's own
+    // "sent" count can be higher if requests went out that connect_queue doesn't know about
+    // (other campaigns, other accounts, un-flagged pushes, etc.). This compares the two and
+    // logs where the gap is. Log-only: it does not change the dataset.
+    async function reconcileSentEvents(emailArr, accountIdMap, sentItems, daysBack) {
+        try {
+            const emailSet = new Set(emailArr.map(e => e.toLowerCase()));
+            const since = daysBack > 0 ? new Date(Date.now() - daysBack * 86400000) : null;
+            const snap = await fetchAllWithRetry(query(
+                collection(emailDB, 'heyreach_activity'),
+                where('eventType', '==', 'CONNECTION_REQUEST_SENT')
+            ), 'heyreach_activity (CONNECTION_REQUEST_SENT)');
+            if (!snap) return;
+
+            const cqUrls = new Set();
+            sentItems.forEach(item => {
+                const u = normalizeUrl(item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || item.linkedInUrl || '');
+                if (u) cqUrls.add(u);
+            });
+
+            const d = { totalEvents: snap.size, outsideDateWindow: 0, notOwned: 0, noUrl: 0, ownedEvents: 0 };
+            const ownedUrls = new Set();
+            const missingByAccount = new Map();
+            const unownedByAccount = new Map();
+            let missingFromQueueUrls = 0;
+            snap.forEach(doc => {
+                const data = doc.data();
+                const ts = safeToDate(data.timestamp);
+                if (since && ts && ts < since) { d.outsideDateWindow++; return; }
+                const bdr  = (data.bdrEmail || '').toLowerCase();
+                const acct = (data.accountEmail || '').toLowerCase();
+                let owned = emailSet.has(bdr) || emailSet.has(acct);
+                let acctLabel = acct || bdr;
+                if (data.linkedInAccountId) {
+                    const mapped = accountIdMap.get(String(data.linkedInAccountId));
+                    if (mapped) { acctLabel = acctLabel || mapped; if (emailSet.has(mapped)) owned = true; }
+                    acctLabel = acctLabel || ('acctId:' + data.linkedInAccountId);
+                }
+                if (!owned) {
+                    d.notOwned++;
+                    unownedByAccount.set(acctLabel || '(unknown)', (unownedByAccount.get(acctLabel || '(unknown)') || 0) + 1);
+                    return;
+                }
+                d.ownedEvents++;
+                const url = extractActivityUrl(data);
+                if (!url) { d.noUrl++; return; }
+                if (!ownedUrls.has(url)) {
+                    ownedUrls.add(url);
+                    if (!cqUrls.has(url)) {
+                        missingFromQueueUrls++;
+                        missingByAccount.set(acctLabel || '(unknown)', (missingByAccount.get(acctLabel || '(unknown)') || 0) + 1);
+                    }
+                }
+            });
+            let queueWithoutEvent = 0;
+            cqUrls.forEach(u => { if (!ownedUrls.has(u)) queueWithoutEvent++; });
+            const top = m => JSON.stringify([...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15));
+            console.log('[SentRecon] heyreach_activity CONNECTION_REQUEST_SENT:', JSON.stringify(d));
+            console.log('[SentRecon] unique owned URLs sent per HeyReach:', ownedUrls.size,
+                '| unique URLs in connect_queue:', cqUrls.size,
+                '| sent in HeyReach but NOT in connect_queue:', missingFromQueueUrls,
+                '| in connect_queue but no SENT event:', queueWithoutEvent);
+            console.log('[SentRecon] top accounts for sent-but-not-in-queue:', top(missingByAccount));
+            console.log('[SentRecon] top accounts for events outside selected BDRs:', top(unownedByAccount));
+        } catch (e) {
+            console.warn('[SentRecon] reconciliation failed:', e);
+        }
     }
 
     // ── Load current LinkedIn connections (heyreach_contacts) ────────────────
@@ -1809,10 +1897,42 @@
                 ), 'conversation_category_overrides (Scheduled)');
                 if (snap) {
                     console.log(`[Scheduled] Source 3: ${snap.size} override docs with Scheduled`);
+                    // Override doc IDs are NOT bare conversation IDs. They look like:
+                    //   <conversationId>_<sanitizedBdrEmail>   (review_replies.html)
+                    //   customer_<ts>_<conversationId>_<sanitizedBdrEmail>
+                    //   webhook_<linkedin-slug>[_<bdrEmail>]   (no inbox doc exists at all)
+                    // The old code looked up d.id directly in convIdToUrl, so every override
+                    // missed (28 of 28 in the last run). Resolve via the stored conversationId
+                    // field, a conversation ID embedded in the doc ID, or the webhook slug.
+                    const embeddedConvIds = (id) => {
+                        const out = [];
+                        const m = /(2-[A-Za-z0-9+\/]+={0,2})/.exec(id || '');
+                        if (m) out.push(m[1]);
+                        return out;
+                    };
+                    const slugFromWebhookId = (id) => {
+                        if (!id || typeof id !== 'string' || !id.startsWith('webhook_')) return null;
+                        let rest = id.slice('webhook_'.length);
+                        const lu = rest.lastIndexOf('_');
+                        if (lu > -1 && rest.slice(lu + 1).includes('@')) rest = rest.slice(0, lu);
+                        return rest || null;
+                    };
                     snap.forEach(d => {
-                        const url = convIdToUrl.get(d.id);
+                        const data = d.data() || {};
+                        let url = convIdToUrl.get(d.id)
+                            || (data.conversationId && convIdToUrl.get(data.conversationId));
+                        if (!url) {
+                            for (const cid of embeddedConvIds(d.id)) {
+                                url = convIdToUrl.get(cid);
+                                if (url) break;
+                            }
+                        }
+                        if (!url) {
+                            const slug = slugFromWebhookId(d.id) || slugFromWebhookId(data.conversationId);
+                            if (slug) url = normalizeUrl(`https://www.linkedin.com/in/${slug}`);
+                        }
                         if (url) { scheduledSet.add(url); src3Count++; }
-                        else console.log(`[Scheduled] Source 3: override doc ${d.id} has no matching inbox URL`);
+                        else console.log(`[Scheduled] Source 3: override doc ${d.id} still unresolved`);
                     });
                 }
             } catch(e) { console.warn('conversation_category_overrides scheduled failed:', e); }
@@ -1929,6 +2049,7 @@
         }
 
         // ── Rows from connect_queue ──
+        const diagCq = { records: sentItems.length, blankUrl: 0, dupSkipped: 0 };
         sentItems.forEach(item => {
             const liUrl   = normalizeUrl(item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || item.linkedInUrl || '');
             const rawBdrEmail = (item.account_email || '').toLowerCase();
@@ -1937,7 +2058,8 @@
             // BDRs and both survive the dedup check below, producing duplicate contact rows.
             const bdrEmail = emailToCanonical.get(rawBdrEmail) || rawBdrEmail;
             const key = `${liUrl}||${bdrEmail}`;
-            if (seen.has(key)) return;
+            if (!liUrl) diagCq.blankUrl++;
+            if (seen.has(key)) { diagCq.dupSkipped++; return; }
             seen.add(key);
 
             const firstName = item.contactFirstName || item.prospect_first_name || item.firstName || '';
@@ -2105,6 +2227,14 @@
         const outreachRows = rows.filter(r =>
             r.scheduled === 1 || (r.contact_title || '').trim() !== ''
         );
+        console.log('[buildRows] funnel:', JSON.stringify({
+            connect_queue_records: diagCq.records,
+            blank_url_records: diagCq.blankUrl,
+            duplicate_url_bdr_records_collapsed: diagCq.dupSkipped,
+            rows_before_title_filter: rows.length,
+            rows_dropped_for_no_job_title: rows.length - outreachRows.length,
+            final_rows: outreachRows.length
+        }));
 
         // Sort by first_outreach_date descending
         outreachRows.sort((a, b) => {

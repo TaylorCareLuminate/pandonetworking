@@ -574,9 +574,9 @@
                 <div class="form-group">
                     <label style="display: flex; align-items: center; gap: 8px;">
                         <input type="checkbox" id="fpBackfillEnabled" style="width: auto;">
-                        <span><i class="fas fa-recycle"></i> Use already-scanned contacts without a message first (no re-scan)</span>
+                        <span><i class="fas fa-recycle"></i> ONLY Use already-scanned contacts without a message first (no re-scan)</span>
                     </label>
-                    <div class="form-help">Off by default. When on, before any new organization is scanned, each selected BDR's <code>prospect_contacts</code> already tagged with this hypothesis group — Top Contacts Cap overflow, contacts from runs that stopped early, rescued contacts — are checked the same way <a href="generate_messages.html" target="_blank">Generate Messages → Full AI Generate</a> does it: anyone with an existing (non-deleted) message in the queue, already connected, excluded, or under the connection floor is skipped. Everyone left is grouped by organization and queued <strong>ahead of the Apify scans</strong>, so they're used up (free — no scan cost) before new organizations are scanned. Rules are not re-run (they passed when they were tagged); the Top Contacts Cap and the 30-day organization limit below still apply.</div>
+                    <div class="form-help">Off by default. When on, this run <strong>does not search for any new contacts</strong> — no organization is researched or scanned (no Apify cost). Instead, each selected BDR's <code>prospect_contacts</code> already tagged with this hypothesis group — Top Contacts Cap overflow, contacts from runs that stopped early, rescued contacts — are checked the same way <a href="generate_messages.html" target="_blank">Generate Messages → Full AI Generate</a> does it: anyone with an existing (non-deleted) message in the queue, already connected, excluded, or under the connection floor is skipped. Everyone left is grouped <strong>organization by organization</strong>, and each organization is checked against the 30-day organization limit below to see whether there is still runway to re-engage it through these other contacts. Organizations at the limit are skipped (their contacts stay saved for a later month); organizations with runway get messages for up to the remaining slots. Rules are not re-run (they passed when they were tagged); the Top Contacts Cap, DNC check and 30-day organization limit still apply. <strong>Tip:</strong> turn on the 30-Day Organization Limit below — without it, no organization is ever treated as "full".</div>
                 </div>
                 <div class="form-group">
                     <label><i class="fas fa-building-circle-exclamation"></i> 30-Day Organization Limit</label>
@@ -586,7 +586,7 @@
                         <input type="number" id="fpOrgMsgLimitMax" value="3" min="1" style="width: 70px;" onchange="fpSaveOrgMsgLimitSettings()">
                         <span style="font-size: 13px;">contacts per organization with a message created in the past 30 days</span>
                     </div>
-                    <div class="form-help">Same setting as the 30-day limit on Generate Messages (shared — checking it here checks it there too). Counts distinct contacts with a non-deleted <code>connect_queue</code> message created in the past 30 days, across <strong>all</strong> BDRs. An organization already at the limit is skipped <em>before</em> it is scanned (no Apify cost), and within an organization message generation stops once the limit is reached — remaining matched contacts stay saved and tagged for a later month. <span id="fpOrgMsgLimitStatus" style="display:block; margin-top:4px; font-weight:600;"></span></div>
+                    <div class="form-help">Same setting as the 30-day limit on Generate Messages (shared — checking it here checks it there too). Counts distinct contacts with a <strong>live</strong> <code>connect_queue</code> message (sent to HeyReach, approved, or still pending review) created in the past 30 days, across <strong>all</strong> BDRs. Messages that were deleted, rejected, or flagged duplicate / already-connected do <strong>not</strong> count — their slots open back up (e.g. 3 created, 1 sent, 2 deleted = 1 used, room for 2 more). An organization already at the limit is skipped <em>before</em> it is scanned (no Apify cost), and within an organization message generation stops once the limit is reached — remaining matched contacts stay saved and tagged for a later month. <span id="fpOrgMsgLimitStatus" style="display:block; margin-top:4px; font-weight:600;"></span></div>
                 </div>
             </div>
 
@@ -3262,6 +3262,32 @@
         const FP_ORG_MSG_LIMIT_CACHE_MS = 5 * 60 * 1000;
         let _fpOrgMsgLimitCache = null; // { loadedAt, orgs: Map<orgKey, Set<contactUrl>> }
 
+        /**
+         * Is this connect_queue message "dead" — i.e. it no longer occupies one of an
+         * organization's 30-day slots? The limit is meant to cap messages that are LIVE
+         * (sent, or still waiting to be sent), not every doc that was ever created. Returns
+         * a short reason string for a dead message, or null for a live one. A live message
+         * is any of: sent to HeyReach, approved, or still pending review.
+         *
+         * Dead states, matching how the other pages mark a message as gone:
+         *   - deleted:true                      (Fast Connect Review / Generate Messages / cleanup pages)
+         *   - reviewStatus 'rejected' or rejected:true   (customer/BDR rejected it in Fast Customer Review)
+         *   - reviewStatus 'duplicate' / 'already_connected'  (blocked by the push-queue checks)
+         * A message that was already pushed live is NEVER dead, even if a later flag was set —
+         * it really went out and used up the slot.
+         * (Opus "exclude" flags are only a recommendation until a human deletes the message, so
+         * those still count — otherwise the cap could be exceeded if the reviewer overrides it.)
+         */
+        function fpQueueDocDeadReason(data) {
+            if (data.pushed_to_heyreach) return null;
+            if (data.deleted === true || data.deleted === 'true') return 'deleted';
+            const rs = String(data.reviewStatus || '').toLowerCase();
+            if (rs === 'rejected' || data.rejected === true) return 'rejected';
+            if (rs === 'duplicate') return 'duplicate';
+            if (rs === 'already_connected') return 'already connected';
+            return null;
+        }
+
         function fpIsOrgMsgLimitEnabled() {
             const cb = document.getElementById('fpOrgMsgLimitEnabled');
             return cb ? cb.checked : false;
@@ -3325,20 +3351,27 @@
             const docsById = new Map();
             [...snapUploaded.docs, ...snapCreated.docs].forEach(d => docsById.set(d.id, d.data()));
             const orgs = new Map();
-            let counted = 0;
+            let counted = 0, sentLive = 0;
+            const deadTally = {};
             for (const [docId, data] of docsById.entries()) {
-                if (data.deleted) continue;
                 const ts = data.created_at || data.generated_at || data.uploaded_date || '';
                 if (!ts || ts < cutoffISO) continue;
+                // Only LIVE messages (sent, approved, or still pending) use up an organization's
+                // slots — deleted / rejected / duplicate / already-connected ones free them back up.
+                const deadReason = fpQueueDocDeadReason(data);
+                if (deadReason) { deadTally[deadReason] = (deadTally[deadReason] || 0) + 1; continue; }
                 const orgKey = fpNormOrgNameForLimit(data.prospect_company || data.contactCompany || data.company || data.company_name || data.org_name || '');
                 if (!orgKey) continue;
                 const contactUrl = fpNormContactUrlForLimit(data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || data.linkedInUrl || '') || `doc:${docId}`;
                 if (!orgs.has(orgKey)) orgs.set(orgKey, new Set());
                 orgs.get(orgKey).add(contactUrl);
                 counted++;
+                if (data.pushed_to_heyreach) sentLive++;
             }
             _fpOrgMsgLimitCache = { loadedAt: Date.now(), orgs };
-            logFn(`   🏢 30-day org limit: ${counted} message(s) in the window across ${orgs.size} organization(s).`, 'dim');
+            const deadTotal = Object.values(deadTally).reduce((s, n) => s + n, 0);
+            const deadDetail = Object.entries(deadTally).map(([k, n]) => `${n} ${k}`).join(', ');
+            logFn(`   🏢 30-day org limit: ${counted} live message(s) in the window across ${orgs.size} organization(s) (${sentLive} sent to HeyReach, ${counted - sentLive} awaiting send/review). ${deadTotal} dead message(s) NOT counted${deadDetail ? ` — ${deadDetail}` : ''} — their slots are free again.`, 'dim');
             return orgs;
         }
 
@@ -5645,6 +5678,13 @@
             const dupeCollapse = fpDupeSkipInfo(queuedOrgs, scanName, skipAlreadyScanned);
             const fpRunOrgs = dupeCollapse.orgs;
 
+            // "ONLY use already-scanned contacts" mode — no new organizations are researched or
+            // scanned at all. The scan queue is emptied here; the run's queue is made up purely of
+            // backfill batches (already-tagged contacts without a message, grouped by organization),
+            // each checked against the 30-day organization limit for remaining runway.
+            const backfillOnly = document.getElementById('fpBackfillEnabled').checked;
+            if (backfillOnly) fpRunOrgs.length = 0;
+
             // Organizations that were already researched for a LinkedIn URL and came up
             // empty — by default these are skipped instead of being re-searched (and
             // re-billed) on every single run. Checking "Re-search..." above overrides this.
@@ -5683,8 +5723,8 @@
             const notFoundUrlNote = notFoundUrlCount > 0
                 ? `\n• ${notFoundUrlCount} organization(s) previously had no LinkedIn URL found — ${retryNotFoundUrls ? 'will be RE-SEARCHED because "Re-search..." is checked' : 'will be SKIPPED ENTIRELY (no re-research, no scan job) — check "Re-search organizations whose LinkedIn URL wasn\'t found" in Step 3 to retry them'}`
                 : '';
-            const backfillNoteForConfirm = document.getElementById('fpBackfillEnabled').checked
-                ? `\n• Backfill ON: contacts already scanned and tagged with this group that still have no message are used FIRST (no scan cost), before any new organization is scanned`
+            const backfillNoteForConfirm = backfillOnly
+                ? `\n• ONLY already-scanned contacts: NO new contacts will be searched and NO organization will be scanned (no Apify scan cost). Contacts already tagged with this group that still have no message are grouped by organization, and each organization is checked for runway under the 30-day limit before any messages are made${fpIsOrgMsgLimitEnabled() ? '' : '\n• ⚠️ The 30-Day Organization Limit is OFF — no organization will be treated as full'}`
                 : '';
             const orgLimitNoteForConfirm = fpIsOrgMsgLimitEnabled()
                 ? `\n• 30-Day Organization Limit ON: max ${fpGetOrgMsgLimitMax()} contact(s) per organization messaged in the past 30 days — organizations at the limit are skipped before scanning`
@@ -5694,7 +5734,10 @@
                     ? `\n• Organization Data Columns ON: ${orgDataQueueCount} of ${fpRunOrgs.length} queued organization(s) have data in the selected columns — sent to: ${orgDataStageLabels.join(', ')}`
                     : `\n• Organization Data Columns is ON, but none of the ${fpRunOrgs.length} queued organization(s) have data in the selected columns — nothing extra will be sent to the AI`)
                 : '';
-            if (!confirm(`Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}${dupeNote}${orgTypeNoteForConfirm}${notFoundUrlNote}${backfillNoteForConfirm}${orgLimitNoteForConfirm}${orgDataNoteForConfirm}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules — matches are tagged with this hypothesis group and stay in prospect_contacts (whether or not they end up with a message), while rule-dropped contacts are moved to prospect_contacts_deleted — news is searched once per organization, and messages are generated + Opus reviewed one at a time.`)) return;
+            const confirmBody = backfillOnly
+                ? `Run the Full Pipeline (ONLY already-scanned contacts) for hypothesis group "${groupName}"?\n\n• No new organizations will be scanned${backfillNoteForConfirm}${orgLimitNoteForConfirm}${orgDataNoteForConfirm}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization with leftover contacts is checked against the DNC list and the 30-day organization limit (organizations at the limit are skipped, their contacts stay saved). Contacts already connected to the BDR on LinkedIn are dropped. News is searched once per organization, and messages are generated + Opus reviewed one at a time.`
+                : `Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}${dupeNote}${orgTypeNoteForConfirm}${notFoundUrlNote}${backfillNoteForConfirm}${orgLimitNoteForConfirm}${orgDataNoteForConfirm}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules — matches are tagged with this hypothesis group and stay in prospect_contacts (whether or not they end up with a message), while rule-dropped contacts are moved to prospect_contacts_deleted — news is searched once per organization, and messages are generated + Opus reviewed one at a time.`;
+            if (!confirm(confirmBody)) return;
 
             const buildModel   = document.getElementById('fpBuildModel').value;
             const opusModel    = document.getElementById('fpOpusModel').value;
@@ -5711,7 +5754,7 @@
             } else {
                 addLog('🔝 Top Contacts Cap is OFF (default) — every rule-matched contact is eligible for message generation.', 'dim');
             }
-            const backfillEnabled = document.getElementById('fpBackfillEnabled').checked;
+            const backfillEnabled = backfillOnly;
             const orgLimitEnabled = fpIsOrgMsgLimitEnabled();
             const orgLimitMax = fpGetOrgMsgLimitMax();
             if (orgLimitEnabled) {
@@ -5927,6 +5970,7 @@
                     } : null,
                     topContactsCap: { enabled: topContactsEnabled, limit: topContactsLimit },
                     backfillScannedContacts: backfillEnabled,
+                    backfillOnly: backfillOnly,
                     orgMessageLimit30Days: { enabled: orgLimitEnabled, max: orgLimitMax, windowDays: FP_ORG_MSG_LIMIT_WINDOW_DAYS },
                     scanCriteria, secondScan: secondScanConfig, orgTypeMode: orgTypeConfig,
                     costGuard: { costPerMessage, enforcesAllInCost: true, minSpendBeforeEnforcing: costMinSpend },
@@ -5958,13 +6002,15 @@
             await saveReport();
             document.getElementById('fpReportLink').innerHTML = `<i class="fas fa-file-alt"></i> Run report ID: <code>${runId}</code> (collection <code>full_pipeline_runs</code>)`;
 
-            addLog(`🚀 Full Pipeline started — group "${groupName}", scan "${scanName}", ${fpRunOrgs.length} org(s) queued, ${bdrPlan.length} BDR(s), ${totalTarget} messages target.`);
-            if (alreadyScannedCount > 0) {
+            addLog(backfillOnly
+                ? `🚀 Full Pipeline started (ONLY already-scanned contacts — no new contact search, no organization scans) — group "${groupName}", ${bdrPlan.length} BDR(s), ${totalTarget} messages target.`
+                : `🚀 Full Pipeline started — group "${groupName}", scan "${scanName}", ${fpRunOrgs.length} org(s) queued, ${bdrPlan.length} BDR(s), ${totalTarget} messages target.`);
+            if (!backfillOnly && alreadyScannedCount > 0) {
                 addLog(skipAlreadyScanned
                     ? `⏭️ Skipping ${alreadyScannedCount} organization(s) already scanned as "${scanName}".`
                     : `↩️ ${alreadyScannedCount} organization(s) already scanned as "${scanName}" moved to the back of the queue.`, 'dim');
             }
-            if (dupeCollapse.extraCount > 0) {
+            if (!backfillOnly && dupeCollapse.extraCount > 0) {
                 addLog(`⏭️ Skipping ${dupeCollapse.extraCount} duplicate organization record(s) so the same company is not scanned twice this run. Merge them in Prospect Organizations Admin to remove the extras permanently.`, 'warning');
             }
             if (notFoundUrlCount > 0) {
@@ -6074,12 +6120,52 @@
                         report.totals.backfill = { taggedContacts: bf.totals.tagged, alreadyConnected: bf.totals.connected, eligibleContacts: bf.totals.eligible, organizations: bf.totals.orgs, messagesGenerated: 0 };
                         if (bf.queue.length > 0) {
                             fpRunOrgs.unshift(...bf.queue);
-                            addLog(`♻️ Backfill: ${bf.totals.eligible} eligible contact(s) across ${bf.queue.length} organization batch(es) queued AHEAD of the ${fpRunOrgs.length - bf.queue.length} organization(s) to scan — no Apify scan needed for these.`, 'success');
+                            addLog(backfillOnly
+                                ? `♻️ ONLY-already-scanned mode: ${bf.totals.eligible} eligible contact(s) across ${bf.queue.length} organization batch(es) — no new contacts searched, no organizations scanned.`
+                                : `♻️ Backfill: ${bf.totals.eligible} eligible contact(s) across ${bf.queue.length} organization batch(es) queued AHEAD of the ${fpRunOrgs.length - bf.queue.length} organization(s) to scan — no Apify scan needed for these.`, 'success');
+
+                            // ── Runway preview (ONLY mode) — walk the organizations one by one and
+                            // report whether each is still under the 30-day limit, i.e. whether there
+                            // is room to re-engage it through these other contacts. This is purely
+                            // informational: the main loop re-checks each organization (and each
+                            // contact, reserving slots) right before generating, so the numbers can't
+                            // drift. Organizations at the limit are skipped there with a report entry.
+                            if (backfillOnly) {
+                                if (!orgLimitEnabled) {
+                                    addLog(`   ℹ️ 30-Day Organization Limit is OFF — every organization with leftover contacts is treated as having runway.`, 'warning');
+                                } else {
+                                    try {
+                                        const counts = await fpLoadOrgMessageCounts30Days(addLog);
+                                        let withRunway = 0, atLimit = 0, runwaySlots = 0, runwayContacts = 0;
+                                        addLog(`\n🔎 Checking runway organization by organization (limit ${orgLimitMax} contact(s) per ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days):`);
+                                        for (const b of bf.queue) {
+                                            const count = Math.max(0, ...fpOrgLimitKeys(b, null).map(k => (counts.get(k) || new Set()).size));
+                                            const slots = Math.max(0, orgLimitMax - count);
+                                            const n = b._backfill.contacts.length;
+                                            if (slots > 0) {
+                                                withRunway++; runwaySlots += slots; runwayContacts += Math.min(slots, n);
+                                                addLog(`   ✅ ${b.company_name}: ${count}/${orgLimitMax} used — ${slots} slot(s) open, ${n} leftover contact(s) available (${bdrContexts.get(b._backfill.bdrEmail)?.bdrRec?.name || b._backfill.bdrEmail})`, 'dim');
+                                            } else {
+                                                atLimit++;
+                                                addLog(`   ⛔ ${b.company_name}: ${count}/${orgLimitMax} used — at the limit, no runway; ${n} leftover contact(s) stay saved for later`, 'dim');
+                                            }
+                                        }
+                                        report.totals.backfill.runway = { organizationsChecked: bf.queue.length, withRunway, atLimit, openSlots: runwaySlots, contactsUsableNow: runwayContacts };
+                                        addLog(`🔎 Runway: ${withRunway} of ${bf.queue.length} organization batch(es) can be re-engaged now (~${runwayContacts} message(s) possible); ${atLimit} at the 30-day limit.`, withRunway > 0 ? 'success' : 'warning');
+                                    } catch (e) {
+                                        addLog(`   ⚠️ Could not preview runway (${e.message}) — each organization is still checked as it is processed.`, 'warning');
+                                    }
+                                }
+                            }
                         } else {
-                            addLog(`♻️ Backfill: nothing to reuse — every tagged contact already has a message, is connected, excluded, or under the connection floor. Proceeding to the scan queue.`, 'dim');
+                            addLog(backfillOnly
+                                ? `♻️ ONLY-already-scanned mode: nothing to reuse — every tagged contact already has a message, is connected, excluded, or under the connection floor. No new contacts are searched in this mode, so the run ends here.`
+                                : `♻️ Backfill: nothing to reuse — every tagged contact already has a message, is connected, excluded, or under the connection floor. Proceeding to the scan queue.`, 'dim');
                         }
                     } catch (e) {
-                        addLog(`⚠️ Backfill failed (${e.message}) — continuing with the scan queue only.`, 'warning');
+                        addLog(backfillOnly
+                            ? `⚠️ Backfill failed (${e.message}) — ONLY-already-scanned mode has no scan queue, so nothing will be processed.`
+                            : `⚠️ Backfill failed (${e.message}) — continuing with the scan queue only.`, 'warning');
                     }
                     await saveReport();
                 }
