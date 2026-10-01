@@ -1921,6 +1921,7 @@
         if (ts instanceof Date) return ts;
         if (typeof ts.toDate === 'function') return ts.toDate();
         if (ts.seconds !== undefined) return new Date(ts.seconds * 1000);
+        if (ts._seconds !== undefined) return new Date(ts._seconds * 1000);
         if (typeof ts === 'number') return new Date(ts);
         if (typeof ts === 'string') return new Date(ts);
         return null;
@@ -3211,9 +3212,30 @@
                     item.uploaded_date || item.generated_at || item.review_date
                 );
             }
+            // "Sent" should mean what HeyReach reports: the day the connection request actually
+            // went out (CONNECTION_REQUEST_SENT webhook), not the day it was pushed to the
+            // queue — HeyReach drips queued requests out over days/weeks, so the push date
+            // badly undercounts recent windows. Use the webhook timestamp when we have one,
+            // and fall back to the push/created date otherwise.
+            const sentAtMap = actuallySentUrls.sentAt || new Map();
+            const inWindow = d => (!_since || d >= _since) && (!_until || d < _until);
+            function sentEventDates(item) {
+                if (!sentAtMap.size) return null;
+                const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
+                const m = sentAtMap.get(liSlug(raw)) || sentAtMap.get(normalizeUrl(raw));
+                return m ? [...m.values()] : null;
+            }
+
             let sentItems = sentItemsAllTime;
+            let byEvent = 0, byPushDate = 0;
             if (_since || _until) {
                 sentItems = sentItemsAllTime.filter(item => {
+                    const evDates = sentEventDates(item);
+                    if (evDates && evDates.length) {
+                        byEvent++;
+                        return evDates.some(inWindow);
+                    }
+                    byPushDate++;
                     const created = sentCreatedAt(item);
                     if (created && _since && created < _since) return false;
                     if (created && _until && created >= _until) return false;
@@ -3221,7 +3243,14 @@
                 });
             }
             console.log('[outcomes] sentItems (windowed):', sentItems.length,
-                '| sentItemsAllTime:', sentItemsAllTime.length);
+                '| sentItemsAllTime:', sentItemsAllTime.length,
+                '| dated by send event:', byEvent, '| dated by push date (no send event):', byPushDate);
+            if (sentAtMap.size && (_since || _until)) {
+                let eventLeadsInWindow = 0;
+                sentAtMap.forEach(m => { if ([...m.values()].some(inWindow)) eventLeadsInWindow++; });
+                console.log('[outcomes] HeyReach send events in window (unique leads):', eventLeadsInWindow,
+                    '— these should roughly match HeyReach\'s "Connections sent". Any not in the Sent count have no matching connect_queue record.');
+            }
 
             // Nothing sent in this window, but older sends exist: keep going so outcomes
             // (accepts / replies / meetings) that happened in the window still show up.
@@ -3510,11 +3539,23 @@
         const emailSet = new Set(emailArr.map(e => e.toLowerCase()));
         const BACKEND = 'https://railwayclemail-production.up.railway.app';
 
-        function addUrl(leadProfileUrl) {
+        // When each lead's connection request was actually sent (HeyReach webhook
+        // timestamp). Keyed by slug (or normalized URL if no slug) → Map<ms, Date>
+        // (keyed by ms so the same event seen via multiple query paths isn't doubled).
+        // Attached to the returned Set as `.sentAt`.
+        const sentAtByKey = new Map();
+
+        function addUrl(leadProfileUrl, ts) {
             const url = normalizeUrl(leadProfileUrl || '');
             if (url) sentByHeyreach.add(url);
             const slug = liSlug(leadProfileUrl || '');
             if (slug) sentByHeyreach.add(slug);
+            const d = safeToDate(ts);
+            const key = slug || url;
+            if (key && d && !isNaN(d.getTime())) {
+                if (!sentAtByKey.has(key)) sentAtByKey.set(key, new Map());
+                sentAtByKey.get(key).set(d.getTime(), d);
+            }
         }
 
         // Collect HeyReach numeric account IDs for our BDR emails
@@ -3557,7 +3598,7 @@
             snap.forEach(d => {
                 const data = d.data();
                 if ((data.eventType || '') !== 'CONNECTION_REQUEST_SENT') return;
-                addUrl(data.leadProfileUrl);
+                addUrl(data.leadProfileUrl, data.timestamp || data.createdAt || data.eventTimestamp);
             });
         });
 
@@ -3579,7 +3620,7 @@
                         const evId    = ev.linkedInAccountId ? String(ev.linkedInAccountId) : null;
                         const match   = (evEmail && emailSet.has(evEmail)) ||
                                         (evId    && heyreachAccountIds.includes(evId));
-                        if (match) addUrl(ev.leadProfileUrl);
+                        if (match) addUrl(ev.leadProfileUrl, ev.timestamp || ev.createdAt || ev.eventTimestamp);
                     }
                 }
             } else {
@@ -3592,7 +3633,8 @@
         console.log('[outcomes] loadActuallySentConnections:',
             sentByHeyreach.size, 'confirmed-sent URLs',
             '| heyreachAccountIds:', heyreachAccountIds,
-            '| emails:', emailArr);
+            '| emails:', emailArr, '| leads with send timestamps:', sentAtByKey.size);
+        sentByHeyreach.sentAt = sentAtByKey;
         return sentByHeyreach;
     }
 
