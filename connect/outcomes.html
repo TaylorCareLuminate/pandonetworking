@@ -3200,10 +3200,14 @@
             // This is purely a date filter on the connect_queue record's own push/created
             // date — it does NOT gate whether a later Accepted/Replied/Scheduled event
             // counts (that's handled per-event, against sentItemsAllTime, in buildResults).
+            // Prefer the date the message was actually pushed to HeyReach (same priority as
+            // the in-queue filter) over the approval date: approvals happen in bulk and the
+            // push can trail by days, which would otherwise shift recent sends out of short
+            // windows like "Last 7 Days".
             function sentCreatedAt(item) {
                 return safeToDate(
-                    item.adminApprovedAt || item.customerApprovedAt ||
-                    item.pushed_at || item.created_at ||
+                    item.heyreach_push_date || item.pushed_date || item.pushed_at ||
+                    item.adminApprovedAt || item.customerApprovedAt || item.created_at ||
                     item.uploaded_date || item.generated_at || item.review_date
                 );
             }
@@ -3219,7 +3223,11 @@
             console.log('[outcomes] sentItems (windowed):', sentItems.length,
                 '| sentItemsAllTime:', sentItemsAllTime.length);
 
-            if (!sentItems.length) {
+            // Nothing sent in this window, but older sends exist: keep going so outcomes
+            // (accepts / replies / meetings) that happened in the window still show up.
+            const noSendsInWindow = !sentItems.length && sentItemsAllTime.length > 0 && _dataLoadIssues.length === 0;
+
+            if (!sentItems.length && !noSendsInWindow) {
                 // Don't report a clean "no data" result if the reason the sent-messages
                 // list is empty is that the connect_queue queries themselves failed
                 // (e.g. Railway cold-start timeouts) — that's a backend problem, not an
@@ -3286,6 +3294,11 @@
             renderResults(results, viewLabel, sentItems.length, _computedRangeLabel);
             showAiGrouperPanel();
             renderDataIssuesBanner();
+            if (noSendsInWindow) {
+                document.getElementById('alertArea').innerHTML = `
+                    <div class="alert info"><i class="fas fa-info-circle"></i>No connection requests were sent for ${viewLabel} during ${_computedRangeLabel}
+                    (${sentItemsAllTime.length} total sends exist outside this window). Accepted / Replied / Scheduled below are outcomes that happened during the window, from earlier sends.</div>`;
+            }
 
             // ── Hypothesis group breakdown (BDR + Company tabs only) ──
             const targetEmails = new Set(targetBdrs.map(b => (b.primaryEmail || b.id || '').toLowerCase()).filter(Boolean));
@@ -3968,9 +3981,13 @@
             return { sent: sentSlugs.size || sentNorms.size, accepted, replied, scheduled };
         }
 
+        // A type is shown if it had sends in the window OR any outcome events (accepted /
+        // replied / scheduled) landed in the window from earlier sends — important for
+        // short windows (e.g. the past week) where outcomes mostly come from older connections.
         types.forEach(t => {
-            if (!typeGroups[t].length) return;
+            if (!typeGroups[t].length && !typeGroupsAllTime[t].length) return;
             const row = computeRow(typeGroups[t], typeGroupsAllTime[t]);
+            if (!typeGroups[t].length && !row.accepted && !row.replied && !row.scheduled) return;
             row.type = t;
             rows.push(row);
         });
@@ -4005,10 +4022,11 @@
 
             const matchesBdrEmail = item => bdrEmails.has((item.account_email || '').toLowerCase());
             const bdrItems = sentItems.filter(matchesBdrEmail);
-            if (!bdrItems.length) return;
             const bdrItemsAllTime = (sentItemsAllTime || sentItems).filter(matchesBdrEmail);
+            if (!bdrItems.length && !bdrItemsAllTime.length) return;
 
             const row = computeRow(bdrItems, bdrItemsAllTime);
+            if (!bdrItems.length && !row.accepted && !row.replied && !row.scheduled) return;
             row.name = bdr.name || bdr.primaryEmail || bdr.id;
             bdrRows.push(row);
         });
