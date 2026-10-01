@@ -864,6 +864,10 @@ const RESEARCH_DIMENSIONS = [
     // display-ready (rawLevels) and the panel only renders when the segment actually has
     // a variation test running (hideWhenEmpty) — most hypothesis groups don't.
     { group: 'Message Craft', key: 'message_variation', title: 'Message Angles Tested (A/B)', icon: 'fa-flask', rawLevels: true, hideWhenEmpty: true },
+    // "A 'No' is a 'Yes'" has no research node of its own — it's built from the neg_question_*
+    // items in keys.working / keys.not_working (see renderReverseAsk). Always shown, with an
+    // explicit "not enough data yet" state when a placement hasn't cleared the bar.
+    { group: 'Message Craft', key: 'neg_question', title: '\u201CA No is a Yes\u201D (Reverse-Ask)', icon: 'fa-arrows-rotate', special: 'reverse_ask' },
     { group: 'Message Craft', key: 'reason_to_connect', title: 'Reason for Connecting', icon: 'fa-link' },
     { group: 'Message Craft', key: 'hook_type', title: 'Opening Hook', icon: 'fa-magnet' },
     { group: 'Message Craft', key: 'tone', title: 'Tone', icon: 'fa-comment-dots' },
@@ -967,6 +971,7 @@ let PAYLOAD = null;
 let RUN_CANDIDATES = []; // [{run_date, source: 'firebase'|'local', file?}]
 let CURRENT_RUN_DATE = null;
 let CURRENT_SOURCE = null;
+let CURRENT_KEYS = null; // keys object (working / not_working) for the currently-rendered segment; used by the Reverse-Ask panel
 let CURRENT_RESEARCH = null; // research object for the currently-rendered segment; used by the "compare styles" widget
 
 async function fetchLocalManifest() {
@@ -1424,8 +1429,7 @@ function resolveKeyLink(item) {
 
     // "A 'No' is a 'Yes'" reverse-ask signals are about the kind of question asked.
     if (/^neg_question_/.test(item.id || '')) {
-        const dim = RESEARCH_DIMENSIONS.find(d => d.key === 'question_type');
-        return { targetId: 'research-dim-question_type', label: `See "${dim ? dim.title : 'Question Asked'}" data` };
+        return { targetId: 'research-dim-neg_question', label: 'See "Reverse-Ask" data' };
     }
 
     // "Personalization" is an umbrella category covering both company_vs_prospect
@@ -1943,6 +1947,104 @@ function renderAiFeel(data) {
     `;
 }
 
+// "A No is a Yes" (reverse-ask) panel for Deep-Dive Research. The backend exposes this
+// only through keys.working / keys.not_working as ordinary KeyItems, so this gathers the
+// four neg_question_* items for the current segment and shows each placement — opening
+// message, pre-reply follow-up, follow-up after the first reply, or anywhere — as a normal
+// key card. A placement that's missing isn't "doesn't work": it just hasn't had enough
+// uses (n_with < 12) or hasn't cleared the effect-size bar yet.
+const REVERSE_ASK_PLACEMENTS = [
+    { id: 'neg_question_any', label: 'Uses a negative/rhetorical question anywhere in the sequence' },
+    { id: 'neg_question_first', label: 'Uses a negative/rhetorical question in the opening message' },
+    { id: 'neg_question_second', label: 'Uses a negative/rhetorical question in the pre-reply follow-up (2nd message)' },
+    { id: 'neg_question_followup', label: 'Uses a negative/rhetorical question in the follow-up right after the prospect\u2019s first reply' }
+];
+// Side-by-side trend table for the four Reverse-Ask placements: this segment vs. ALL data
+// (payload.overall). Overall numbers come from the overall segment's own neg_question_*
+// keys; if the overall segment doesn't surface a placement but this segment's item carries
+// overall_effect_pp, that benchmark effect is shown instead. When viewing Overall itself,
+// only one set of columns is shown.
+function reverseAskOverview() {
+    const overallKeys = PAYLOAD && PAYLOAD.overall && PAYLOAD.overall.keys;
+    const isOverall = !!overallKeys && CURRENT_KEYS === overallKeys;
+    const find = (keys, id) => {
+        if (!keys) return null;
+        const w = (keys.working || []).find(k => k.id === id);
+        if (w) return { item: w, working: true };
+        const n = (keys.not_working || []).find(k => k.id === id);
+        return n ? { item: n, working: false } : null;
+    };
+    const effectHtml = v => isNum(v)
+        ? `<strong style="font-size:1.05rem;color:${v >= 0 ? 'var(--success-dark)' : 'var(--danger-dark)'};">${fmtPP(v)}</strong>`
+        : '<span style="color:var(--gray-400);">—</span>';
+    const cell = (hit, benchmarkEffect) => {
+        if (hit) {
+            const k = hit.item;
+            return `<td style="padding:0.6rem 0.7rem;vertical-align:top;">
+                ${effectHtml(k.effect_pp)} ${confidenceBadge(k.confidence)}
+                <div style="font-size:0.78rem;color:var(--gray-600);margin-top:0.2rem;">${fmtPct(k.rate_with)} with vs ${fmtPct(k.rate_without)} without</div>
+                <div style="font-size:0.74rem;color:var(--gray-500);">n=${fmtNum(k.n_with)} used it</div>
+            </td>`;
+        }
+        if (isNum(benchmarkEffect)) {
+            return `<td style="padding:0.6rem 0.7rem;vertical-align:top;">${effectHtml(benchmarkEffect)}
+                <div style="font-size:0.74rem;color:var(--gray-500);margin-top:0.2rem;">benchmark effect only</div></td>`;
+        }
+        return '<td style="padding:0.6rem 0.7rem;vertical-align:top;color:var(--gray-400);font-size:0.8rem;">Not enough data yet</td>';
+    };
+    const shortLabel = { neg_question_any: 'Anywhere in the sequence', neg_question_first: 'Opening message', neg_question_second: 'Pre-reply follow-up (2nd message)', neg_question_followup: 'Follow-up after first reply' };
+    const outcomeOf = { neg_question_any: 'reply rate', neg_question_first: 'reply rate', neg_question_second: 'reply rate', neg_question_followup: 'meeting rate' };
+
+    const rows = REVERSE_ASK_PLACEMENTS.map(p => {
+        const seg = isOverall ? null : find(CURRENT_KEYS, p.id);
+        const ov = find(overallKeys, p.id);
+        const benchmark = seg && seg.item ? seg.item.overall_effect_pp : null;
+        return `<tr style="border-top:1px solid var(--gray-200);">
+            <td style="padding:0.6rem 0.7rem;vertical-align:top;font-weight:600;">${shortLabel[p.id]}<div style="font-size:0.74rem;font-weight:500;color:var(--gray-500);">effect on ${outcomeOf[p.id]}</div></td>
+            ${isOverall ? '' : cell(seg)}
+            ${cell(ov, ov ? null : benchmark)}
+        </tr>`;
+    }).join('');
+    const th = 'padding:0.5rem 0.7rem;text-align:left;font-size:0.74rem;text-transform:uppercase;letter-spacing:0.04em;color:var(--gray-500);';
+    return `
+        <div style="overflow-x:auto;margin-bottom:1rem;">
+            <table style="width:100%;border-collapse:collapse;">
+                <thead><tr>
+                    <th style="${th}">Where it's used</th>
+                    ${isOverall ? '' : `<th style="${th}">This segment</th>`}
+                    <th style="${th}">Overall (all data)</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
+}
+
+function renderReverseAsk() {
+    const working = (CURRENT_KEYS && CURRENT_KEYS.working) || [];
+    const notWorking = (CURRENT_KEYS && CURRENT_KEYS.not_working) || [];
+    let found = 0;
+    const cards = REVERSE_ASK_PLACEMENTS.map(p => {
+        const w = working.find(k => k.id === p.id);
+        const nw = notWorking.find(k => k.id === p.id);
+        const item = w || nw;
+        if (item) { found++; return renderKeyCard(item, !!w); }
+        return `
+            <div class="key-card" style="opacity:0.7;">
+                <div class="key-card-top"><div class="key-card-label">${escapeHtml(p.label)}</div></div>
+                <div class="key-card-meta">
+                    <span class="chip">Message Craft</span>
+                    ${reverseAskBadge({ id: p.id })}
+                </div>
+                <p class="empty-note" style="margin:0.6rem 0 0;">Not enough data yet for this segment — this tactic is used in too few messages (under 12) or hasn&rsquo;t cleared the effect-size bar. That means &ldquo;not enough data,&rdquo; not &ldquo;doesn&rsquo;t work.&rdquo;</p>
+            </div>`;
+    }).join('');
+    return `
+        <p class="card-subtitle" style="margin-bottom:0.9rem;"><i class="fas fa-arrows-rotate"></i> Negative or rhetorical questions where &ldquo;no&rdquo; actually means &ldquo;yes&rdquo; &mdash; e.g. &ldquo;Wouldn&rsquo;t it help to grab 15 minutes?&rdquo; or &ldquo;Would it not help to find a time and meet?&rdquo; Compares reply (or, for the post-reply follow-up, meeting) rates with vs. without the tactic at each point in the sequence.${found ? '' : ' None of the placements have enough data for this segment yet.'}</p>
+        ${reverseAskOverview()}
+        <div style="display:grid;gap:0.8rem;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));">${cards}</div>
+    `;
+}
+
 // "Message angles tested" — research.message_variation: one row per A/B angle
 // (hypothesis_variation_label), ranked by reply rate, with the same rate bars / examples
 // drawer / compare widget as every other breakdown. Untagged messages are excluded by the
@@ -1975,6 +2077,7 @@ function renderResearch(research) {
                 if (dim.special === 'company_vs_prospect') innerHtml = renderCompanyVsProspect(data);
                 else if (dim.special === 'ai_feel') innerHtml = renderAiFeel(data);
                 else if (dim.special === 'day_time') innerHtml = renderDayTimeHeatmap(data, dim.key, 'reply_rate');
+                else if (dim.special === 'reverse_ask') innerHtml = renderReverseAsk();
                 else if (dim.key === 'message_variation') innerHtml = renderMessageVariation(data);
                 else innerHtml = renderRateTable(data, dim.ordinal, dim.key);
                 // These three track first-message/outreach dates, which largely follow
@@ -2216,6 +2319,7 @@ function renderAll() {
         document.getElementById(id).style.display = suff ? '' : 'none';
     });
     CURRENT_RESEARCH = suff ? segment.research : null;
+    CURRENT_KEYS = suff ? segment.keys : null;
     CURRENT_COMPARE_ROWS = {};
     DAY_TIME_ROWS_BY_KEY = {};
     if (suff) {

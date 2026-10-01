@@ -8071,7 +8071,27 @@ Does this job title meet the criteria? Return JSON with "shouldKeep" (boolean) a
         }
 
         // Load prospects for AI profile review (optional - job will load them on Railway)
+        // Guard against double-clicks / overlapping loads. Each load resets and then appends to the
+        // shared aiProfileProspects array, so two overlapping loads interleave and double the list
+        // (e.g. 5,713 contacts reported as 11,426).
+        let _aiProfileLoadInFlight = false;
         async function loadAIProfileProspects() {
+            if (_aiProfileLoadInFlight) {
+                console.warn('⏳ AI profile prospect load already in progress — ignoring duplicate request');
+                return;
+            }
+            _aiProfileLoadInFlight = true;
+            const loadBtn = document.querySelector('button[onclick="loadAIProfileProspects()"]');
+            if (loadBtn) loadBtn.disabled = true;
+            try {
+                await _loadAIProfileProspectsImpl();
+            } finally {
+                _aiProfileLoadInFlight = false;
+                if (loadBtn) loadBtn.disabled = false;
+            }
+        }
+
+        async function _loadAIProfileProspectsImpl() {
             const bdrEmail = document.getElementById('aiProfileBdrSelect').value;
             if (!bdrEmail) {
                 alert('Please select a BDR or Workspace first');
@@ -8619,6 +8639,16 @@ Does this job title meet the criteria? Return JSON with "shouldKeep" (boolean) a
 
             const model = document.getElementById('aiModel').value;
 
+            // If "Skip already-reviewed" is on and every loaded contact already has a decision, the
+            // server job finishes instantly with 0 contacts and nothing appears to happen.
+            if (document.getElementById('skipReviewedToggle')?.checked !== false && aiProfileProspects.length > 0) {
+                const pending = aiProfileProspects.filter(p => !p.aiCleanupDecision).length;
+                if (pending === 0) {
+                    alert(`All ${aiProfileProspects.length.toLocaleString()} contacts in this selection already have an AI decision, so there is nothing to process.\n\nTo re-review them (for example with a different model), untick "Skip already-reviewed contacts" and run again.`);
+                    return;
+                }
+            }
+
             if (!isTest) {
                 if (!confirm(`This will process prospects on Railway (server-side in batches of 300). The job will continue even if you close this page. Continue?`)) {
                     return;
@@ -8998,6 +9028,9 @@ self.onmessage = function(e) {
                         document.getElementById('stopAIProfileBtn').style.display = 'none';
                         
                         addLog('\n✅ Job completed successfully!', 'success');
+                        if (parsed.stats && parsed.stats.total === 0 && (job.resultsCount || 0) === 0) {
+                            addLog('ℹ️ 0 contacts were processed. If "Skip already-reviewed contacts" is ticked, every contact in this selection already has an AI decision — untick it to re-review them.', 'error');
+                        }
 
                         // Fetch full results now that the job is done (polling used includeResults=false)
                         try {
