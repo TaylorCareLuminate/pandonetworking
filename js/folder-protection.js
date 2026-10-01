@@ -375,7 +375,10 @@ async function protectFolder(folderName, options = {}) {
       } else {
         console.log('🔒 Firebase reports no user and no saved session exists — redirecting to login');
         if (window.redirectToLogin) {
-          window.redirectToLogin(`You must be logged in to access ${folderName}.`);
+          const msg = window._indexedDbStalled
+            ? 'Your browser\'s site storage stopped responding, so your saved sign-in could not be restored. Please sign in again.'
+            : `You must be logged in to access ${folderName}.`;
+          window.redirectToLogin(msg);
         } else {
           window.location.href = '/login.html';
         }

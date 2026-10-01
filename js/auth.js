@@ -1,5 +1,5 @@
 // Version and debug info
-const AUTH_VERSION = '1.6.0-auth-state-ready';
+const AUTH_VERSION = '1.6.1-auth-state-ready-idb-fallback';
 console.log(`🔄 Auth script loading... (v${AUTH_VERSION})`);
 console.log(`🛡️ 12-hour session protection enabled globally`);
 console.log(`👥 Cross-tab authentication synchronization enabled`);
@@ -95,6 +95,10 @@ window.authStateReady = new Promise((resolve) => {
 //   null  = could not tell (IndexedDB unavailable / timed out)
 // window._persistedFirebaseUserHint caches the latest answer for sync callers.
 window._persistedFirebaseUserHint = null;
+// Set to true when a trivial indexedDB.open() gets NO response within the probe
+// timeout. In that state the Firebase SDK (which has no timeout on its IndexedDB
+// reads) will never finish initializing auth, so we must not use IndexedDB.
+window._indexedDbStalled = false;
 
 function readPersistedUserFromIndexedDB(timeoutMs = 3000) {
   return new Promise((resolve) => {
@@ -102,7 +106,13 @@ function readPersistedUserFromIndexedDB(timeoutMs = 3000) {
     const finish = (val) => { if (!settled) { settled = true; resolve(val); } };
     try {
       if (!window.indexedDB) return finish(null);
-      const timer = setTimeout(() => finish(null), timeoutMs);
+      const timer = setTimeout(() => {
+        if (!settled) {
+          window._indexedDbStalled = true;
+          console.warn(`⚠️ IndexedDB did not respond to a simple open() within ${timeoutMs}ms — site storage appears stalled in this browser`);
+        }
+        finish(null);
+      }, timeoutMs);
       // Open WITHOUT a version so we never upgrade/create Firebase's database.
       const req = indexedDB.open('firebaseLocalStorageDb');
       req.onupgradeneeded = (ev) => {
@@ -150,18 +160,45 @@ window.hasPersistedFirebaseUser = async function() {
   } catch (e) { /* ignore */ }
   if (result !== true) {
     const idb = await readPersistedUserFromIndexedDB();
-    if (idb === true) result = true;
-    else if (idb === false && result === null) result = false;
+    if (idb === true) { result = true; window._indexedDbStalled = false; }
+    else if (idb === false) { window._indexedDbStalled = false; if (result === null) result = false; }
   }
   window._persistedFirebaseUserHint = result;
   return result;
 };
 
 // Prime the hint early so sync guards (isTrulyLoggedOut) have an answer by the
-// time Firebase reports anything.
-window.hasPersistedFirebaseUser().then((hint) => {
+// time Firebase reports anything. initializeFirebaseAuth() also awaits this probe
+// to decide whether IndexedDB is safe to use for auth persistence.
+window._persistedUserProbe = window.hasPersistedFirebaseUser().then((hint) => {
   if (hint !== null) console.log(`💾 Persisted Firebase session on this device: ${hint ? 'yes' : 'no'}`);
-}).catch(() => { /* non-critical */ });
+  return hint;
+}).catch(() => null);
+
+// One-time, dismissible banner explaining a stalled-storage situation and how
+// to get out of it. Only shown when we KNOW IndexedDB is unresponsive.
+window.showStorageStalledNotice = function() {
+  try {
+    if (document.getElementById('hl-storage-stalled-notice')) return;
+    const show = () => {
+      if (!document.body || document.getElementById('hl-storage-stalled-notice')) return;
+      const el = document.createElement('div');
+      el.id = 'hl-storage-stalled-notice';
+      el.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:2147483000;max-width:640px;width:calc(100% - 32px);background:#1f2937;color:#f9fafb;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.35);padding:14px 16px;font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;gap:12px;align-items:flex-start;';
+      el.innerHTML =
+        '<div style="flex:1">' +
+          '<strong style="display:block;margin-bottom:4px">Browser storage for this site isn\'t responding</strong>' +
+          'Your saved sign-in couldn\'t be restored because this browser\'s IndexedDB for pandonetworking.com has stalled. ' +
+          'To fix it: <b>close every pandonetworking.com tab</b>, then reopen this page. If it still happens, restart the browser, ' +
+          'or clear site data for pandonetworking.com (Chrome: lock icon → Site settings → Delete data) and sign in again.' +
+        '</div>' +
+        '<button type="button" aria-label="Dismiss" style="background:transparent;border:0;color:#9ca3af;font-size:18px;cursor:pointer;line-height:1;padding:0 2px">&times;</button>';
+      el.querySelector('button').addEventListener('click', () => el.remove());
+      document.body.appendChild(el);
+    };
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+  } catch (e) { /* non-critical */ }
+};
 
 // Wait for header elements to be available (optional - not all pages have these)
 function waitForHeaderElements() {
@@ -617,7 +654,7 @@ async function initializeFirebaseAuth() {
     
     // Import Firebase modules
     const { initializeApp, getApps } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js');
-    const { getAuth, onAuthStateChanged } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
+    const { getAuth, onAuthStateChanged, initializeAuth, browserLocalPersistence, browserPopupRedirectResolver } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
     const { getFirestore } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
     const { getDatabase, ref, get, set, update, remove, child } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js');
     
@@ -633,7 +670,35 @@ async function initializeFirebaseAuth() {
       app = initializeApp(firebaseConfig);
     }
     
-    auth = getAuth(app);
+    // Is IndexedDB usable? getAuth() defaults to IndexedDB-first persistence and the
+    // SDK has NO timeout on that read — if the browser's IndexedDB for this origin is
+    // wedged (it happens in long-lived Chrome profiles with many tabs), Auth never
+    // reports a state, auth.currentUser stays null forever, every page looks "not
+    // authenticated", and you can't even sign in again. The storage probe kicked off
+    // at script load tells us; if it saw no response, initialize Auth on localStorage
+    // instead so the page (and login.html) can at least function.
+    await Promise.race([
+      window._persistedUserProbe,
+      new Promise(resolve => setTimeout(resolve, 3500))
+    ]);
+    
+    if (window._indexedDbStalled) {
+      console.warn('⚠️ IndexedDB is unresponsive — initializing Firebase Auth with localStorage persistence as a fallback.');
+      console.warn('   Any session saved in IndexedDB cannot be read until the browser recovers; you may need to sign in again.');
+      try {
+        auth = initializeAuth(app, {
+          persistence: browserLocalPersistence,
+          popupRedirectResolver: browserPopupRedirectResolver
+        });
+      } catch (e) {
+        // auth/already-initialized — some other script on the page called getAuth() first
+        console.warn('⚠️ Could not override Auth persistence (already initialized):', e.code || e.message);
+        auth = getAuth(app);
+      }
+      window.showStorageStalledNotice();
+    } else {
+      auth = getAuth(app);
+    }
     db = getFirestore(app);
     database = getDatabase(app);
     
@@ -934,7 +999,10 @@ async function initializeFirebaseAuth() {
       } else if (persisted === false) {
         console.warn('   No saved session found in IndexedDB or localStorage — the SDK itself appears stuck.');
       } else {
-        console.warn('   IndexedDB could not be read (stalled/blocked) — likely the SDK is stuck on IndexedDB too.');
+        console.warn('   IndexedDB could not be read (stalled/blocked) — the SDK is stuck on IndexedDB too.');
+        console.warn('   Remedy: close ALL pandonetworking.com tabs and reopen; if it persists, restart the browser or clear');
+        console.warn('   site data for pandonetworking.com and sign in again.');
+        window.showStorageStalledNotice();
       }
     }, 10000);
     window.authStateReady.then(() => clearTimeout(stallTimer));
