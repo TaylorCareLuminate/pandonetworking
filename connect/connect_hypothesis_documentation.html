@@ -508,6 +508,15 @@
             border-radius: 10px;
             padding: 0.85rem 1rem;
         }
+        /* Stopped variation: kept on the group for reporting, but no longer used for new messages */
+        .variation-row.inactive { background: #f3f4f6; border-style: dashed; }
+        .variation-row.inactive .variation-row-top input[type="text"],
+        .variation-row.inactive textarea { opacity: 0.6; }
+        .variation-stopped-badge {
+            display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap;
+            font-size: 0.72rem; font-weight: 700; color: #92400e;
+            background: #fef3c7; border: 1px solid #fcd34d; border-radius: 10px; padding: 0.2rem 0.55rem;
+        }
         .variation-row-top { display: flex; gap: 0.6rem; align-items: center; }
         .variation-row-top input[type="text"] {
             flex: 1;
@@ -2462,7 +2471,8 @@
                     Define different outreach message approaches to test within this hypothesis (e.g. "Staffing ROI angle" vs.
                     "Clinical outcomes angle"). Each variation has its own label and AI writing prompt/instructions, which is
                     appended to the bottom of this group's Message Review Instructions (above) whenever that variation is
-                    selected. Assign a variation to individual messages by hand in
+                    selected. Use <strong>Stop using</strong> to retire a variation: it stays on the group so messages already sent with it
+                    keep reporting on Outcomes, but Generate Messages and Full Pipeline will no longer offer or pick it. Assign a variation to individual messages by hand in
                     <a href="fast_connect_review.html" target="_blank" style="color:var(--primary);">Fast Connect Review</a>,
                     or when generating messages in
                     <a href="generate_messages.html" target="_blank" style="color:var(--primary);">Generate Messages</a>' Full AI
@@ -3880,6 +3890,7 @@
         const batchCount   = (g.sourceBatchIds || []).length;
         const promptCount  = (g.sourcePrompts || []).length;
         const variationCount = (g.messageVariations || []).length;
+        const stoppedVariationCount = (g.messageVariations || []).filter(v => v.inactive).length;
         const bdrEmailList = g.bdrEmails?.length ? g.bdrEmails : (g.bdrEmail ? [g.bdrEmail] : []);
         const bdrName = bdrEmailList.map(email => allBdrs.find(b => (b.primaryEmail||b.id) === email)?.name || email).join(', ');
         const wsName  = allWorkspaces.find(w => w.id === g.workspaceId)?.name || '';
@@ -3958,7 +3969,7 @@
                         ${variationCount ? `<div class="group-stat-sep"></div>
                         <div class="group-stat-block">
                             <div class="group-stat-val">${variationCount}</div>
-                            <div class="group-stat-label">Variations</div>
+                            <div class="group-stat-label">Variations${stoppedVariationCount ? ` (${stoppedVariationCount} stopped)` : ''}</div>
                         </div>` : ''}
                     </div>
                     ${coverageHtml}
@@ -4356,22 +4367,24 @@
     // Rescales every existing variation's sharePercent proportionally so the group
     // sums to `targetSum` (preserving relative weights), then nudges the largest
     // share to soak up any rounding remainder so the total lands exactly on target.
+    // Stopped (inactive) variations are excluded — they carry a 0% share and are never picked.
     function _rebalanceShares(targetSum) {
-        const n = pendingVariations.length;
+        const active = pendingVariations.filter(v => !v.inactive);
+        const n = active.length;
         if (!n) return;
-        const sum = pendingVariations.reduce((s, v) => s + (v.sharePercent || 0), 0);
+        const sum = active.reduce((s, v) => s + (v.sharePercent || 0), 0);
         if (sum > 0) {
-            pendingVariations.forEach(v => {
+            active.forEach(v => {
                 v.sharePercent = Math.round((v.sharePercent || 0) * targetSum / sum);
             });
         } else {
             const even = Math.round(targetSum / n);
-            pendingVariations.forEach(v => { v.sharePercent = even; });
+            active.forEach(v => { v.sharePercent = even; });
         }
-        const total = pendingVariations.reduce((s, v) => s + (v.sharePercent || 0), 0);
+        const total = active.reduce((s, v) => s + (v.sharePercent || 0), 0);
         const diff  = targetSum - total;
         if (diff !== 0) {
-            const biggest = pendingVariations.reduce((a, b) => (b.sharePercent || 0) > (a.sharePercent || 0) ? b : a);
+            const biggest = active.reduce((a, b) => (b.sharePercent || 0) > (a.sharePercent || 0) ? b : a);
             biggest.sharePercent = Math.max(0, (biggest.sharePercent || 0) + diff);
         }
     }
@@ -4381,8 +4394,9 @@
         // share %" mode in Generate Messages / Full Pipeline. Give the new row an even
         // slice of 100%, and shrink the existing rows proportionally to make room so
         // the whole group still sums to 100% instead of drifting past it.
-        const newShare = Math.round(100 / (pendingVariations.length + 1));
-        if (pendingVariations.length > 0) _rebalanceShares(100 - newShare);
+        const activeCount = pendingVariations.filter(v => !v.inactive).length;
+        const newShare = Math.round(100 / (activeCount + 1));
+        if (activeCount > 0) _rebalanceShares(100 - newShare);
         pendingVariations.push({
             id: _newVariationId(),
             label: '',
@@ -4407,11 +4421,38 @@
         renderVariationsInModal();
     };
 
+    // Stop / resume using a variation. A stopped variation stays on the group (same id + label,
+    // so already-sent messages keep reporting against it on Outcomes / Fast Connect Review),
+    // but Generate Messages and Full Pipeline no longer offer or pick it for new messages.
+    window.toggleVariationInactive = function(idx) {
+        const v = pendingVariations[idx];
+        if (!v) return;
+        if (!v.inactive) {
+            v.inactive = true;
+            v.inactiveAt = new Date().toISOString();
+            v.sharePercent = 0;
+            _rebalanceShares(100); // hand its share back to the remaining active variations
+        } else {
+            // Give the resumed variation an even slice and shrink the others to make room
+            // (rebalance while it's still flagged inactive so it isn't scaled with the others)
+            const othersActive = pendingVariations.filter(x => x !== v && !x.inactive).length;
+            const newShare = Math.round(100 / (othersActive + 1));
+            if (othersActive > 0) _rebalanceShares(100 - newShare);
+            v.inactive = false;
+            v.inactiveAt = null;
+            v.sharePercent = newShare;
+        }
+        renderVariationsInModal();
+    };
+
     function renderVariationsInModal() {
         const list  = document.getElementById('variationsList');
         const noMsg = document.getElementById('noVariationsMsg');
         const badge = document.getElementById('variationCountBadge');
-        if (badge) badge.textContent = pendingVariations.length;
+        if (badge) {
+            const activeN = pendingVariations.filter(v => !v.inactive).length;
+            badge.textContent = activeN === pendingVariations.length ? pendingVariations.length : `${activeN}/${pendingVariations.length}`;
+        }
         updateVariationAiAssignVisibility();
         if (!pendingVariations.length) {
             list.innerHTML = '';
@@ -4420,12 +4461,17 @@
         }
         noMsg.style.display = 'none';
         list.innerHTML = pendingVariations.map((v, i) => `
-            <div class="variation-row">
+            <div class="variation-row${v.inactive ? ' inactive' : ''}">
                 <div class="variation-row-top">
                     <input type="text" value="${escHtml(v.label)}" placeholder="Variation label (e.g. Variation A — Staffing ROI)"
                         oninput="window.updateVariationLabel(${i}, this.value)">
+                    ${v.inactive ? `<span class="variation-stopped-badge" title="${v.inactiveAt ? 'Stopped ' + escHtml(new Date(v.inactiveAt).toLocaleDateString()) + ' — ' : ''}Not offered in Generate Messages / Full Pipeline, still reported on Outcomes"><i class="fas fa-pause-circle"></i> Stopped</span>` : ''}
                     <input type="color" value="${v.color || '#0F2D4D'}" title="Color tag"
                         oninput="window.updateVariationColor(${i}, this.value)">
+                    <button class="btn btn-xs ${v.inactive ? 'btn-success' : 'btn-outline'}" onclick="window.toggleVariationInactive(${i})"
+                        title="${v.inactive ? 'Resume using this variation for new messages' : 'Stop using this variation for new messages — it stays on the group so existing messages still report against it'}">
+                        <i class="fas ${v.inactive ? 'fa-play' : 'fa-pause'}"></i> ${v.inactive ? 'Resume' : 'Stop using'}
+                    </button>
                     <button class="btn btn-xs btn-danger" onclick="window.removeVariationRow(${i})">
                         <i class="fas fa-trash"></i>
                     </button>
@@ -4452,7 +4498,7 @@
                         </div>
                         <div class="variation-share-input-wrap">
                             <input type="number" class="variation-share-input" min="0" max="100" step="1"
-                                value="${v.sharePercent ?? ''}" placeholder="0"
+                                value="${v.sharePercent ?? ''}" placeholder="0" ${v.inactive ? 'disabled title="Stopped variations are never picked"' : ''}
                                 oninput="window.updateVariationSharePercent(${i}, this.value)">
                             <span class="variation-share-suffix">%</span>
                         </div>
@@ -4493,7 +4539,7 @@
     // Firestore's/JS's arbitrary object key ordering (a naive JSON.stringify compare would
     // false-positive on "unsaved changes" for identical data with keys in a different order).
     function _variationsSignature(arr) {
-        return (arr || []).map(v => [v.id, v.label, v.prompt, v.exampleMessage, v.sharePercent, v.aiCriteria].join('\u0001')).join('\u0002');
+        return (arr || []).map(v => [v.id, v.label, v.prompt, v.exampleMessage, v.sharePercent, v.aiCriteria, v.inactive ? 1 : 0].join('\u0001')).join('\u0002');
     }
 
     // Shows the AI Scan & Auto-Assign box only for an already-saved group (a real
@@ -7669,7 +7715,11 @@
                 // Random Selection Share % — relative weight for "Random selection by share %" mode
                 sharePercent:   Math.max(0, Math.min(100, parseFloat(v.sharePercent) || 0)),
                 // AI Selection Criteria — used by "AI decides by criteria" mode
-                aiCriteria:     (v.aiCriteria || '').trim()
+                aiCriteria:     (v.aiCriteria || '').trim(),
+                // Stopped variations stay on the group for reporting but are skipped when
+                // generating new messages (Generate Messages / Full Pipeline).
+                inactive:       !!v.inactive,
+                inactiveAt:     v.inactive ? (v.inactiveAt || new Date().toISOString()) : null
             }))
             .filter(v => v.label || v.prompt);
 

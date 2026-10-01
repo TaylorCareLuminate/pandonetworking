@@ -1832,6 +1832,64 @@
                     console.log(`✅ Found ${linkedInEmailSnapshot.size} contacts with LinkedIn email`);
                 }
                 
+                // Fallback: heyreach_contacts.accountEmail is the LinkedIn SEAT email reported by
+                // HeyReach, which often differs from the BDR's login email. When there is no
+                // linkedin_email_associations row (e.g. a newly added BDR), the email queries above
+                // find nothing. Resolve the BDR's HeyReach sender account ID(s) instead and match
+                // contacts on linkedInAccountId, which is stored on every synced contact.
+                if (contactsArray.length === 0) {
+                    try {
+                        console.log('📊 No contacts via email - trying HeyReach account ID fallback...');
+                        const bdrLower = (userEmail || '').toLowerCase();
+                        const accountIds = new Set();
+                        const seatEmails = new Set();
+
+                        // linkedin_accounts: bdrEmail -> heyreachAccountId
+                        const liAccountsSnap = await getDocs(collection(db, 'linkedin_accounts'));
+                        liAccountsSnap.forEach(d => {
+                            const a = d.data();
+                            if (String(a.bdrEmail || '').toLowerCase() === bdrLower && a.heyreachAccountId) {
+                                accountIds.add(String(a.heyreachAccountId));
+                            }
+                        });
+
+                        // bdr_leaders: linkedInAccounts[] may list seat emails / account IDs
+                        (bdrInfo && Array.isArray(bdrInfo.linkedInAccounts) ? bdrInfo.linkedInAccounts : []).forEach(a => {
+                            if (a && a.email) seatEmails.add(String(a.email));
+                            if (a && (a.heyreachAccountId || a.accountId)) accountIds.add(String(a.heyreachAccountId || a.accountId));
+                        });
+                        if (bdrInfo && bdrInfo.linkedInEmail) seatEmails.add(String(bdrInfo.linkedInEmail));
+
+                        console.log('🔍 Fallback HeyReach account IDs:', [...accountIds], 'seat emails:', [...seatEmails]);
+
+                        const existingIds = new Set();
+                        const addDocs = (snap) => snap.forEach(d => {
+                            if (!existingIds.has(d.id)) {
+                                existingIds.add(d.id);
+                                contactsArray.push({ id: d.id, ...d.data() });
+                            }
+                        });
+
+                        for (const idStr of accountIds) {
+                            // linkedInAccountId may be stored as a number or a string depending on sync version
+                            const variants = [idStr];
+                            if (/^\d+$/.test(idStr)) variants.push(Number(idStr));
+                            for (const v of variants) {
+                                const snap = await getDocs(query(collection(db, 'heyreach_contacts'), where('linkedInAccountId', '==', v)));
+                                console.log(`✅ Found ${snap.size} contacts with linkedInAccountId=${v}`);
+                                addDocs(snap);
+                            }
+                        }
+                        for (const seat of seatEmails) {
+                            const snap = await getDocs(query(collection(db, 'heyreach_contacts'), where('accountEmail', '==', seat)));
+                            console.log(`✅ Found ${snap.size} contacts with seat email ${seat}`);
+                            addDocs(snap);
+                        }
+                    } catch (fallbackErr) {
+                        console.warn('⚠️ Account ID fallback failed:', fallbackErr.message);
+                    }
+                }
+
                 console.log(`📊 Total unique contacts: ${contactsArray.length}`);
 
                 if (contactsArray.length === 0) {

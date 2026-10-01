@@ -786,6 +786,52 @@
 
     const PREVIEW_LIMIT = 200;
 
+    // ── Load-integrity tracking ──────────────────────────────────────────────
+    // Every loader used to swallow errors (console.warn only) and use hard limit()
+    // caps, so a transient network/server failure or a cap being hit silently
+    // produced a smaller dataset (e.g. 820 → 484 scheduled) with no indication.
+    // Now every query retries, paginates fully, and records anything that still
+    // failed or was truncated here so the UI can tell the user.
+    let loadIssues = [];
+
+    function recordLoadIssue(msg) {
+        console.error('[LoadIssue]', msg);
+        loadIssues.push(msg);
+    }
+
+    // Fetch ALL docs for a query (cursor-paginated, no hard cap) with retries on any
+    // failure. If it still fails after retries the failure is recorded in loadIssues
+    // and null is returned (callers already treat null as "no data").
+    async function fetchAllWithRetry(q, label, attempts = 4) {
+        let lastErr;
+        for (let i = 1; i <= attempts; i++) {
+            try {
+                return await getAllDocs(q, { maxDocs: 1000000 });
+            } catch (e) {
+                lastErr = e;
+                console.warn(`${label}: attempt ${i}/${attempts} failed:`, e);
+                if (i < attempts) await new Promise(r => setTimeout(r, 1500 * i));
+            }
+        }
+        recordLoadIssue(`${label} FAILED after ${attempts} attempts (${lastErr?.message || lastErr}) — data from this query is MISSING`);
+        return null;
+    }
+
+    // Run async task factories with bounded concurrency (avoids flooding the backend
+    // with dozens of simultaneous requests, which causes timeouts/dropped queries).
+    async function runPool(taskFns, concurrency = 4) {
+        const results = new Array(taskFns.length);
+        let next = 0;
+        async function worker() {
+            while (next < taskFns.length) {
+                const idx = next++;
+                results[idx] = await taskFns[idx]();
+            }
+        }
+        await Promise.all(Array.from({ length: Math.min(concurrency, taskFns.length) }, worker));
+        return results;
+    }
+
     // ── Auth ─────────────────────────────────────────────────────────────────
     onAuthStateChanged(auth, async (user) => {
         if (!user) return;
@@ -1026,9 +1072,13 @@
         document.getElementById('loadingSteps').innerHTML = '';
         document.getElementById('loadingTitle').textContent = 'Building dataset…';
 
+        loadIssues = [];
         const daysBack = parseInt(document.getElementById('dateRange').value) || 0;
         const maxRowsRaw = document.getElementById('maxRows').value;
-        const maxRows  = maxRowsRaw === 'all' ? null : (parseInt(maxRowsRaw) || 5000);
+        // The Max Records control is only visible in "All BDRs" scope. It used to still be
+        // read (default 5,000, per 30-email chunk) in BDR/company scope where the user can't
+        // see or change it, silently truncating connect_queue. Only apply it when visible.
+        const maxRows  = (currentScope !== 'all' || maxRowsRaw === 'all') ? null : (parseInt(maxRowsRaw) || 5000);
 
         try {
             // ── Determine target BDRs ──
@@ -1125,6 +1175,12 @@
             // ── Render ──
             renderResults();
             updateEnrichmentBanner(enrichResult);
+
+            if (loadIssues.length) {
+                showAlert(`<strong>Dataset may be INCOMPLETE</strong> — ${loadIssues.length} load problem(s):<br>` +
+                    loadIssues.map(m => '• ' + m).join('<br>') +
+                    `<br>Click Build Dataset again to retry.`, 'warning');
+            }
 
         } catch(err) {
             console.error('Build error:', err);
@@ -1437,9 +1493,12 @@
                 if (maxRows) {
                     const q = query(collection(emailDB, 'connect_queue'), ...constraints, limit(maxRows));
                     snap = await getDocs(q);
+                    if (snap.size >= maxRows) {
+                        recordLoadIssue(`connect_queue: a chunk of BDR emails hit the Max Records cap (${maxRows.toLocaleString()}) — records were TRUNCATED. Raise "Max Records" or choose "All (no cap)".`);
+                    }
                 } else {
                     const q = query(collection(emailDB, 'connect_queue'), ...constraints);
-                    snap = await getAllDocs(q);
+                    snap = await getAllDocs(q, { maxDocs: 1000000 });
                 }
                 snap.forEach(d => {
                     const data = d.data();
@@ -1460,9 +1519,12 @@
                     if (maxRows) {
                         const q2 = query(collection(emailDB, 'connect_queue'), ...constraints2, limit(maxRows));
                         snap2 = await getDocs(q2);
+                        if (snap2.size >= maxRows) {
+                            recordLoadIssue(`connect_queue (fallback): a chunk hit the Max Records cap (${maxRows.toLocaleString()}) — records were TRUNCATED.`);
+                        }
                     } else {
                         const q2 = query(collection(emailDB, 'connect_queue'), ...constraints2);
-                        snap2 = await getAllDocs(q2);
+                        snap2 = await getAllDocs(q2, { maxDocs: 1000000 });
                     }
                     snap2.forEach(d => {
                         const data = d.data();
@@ -1473,7 +1535,10 @@
                         }
                         results.push({ id: d.id, ...data });
                     });
-                } catch(e2) { console.warn('connect_queue fallback failed:', e2); }
+                } catch(e2) {
+                    console.warn('connect_queue fallback failed:', e2);
+                    recordLoadIssue(`connect_queue chunk FAILED (${e2?.message || e2}) — outreach records for ${chunk.length} BDR email(s) are MISSING`);
+                }
             }
         }
         return results;
@@ -1497,18 +1562,18 @@
         const chunks = [];
         for (let i = 0; i < emailArr.length; i += 30) chunks.push(emailArr.slice(i, i + 30));
 
-        const promises = [];
+        const tasks = [];
         for (const field of fields) {
             for (const chunk of chunks) {
                 if (!chunk.length) continue;
-                promises.push(
-                    getDocs(query(collection(emailDB, 'heyreach_inbox'), where(field, 'in', chunk), limit(50000)))
-                        .catch(e => { console.warn(`heyreach_inbox ${field} failed:`, e); return null; })
-                );
+                tasks.push(() => fetchAllWithRetry(
+                    query(collection(emailDB, 'heyreach_inbox'), where(field, 'in', chunk)),
+                    `heyreach_inbox (${field})`
+                ));
             }
         }
 
-        const results = await Promise.all(promises);
+        const results = await runPool(tasks, 4);
         results.forEach(snap => {
             if (!snap) return;
             snap.forEach(d => {
@@ -1624,15 +1689,15 @@
         // auth is fresh. This is the only query that actually returns data since
         // heyreach_activity records store linkedInAccountId rather than email.
         try {
-            const snap = await getDocs(query(
+            const snap = await getAllDocs(query(
                 collection(emailDB, 'heyreach_activity'),
-                where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
-                limit(20000)
-            ));
+                where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED')
+            ), { maxDocs: 1000000 });
             snap.forEach(processDoc);
             console.log(`loadConnectionDates: ${connectionDateMap.size} connection dates found via global query`);
         } catch(e) {
             console.warn('Global heyreach_activity query failed:', e);
+            recordLoadIssue(`heyreach_activity (connection dates) FAILED (${e?.message || e}) — connection dates are MISSING`);
         }
 
         // Secondary: per-email queries as a supplemental pass for records that
@@ -1671,18 +1736,18 @@
         const chunks = [];
         for (let i = 0; i < emailArr.length; i += 30) chunks.push(emailArr.slice(i, i + 30));
 
-        const promises = [];
+        const tasks = [];
         for (const field of fields) {
             for (const chunk of chunks) {
                 if (!chunk.length) continue;
-                promises.push(
-                    getDocs(query(collection(emailDB, 'heyreach_contacts'), where(field, 'in', chunk), limit(50000)))
-                        .catch(e => { console.warn(`heyreach_contacts ${field} failed:`, e); return null; })
-                );
+                tasks.push(() => fetchAllWithRetry(
+                    query(collection(emailDB, 'heyreach_contacts'), where(field, 'in', chunk)),
+                    `heyreach_contacts (${field})`
+                ));
             }
         }
 
-        const results = await Promise.all(promises);
+        const results = await runPool(tasks, 4);
         results.forEach(snap => {
             if (!snap) return;
             snap.forEach(d => {
@@ -1706,19 +1771,16 @@
         let src1Count = 0;
         for (const chunk of chunks) {
             if (!chunk.length) continue;
-            try {
-                const q = query(
-                    collection(emailDB, 'activity_tracking'),
-                    where('activity_type', '==', 'meeting_scheduled'),
-                    where('bdr_email', 'in', chunk),
-                    limit(2000)
-                );
-                const snap = await getDocs(q).catch(() => null);
-                if (snap) snap.forEach(d => {
-                    const url = normalizeUrl(d.data().contact_linkedin_url || '');
-                    if (url) { scheduledSet.add(url); src1Count++; }
-                });
-            } catch(e) { console.warn('activity_tracking scheduled failed:', e); }
+            const q = query(
+                collection(emailDB, 'activity_tracking'),
+                where('activity_type', '==', 'meeting_scheduled'),
+                where('bdr_email', 'in', chunk)
+            );
+            const snap = await fetchAllWithRetry(q, 'activity_tracking (meeting_scheduled)');
+            if (snap) snap.forEach(d => {
+                const url = normalizeUrl(d.data().contact_linkedin_url || '');
+                if (url) { scheduledSet.add(url); src1Count++; }
+            });
         }
         console.log(`[Scheduled] Source 1 (activity_tracking): ${src1Count} URLs`);
 
@@ -1741,11 +1803,10 @@
             });
             console.log(`[Scheduled] Source 3: ${convIdToUrl.size} conversations with IDs mapped`);
             try {
-                const snap = await getDocs(query(
+                const snap = await fetchAllWithRetry(query(
                     collection(emailDB, 'conversation_category_overrides'),
-                    where('responseCategory', '==', 'Scheduled'),
-                    limit(2000)
-                )).catch(e => { console.warn('conversation_category_overrides failed:', e); return null; });
+                    where('responseCategory', '==', 'Scheduled')
+                ), 'conversation_category_overrides (Scheduled)');
                 if (snap) {
                     console.log(`[Scheduled] Source 3: ${snap.size} override docs with Scheduled`);
                     snap.forEach(d => {
