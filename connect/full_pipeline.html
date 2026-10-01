@@ -580,13 +580,18 @@
                 </div>
                 <div class="form-group">
                     <label><i class="fas fa-building-circle-exclamation"></i> 30-Day Organization Limit</label>
-                    <div style="display: flex; align-items: center; gap: 8px;">
+                    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                         <input type="checkbox" id="fpOrgMsgLimitEnabled" style="width: auto;" onchange="fpSaveOrgMsgLimitSettings()">
                         <span style="font-size: 13px;">Max</span>
                         <input type="number" id="fpOrgMsgLimitMax" value="3" min="1" style="width: 70px;" onchange="fpSaveOrgMsgLimitSettings()">
-                        <span style="font-size: 13px;">contacts per organization with a message created in the past 30 days</span>
+                        <span style="font-size: 13px;">contacts per organization</span>
+                        <select id="fpOrgMsgLimitScope" style="width: auto;" onchange="fpSaveOrgMsgLimitSettings()">
+                            <option value="org">across all BDRs combined (by Organization)</option>
+                            <option value="bdr">for each BDR separately (by BDR)</option>
+                        </select>
+                        <span style="font-size: 13px;">with a message created in the past 30 days</span>
                     </div>
-                    <div class="form-help">Same setting as the 30-day limit on Generate Messages (shared — checking it here checks it there too). Counts distinct contacts with a <strong>live</strong> <code>connect_queue</code> message (sent to HeyReach, approved, or still pending review) created in the past 30 days, across <strong>all</strong> BDRs. Messages that were deleted, rejected, or flagged duplicate / already-connected do <strong>not</strong> count — their slots open back up (e.g. 3 created, 1 sent, 2 deleted = 1 used, room for 2 more). An organization already at the limit is skipped <em>before</em> it is scanned (no Apify cost), and within an organization message generation stops once the limit is reached — remaining matched contacts stay saved and tagged for a later month. <span id="fpOrgMsgLimitStatus" style="display:block; margin-top:4px; font-weight:600;"></span></div>
+                    <div class="form-help"><strong>Scope:</strong> <em>By Organization</em> (default) counts messages from <strong>all</strong> BDRs together — once an organization has the max, no BDR can message it. <em>By BDR</em> counts only the BDR being processed — each BDR can have up to the max live contacts at the same organization, regardless of what other BDRs have sent. The on/off checkbox and the max are the same setting as the 30-day limit on Generate Messages (shared — checking it here checks it there too); the scope applies to Full Pipeline runs only. Counts distinct contacts with a <strong>live</strong> <code>connect_queue</code> message (sent to HeyReach, approved, or still pending review) created in the past 30 days. Messages that were deleted, rejected, or flagged duplicate / already-connected do <strong>not</strong> count — their slots open back up (e.g. 3 created, 1 sent, 2 deleted = 1 used, room for 2 more). An organization already at the limit is skipped <em>before</em> it is scanned (no Apify cost), and within an organization message generation stops once the limit is reached — remaining matched contacts stay saved and tagged for a later month. <span id="fpOrgMsgLimitStatus" style="display:block; margin-top:4px; font-weight:600;"></span></div>
                 </div>
             </div>
 
@@ -3296,16 +3301,28 @@
             const input = document.getElementById('fpOrgMsgLimitMax');
             return Math.max(1, input ? (parseInt(input.value, 10) || 3) : 3);
         }
+        // Scope of the limit: 'org' = all BDRs combined (default, original behavior);
+        // 'bdr' = each BDR counted separately. Full Pipeline only (own localStorage key).
+        function fpGetOrgLimitScope() {
+            const sel = document.getElementById('fpOrgMsgLimitScope');
+            return sel && sel.value === 'bdr' ? 'bdr' : 'org';
+        }
+        // Frozen at run start so editing the dropdown mid-run can't mix two scopes in one tally.
+        let _fpOrgLimitScopeLocked = null;
+        function fpEffectiveOrgLimitScope() { return _fpOrgLimitScopeLocked || fpGetOrgLimitScope(); }
+
         window.fpSaveOrgMsgLimitSettings = function() {
             const enabled = fpIsOrgMsgLimitEnabled();
             const max = fpGetOrgMsgLimitMax();
+            const scope = fpGetOrgLimitScope();
             // Shared with generate_messages.html on purpose — "the 30-day limit" is one setting.
             localStorage.setItem('omlEnabled', enabled ? '1' : '0');
             localStorage.setItem('omlMax', String(max));
+            localStorage.setItem('fpOmlScope', scope); // Full Pipeline only
             const status = document.getElementById('fpOrgMsgLimitStatus');
             if (status) {
                 status.textContent = enabled
-                    ? `Limit ON — organizations with ≥ ${max} contact(s) messaged in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days are skipped (also applies on Generate Messages)`
+                    ? `Limit ON — ${scope === 'bdr' ? 'each BDR may message at most' : 'organizations with ≥'} ${max} contact(s) ${scope === 'bdr' ? 'per organization' : 'messaged'} in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days${scope === 'bdr' ? ' (counted per BDR)' : ' are skipped (all BDRs combined; also applies on Generate Messages)'}`
                     : 'Limit OFF (default) — no per-organization cap on message creation';
                 status.style.color = enabled ? '#b45309' : 'var(--gray-500)';
             }
@@ -3318,6 +3335,9 @@
             const savedMax = localStorage.getItem('omlMax');
             if (savedEnabled !== null) cb.checked = savedEnabled === '1';
             if (savedMax !== null) input.value = savedMax;
+            const scopeSel = document.getElementById('fpOrgMsgLimitScope');
+            const savedScope = localStorage.getItem('fpOmlScope');
+            if (scopeSel && (savedScope === 'bdr' || savedScope === 'org')) scopeSel.value = savedScope;
             window.fpSaveOrgMsgLimitSettings();
         })();
 
@@ -3351,6 +3371,9 @@
             const docsById = new Map();
             [...snapUploaded.docs, ...snapCreated.docs].forEach(d => docsById.set(d.id, d.data()));
             const orgs = new Map();
+            // Same tally split by BDR (for the "by BDR" scope): bdrId (lowercased bdr_auth_email
+            // or account_email on the doc) -> Map<orgKey, Set<contactUrl>>.
+            const byBdr = new Map();
             let counted = 0, sentLive = 0;
             const deadTally = {};
             for (const [docId, data] of docsById.entries()) {
@@ -3365,10 +3388,16 @@
                 const contactUrl = fpNormContactUrlForLimit(data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || data.linkedInUrl || '') || `doc:${docId}`;
                 if (!orgs.has(orgKey)) orgs.set(orgKey, new Set());
                 orgs.get(orgKey).add(contactUrl);
+                new Set([data.bdr_auth_email, data.account_email].map(e => String(e || '').toLowerCase().trim()).filter(Boolean)).forEach(id => {
+                    if (!byBdr.has(id)) byBdr.set(id, new Map());
+                    const m = byBdr.get(id);
+                    if (!m.has(orgKey)) m.set(orgKey, new Set());
+                    m.get(orgKey).add(contactUrl);
+                });
                 counted++;
                 if (data.pushed_to_heyreach) sentLive++;
             }
-            _fpOrgMsgLimitCache = { loadedAt: Date.now(), orgs };
+            _fpOrgMsgLimitCache = { loadedAt: Date.now(), orgs, byBdr, bdrViews: new Map() };
             const deadTotal = Object.values(deadTally).reduce((s, n) => s + n, 0);
             const deadDetail = Object.entries(deadTally).map(([k, n]) => `${n} ${k}`).join(', ');
             logFn(`   🏢 30-day org limit: ${counted} live message(s) in the window across ${orgs.size} organization(s) (${sentLive} sent to HeyReach, ${counted - sentLive} awaiting send/review). ${deadTotal} dead message(s) NOT counted${deadDetail ? ` — ${deadDetail}` : ''} — their slots are free again.`, 'dim');
@@ -3383,16 +3412,48 @@
             return [...keys];
         }
 
+        /** The identifiers a BDR's messages carry on connect_queue docs (bdr_auth_email / account_email). */
+        function fpOrgLimitBdrFor(bdrEmail, bdrRec) {
+            const ids = new Set([bdrEmail, bdrRec?.primaryEmail, bdrRec?.linkedInEmail]
+                .map(e => String(e || '').toLowerCase().trim()).filter(Boolean));
+            return { email: String(bdrEmail || '').toLowerCase().trim(), ids: [...ids], label: bdrRec?.name || bdrEmail || '' };
+        }
+
+        /**
+         * The tally the limit is checked against: every BDR combined ('org' scope — the shared
+         * Map itself), or just this BDR's own messages ('bdr' scope — a merged per-BDR view,
+         * built once and cached so slot reservations persist for the rest of the run). Must be
+         * called after fpLoadOrgMessageCounts30Days() has populated the cache.
+         */
+        function fpOrgLimitView(orgs, bdr) {
+            const cache = _fpOrgMsgLimitCache;
+            if (fpEffectiveOrgLimitScope() !== 'bdr' || !bdr || !cache || cache.orgs !== orgs) return orgs;
+            if (!cache.bdrViews.has(bdr.email)) {
+                const view = new Map();
+                for (const id of bdr.ids) {
+                    const m = cache.byBdr.get(id);
+                    if (!m) continue;
+                    for (const [orgKey, urls] of m.entries()) {
+                        if (!view.has(orgKey)) view.set(orgKey, new Set());
+                        urls.forEach(u => view.get(orgKey).add(u));
+                    }
+                }
+                cache.bdrViews.set(bdr.email, view);
+            }
+            return cache.bdrViews.get(bdr.email);
+        }
+
         /**
          * Organization-level check (no contact yet). Returns { skip, count, max } —
-         * count is the largest tally across the org's name keys. Never throws:
-         * a load failure logs a warning and lets the run proceed unchecked.
+         * count is the largest tally across the org's name keys (all BDRs combined, or just
+         * `bdr`'s own messages in "by BDR" scope). Never throws: a load failure logs a
+         * warning and lets the run proceed unchecked.
          */
-        async function fpOrgLimitPrecheck(org, logFn) {
+        async function fpOrgLimitPrecheck(org, logFn, bdr) {
             if (!fpIsOrgMsgLimitEnabled()) return { skip: false, count: null, max: null };
             const max = fpGetOrgMsgLimitMax();
             let orgs;
-            try { orgs = await fpLoadOrgMessageCounts30Days(logFn); }
+            try { orgs = fpOrgLimitView(await fpLoadOrgMessageCounts30Days(logFn), bdr); }
             catch (e) {
                 logFn(`   ⚠️ 30-day org limit: failed to load recent messages (${e.message}) — proceeding WITHOUT the check`, 'warning');
                 return { skip: false, count: null, max };
@@ -3407,7 +3468,7 @@
          * when the contact ends up with no saved message, so a skipped/failed contact
          * doesn't burn one of the organization's few slots for the rest of the run.
          */
-        async function fpCheckOrgMessageLimit30Days(contact, org, logFn) {
+        async function fpCheckOrgMessageLimit30Days(contact, org, logFn, bdr) {
             const noop = { skip: false, count: null, release: () => {} };
             if (!fpIsOrgMsgLimitEnabled()) return noop;
             const max = fpGetOrgMsgLimitMax();
@@ -3417,17 +3478,18 @@
                 return noop;
             }
             let orgs;
-            try { orgs = await fpLoadOrgMessageCounts30Days(logFn); }
+            try { orgs = fpOrgLimitView(await fpLoadOrgMessageCounts30Days(logFn), bdr); }
             catch (e) {
                 logFn(`   ⚠️ 30-day org limit: failed to load recent messages (${e.message}) — proceeding WITHOUT the check`, 'warning');
                 return noop;
             }
+            const scopeNote = (fpEffectiveOrgLimitScope() === 'bdr' && bdr) ? ` for ${bdr.label}` : '';
             const contactUrl = fpNormContactUrlForLimit(contact.linkedInUrl || contact.li_url || contact.linkedin_url || '');
             const alreadyCounted = keys.some(k => contactUrl && orgs.get(k)?.has(contactUrl));
             const count = Math.max(0, ...keys.map(k => (orgs.get(k) || new Set()).size));
             const orgName = org?.company_name || contact.company || contact.companyName || '';
             if (count >= max && !alreadyCounted) {
-                logFn(`   ⛔ 30-day org limit: skipped — "${orgName}" already has ${count} contact(s) with a message created in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days (limit: ${max})`, 'warning');
+                logFn(`   ⛔ 30-day org limit: skipped — "${orgName}" already has ${count} contact(s)${scopeNote} with a message created in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days (limit: ${max})`, 'warning');
                 return { skip: true, count, release: () => {} };
             }
             const reservedIn = [];
@@ -3437,7 +3499,7 @@
                     if (!orgs.get(k).has(contactUrl)) { orgs.get(k).add(contactUrl); reservedIn.push(k); }
                 }
             }
-            logFn(`   ✅ 30-day org limit: "${orgName}" at ${count}/${max} in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days — OK${alreadyCounted ? ' (this contact already counted)' : ', slot reserved'}`, 'dim');
+            logFn(`   ✅ 30-day org limit: "${orgName}"${scopeNote} at ${count}/${max} in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days — OK${alreadyCounted ? ' (this contact already counted)' : ', slot reserved'}`, 'dim');
             return { skip: false, count, release: () => { reservedIn.forEach(k => orgs.get(k)?.delete(contactUrl)); } };
         }
 
@@ -5727,7 +5789,7 @@
                 ? `\n• ONLY already-scanned contacts: NO new contacts will be searched and NO organization will be scanned (no Apify scan cost). Contacts already tagged with this group that still have no message are grouped by organization, and each organization is checked for runway under the 30-day limit before any messages are made${fpIsOrgMsgLimitEnabled() ? '' : '\n• ⚠️ The 30-Day Organization Limit is OFF — no organization will be treated as full'}`
                 : '';
             const orgLimitNoteForConfirm = fpIsOrgMsgLimitEnabled()
-                ? `\n• 30-Day Organization Limit ON: max ${fpGetOrgMsgLimitMax()} contact(s) per organization messaged in the past 30 days — organizations at the limit are skipped before scanning`
+                ? `\n• 30-Day Organization Limit ON (${fpGetOrgLimitScope() === 'bdr' ? 'BY BDR' : 'BY ORGANIZATION'}): max ${fpGetOrgMsgLimitMax()} contact(s) per organization ${fpGetOrgLimitScope() === 'bdr' ? 'for each BDR separately' : 'across all BDRs combined'} messaged in the past 30 days — organizations at the limit are skipped before scanning`
                 : '';
             const orgDataNoteForConfirm = orgDataCfg.enabled
                 ? (orgDataQueueCount > 0
@@ -5757,8 +5819,12 @@
             const backfillEnabled = backfillOnly;
             const orgLimitEnabled = fpIsOrgMsgLimitEnabled();
             const orgLimitMax = fpGetOrgMsgLimitMax();
+            const orgLimitScope = fpGetOrgLimitScope();
+            _fpOrgLimitScopeLocked = orgLimitScope; // frozen for the whole run
             if (orgLimitEnabled) {
-                addLog(`🏢 30-Day Organization Limit is ON — max ${orgLimitMax} contact(s) per organization with a message created in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days (all BDRs). Organizations already at the limit are skipped before any scan; generation at an organization stops once it reaches the limit.`, 'info');
+                addLog(orgLimitScope === 'bdr'
+                    ? `🏢 30-Day Organization Limit is ON (BY BDR) — each BDR may have at most ${orgLimitMax} contact(s) per organization with a live message created in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days; other BDRs' messages at the same organization are NOT counted. Organizations already at the limit for the BDR being processed are skipped before any scan; generation stops once that BDR reaches the limit there.`
+                    : `🏢 30-Day Organization Limit is ON (BY ORGANIZATION) — max ${orgLimitMax} contact(s) per organization with a live message created in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days (all BDRs combined). Organizations already at the limit are skipped before any scan; generation at an organization stops once it reaches the limit.`, 'info');
                 _fpOrgMsgLimitCache = null; // always start a run from a fresh 30-day tally
             }
             // Pull the latest shared rule set from Firestore before the run so the same
@@ -5971,7 +6037,7 @@
                     topContactsCap: { enabled: topContactsEnabled, limit: topContactsLimit },
                     backfillScannedContacts: backfillEnabled,
                     backfillOnly: backfillOnly,
-                    orgMessageLimit30Days: { enabled: orgLimitEnabled, max: orgLimitMax, windowDays: FP_ORG_MSG_LIMIT_WINDOW_DAYS },
+                    orgMessageLimit30Days: { enabled: orgLimitEnabled, max: orgLimitMax, scope: orgLimitScope, windowDays: FP_ORG_MSG_LIMIT_WINDOW_DAYS },
                     scanCriteria, secondScan: secondScanConfig, orgTypeMode: orgTypeConfig,
                     costGuard: { costPerMessage, enforcesAllInCost: true, minSpendBeforeEnforcing: costMinSpend },
                     scanName, skipAlreadyScanned, alreadyScannedSkippedAtStart: skipAlreadyScanned ? alreadyScannedCount : 0,
@@ -6135,10 +6201,12 @@
                                     addLog(`   ℹ️ 30-Day Organization Limit is OFF — every organization with leftover contacts is treated as having runway.`, 'warning');
                                 } else {
                                     try {
-                                        const counts = await fpLoadOrgMessageCounts30Days(addLog);
+                                        const allCounts = await fpLoadOrgMessageCounts30Days(addLog);
                                         let withRunway = 0, atLimit = 0, runwaySlots = 0, runwayContacts = 0;
-                                        addLog(`\n🔎 Checking runway organization by organization (limit ${orgLimitMax} contact(s) per ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days):`);
+                                        addLog(`\n🔎 Checking runway organization by organization (limit ${orgLimitMax} contact(s) per ${orgLimitScope === 'bdr' ? 'organization for each BDR' : 'organization, all BDRs combined'}, past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days):`);
                                         for (const b of bf.queue) {
+                                            const bfCtx = bdrContexts.get(b._backfill.bdrEmail);
+                                            const counts = fpOrgLimitView(allCounts, fpOrgLimitBdrFor(b._backfill.bdrEmail, bfCtx?.bdrRec));
                                             const count = Math.max(0, ...fpOrgLimitKeys(b, null).map(k => (counts.get(k) || new Set()).size));
                                             const slots = Math.max(0, orgLimitMax - count);
                                             const n = b._backfill.contacts.length;
@@ -6296,12 +6364,12 @@
                             // classification / scan spend. An organization that already has the
                             // maximum number of contacts messaged in the window gets no scan at all.
                             if (orgLimitEnabled) {
-                                const pre = await fpOrgLimitPrecheck(org, addLog);
+                                const pre = await fpOrgLimitPrecheck(org, addLog, fpOrgLimitBdrFor(bdrEmail, bdrRec));
                                 if (pre.skip) {
                                     orgReport.error = 'org_30day_limit';
                                     orgReport.orgLimit = { count: pre.count, max: pre.max };
                                     report.totals.orgLimitSkippedOrgs = (report.totals.orgLimitSkippedOrgs || 0) + 1;
-                                    addLog(`   ⛔ SKIPPED — 30-day org limit: "${org.company_name}" already has ${pre.count} contact(s) with a message created in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days (limit ${pre.max}). ${org._backfill ? 'Its backfill contacts stay saved and tagged for a later month.' : 'No scan submitted, no cost.'}`, 'warning');
+                                    addLog(`   ⛔ SKIPPED — 30-day org limit: "${org.company_name}" already has ${pre.count} contact(s)${orgLimitScope === 'bdr' ? ` for ${bdrRec.name || bdrEmail}` : ''} with a message created in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days (limit ${pre.max}). ${org._backfill ? 'Its backfill contacts stay saved and tagged for a later month.' : 'No scan submitted, no cost.'}`, 'warning');
                                     report.orgs.push(orgReport);
                                     await saveReport();
                                     continue;
@@ -6755,7 +6823,7 @@
                                 const msgsBeforeThisContact = orgReport.messagesGenerated;
                                 let orgLimitSlot = { skip: false, release: () => {} };
                                 if (orgLimitEnabled) {
-                                    orgLimitSlot = await fpCheckOrgMessageLimit30Days(prospect, org, addLog);
+                                    orgLimitSlot = await fpCheckOrgMessageLimit30Days(prospect, org, addLog, fpOrgLimitBdrFor(bdrEmail, bdrRec));
                                     if (orgLimitSlot.skip) {
                                         report.totals.orgLimitSkippedContacts = (report.totals.orgLimitSkippedContacts || 0) + 1;
                                         fpTallyNoMessage(orgReport, prospect, '30-day org limit reached', `"${org.company_name}" already has ${orgLimitSlot.count} contact(s) messaged in the past ${FP_ORG_MSG_LIMIT_WINDOW_DAYS} days (limit ${orgLimitMax}) — contact stays saved and tagged for a later month`);
