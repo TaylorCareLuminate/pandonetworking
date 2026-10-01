@@ -1011,20 +1011,17 @@ function isAnalysisFunnelUsable(funnel) {
 }
 
 async function loadPayloadForRun(entry) {
-    // Prefer live Firebase data; fall back to a local static file for the same date.
-    try {
-        const fb = await fetchPayloadFromFirebase(entry ? entry.run_date : null);
-        if (fb && (entry || isAnalysisFunnelUsable(fb.overall && fb.overall.funnel))) {
-            return { payload: fb, source: 'firebase' };
+    // Local files are the source of truth: connect_analysis/regenerate-analysis-data.bat
+    // (regenerate_manifest.js) keeps manifest.json / latest.json in sync with the dated
+    // Connect_Analysis_<date>.json exports. Live Firebase is only a fallback.
+    if (entry && entry.file) {
+        try {
+            const payload = await fetchPayloadFromLocal(entry);
+            return { payload, source: 'local' };
+        } catch (e) {
+            console.warn(`Local ${entry.file} failed, falling back to Firebase:`, e.message);
         }
-        if (fb && !entry) {
-            console.warn('Firebase latest has an incoherent funnel (meetings > replies); falling back to a local run.');
-        }
-    } catch (e) {
-        console.warn('Firebase RTDB fetch failed, falling back to local file:', e.message);
     }
-    // No specific historical run requested — the R pipeline keeps this file current,
-    // mirroring the Firebase ConnectAnalysis/latest node, so it's the preferred local fallback.
     if (!entry) {
         try {
             const resp = await fetch('connect_analysis/latest.json', { cache: 'no-store' });
@@ -1048,9 +1045,14 @@ async function loadPayloadForRun(entry) {
             } catch (e) { /* try next dated run */ }
         }
     }
-    if (entry && entry.file) {
-        const payload = await fetchPayloadFromLocal(entry);
-        return { payload, source: 'local' };
+    // Nothing usable on disk — fall back to live Firebase data.
+    try {
+        const fb = await fetchPayloadFromFirebase(entry ? entry.run_date : null);
+        if (fb && (entry || isAnalysisFunnelUsable(fb.overall && fb.overall.funnel))) {
+            return { payload: fb, source: 'firebase' };
+        }
+    } catch (e) {
+        console.warn('Firebase RTDB fetch failed:', e.message);
     }
     throw new Error('No analysis data is available yet. Check back after the next weekly run.');
 }
@@ -2818,7 +2820,7 @@ trendCardToggleEl.addEventListener('keydown', e => {
 })();
 
 async function switchRun(runDate) {
-    // Empty value = "Latest" (dynamic — Firebase live data, else local latest.json).
+    // Empty value = "Latest" (local latest.json, else Firebase live data).
     const entry = runDate ? RUN_CANDIDATES.find(r => r.run_date === runDate) : null;
     try {
         const { payload, source } = await loadPayloadForRun(entry);
@@ -3133,7 +3135,7 @@ let _adminAiInstructionsInitialized = false;
 
         RUN_CANDIDATES = await loadRunCandidates();
         // Empty/unrecognized ?run= means "Latest" — pass entry=null so loadPayloadForRun
-        // prefers live Firebase data, then the local latest.json snapshot.
+        // prefers the local latest.json snapshot, then live Firebase data.
         const entry = state.run ? RUN_CANDIDATES.find(r => r.run_date === state.run) : null;
         if (!entry) state.run = '';
 
