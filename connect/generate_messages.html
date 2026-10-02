@@ -5208,6 +5208,44 @@
                 .replace(/\/+$/, '');
         }
 
+        /**
+         * Load the exclusion URLs that apply to ONE specific BDR (prospect_exclusions +
+         * connect_exclusions). Exclusions are strictly PER BDR: a contact excluded for BDR A
+         * (e.g. wrong fit for A's hypothesis) can still be a great fit for BDR B, so we must
+         * NEVER read these collections unfiltered. A doc belongs to a BDR when
+         *   - excludedByBdr == bdr  (written by Target Contact / Exclude Rules, Process
+         *     Exclusions, org purge, Fast Connect Review), or
+         *   - excludedBy == bdr     (legacy docs where the BDR excluded the contact themselves)
+         * Both the as-typed and lowercased email are queried since stored case can vary.
+         */
+        async function loadBdrExclusionUrls(bdrEmail, { addLog } = {}) {
+            const urls = new Set();
+            if (!bdrEmail) return urls;
+            const { collection: col, query: q, where: wh, getDocs: gd, getAllDocs: gad } = window.clemailFirestore;
+            const fetchFn = gad || gd;
+            const emails = [...new Set([bdrEmail, String(bdrEmail).toLowerCase()].filter(Boolean))];
+            for (const collName of ['prospect_exclusions', 'connect_exclusions']) {
+                for (const field of ['excludedByBdr', 'excludedBy']) {
+                    for (const em of emails) {
+                        try {
+                            const snap = await fetchFn(
+                                q(col(db, collName), wh(field, '==', em)),
+                                { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 }
+                            );
+                            snap.forEach(d => {
+                                const data = d.data();
+                                const u = normalizeLinkedInUrl(data.linkedinUrl || data.linkedInUrl || '');
+                                if (u) urls.add(u);
+                            });
+                        } catch (e) {
+                            if (addLog) addLog(`   ⚠️ Could not load ${collName}.${field} for ${em}: ${e.message}`, 'warning');
+                        }
+                    }
+                }
+            }
+            return urls;
+        }
+
         // Check if a contact was recently pushed to HeyReach (past 30 days)
         function wasRecentlyPushed(linkedinUrl) {
             if (!linkedinUrl) return false;
@@ -16179,14 +16217,8 @@
             } catch (e) { addLog(`   ⚠️ Could not load prospect list: ${e.message}`, 'warning'); }
 
             try {
-                for (const collName of ['prospect_exclusions', 'connect_exclusions']) {
-                    const snap = await fetchFn(col(db, collName), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
-                    snap.forEach(d => {
-                        const data = d.data();
-                        const u = normalizeLinkedInUrl(data.linkedinUrl || data.linkedInUrl || '');
-                        if (u) excludedUrls.add(u);
-                    });
-                }
+                // PER BDR only — never the global exclusion collections.
+                (await loadBdrExclusionUrls(bdrEmail, { addLog })).forEach(u => excludedUrls.add(u));
             } catch (e) { addLog(`   ⚠️ Could not load exclusion lists: ${e.message}`, 'warning'); }
 
             addLog(`   🤝 Loading ${bdrEmail}'s already-connected URLs...`, 'info');
@@ -16830,14 +16862,8 @@
             } catch (e) { addLog(`   ⚠️ Could not load prospect list: ${e.message}`, 'warning'); }
 
             try {
-                for (const collName of ['prospect_exclusions', 'connect_exclusions']) {
-                    const snap = await fetchFn(col(db, collName), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
-                    snap.forEach(d => {
-                        const data = d.data();
-                        const u = normalizeLinkedInUrl(data.linkedinUrl || data.linkedInUrl || '');
-                        if (u) excludedUrls.add(u);
-                    });
-                }
+                // PER BDR only — never the global exclusion collections.
+                (await loadBdrExclusionUrls(bdrEmail, { addLog })).forEach(u => excludedUrls.add(u));
             } catch (e) { addLog(`   ⚠️ Could not load exclusion lists: ${e.message}`, 'warning'); }
 
             addLog(`   🤝 Loading ${bdrEmail}'s already-connected URLs...`, 'info');
@@ -17199,15 +17225,9 @@
             // Review, Process Exclusions). Without this, deleting a BDR copy and re-pulling from a
             // workspace would resurrect contacts that were already rule-excluded.
             try {
-                for (const collName of ['prospect_exclusions', 'connect_exclusions']) {
-                    const snap = await fetchFn(col(db, collName), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
-                    snap.forEach(d => {
-                        const data = d.data();
-                        const u = normalizeLinkedInUrl(data.linkedinUrl || data.linkedInUrl || '');
-                        if (u) excludedUrls.add(u);
-                    });
-                }
-                addLog(`   🚫 Exclusion list: ${excludedUrls.size.toLocaleString()} unique URL(s)`, 'info');
+                // PER BDR only — a contact excluded for another BDR may be a great fit here.
+                (await loadBdrExclusionUrls(bdrEmail, { addLog })).forEach(u => excludedUrls.add(u));
+                addLog(`   🚫 Exclusion list (${bdrEmail} only): ${excludedUrls.size.toLocaleString()} unique URL(s)`, 'info');
             } catch (e) {
                 addLog(`   ⚠️ Could not load exclusion lists: ${e.message}`, 'warning');
             }
@@ -18081,21 +18101,8 @@
                 // returned pool, THEN we take `count`. Previously the server sliced to
                 // `count` first and this pass shrank the batch (e.g. 400 → 66 → 1).
                 try {
-                    const { collection: colEx, getDocs: gdEx, getAllDocs: gadEx } = window.clemailFirestore;
-                    const fetchEx = gadEx || gdEx;
-                    const clientExcludedUrls = new Set();
-                    for (const collName of ['prospect_exclusions', 'connect_exclusions']) {
-                        try {
-                            const snap = await fetchEx(colEx(db, collName), { pageSize: 3000, timeoutMs: 60000, maxRetries: 2 });
-                            snap.forEach(d => {
-                                const data = d.data();
-                                const u = normalizeLinkedInUrl(data.linkedinUrl || data.linkedInUrl || '');
-                                if (u) clientExcludedUrls.add(u);
-                            });
-                        } catch (e) {
-                            addLog(`   ⚠️ Could not load ${collName} for client filter: ${e.message}`, 'warning');
-                        }
-                    }
+                    // PER BDR only — exclusions for other BDRs must not affect this BDR's pool.
+                    const clientExcludedUrls = await loadBdrExclusionUrls(bdrEmail, { addLog });
                     const beforeClientFilter = prospectList.length;
                     let droppedExcluded = 0, droppedSoft = 0, droppedOutsideHyp = 0, droppedNoUrl = 0;
                     prospectList = prospectList.filter(p => {

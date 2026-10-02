@@ -172,8 +172,8 @@ async function runFullAiGenerate(job, opts) {
         const [queueByBdr, queueByAccount, connectExclusionsSnap, prospectExclusionsSnap] = await Promise.all([
             db.collection('connect_queue').where('bdr_email',    '==', bdrEmail).get(),
             db.collection('connect_queue').where('account_email','==', bdrEmail).get(),
-            db.collection('connect_exclusions').get(),
-            db.collection('prospect_exclusions').get()
+            loadBdrExclusionSnap(db, 'connect_exclusions', bdrEmail),
+            loadBdrExclusionSnap(db, 'prospect_exclusions', bdrEmail)
         ]);
 
         const messagedUrls = new Set();
@@ -181,6 +181,7 @@ async function runFullAiGenerate(job, opts) {
             snap.forEach(d => { const u = normalizeUrl(d.data().prospect_li_url || ''); if (u) messagedUrls.add(u); })
         );
 
+        // Exclusions are PER BDR only
         const excludedUrls = new Set();
         [connectExclusionsSnap, prospectExclusionsSnap].forEach(snap =>
             snap.forEach(d => {
@@ -1412,6 +1413,21 @@ function addJobLog(job, message, type = 'info') {
 // Must match protocol-stripped forms written by hypothesis_target_rules.html
 // (linkedin.com/in/slug) AND full URLs from Fast Connect Review / connect_queue
 // (https://www.linkedin.com/in/slug, locale subdomains, trailing slash, query params).
+// Exclusions are strictly PER BDR (excludedByBdr or excludedBy == this BDR) - a contact
+// excluded for one BDR can still be a great fit for another. Returns { size, forEach }.
+async function loadBdrExclusionSnap(db, collName, bdrEmail) {
+    const emails = [...new Set([bdrEmail, String(bdrEmail || '').toLowerCase()].filter(Boolean))];
+    const queries = [];
+    for (const field of ['excludedByBdr', 'excludedBy']) {
+        for (const em of emails) queries.push(db.collection(collName).where(field, '==', em).get());
+    }
+    const snaps = await Promise.all(queries);
+    const byId = new Map();
+    snaps.forEach(s => s.forEach(d => { if (!byId.has(d.id)) byId.set(d.id, d); }));
+    const docs = [...byId.values()];
+    return { size: docs.length, forEach: fn => docs.forEach(fn) };
+}
+
 function normalizeUrl(url) {
     if (!url) return '';
     const s = String(url).toLowerCase().trim();
@@ -1513,8 +1529,8 @@ router.post('/full-ai-init', requireAuth, async (req, res) => {
         const [queueByBdr, queueByAccount, connectExclusionsSnap, prospectExclusionsSnap] = await Promise.all([
             db.collection('connect_queue').where('bdr_email',    '==', bdrEmail).get(),
             db.collection('connect_queue').where('account_email','==', bdrEmail).get(),
-            db.collection('connect_exclusions').get(),
-            db.collection('prospect_exclusions').get()
+            loadBdrExclusionSnap(db, 'connect_exclusions', bdrEmail),
+            loadBdrExclusionSnap(db, 'prospect_exclusions', bdrEmail)
         ]);
 
         const messagedUrls = new Set();

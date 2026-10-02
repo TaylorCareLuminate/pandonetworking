@@ -3917,10 +3917,17 @@
                     </button>
                 </div>
                 <span class="li-filter-count" id="liFilterCount"></span>
+                <button type="button" id="liShowNotPandoBtn" onclick="window.liToggleShowNotPando()" style="display:none; align-items:center; gap:6px; margin-left:auto; padding:6px 12px; border-radius:8px; border:2px solid #6b7280; background:#f3f4f6; color:#374151; font-size:0.8rem; font-weight:600; cursor:pointer;" title="Replies that didn't originate with Pando outreach (the lead messaged first, or there's no outreach record for them) are hidden by default.">
+                    <i class="fas fa-eye"></i> Show Not-Pando (0)
+                </button>
             </div>
             <div class="li-filter-empty-state" id="liFilterEmptyState">
                 <i class="fas fa-search" style="font-size:1.1rem;"></i>
                 <span>No replies match that filter. Try a different name, company, or BDR.</span>
+            </div>
+            <div class="li-filter-empty-state" id="liNotPandoEmptyState">
+                <i class="fas fa-eye-slash" style="font-size:1.1rem;"></i>
+                <span></span>
             </div>
             <div class="li-alerts-list" id="liAlertsList"></div>
         </div>
@@ -6305,6 +6312,11 @@
         // appear within 5 minutes of each Railway scan completing.
 
         let _liAlerts = [];
+        // Replies that did NOT originate with Pando (same rule as the gray "Not Pando Outreach" /
+        // "Inbound" cards in company_review_replies.html) are hidden unless this is toggled on.
+        let _liShowNotPando = false;
+        // alertId -> { notInQueue: boolean } — async result of the connect_queue lookup
+        const _liPandoOriginCache = new Map();
         // Full deduped alert list before team-scope filtering is applied — kept
         // around so toggling "Show all BDRs" (or a fresh BDR assignment save) can
         // re-derive the visible _liAlerts instantly without re-hitting Railway.
@@ -8476,8 +8488,13 @@
             }
 
             // Re-apply any active BDR/name filter so a refresh (poll or manual scan)
-            // doesn't blow away a search someone is in the middle of using.
+            // doesn't blow away a search someone is in the middle of using. This also
+            // hides not-Pando-originated replies (unless toggled on) and fixes the badge.
             window.liApplyFilter();
+
+            // Look up connect_queue in the background for alerts we haven't classified yet;
+            // re-applies the filter itself if any turn out to be not Pando-originated.
+            _liClassifyPandoOrigin(_liAlerts).catch(err => console.warn('[LiAlerts] Pando-origin classification failed:', err.message));
 
             // Re-render wipes the compose textareas, so re-seed each card with its
             // stored AI draft (and restore generating/error status indicators).
@@ -8488,6 +8505,121 @@
             // so an in-progress reply survives this refresh untouched.
             _liRestoreComposeState(composeState);
         }
+
+        // ── "Not originated by Pando" detection (mirrors company_review_replies.html) ─────
+        // An alert is NOT Pando-originated when either:
+        //   • the lead sent the first message in the thread (inbound), or
+        //   • the lead's LinkedIn URL has no record in connect_queue for this BDR
+        //     (Pando never sent them a connection request or message).
+        const _LI_LEAD_SENDERS = new Set(['correspondent', 'lead', 'them', 'inbound']);
+
+        function _liAlertFirstMessageInbound(a) {
+            const first = Array.isArray(a.messages) && a.messages.length > 0 ? a.messages[0] : null;
+            if (!first) return false;
+            return _LI_LEAD_SENDERS.has(String(first.sender || first.senderType || first.direction || '').toLowerCase());
+        }
+
+        function _liIsNotPandoOriginated(a) {
+            if (_liAlertFirstMessageInbound(a)) return true;
+            const r = _liPandoOriginCache.get(a.id);
+            return !!(r && r.notInQueue);
+        }
+
+        // True when this alert should currently be hidden from the list.
+        function _liIsHiddenNotPando(a) {
+            return !_liShowNotPando && _liIsNotPandoOriginated(a);
+        }
+
+        // Lowercase + original-case URL forms (with/without protocol, www, trailing slash) so the
+        // exact-match Firestore 'in' query finds the connect_queue doc however it was stored.
+        function _liPandoUrlCandidates(rawUrl) {
+            const trimmed = (rawUrl || '').trim();
+            if (!trimmed) return [];
+            const bare = trimmed.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '');
+            const out = new Set();
+            for (const b of [bare, bare.toLowerCase()]) {
+                for (const p of ['https://', 'http://', '']) {
+                    for (const w of ['www.', '']) {
+                        for (const s of ['', '/']) out.add(`${p}${w}${b}${s}`);
+                    }
+                }
+            }
+            out.add(trimmed);
+            out.add(trimmed.toLowerCase());
+            return Array.from(out).slice(0, 30); // Firestore 'in' limit
+        }
+
+        // Returns true if connect_queue has an outreach record for this alert's lead under one of the
+        // BDR's emails, false if not, or null if the lookup failed (unknown — don't hide on errors).
+        async function _liHasConnectQueueRecord(a) {
+            if (!window.clemailFirestore || !window.clemailDb) return null;
+            const { collection, query, where, getDocs, limit } = window.clemailFirestore;
+            const db = window.clemailDb;
+
+            // This BDR's emails: canonical + raw alert email + any LinkedIn-login aliases of the canonical.
+            const canonical = (_liAlertCanonicalEmail.get(a.id) || '').toLowerCase();
+            const variants = new Set([canonical, (a.bdrEmail || '').toLowerCase()].filter(Boolean));
+            if (_liAliasToCanonicalEmail && canonical) {
+                _liAliasToCanonicalEmail.forEach((canon, alias) => { if (canon === canonical) variants.add(alias); });
+            }
+
+            const candidates = _liPandoUrlCandidates(a.leadProfileUrl);
+            if (!candidates.length) return false; // no URL at all → no outreach record can match
+
+            const fields = ['prospect_li_url', 'linkedInUrl', 'prospect_linkedin_url'];
+            const results = await Promise.allSettled(fields.map(f =>
+                getDocs(query(collection(db, 'connect_queue'), where(f, 'in', candidates), limit(200)), { timeoutMs: 30000 })
+            ));
+
+            let anyOk = false;
+            for (const r of results) {
+                if (r.status !== 'fulfilled') continue;
+                anyOk = true;
+                let found = false;
+                r.value.forEach(d => {
+                    const acct = String((d.data() || {}).account_email || '').toLowerCase();
+                    if (variants.size === 0 || variants.has(acct)) found = true;
+                });
+                if (found) return true;
+            }
+            return anyOk ? false : null;
+        }
+
+        let _liPandoClassifyRunning = false;
+        async function _liClassifyPandoOrigin(alerts) {
+            if (_liPandoClassifyRunning) return;
+            // Alerts whose first message is inbound are already classified (no lookup needed).
+            const todo = (alerts || []).filter(a => a && a.id && !_liPandoOriginCache.has(a.id) && !_liAlertFirstMessageInbound(a));
+            if (!todo.length) return;
+            _liPandoClassifyRunning = true;
+            let changed = false;
+            try {
+                await _liGetAliasToCanonicalEmailMap();
+                const queue = [...todo];
+                const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
+                    while (queue.length) {
+                        const a = queue.shift();
+                        try {
+                            const has = await _liHasConnectQueueRecord(a);
+                            if (has === null) continue; // unknown — leave unclassified, retry next poll
+                            _liPandoOriginCache.set(a.id, { notInQueue: !has });
+                            if (!has) changed = true;
+                        } catch (err) {
+                            console.warn('[LiAlerts] Pando-origin check failed for', a.id, err.message);
+                        }
+                    }
+                });
+                await Promise.all(workers);
+            } finally {
+                _liPandoClassifyRunning = false;
+            }
+            if (changed) window.liApplyFilter();
+        }
+
+        window.liToggleShowNotPando = function() {
+            _liShowNotPando = !_liShowNotPando;
+            window.liApplyFilter();
+        };
 
         // ── BDR / name / company filter for the alert list ──────────────────
         // Lets a BDR (or admin) jump straight to one contact's card — e.g. "Shelby
@@ -8548,16 +8680,46 @@
             if (clearBtn) clearBtn.style.display = hasFilter ? 'flex' : 'none';
 
             let visibleCount = 0;
+            let notPandoCount = 0;     // all not-Pando-originated alerts (hidden or not)
+            let hiddenNotPando = 0;    // the ones currently hidden by the toggle
             _liAlerts.forEach(alert => {
+                const isNotPando = _liIsNotPandoOriginated(alert);
+                if (isNotPando) notPandoCount++;
+                const hiddenNP = !_liShowNotPando && isNotPando;
+                if (hiddenNP) hiddenNotPando++;
                 const card = document.getElementById(`li-card-${alert.id}`);
                 if (!card) return;
-                const matches = _liAlertMatchesBdrFilter(alert, bdrEmail) && _liAlertMatchesSearchFilter(alert, q);
+                const matches = !hiddenNP && _liAlertMatchesBdrFilter(alert, bdrEmail) && _liAlertMatchesSearchFilter(alert, q);
                 card.style.display = matches ? '' : 'none';
                 if (matches) visibleCount++;
             });
 
-            if (countEl) countEl.textContent = hasFilter ? `Showing ${visibleCount} of ${_liAlerts.length}` : '';
+            const totalShown = _liAlerts.length - hiddenNotPando;
+            if (countEl) countEl.textContent = hasFilter ? `Showing ${visibleCount} of ${totalShown}` : '';
             if (emptyEl) emptyEl.style.display = (hasFilter && visibleCount === 0) ? 'flex' : 'none';
+
+            // Header badge reflects what's actually visible (not hidden not-Pando replies)
+            const badge = document.getElementById('liAlertsBadge');
+            if (badge) badge.textContent = totalShown;
+
+            // Toggle button: only offered when there's something to show/hide
+            const npBtn = document.getElementById('liShowNotPandoBtn');
+            if (npBtn) {
+                npBtn.style.display = (notPandoCount > 0 || _liShowNotPando) ? 'inline-flex' : 'none';
+                npBtn.innerHTML = _liShowNotPando
+                    ? `<i class="fas fa-eye-slash"></i> Hide Not-Pando (${notPandoCount})`
+                    : `<i class="fas fa-eye"></i> Show Not-Pando (${notPandoCount})`;
+                npBtn.classList.toggle('active', _liShowNotPando);
+            }
+
+            // If everything is hidden because it's not from Pando, say so rather than showing a blank banner
+            const npEmpty = document.getElementById('liNotPandoEmptyState');
+            if (npEmpty) {
+                const allHidden = _liAlerts.length > 0 && totalShown === 0;
+                npEmpty.style.display = allHidden ? 'flex' : 'none';
+                const span = npEmpty.querySelector('span');
+                if (span && allHidden) span.textContent = `${hiddenNotPando} repl${hiddenNotPando === 1 ? 'y is' : 'ies are'} hidden because they didn't originate with Pando outreach. Click "Show Not-Pando" to see ${hiddenNotPando === 1 ? 'it' : 'them'}.`;
+            }
         };
 
         window.liClearFilter = function() {
@@ -8748,17 +8910,19 @@
         };
 
         window.liDismissAll = async function() {
-            if (!_liAlerts.length) return;
+            // Hidden not-Pando replies are not "currently shown", so they are left alone.
+            const toDismiss = _liAlerts.filter(a => !_liIsHiddenNotPando(a));
+            if (!toDismiss.length) return;
             // Only dismiss what's currently shown to THIS viewer (only their own
             // scoped BDRs, or literally everyone if "Show all BDRs" is on)
             // — never wipe out a teammate's reply queue just because they aren't
             // the one who clicked the button. Uses the per-alert dismiss endpoint
             // (same as liDismissOne) rather than the blanket dismiss-all endpoint.
-            if (!confirm(`Dismiss ${_liAlerts.length} reply alert(s) currently shown to you?`)) return;
+            if (!confirm(`Dismiss ${toDismiss.length} reply alert(s) currently shown to you?`)) return;
             try {
                 const currentUser = window.auth?.currentUser;
                 const email = currentUser?.email || 'unknown';
-                const idsToClear = [...new Set(_liAlerts.flatMap(a => _liSiblingAlertIds(a.id)))];
+                const idsToClear = [...new Set(toDismiss.flatMap(a => _liSiblingAlertIds(a.id)))];
                 const results = await Promise.all(idsToClear.map(id =>
                     fetch(`${RAILWAY_BASE}/api/linkedin-reply-alerts/${encodeURIComponent(id)}/dismiss`, {
                         method: 'POST',
@@ -8769,7 +8933,7 @@
                 const failed = results.find(resp => !resp.ok);
                 if (failed) throw new Error(`HTTP ${failed.status}`);
                 const clearedSet = new Set(idsToClear);
-                _liAlerts = [];
+                _liAlerts = _liAlerts.filter(a => !clearedSet.has(a.id));
                 _liAllAlertsDeduped = (_liAllAlertsDeduped || []).filter(a => !clearedSet.has(a.id));
                 _liRawAlerts = (_liRawAlerts || []).filter(a => !clearedSet.has(a.id));
                 _liRenderBanner(null);
@@ -9405,6 +9569,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         async function _liEnsureAiDrafts() {
             const pending = _liAlerts.filter(a => {
                 if (_liAiDraftInFlight.has(a.id)) return false;
+                if (_liIsHiddenNotPando(a)) return false; // don't spend AI calls on hidden replies
                 return !(a.aiDraft && a.aiDraftKey === _liDraftKey(a));
             }).slice(0, LI_AI_MAX_DRAFTS_PER_PASS);
             // Alerts that already have a fresh stored draft just get applied

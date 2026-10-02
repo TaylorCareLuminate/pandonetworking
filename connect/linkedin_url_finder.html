@@ -699,6 +699,8 @@ function syncLogsFromJob(logs, lastTs) {
         box.appendChild(d);
         if (entry.ts && entry.ts > newestTs) newestTs = entry.ts;
     }
+    // Keep the DOM bounded on long runs (hundreds of contacts => thousands of lines).
+    while (box.childElementCount > 1500) box.removeChild(box.firstElementChild);
     box.scrollTop = box.scrollHeight;
     return newestTs;
 }
@@ -929,8 +931,8 @@ async function refreshJobList() {
         // limit=200 (server default is 50) so an overnight/unattended batch checked the next
         // morning doesn't get pushed out of the list just because other jobs ran in between —
         // the underlying Firestore doc is never deleted, only this list's window was too small.
-        const resp = await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/jobs?limit=200`);
-        const data = await resp.json();
+        const resp = await fetchWithTimeout(`${RAILWAY}/api/apify/linkedin-url-finder-v2/jobs?limit=200`, {}, 30000);
+        const data = resp.json();
         if (data.success) serverJobs = data.jobs;
     } catch (e) { serverReachable = false; }
 
@@ -996,8 +998,8 @@ async function recoverJob(jobId, onServer) {
 
     if (onServer) {
         try {
-            const resp = await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/job/${jobId}`);
-            const data = await resp.json();
+            const resp = await fetchWithTimeout(`${RAILWAY}/api/apify/linkedin-url-finder-v2/job/${jobId}`, {}, 60000);
+            const data = resp.json();
             if (!data.success) throw new Error(data.error || 'Job not found on server');
             results = data.results || [];
             jobMeta = data;
@@ -1081,16 +1083,16 @@ async function startJob(contactsToSearch) {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         let resp;
         try {
-            resp = await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/start`, {
+            resp = await fetchWithTimeout(`${RAILWAY}/api/apify/linkedin-url-finder-v2/start`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ contacts: contactsToSearch, matchStrictness: getMatchStrictness() })
-            });
+            }, 60000);
         } catch (netErr) {
             if (attempt === MAX_ATTEMPTS) {
                 throw new Error('Could not reach the server to start the job. It may be restarting — please try again shortly.');
             }
-            log(`  ⚠ Server unreachable (attempt ${attempt}/${MAX_ATTEMPTS}), it may be restarting. Retrying…`, 'log-dim');
+            log(`  ⚠ Server unreachable: ${netErr.message} (attempt ${attempt}/${MAX_ATTEMPTS}), it may be restarting. Retrying…`, 'log-dim');
             await sleep(delay);
             delay = Math.min(delay * 2, 15000);
             continue;
@@ -1105,7 +1107,7 @@ async function startJob(contactsToSearch) {
 
         let data;
         try {
-            data = await resp.json();
+            data = resp.json();
         } catch (parseErr) {
             throw new Error(`Server returned an invalid response (HTTP ${resp.status}). It may still be starting up — please try again shortly.`);
         }
@@ -1116,11 +1118,48 @@ async function startJob(contactsToSearch) {
     throw new Error('Failed to start job after multiple attempts.');
 }
 
+// fetch() with a hard timeout that covers BOTH the response headers and the
+// body. A plain fetch() has no timeout at all, so one stalled connection used
+// to leave the poll loop awaiting forever — the page just "froze" at N/total
+// with no error and nothing retrying.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const resp = await fetch(url, { ...options, signal: controller.signal });
+        const text = await resp.text();
+        return {
+            ok: resp.ok,
+            status: resp.status,
+            text,
+            json() { return JSON.parse(text); }
+        };
+    } catch (e) {
+        if (e.name === 'AbortError') throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function pollJobUntilDone(jobId) {
-    const DEADLINE = Date.now() + 60 * 60 * 1000; // 1 hour max
+    // No fixed "1 hour" cap any more: a 1000-contact batch legitimately takes
+    // longer than that. Instead we give up only when progress has genuinely
+    // stopped (see STALL_* below) or after a generous absolute ceiling.
+    const DEADLINE = Date.now() + 8 * 60 * 60 * 1000;
+    const STALL_WARN_MS  = 5 * 60 * 1000;    // warn in the log if nothing has advanced for this long
+    const STALL_ABORT_MS = 25 * 60 * 1000;   // server gives up on a single contact after 12 min, so this means the job itself is wedged
+    const POLL_TIMEOUT_MS = 30000;
     let lastLogTs = '';   // ISO timestamp of the newest log line already shown
     let consecutiveNotFound = 0;
     let consecutiveErrors = 0;
+    // Results are fetched incrementally (?after=N) and accumulated here, so a
+    // poll doesn't re-download every full LinkedIn profile found so far.
+    let allResults = [];
+    let lastProcessed = -1;
+    let lastProgressAt = Date.now();
+    let stallWarned = false;
+    let savedCount = 0;
     // The server mirrors job progress to Firestore so any Railway replica can
     // answer a poll, so a 404 here should be rare and usually means the job
     // is genuinely gone (real restart) rather than just landing on a replica
@@ -1136,11 +1175,13 @@ async function pollJobUntilDone(jobId) {
 
         let resp;
         try {
-            resp = await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/job/${jobId}`);
+            resp = await fetchWithTimeout(
+                `${RAILWAY}/api/apify/linkedin-url-finder-v2/job/${jobId}?after=${allResults.length}`,
+                {}, POLL_TIMEOUT_MS);
         } catch (netErr) {
             consecutiveErrors++;
             pollDelay = Math.min(pollDelay * 1.5, 20000);
-            log(`  ⚠ Can't reach server (attempt ${consecutiveErrors}/${MAX_CONSEC_ERRORS})… it may be restarting.`, 'log-dim');
+            log(`  ⚠ Can't reach server (${netErr.message}) (attempt ${consecutiveErrors}/${MAX_CONSEC_ERRORS})… it may be restarting.`, 'log-dim');
             if (consecutiveErrors >= MAX_CONSEC_ERRORS) {
                 throw new Error('Lost connection to the server for too long. Please wait a minute and click Search again.');
             }
@@ -1176,7 +1217,7 @@ async function pollJobUntilDone(jobId) {
 
         let d;
         try {
-            d = await resp.json();
+            d = resp.json();
         } catch (parseErr) {
             consecutiveErrors++;
             log('  ⚠ Server sent an invalid response, retrying…', 'log-dim');
@@ -1186,14 +1227,43 @@ async function pollJobUntilDone(jobId) {
             continue;
         }
 
+        // A {success:false} body used to be logged and then retried forever
+        // without ever counting toward the give-up limit.
+        if (!d.success) {
+            consecutiveErrors++;
+            pollDelay = Math.min(pollDelay * 1.5, 20000);
+            log(`  Poll error: ${d.error} (attempt ${consecutiveErrors}/${MAX_CONSEC_ERRORS})`, 'log-err');
+            if (consecutiveErrors >= MAX_CONSEC_ERRORS) {
+                throw new Error(`Server kept reporting an error: ${d.error || 'unknown'}. Please wait a minute and click Search again.`);
+            }
+            continue;
+        }
+
         consecutiveErrors = 0;
         pollDelay = 5000;
 
-        if (!d.success) { log(`  Poll error: ${d.error}`, 'log-err'); continue; }
+        // Merge this poll's slice into the accumulated results. A server that
+        // predates ?after= just returns the full list with no offset, which
+        // replaces everything (offset 0) — so this works against old and new.
+        const incoming = d.results || [];
+        const offset = typeof d.resultsOffset === 'number' ? d.resultsOffset : 0;
+        if (offset <= allResults.length) {
+            allResults = allResults.slice(0, offset).concat(incoming);
+        } else {
+            // Gap (shouldn't happen) — drop what we have and re-fetch from the top next poll.
+            allResults = [];
+            pollDelay = 1000;
+            continue;
+        }
 
         // Mirror progress locally in case the backend loses this job later
         // (it only keeps jobs in memory, so a restart wipes them permanently).
-        saveJobCheckpoint(jobId, d.results);
+        // Only when something new arrived — re-serialising megabytes of
+        // profiles on every 5s poll was needless main-thread work.
+        if (allResults.length !== savedCount) {
+            saveJobCheckpoint(jobId, allResults);
+            savedCount = allResults.length;
+        }
 
         // Stream new logs from server
         lastLogTs = syncLogsFromJob(d.logs || [], lastLogTs);
@@ -1205,16 +1275,53 @@ async function pollJobUntilDone(jobId) {
 
         if (['completed','cancelled','failed'].includes(d.status)) {
             if (d.status === 'failed') throw new Error(d.error || 'Job failed on server');
-            return d.results || [];
+
+            // Safety net: if our accumulated list doesn't line up with what the
+            // server says it processed (e.g. a replica's Firestore mirror lagged
+            // mid-run), pull the authoritative full list once before returning.
+            if (allResults.length !== d.processed) {
+                try {
+                    const full = await fetchWithTimeout(
+                        `${RAILWAY}/api/apify/linkedin-url-finder-v2/job/${jobId}`, {}, 60000);
+                    if (full.ok) {
+                        const fd = full.json();
+                        if (fd.success && Array.isArray(fd.results) && fd.results.length >= allResults.length) {
+                            allResults = fd.results;
+                        }
+                    }
+                } catch (e) {
+                    log(`  ⚠ Final full-results fetch failed (${e.message}); using what was received during polling.`, 'log-dim');
+                }
+            }
+            return allResults;
+        }
+
+        // Stall detection: the server has a per-contact watchdog, so progress
+        // should always advance eventually. If it doesn't, say so (instead of
+        // looking frozen) and eventually bail out so the caller can recover the
+        // partial results rather than waiting forever.
+        if (d.processed !== lastProcessed) {
+            lastProcessed = d.processed;
+            lastProgressAt = Date.now();
+            stallWarned = false;
+        } else {
+            const stalledFor = Date.now() - lastProgressAt;
+            if (stalledFor >= STALL_ABORT_MS) {
+                throw new Error(`No progress for ${Math.round(stalledFor / 60000)} minutes (stuck at ${d.processed}/${d.total}). Partial results were saved — use "Recover" to load them, then re-run the remaining range.`);
+            }
+            if (stalledFor >= STALL_WARN_MS && !stallWarned) {
+                stallWarned = true;
+                log(`  ⚠ No progress for ${Math.round(stalledFor / 60000)} min (stuck at ${d.processed}/${d.total}). The server will skip a contact it can't finish; still waiting…`, 'log-dim');
+            }
         }
     }
-    throw new Error('Job polling timed out after 60 minutes');
+    throw new Error('Job polling timed out after 8 hours');
 }
 
 async function cancelSearch() {
     if (!activeJobId) return;
     try {
-        await fetch(`${RAILWAY}/api/apify/linkedin-url-finder-v2/job/${activeJobId}/cancel`, { method: 'POST' });
+        await fetchWithTimeout(`${RAILWAY}/api/apify/linkedin-url-finder-v2/job/${activeJobId}/cancel`, { method: 'POST' }, 15000);
         log('⏹ Cancellation requested.', 'log-dim');
     } catch (e) { console.warn('Cancel error:', e.message); }
 }
