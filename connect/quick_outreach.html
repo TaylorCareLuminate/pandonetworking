@@ -167,6 +167,11 @@
         .conn-banner.connected { background: #ecfdf5; border: 1px solid #a7f3d0; color: #047857; }
         .conn-banner.not-connected { background: #eff6ff; border: 1px solid #bfdbfe; color: #1d4ed8; }
         .conn-banner.unknown { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; }
+        .referral-box {
+            display: none; border: 1px solid #bfdbfe; background: #f5f9ff; border-radius: 12px;
+            padding: 14px 16px; margin-bottom: 16px;
+        }
+        .referral-title { font-size: 14px; font-weight: 800; color: var(--primary-dark); margin-bottom: 4px; display: flex; align-items: center; gap: 7px; }
         .src-badge.message { background: #ecfdf5; color: #047857; border-color: #a7f3d0; }
         .src-badge.connect-kind { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
         .sticky-bar {
@@ -211,6 +216,35 @@
         <div class="tab-panel active" id="panelSingle">
             <div class="section">
                 <div class="section-title"><i class="fas fa-user-plus"></i> Message One Person</div>
+
+                <!-- Referral (shown when arriving from "Make Referral" on the admin dashboard) -->
+                <div class="referral-box" id="referralBox">
+                    <div class="referral-title"><i class="fas fa-share-nodes"></i> Referral Outreach</div>
+                    <div class="form-help" style="margin: 0 0 10px;">Finds the referred person's LinkedIn URL, then drafts: <em>"Hi [first name]. [Referrer] recommended I reach out to you. [details]"</em>. You review and edit before anything is sent.</div>
+                    <div class="grid-2">
+                        <div class="form-group">
+                            <label for="referralName"><i class="fas fa-user"></i> Person we're reaching out to</label>
+                            <input type="text" id="referralName" placeholder="Anders Hansen" />
+                        </div>
+                        <div class="form-group">
+                            <label for="referralCompany"><i class="fas fa-building"></i> Their company (optional, improves the match)</label>
+                            <input type="text" id="referralCompany" placeholder="Acme Health System" />
+                        </div>
+                        <div class="form-group">
+                            <label for="referralReferrer"><i class="fas fa-handshake"></i> Who referred us</label>
+                            <input type="text" id="referralReferrer" placeholder="Agathe Le Lay" />
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="referralDetails"><i class="fas fa-pen"></i> Details about why we're reaching out</label>
+                        <textarea id="referralDetails" rows="2" placeholder="I'd love to get your perspective on ..."></textarea>
+                    </div>
+                    <button class="btn btn-primary" id="btnReferralRun" onclick="qoRunReferral()">
+                        <i class="fas fa-magnifying-glass"></i> Find LinkedIn URL &amp; Build Message
+                    </button>
+                    <div class="run-log" id="referralLog" style="height: 150px;"></div>
+                </div>
+
                 <div class="form-group">
                     <label><i class="fas fa-sliders"></i> How to write it</label>
                     <div class="mode-toggle">
@@ -1656,7 +1690,7 @@
                         prospect,
                         singleData: singleDataStub,
                         src: 'Manual',
-                        msgText: '',
+                        msgText: qoTakeReferralDraft(inputUrl),
                         altText: '',
                         messageType,
                         alreadyConnected,
@@ -2056,6 +2090,230 @@
             }
         };
 
+        // ── Referral outreach ────────────────────────────────────────────────
+        // Flow: (admin dashboard "Make Referral") → BDR + referred name pre-filled →
+        // LinkedIn URL Finder (same Railway job API as linkedin_url_finder.html) →
+        // draft "Hi X. <referrer> recommended I reach out to you. <details>" →
+        // the normal Write & send single-contact flow takes over from there.
+        let qoReferralDraft = null;     // { url: normalized url | null, text }
+
+        // Returns the pending referral draft for this run (and clears it), or ''.
+        // url === null means "use for the next write-mode run" (URL had to be pasted by hand).
+        function qoTakeReferralDraft(inputUrl) {
+            if (!qoReferralDraft) return '';
+            const d = qoReferralDraft;
+            if (d.url !== null && d.url !== qoNormalizeUrl(inputUrl)) return '';
+            qoReferralDraft = null;
+            return d.text;
+        }
+
+        function qoBuildReferralMessage({ referredName, referrerName, details }) {
+            const first = String(referredName || '').trim().split(/\s+/)[0] || 'there';
+            const referrer = String(referrerName || '').trim();
+            const who = referrer ? `${referrer} recommended I reach out to you.` : 'I was recommended to reach out to you.';
+            return [`Hi ${first}.`, who, String(details || '').trim()].filter(Boolean).join(' ');
+        }
+
+        async function qoFetchJsonWithTimeout(url, options = {}, timeoutMs = 30000) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const resp = await fetch(url, { ...options, signal: controller.signal });
+                const text = await resp.text();
+                let json = null;
+                try { json = JSON.parse(text); } catch (_) {}
+                return { ok: resp.ok, status: resp.status, json };
+            } catch (e) {
+                if (e.name === 'AbortError') throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+                throw e;
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        // Same backend job the LinkedIn URL Finder page uses (linkedin-url-finder-v2).
+        // Returns { url, match, confidence, aiReason } — url is '' when nobody matched.
+        async function qoFindLinkedInUrl({ name, company }, addLog) {
+            const parts = String(name || '').trim().split(/\s+/);
+            const contact = {
+                name: parts.join(' '),
+                firstName: parts[0] || '',
+                lastName: parts.slice(1).join(' '),
+                company: company || '',
+                title: '',
+                email: '',
+                _rowIdx: 0,
+                _orig: {}
+            };
+
+            // Start the job (retry on server restarts / 5xx, like the finder page)
+            let jobId = null;
+            let delay = 2000;
+            for (let attempt = 1; attempt <= 5 && !jobId; attempt++) {
+                try {
+                    const r = await qoFetchJsonWithTimeout(`${RAILWAY_API}/api/apify/linkedin-url-finder-v2/start`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ contacts: [contact], matchStrictness: 'balanced' })
+                    }, 60000);
+                    if (!r.ok && r.status >= 500 && attempt < 5) throw new Error(`HTTP ${r.status}`);
+                    if (!r.json || !r.json.success) throw Object.assign(new Error(r.json?.error || `Failed to start search (HTTP ${r.status})`), { fatal: true });
+                    jobId = r.json.jobId;
+                } catch (e) {
+                    if (e.fatal || attempt === 5) throw e;
+                    addLog(`   ⚠️ Could not start search (${e.message}), retrying (${attempt}/5)…`, 'warning');
+                    await sleep(delay);
+                    delay = Math.min(delay * 2, 15000);
+                }
+            }
+            addLog(`   🔎 URL search started (job ${jobId}) — usually under a minute…`, 'dim');
+
+            // Poll until finished
+            const deadline = Date.now() + 15 * 60 * 1000;
+            let errors = 0, notFound = 0, lastLog = 0;
+            while (Date.now() < deadline) {
+                await sleep(4000);
+                let r;
+                try {
+                    r = await qoFetchJsonWithTimeout(`${RAILWAY_API}/api/apify/linkedin-url-finder-v2/job/${jobId}`, {}, 30000);
+                } catch (e) {
+                    if (++errors >= 8) throw new Error('Lost connection to the server while searching. Please try again.');
+                    continue;
+                }
+                if (r.status === 404) {
+                    if (++notFound >= 3) throw new Error('The search job was lost (server may have restarted). Please try again.');
+                    continue;
+                }
+                notFound = 0;
+                if (!r.ok || !r.json || !r.json.success) {
+                    if (++errors >= 8) throw new Error(r.json?.error || `Server kept returning HTTP ${r.status}.`);
+                    continue;
+                }
+                errors = 0;
+                const d = r.json;
+                if (Date.now() - lastLog > 20000) { addLog(`   ⏳ Still searching… (${d.processed || 0}/${d.total || 1})`, 'dim'); lastLog = Date.now(); }
+                if (d.status === 'failed') throw new Error(d.error || 'URL search failed on the server.');
+                if (['completed', 'cancelled'].includes(d.status)) {
+                    const row = (d.results || [])[0];
+                    const match = row?.match || null;
+                    const url = (match?.basic_info?.profile_url || '').trim();
+                    return { url, match, confidence: row?.confidence || null, aiReason: row?.aiReason || '' };
+                }
+            }
+            throw new Error('Timed out waiting for the LinkedIn URL search.');
+        }
+
+        // Pick the BDR dropdown entry for an email that may be a canonical work email
+        // or one of that BDR's LinkedIn-seat aliases.
+        async function qoSelectBdrByEmail(email) {
+            const want = String(email || '').trim().toLowerCase();
+            if (!want) return false;
+            const sel = document.getElementById('bdrSelect');
+            let hit = qoBdrs.find(b => (b.primaryEmail || '').toLowerCase() === want);
+            if (!hit) {
+                hit = qoBdrs.find(b => [b.linkedInEmail, b.linkedinEmail].some(e => String(e || '').toLowerCase() === want));
+            }
+            if (!hit) {
+                const assocs = await qoLoadEmailAssociations();
+                const linked = assocs.filter(a => a.authEmail === want || a.linkedInEmail === want);
+                for (const a of linked) {
+                    hit = qoBdrs.find(b => [b.primaryEmail, b.linkedInEmail, b.linkedinEmail].some(e => {
+                        const v = String(e || '').toLowerCase();
+                        return v === a.authEmail || v === a.linkedInEmail;
+                    }));
+                    if (hit) break;
+                }
+            }
+            if (!hit) return false;
+            sel.value = hit.primaryEmail;
+            sel.dispatchEvent(new Event('change'));
+            return true;
+        }
+
+        window.qoRunReferral = async function() {
+            if (qoBusy) { alert('Another run is in progress — wait for it to finish.'); return; }
+            const bdr = qoSelectedBdr();
+            if (!bdr) { alert('Please select a BDR first.'); return; }
+            const referredName = document.getElementById('referralName').value.trim();
+            if (!referredName) { alert("Please enter the name of the person we're reaching out to."); return; }
+            const referrerName = document.getElementById('referralReferrer').value.trim();
+            const company = document.getElementById('referralCompany').value.trim();
+            const details = document.getElementById('referralDetails').value.trim();
+
+            const btn = document.getElementById('btnReferralRun');
+            const logEl = document.getElementById('referralLog');
+            logEl.innerHTML = '';
+            const addLog = makeLogger('referralLog');
+
+            const draftText = qoBuildReferralMessage({ referredName, referrerName, details });
+            qoBusy = true;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Finding LinkedIn URL…';
+            let foundUrl = '';
+            try {
+                addLog(`🤝 Referral for ${bdr.name || bdr.primaryEmail}: ${referredName}${company ? ' @ ' + company : ''}`);
+                if (!referrerName) addLog('   ⚠️ No referrer name entered — the message will use generic wording.', 'warning');
+                if (!details) addLog('   ⚠️ No details about why entered — the draft will only contain the referral line. Add the reason before sending.', 'warning');
+                addLog('🔍 Running LinkedIn URL Finder…');
+                const found = await qoFindLinkedInUrl({ name: referredName, company }, addLog);
+                if (found.url) {
+                    foundUrl = found.url;
+                    const bi = found.match?.basic_info || {};
+                    addLog(`   ✅ Found: ${bi.fullname || referredName}${bi.headline ? ' — ' + bi.headline : ''}`, 'success');
+                    addLog(`   🔗 ${found.url}${found.confidence ? ` (confidence: ${found.confidence})` : ''}`, 'success');
+                    if (found.aiReason) addLog(`   ℹ️ ${found.aiReason}`, 'dim');
+                    addLog('   👀 Verify this is the right person on the card below before sending.', 'warning');
+                } else {
+                    addLog(`   ❌ No LinkedIn profile matched${found.aiReason ? ` (${found.aiReason})` : ''}.`, 'warning');
+                }
+            } catch (e) {
+                console.error('Referral URL search failed:', e);
+                addLog(`❌ ${e.message}`, 'error');
+            } finally {
+                qoBusy = false;
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Find LinkedIn URL &amp; Build Message';
+            }
+
+            // Hand off to the normal "Write & send" flow with the draft pre-filled.
+            window.qoSwitchTab('single');
+            window.qoSwitchSingleMode('write');
+            if (foundUrl) {
+                document.getElementById('singleUrl').value = foundUrl;
+                qoReferralDraft = { url: qoNormalizeUrl(foundUrl), text: draftText };
+                addLog('➡️ Looking up the profile and building your message…', 'info');
+                await window.qoRunSingle();
+            } else {
+                qoReferralDraft = { url: null, text: draftText };
+                document.getElementById('singleUrl').value = '';
+                document.getElementById('singleUrl').focus();
+                addLog('➡️ Paste their LinkedIn URL in the field below and click "Look Up & Compose" — the referral message will be filled in automatically.', 'info');
+            }
+        };
+
+        // Arriving from the admin dashboard's "Make Referral" button:
+        // ?referral=1&bdr=…&referredName=…&referredCompany=…&referrer=…&details=…
+        async function qoInitReferralFromUrl() {
+            const p = new URLSearchParams(window.location.search);
+            if (p.get('referral') !== '1') return;
+            document.getElementById('referralBox').style.display = 'block';
+            document.getElementById('referralName').value = p.get('referredName') || '';
+            document.getElementById('referralCompany').value = p.get('referredCompany') || '';
+            document.getElementById('referralReferrer').value = p.get('referrer') || '';
+            document.getElementById('referralDetails').value = p.get('details') || '';
+            window.qoSwitchTab('single');
+            window.qoSwitchSingleMode('write');
+
+            const bdrEmail = p.get('bdr') || '';
+            const bdrOk = await qoSelectBdrByEmail(bdrEmail);
+            if (!bdrOk) {
+                const addLog = makeLogger('referralLog');
+                addLog(`⚠️ Couldn't match "${bdrEmail || 'the BDR'}" to a BDR in the list — select the sending BDR above, then click "Find LinkedIn URL & Build Message".`, 'warning');
+                return;
+            }
+            if (p.get('referredName')) await window.qoRunReferral();
+        }
+
         // ── Bootstrap ────────────────────────────────────────────────────────
         let appInitialized = false;
         onAuthStateChanged(auth, async (user) => {
@@ -2065,6 +2323,7 @@
                 currentUser = user;
                 console.log('🔄 Auth ready in quick_outreach.html:', user.email);
                 await qoLoadBdrs();
+                try { await qoInitReferralFromUrl(); } catch (e) { console.error('Referral init failed:', e); }
             } else {
                 const authState = window.getCurrentAuthState?.();
                 if (authState?.isLoggedIn) return;
