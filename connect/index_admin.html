@@ -2219,6 +2219,12 @@
         .li-referral-modal .li-referral-actions button {
             padding: 8px 16px; border-radius: 8px; border: none; font-weight: 700; cursor: pointer; font-size: 0.85rem;
         }
+        .li-referral-modal .li-referral-ai { font-size: 0.8rem; font-weight: 600; padding: 8px 10px; border-radius: 8px; margin-bottom: 4px; }
+        .li-referral-modal .li-referral-ai.working { background: #f5f3ff; color: #6d28d9; }
+        .li-referral-modal .li-referral-ai.done { background: #ecfdf5; color: #047857; }
+        .li-referral-modal .li-referral-ai.warn { background: #fffbeb; color: #92400e; }
+        .li-referral-modal .li-referral-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .li-referral-modal .li-referral-rescan { background: #f5f3ff; color: #6d28d9; margin-right: auto; }
         .li-referral-modal .li-referral-cancel { background: #e2e8f0; color: #334155; }
         .li-referral-modal .li-referral-go { background: #12314C; color: white; }
 
@@ -6806,10 +6812,52 @@
         }
 
         // ── Make Referral ────────────────────────────────────────────────────
-        // When a prospect replies "you should talk to X instead", this collects who X
-        // is (name, company hint, and why we're reaching out) and hands it to
-        // Quick Outreach, which finds X's LinkedIn URL and drafts the
-        // "<this person> recommended I reach out to you" message.
+        // When a prospect replies "you should talk to X instead", AI reads the
+        // conversation to work out who X is (name, company, and why we're reaching
+        // out), then hands it to Quick Outreach, which finds X's LinkedIn URL and
+        // drafts the "<this person> recommended I reach out to you" message.
+        const _liReferralAiCache = new Map(); // alert id + conversation key -> extracted referral
+
+        async function _liExtractReferralWithAi(alertObj) {
+            const cacheKey = `${alertObj.id}|${_liDraftKey(alertObj)}`;
+            if (_liReferralAiCache.has(cacheKey)) return _liReferralAiCache.get(cacheKey);
+
+            const leadName = alertObj.leadName || [alertObj.leadFirstName, alertObj.leadLastName].filter(Boolean).join(' ') || 'Prospect';
+            const transcript = (alertObj.messages || []).map(m => {
+                const sender = (m.sender === 'ME' || m.sender === 'account') ? 'BDR (us)' : leadName;
+                return `${sender}: ${_liExtractMessageText(m)}`;
+            }).join('\n\n');
+
+            const prompt = `You are helping a business development rep (BDR) follow up on a LinkedIn conversation in which the prospect recommended we talk to someone else.
+
+PROSPECT WHO REPLIED: ${leadName}${alertObj.leadPosition ? `, ${alertObj.leadPosition}` : ''}${alertObj.leadCompany ? ` at ${alertObj.leadCompany}` : ''}
+
+CONVERSATION (oldest first):
+${transcript}
+
+Find the person ${leadName} recommends we reach out to INSTEAD of (or in addition to) them. Respond with ONLY a valid JSON object, no markdown:
+{
+  "found": true or false,
+  "name": "full name of the recommended person exactly as written in the conversation (include surname if given), or null",
+  "company": "that person's company/organization if stated or clearly implied (e.g. 'my colleague' or 'someone on my team' means ${alertObj.leadCompany || "the prospect's company"}), otherwise null",
+  "title": "their role/title if mentioned, otherwise null",
+  "why": "1-2 short sentences, written in first person as the BDR, explaining why we are reaching out to this person. Base it on what ${leadName} said about why this person is the right contact (their role, what they own, what they know) and on the topic of our original outreach. Do NOT start with a greeting. Do NOT repeat that ${leadName} recommended us - that sentence is added separately. Keep it under 200 characters. Plain text, no quotes.",
+  "confidence": "high" or "medium" or "low"
+}
+
+Rules:
+- If no one is recommended, set "found" to false and the other fields to null.
+- Never invent a name, company, or details that are not supported by the conversation.
+- If several people are recommended, pick the first/primary one.`;
+
+            const raw = await _liCallAiModel(prompt, { temperature: 0.1, max_tokens: 600 });
+            const m = raw.match(/\{[\s\S]*\}/);
+            if (!m) throw new Error('Could not parse AI response');
+            const result = JSON.parse(m[0]);
+            _liReferralAiCache.set(cacheKey, result);
+            return result;
+        }
+
         window.liMakeReferral = function(id) {
             const alertObj = _liAlerts.find(a => a.id === id);
             if (!alertObj) return;
@@ -6826,6 +6874,7 @@
                 <div class="li-referral-modal" role="dialog" aria-modal="true">
                     <h3><i class="fas fa-share-nodes"></i> Make Referral</h3>
                     <div class="li-referral-sub"></div>
+                    <div class="li-referral-ai" id="liReferralAiStatus"></div>
                     <label for="liReferralName">Who should we reach out to? (full name)</label>
                     <input type="text" id="liReferralName" placeholder="e.g. Anders Hansen" autocomplete="off">
                     <label for="liReferralCompany">Their company (helps find the right LinkedIn profile)</label>
@@ -6834,17 +6883,64 @@
                     <textarea id="liReferralDetails" placeholder="e.g. I'd love to get your perspective on how your team is approaching ..."></textarea>
                     <div class="li-referral-actions">
                         <button type="button" class="li-referral-cancel">Cancel</button>
+                        <button type="button" class="li-referral-rescan" title="Read the conversation again with AI and refill the fields"><i class="fas fa-sync-alt"></i> Re-scan</button>
                         <button type="button" class="li-referral-go"><i class="fas fa-arrow-up-right-from-square"></i> Open Quick Outreach</button>
                     </div>
                 </div>`;
             // Fill dynamic text via DOM (not template interpolation) so names with quotes can't break the markup.
             overlay.querySelector('.li-referral-sub').textContent =
                 `${referrerName || 'This contact'} recommended we reach out to someone else. ` +
-                `Quick Outreach will open with the BDR selected, find their LinkedIn profile, and draft: ` +
+                `AI reads the conversation to fill this in. Quick Outreach will then open with the BDR selected, find their LinkedIn profile, and draft: ` +
                 `"Hi [first name]. ${referrerName || '[Name]'} recommended I reach out to you. [why]"`;
-            overlay.querySelector('#liReferralCompany').value = alertObj.leadCompany || '';
 
-            const close = () => overlay.remove();
+            const nameEl = overlay.querySelector('#liReferralName');
+            const companyEl = overlay.querySelector('#liReferralCompany');
+            const detailsEl = overlay.querySelector('#liReferralDetails');
+            const statusEl = overlay.querySelector('#liReferralAiStatus');
+            const goBtn = overlay.querySelector('.li-referral-go');
+            const rescanBtn = overlay.querySelector('.li-referral-rescan');
+
+            // Read the conversation with AI and fill the fields. Fields are locked
+            // while it works so a late result can't clobber anything the user typed.
+            let scanSeq = 0;
+            const runAiScan = async (force) => {
+                const seq = ++scanSeq;
+                if (force) _liReferralAiCache.clear();
+                [nameEl, companyEl, detailsEl].forEach(el => { el.disabled = true; });
+                goBtn.disabled = true; rescanBtn.disabled = true;
+                statusEl.className = 'li-referral-ai working';
+                statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> AI is reading the conversation…';
+                let result = null, errMsg = '';
+                try {
+                    result = await _liExtractReferralWithAi(alertObj);
+                } catch (e) {
+                    console.warn('[Referral] AI extraction failed:', e);
+                    errMsg = e.message;
+                }
+                if (seq !== scanSeq || !document.body.contains(overlay)) return;
+                [nameEl, companyEl, detailsEl].forEach(el => { el.disabled = false; });
+                goBtn.disabled = false; rescanBtn.disabled = false;
+
+                if (result && result.found && result.name) {
+                    nameEl.value = String(result.name).trim();
+                    // Company: what AI found, else assume the same company as the person who referred us
+                    companyEl.value = String(result.company || alertObj.leadCompany || '').trim();
+                    detailsEl.value = String(result.why || '').trim();
+                    statusEl.className = 'li-referral-ai done';
+                    const conf = result.confidence ? ` (${result.confidence} confidence)` : '';
+                    statusEl.innerHTML = `<i class="fas fa-wand-magic-sparkles"></i> Filled in by AI${_liEscHtml(conf)}${result.title ? ` · ${_liEscHtml(result.title)}` : ''}. Check it before continuing.`;
+                } else {
+                    companyEl.value = companyEl.value || alertObj.leadCompany || '';
+                    statusEl.className = 'li-referral-ai warn';
+                    statusEl.innerHTML = errMsg
+                        ? `<i class="fas fa-triangle-exclamation"></i> AI scan failed (${_liEscHtml(errMsg)}). Fill the fields in by hand or Re-scan.`
+                        : '<i class="fas fa-triangle-exclamation"></i> AI could not find a recommended person in this conversation. Fill the fields in by hand if there is one.';
+                }
+                nameEl.focus();
+            };
+            rescanBtn.addEventListener('click', () => runAiScan(true));
+
+            const close = () => { scanSeq++; overlay.remove(); };
             overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
             overlay.querySelector('.li-referral-cancel').addEventListener('click', close);
             overlay.querySelector('.li-referral-go').addEventListener('click', () => {
@@ -6867,7 +6963,7 @@
                 close();
             });
             document.body.appendChild(overlay);
-            overlay.querySelector('#liReferralName').focus();
+            runAiScan(false);
         };
 
         // ── Conversation Snapshot (screenshot) ───────────────────────────────
@@ -9510,7 +9606,7 @@ Rules:
 Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         }
 
-        async function _liCallAiModel(prompt) {
+        async function _liCallAiModel(prompt, opts = {}) {
             const resp = await fetch(`${RAILWAY_BASE}/api/ai-profile-eval`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -9518,8 +9614,8 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                     provider: 'openrouter',
                     model: LI_AI_MODEL,
                     prompt,
-                    temperature: 0.4,
-                    max_tokens: 1200
+                    temperature: opts.temperature ?? 0.4,
+                    max_tokens: opts.max_tokens ?? 1200
                 })
             });
             if (!resp.ok) throw new Error(`AI request failed (HTTP ${resp.status})`);
