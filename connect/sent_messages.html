@@ -1634,6 +1634,13 @@
                     </div>
                     <div id="bulkProgress" style="font-size:0.84rem;margin-top:0.55rem;display:none;"></div>
                     <div id="bulkPreview"></div>
+                    <div style="margin-top:0.9rem;padding-top:0.75rem;border-top:1px dashed #e2e8f0;">
+                        <div style="font-weight:700;font-size:0.9rem;margin-bottom:0.2rem;"><i class="fas fa-arrows-rotate" style="color:#3b82f6;margin-right:0.35rem;"></i> Sync saved text to HeyReach</div>
+                        <p style="font-size:0.82rem;color:#64748b;margin:0 0 0.5rem;max-width:60rem;">
+                            No find/replace needed. Compares the message saved here (Firestore) for every queued lead with what HeyReach actually holds, then pushes the saved text for any that differ &mdash; use this when edits were saved but never reached HeyReach.
+                        </p>
+                        <button type="button" id="btnBulkSyncAll" class="btn btn-secondary" style="font-size:0.85rem;padding:0.5rem 1rem;"><i class="fas fa-arrows-rotate"></i> Compare &amp; sync all queued messages</button>
+                    </div>
                 </div>
                 <div id="upcomingMessagesGrid" class="messages-grid upcoming-grid-wrap"></div>
                 <div id="upcomingEmptyState" class="upcoming-empty" style="display:none;">
@@ -4943,27 +4950,82 @@
         // HeyReach's API can answer "200 OK" to an update without changing anything, so a
         // successful response alone is never treated as proof.
         //   state: 'verified' | 'mismatch' (HeyReach still shows different text) | 'unknown' (couldn't check)
+        //
+        // NOTE: HeyReach's /lead/GetLead returns only the LinkedIn profile (name, company, about…) — it
+        // never includes the campaign's custom variables, so it can't be used to read the message back
+        // (that's why this used to always say "couldn't read it back"). The campaign's lead LIST
+        // (/leads/getall → GetLeadsFromCampaign) does carry them, so we read that instead.
+        const HR_CONTENT_FIELD_NAMES = ['content', 'message', 'custommessage', 'custom_message'];
+
+        // The {{content}} value of one lead object from a HeyReach campaign lead list ('' if not present).
+        function extractLiveLeadContent(lead) {
+            if (!lead || typeof lead !== 'object') return '';
+            const bags = [lead, lead.linkedInUserProfile, lead.leadProfile, lead.lead].filter(Boolean);
+            for (const bag of bags) {
+                const fields = bag.customUserFields || bag.customFields || bag.customVariables || bag.variables || bag.userVariables;
+                if (Array.isArray(fields)) {
+                    const hit = fields.find(f => HR_CONTENT_FIELD_NAMES.includes(String(f.name || f.Name || f.key || f.fieldName || '').toLowerCase()));
+                    const val = hit && (hit.value ?? hit.Value ?? hit.content ?? hit.fieldValue);
+                    if (val) return String(val);
+                } else if (fields && typeof fields === 'object') {
+                    const k = Object.keys(fields).find(k => HR_CONTENT_FIELD_NAMES.includes(k.toLowerCase()));
+                    if (k && fields[k]) return String(fields[k]);
+                }
+                if (bag.content) return String(bag.content);
+                if (bag.customMessage) return String(bag.customMessage);
+            }
+            return '';
+        }
+
+        // Pulls the live lead list for each campaign and indexes it by canonical LinkedIn URL.
+        async function loadLiveContentIndex(apiKey, campaignIds) {
+            const maps = await Promise.all(campaignIds.map(id => fetchLiveCampaignStatusMapForContent(apiKey, id)));
+            const idx = new Map();
+            let sampleLead = null, readable = 0;
+            maps.forEach(m => m.forEach((v, u) => {
+                const content = extractLiveLeadContent(v.lead);
+                if (content) readable++;
+                if (!sampleLead) sampleLead = v.lead;
+                idx.set(u, { content, lead: v.lead });
+            }));
+            return { idx, total: idx.size, readable, sampleLead };
+        }
+
+        // Campaign IDs to read for these items: the one each queue record was routed to, otherwise all of the BDR's campaigns.
+        function liveIndexCampaignIds(items) {
+            const ids = new Set();
+            let needAll = false;
+            items.forEach(i => { if (i.queueCampaignId) ids.add(String(i.queueCampaignId)); else needAll = true; });
+            if (needAll) {
+                const bdrInfo = bdrLeaders.find(b => (b.primaryEmail || '').toLowerCase() === currentViewedBdrEmail());
+                ((bdrInfo && bdrInfo.heyreachCampaigns) || []).forEach(c => { const id = c.id || c.campaignId; if (id) ids.add(String(id)); });
+            }
+            return [...ids];
+        }
+
+        function liveIndexLookup(idx, item) {
+            for (const raw of [item.queueLiUrl, item.contact && item.contact.profileUrl]) {
+                const u = raw ? canonicalLinkedInUrl(raw) : '';
+                if (u && idx.has(u)) return idx.get(u);
+            }
+            return null;
+        }
+
         async function verifyLiveMessage(item, expected) {
             try {
                 const ctxKey = await getHeyReachApiKey(currentViewedBdrEmail(), emailDB);
                 if (!ctxKey.success) return { state: 'unknown', reason: ctxKey.error };
-                let url = item.queueLiUrl || item.contact.profileUrl || '';
-                if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+                const ids = liveIndexCampaignIds([item]);
+                if (!ids.length) return { state: 'unknown', reason: 'could not work out which HeyReach campaign to read' };
                 let live = '';
-                for (let attempt = 0; attempt < 3; attempt++) {
-                    if (attempt) await hrSleep(2500);
-                    const res = await fetch(`${BACKEND_API_URL}/proxy/heyreach/leads/getlead`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'x-api-key': ctxKey.apiKey },
-                        body: JSON.stringify({ profileUrl: url })
-                    });
-                    if (res.status === 429) { await hrSleep(3000 * (attempt + 1)); continue; }
-                    if (!res.ok) return { state: 'unknown', reason: `HeyReach lookup failed (HTTP ${res.status})` };
-                    const data = await res.json().catch(() => ({}));
-                    const lead = (data && typeof data.lead === 'object') ? data.lead : data;
-                    live = extractHeyReachContent(data) || extractHeyReachContent(lead) || '';
-                    if (!live) return { state: 'unknown', reason: 'HeyReach returned no message text for this lead' };
-                    if (normalizeMsgForCompare(live) === normalizeMsgForCompare(expected)) return { state: 'verified', live };
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    if (attempt) await hrSleep(4000);
+                    const { idx } = await loadLiveContentIndex(ctxKey.apiKey, ids);
+                    const entry = liveIndexLookup(idx, item);
+                    if (!entry) return { state: 'unknown', reason: 'this lead was not found in the HeyReach campaign list' };
+                    if (!entry.content) return { state: 'unknown', reason: 'the HeyReach campaign list returned no message text for this lead' };
+                    if (normalizeMsgForCompare(entry.content) === normalizeMsgForCompare(expected)) return { state: 'verified', live: entry.content };
+                    live = entry.content;
                 }
                 return { state: 'mismatch', live };
             } catch (err) {
@@ -4984,6 +5046,7 @@
                         campaignId,
                         accountId,
                         listId: listIdNum,
+                        strictSchema: true, // also send HeyReach's documented profileUrl / customUserFields names
                         leads: [{ linkedinUrl: url, firstName, lastName, customVariables: { content: newMessage } }]
                     })
                 });
@@ -5009,13 +5072,15 @@
         // connection-type one (`not_connect_type` — Quick Message / direct messages), update HeyReach directly.
         // After any "successful" push we read the lead back from HeyReach and confirm the new text is
         // really there. Result: { ok, verified:true|false, needsReadd, live, error }
-        async function syncMessageToHeyReach(item, queueId, newMessage) {
+        async function syncMessageToHeyReach(item, queueId, newMessage, opts = {}) {
             let r = await bulkSyncToHeyReach(queueId);
             if (!r.ok && /not_connect_type/i.test(String(r.error || ''))) {
                 console.log('[SyncMessage] Server sync refused (not_connect_type) — pushing directly to HeyReach.');
                 r = await pushDirectToHeyReach(item, newMessage);
             }
             if (!r.ok) return r;
+            // Bulk runs verify everything in ONE campaign read afterwards (bulkVerifyPass) instead of per lead.
+            if (opts.skipVerify) return { ok: true, error: null, verified: false, pushed: true };
 
             const v = await verifyLiveMessage(item, newMessage);
             console.log('[SyncMessage] read-back check:', v.state, v.reason || '', v.live ? `live="${String(v.live).slice(0, 80)}…"` : '');
@@ -5031,7 +5096,7 @@
         // Fallback when an in-place update is ignored: remove the lead from the campaign and add it
         // back with the new message (the same approach the Quick Message pages use). If the re-add
         // fails we immediately try to put the lead back with its previous message so it isn't lost.
-        async function readdLeadWithMessage(item, newMessage, oldMessage) {
+        async function readdLeadWithMessage(item, newMessage, oldMessage, opts = {}) {
             try {
                 const ctx = await resolveDirectContext(item);
                 if (ctx.error) return { ok: false, error: ctx.error };
@@ -5066,6 +5131,7 @@
                             : 'WARNING: putting the lead back also failed — it may no longer be in the HeyReach campaign. Re-add it from HeyReach.')
                     };
                 }
+                if (opts.skipVerify) return { ok: true, verified: false, pushed: true };
                 await hrSleep(2000);
                 const v = await verifyLiveMessage(item, newMessage);
                 if (v.state === 'mismatch') return { ok: false, error: 'Lead was re-added but HeyReach still shows the old message.' };
@@ -5073,6 +5139,128 @@
             } catch (err) {
                 return { ok: false, error: err.message || String(err) };
             }
+        }
+
+        // Reads the affected campaigns back from HeyReach ONCE and compares each entry's expected text with
+        // what HeyReach now holds. entries: [{ item, queueId, oldMessage, newMessage }]
+        // Returns { verified, mismatch (each gets .live), unknown, total, readable }.
+        async function bulkVerifyPass(entries) {
+            const out = { verified: [], mismatch: [], unknown: [], total: 0, readable: 0 };
+            if (!entries.length) return out;
+            const keyRes = await getHeyReachApiKey(currentViewedBdrEmail(), emailDB);
+            if (!keyRes.success) { out.unknown = entries.slice(); return out; }
+            const ids = liveIndexCampaignIds(entries.map(e => e.item));
+            if (!ids.length) { out.unknown = entries.slice(); return out; }
+
+            let pending = entries.slice();
+            for (let attempt = 0; attempt < 2 && pending.length; attempt++) {
+                bulkSetProgress(attempt
+                    ? `Re-checking ${pending.length} lead${pending.length !== 1 ? 's' : ''} that still show the old text…`
+                    : `Reading ${ids.length} campaign${ids.length !== 1 ? 's' : ''} back from HeyReach to confirm the changes…`);
+                await hrSleep(attempt ? 6000 : 4000); // HeyReach applies updates asynchronously
+                const live = await loadLiveContentIndex(keyRes.apiKey, ids);
+                out.total = live.total; out.readable = live.readable;
+                if (live.readable === 0 && live.sampleLead) {
+                    console.warn('[BulkVerify] HeyReach returned', live.total, 'leads but none with readable message text. Sample lead object:', JSON.stringify(live.sampleLead).slice(0, 1500));
+                }
+                const still = [];
+                for (const e of pending) {
+                    const entry = liveIndexLookup(live.idx, e.item);
+                    if (!entry || !entry.content) { out.unknown.push(e); continue; }
+                    if (normalizeMsgForCompare(entry.content) === normalizeMsgForCompare(e.newMessage)) out.verified.push(e);
+                    else { e.live = entry.content; still.push(e); }
+                }
+                pending = still;
+            }
+            out.mismatch = pending;
+            return out;
+        }
+
+        // Pushes every queued message whose saved text differs from what HeyReach holds (or can't be read),
+        // even when no find/replace rule is involved — fixes leads whose Firestore text changed but HeyReach
+        // never picked it up.
+        async function bulkSyncAll() {
+            if (_bulkBusy || !isAdmin) return;
+            const items = bulkEditableQueued();
+            if (!items.length) { showDeleteToast('No editable queued messages to sync.', true); return; }
+            _bulkBusy = true;
+            const syncBtn = document.getElementById('btnBulkSyncAll');
+            syncBtn.disabled = true;
+            document.getElementById('btnBulkRun').disabled = true;
+            let targets = [], inSync = 0, notFound = 0, unreadable = 0, differ = 0, liveInfo = null;
+            try {
+                bulkSetProgress('Reading HeyReach to compare with your saved messages…');
+                const keyRes = await getHeyReachApiKey(currentViewedBdrEmail(), emailDB);
+                if (!keyRes.success) throw new Error(keyRes.error || 'No HeyReach API key for this BDR.');
+                const ids = liveIndexCampaignIds(items);
+                if (!ids.length) throw new Error('Could not work out which HeyReach campaigns to read (no campaign on the queue records or BDR record).');
+                liveInfo = await loadLiveContentIndex(keyRes.apiKey, ids);
+                if (!liveInfo.total) throw new Error('HeyReach returned no leads for this BDR\'s campaigns (rate limited? try again in a minute).');
+                if (liveInfo.readable === 0 && liveInfo.sampleLead) {
+                    console.warn('[BulkSync] No readable message text in HeyReach lead list. Sample lead object:', JSON.stringify(liveInfo.sampleLead).slice(0, 1500));
+                }
+                for (const item of items) {
+                    const saved = item.sentItem.message || '';
+                    const entry = liveIndexLookup(liveInfo.idx, item);
+                    if (!entry) { notFound++; continue; }
+                    if (!entry.content) { unreadable++; targets.push({ item, queueId: item.queueDocId, oldMessage: '', newMessage: saved }); continue; }
+                    if (normalizeMsgForCompare(entry.content) === normalizeMsgForCompare(saved)) { inSync++; continue; }
+                    differ++;
+                    targets.push({ item, queueId: item.queueDocId, oldMessage: entry.content, newMessage: saved });
+                }
+            } catch (err) {
+                _bulkBusy = false;
+                syncBtn.disabled = false;
+                bulkUpdatePreview();
+                bulkSetProgress(`Could not compare with HeyReach: ${escapeHtml(err.message || String(err))}`, true);
+                return;
+            }
+
+            if (!targets.length) {
+                _bulkBusy = false; syncBtn.disabled = false; bulkUpdatePreview();
+                bulkSetProgress(`Everything is already in sync — ${inSync} message${inSync !== 1 ? 's' : ''} match HeyReach${notFound ? ` (${notFound} not found in the campaign list)` : ''}.`);
+                return;
+            }
+            const note = (liveInfo.readable === 0)
+                ? `\n\nNOTE: HeyReach's lead list did not return message text, so I can't tell which leads are out of date — all ${targets.length} will be pushed.`
+                : '';
+            const ok = confirm(
+                `Compared ${items.length} queued message${items.length !== 1 ? 's' : ''} with HeyReach:\n\n` +
+                `• ${differ} show DIFFERENT text in HeyReach\n` +
+                `• ${unreadable} couldn't be read (will be pushed anyway)\n` +
+                `• ${inSync} already match (skipped)\n` +
+                `• ${notFound} not found in the campaign list (skipped)\n\n` +
+                `Push your saved text to HeyReach for ${targets.length} lead${targets.length !== 1 ? 's' : ''}?${note}`);
+            if (!ok) { _bulkBusy = false; syncBtn.disabled = false; bulkUpdatePreview(); bulkSetProgress('Sync cancelled.'); return; }
+
+            _bulkRetry = []; _bulkReadd = []; bulkRefreshRetryButton();
+            let done = 0, hrFail = 0;
+            const pushed = [];
+            bulkSetProgress(`Pushing 0 / ${targets.length}…`);
+            await bulkPool(targets, 3, async t => {
+                const r = await syncMessageToHeyReach(t.item, t.queueId, t.newMessage, { skipVerify: true });
+                if (r.ok) pushed.push(t);
+                else { hrFail++; _bulkRetry.push({ item: t.item, queueId: t.queueId }); console.warn('[BulkSync] push failed', t.queueId, r.error); }
+                done++;
+                bulkSetProgress(`Pushing ${done} / ${targets.length}…`);
+            });
+
+            const vr = await bulkVerifyPass(pushed);
+            vr.mismatch.forEach(e => _bulkReadd.push({ item: e.item, queueId: e.queueId, oldMessage: e.live || e.oldMessage || '', newMessage: e.newMessage }));
+            _bulkBusy = false;
+            syncBtn.disabled = false;
+            renderTable();
+            bulkRefreshRetryButton();
+            bulkUpdatePreview();
+            const problems = hrFail + vr.mismatch.length;
+            bulkSetProgress(
+                `Done — ${vr.verified.length} confirmed in HeyReach` +
+                (vr.unknown.length ? `, ${vr.unknown.length} pushed but not confirmable (spot-check in HeyReach)` : '') +
+                (vr.mismatch.length ? `, ${vr.mismatch.length} STILL show the old text (use "Re-add unchanged leads")` : '') +
+                (hrFail ? `, ${hrFail} failed to push (use Retry)` : '') +
+                `. ${inSync} were already in sync.`,
+                problems > 0);
+            showDeleteToast(problems ? `Sync finished with ${problems} problem${problems !== 1 ? 's' : ''}.` : `<i class="fas fa-check-circle"></i> HeyReach is now up to date.`, problems > 0);
         }
 
         async function bulkPool(items, concurrency, worker) {
@@ -5125,6 +5313,7 @@
             const bdrEmailForAudit = (selectedBdrEmail || window._sentMessagesViewerBDR?.email || window._sentMessagesOwnBDREmail || (currentUser && currentUser.email) || '').toLowerCase();
             const rulesForAudit = bulkGetRules();
             let done = 0, okCount = 0, hrFail = 0, fsFail = 0, unverified = 0, stale = 0;
+            const pushedEntries = [];
             const total = plan.targets.length;
             bulkSetProgress(`Updating 0 / ${total}…`);
 
@@ -5147,9 +5336,11 @@
                 }
 
                 if (firebaseOk) {
-                    const r = await syncMessageToHeyReach(item, queueId, newMessage);
+                    // Verification happens once for the whole run afterwards (bulkVerifyPass), not per lead.
+                    const r = await syncMessageToHeyReach(item, queueId, newMessage, { skipVerify: true });
                     heyreachOk = r.ok; heyreachError = r.error;
                     heyreachVerified = !!r.verified; needsReadd = !!r.needsReadd;
+                    if (r.ok) pushedEntries.push({ item, queueId, oldMessage, newMessage });
                 }
 
                 try {
@@ -5188,6 +5379,15 @@
                 bulkSetProgress(`Updating ${done} / ${total}…`);
             });
 
+            // One read-back of the affected campaigns tells us what HeyReach REALLY holds now.
+            const vr = await bulkVerifyPass(pushedEntries);
+            unverified -= vr.verified.length;
+            vr.mismatch.forEach(e => {
+                okCount--; unverified--; stale++;
+                _bulkReadd.push({ item: e.item, queueId: e.queueId, oldMessage: e.live || e.oldMessage || '', newMessage: e.newMessage });
+                console.warn('[BulkReplace] HeyReach still shows old text', e.queueId);
+            });
+
             _bulkBusy = false;
             renderTable();
             bulkRefreshRetryButton();
@@ -5211,19 +5411,27 @@
             const pending = _bulkRetry.slice();
             _bulkRetry = [];
             let done = 0, okCount = 0;
+            const pushed = [];
             bulkSetProgress(`Retrying 0 / ${pending.length}…`);
             await bulkPool(pending, 3, async entry => {
-                const r = await syncMessageToHeyReach(entry.item, entry.queueId, entry.item.sentItem.message);
-                if (r.ok) okCount++;
-                else if (r.needsReadd) _bulkReadd.push({ item: entry.item, queueId: entry.queueId, oldMessage: '', newMessage: entry.item.sentItem.message });
+                const msg = entry.item.sentItem.message;
+                const r = await syncMessageToHeyReach(entry.item, entry.queueId, msg, { skipVerify: true });
+                if (r.ok) pushed.push({ item: entry.item, queueId: entry.queueId, oldMessage: '', newMessage: msg });
                 else { _bulkRetry.push(entry); console.warn('[BulkReplace] retry failed', entry.queueId, r.error); }
                 done++;
                 bulkSetProgress(`Retrying ${done} / ${pending.length}…`);
             });
+            const vr = await bulkVerifyPass(pushed);
+            okCount = pushed.length - vr.mismatch.length;
+            vr.mismatch.forEach(e => _bulkReadd.push({ item: e.item, queueId: e.queueId, oldMessage: e.live || '', newMessage: e.newMessage }));
             _bulkBusy = false;
             document.getElementById('btnBulkRetry').disabled = false;
             bulkRefreshRetryButton();
-            bulkSetProgress(`Retry finished — ${okCount} updated in HeyReach${_bulkRetry.length ? `, ${_bulkRetry.length} still failing` : ''}.`, _bulkRetry.length > 0);
+            bulkSetProgress(`Retry finished — ${vr.verified.length} confirmed in HeyReach` +
+                (vr.unknown.length ? `, ${vr.unknown.length} pushed but not confirmable` : '') +
+                (vr.mismatch.length ? `, ${vr.mismatch.length} still show the old text (use "Re-add unchanged leads")` : '') +
+                (_bulkRetry.length ? `, ${_bulkRetry.length} still failing` : '') + '.',
+                _bulkRetry.length > 0 || vr.mismatch.length > 0);
         }
 
         async function bulkReaddUnchanged() {
@@ -5233,19 +5441,26 @@
             document.getElementById('btnBulkReadd').disabled = true;
             const pending = _bulkReadd.slice();
             _bulkReadd = [];
-            let done = 0, okCount = 0, unconfirmed = 0;
+            let done = 0;
+            const readded = [];
             bulkSetProgress(`Re-adding 0 / ${pending.length}…`);
             await bulkPool(pending, 2, async entry => {
-                const r = await readdLeadWithMessage(entry.item, entry.newMessage, entry.oldMessage);
-                if (r.ok) { okCount++; if (!r.verified) unconfirmed++; }
+                const r = await readdLeadWithMessage(entry.item, entry.newMessage, entry.oldMessage, { skipVerify: true });
+                if (r.ok) readded.push(entry);
                 else { _bulkReadd.push(entry); console.warn('[BulkReplace] re-add failed', entry.queueId, r.error); }
                 done++;
                 bulkSetProgress(`Re-adding ${done} / ${pending.length}…`);
             });
+            const vr = await bulkVerifyPass(readded);
+            vr.mismatch.forEach(e => _bulkReadd.push({ item: e.item, queueId: e.queueId, oldMessage: e.oldMessage, newMessage: e.newMessage }));
             _bulkBusy = false;
             document.getElementById('btnBulkReadd').disabled = false;
             bulkRefreshRetryButton();
-            bulkSetProgress(`Re-add finished — ${okCount} re-added${unconfirmed ? ` (${unconfirmed} couldn't be confirmed — spot-check in HeyReach)` : ''}${_bulkReadd.length ? `, ${_bulkReadd.length} still failing (see console for details)` : ''}.`, _bulkReadd.length > 0);
+            bulkSetProgress(`Re-add finished — ${vr.verified.length} confirmed in HeyReach` +
+                (vr.unknown.length ? `, ${vr.unknown.length} re-added but not confirmable (spot-check in HeyReach)` : '') +
+                (vr.mismatch.length ? `, ${vr.mismatch.length} STILL show the old text` : '') +
+                (_bulkReadd.length > vr.mismatch.length ? `, ${_bulkReadd.length - vr.mismatch.length} failed to re-add (see console)` : '') + '.',
+                _bulkReadd.length > 0);
         }
 
         (function initBulkReplace() {
@@ -5270,6 +5485,7 @@
             document.getElementById('btnBulkRun').addEventListener('click', bulkRun);
             document.getElementById('btnBulkRetry').addEventListener('click', bulkRetryFailed);
             document.getElementById('btnBulkReadd').addEventListener('click', bulkReaddUnchanged);
+            document.getElementById('btnBulkSyncAll').addEventListener('click', bulkSyncAll);
         })();
 
         // Show a brief non-blocking toast notification
