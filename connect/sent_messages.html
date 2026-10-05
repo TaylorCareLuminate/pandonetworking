@@ -4891,7 +4891,15 @@
                 const j = await resp.json().catch(() => ({}));
                 const row = j && Array.isArray(j.results) ? j.results[0] : null;
                 const ok = !!(resp.ok && j.success && row && row.ok);
-                return { ok, error: ok ? null : ((row && row.error) || j.error || `HTTP ${resp.status}`) };
+                if (row) console.log('[SyncMessage] server result', queueId, { path: row.path, url: row.linkedinUrl, v2: `${row.addedLeadsCount}/${row.updatedLeadsCount}/${row.failedLeadsCount}`, list: row.listUpdate ? `list ${row.listUpdate.listId}: +${row.listUpdate.added}/${row.listUpdate.updated} failed=${row.listUpdate.failed}` : 'no list resolved', live: row.live });
+                return {
+                    ok,
+                    error: ok ? null : ((row && row.error) || j.error || `HTTP ${resp.status}`),
+                    linkedinUrl: row && row.linkedinUrl,
+                    serverVerified: !!(row && row.verified),
+                    serverMismatch: !!(row && row.liveMismatch),
+                    live: row && row.live ? row.live.content : ''
+                };
             } catch (err) {
                 return { ok: false, error: err.message || String(err) };
             }
@@ -4977,17 +4985,61 @@
             return '';
         }
 
-        // Pulls the live lead list for each campaign and indexes it by canonical LinkedIn URL.
+        // Pulls every lead in a campaign's underlying LEAD LIST (/list/GetLeadsFromList — the
+        // only read endpoint that returns customUserFields, i.e. the {{content}} message) and
+        // indexes it by canonical LinkedIn URL. Falls back to the campaign lead view (status
+        // only, no message text) when the list can't be resolved.
+        const _hrListIdCache = new Map();
+        async function listIdForCampaign(apiKey, campaignId) {
+            const k = String(campaignId);
+            if (_hrListIdCache.has(k)) return _hrListIdCache.get(k);
+            const bdrInfo = bdrLeaders.find(b => (b.primaryEmail || '').toLowerCase() === currentViewedBdrEmail());
+            const camp = ((bdrInfo && bdrInfo.heyreachCampaigns) || []).find(c => String(c.id || c.campaignId || '') === k);
+            let lid = camp && camp.listId ? String(camp.listId) : null;
+            if (!lid) lid = await lookupListIdFromHeyReachCampaign(k, apiKey, false);
+            _hrListIdCache.set(k, lid ? String(lid) : null);
+            return _hrListIdCache.get(k);
+        }
+        async function fetchListLeads(apiKey, listId) {
+            const out = [];
+            const PAGE = 1000;
+            for (let offset = 0, pages = 0; pages < 20; offset += PAGE, pages++) {
+                const res = await fetch(`${BACKEND_API_URL}/proxy/heyreach/lists/getleadsfromlist`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+                    body: JSON.stringify({ listId: parseInt(listId, 10), offset, limit: PAGE })
+                });
+                if (res.status === 429) { await hrSleep(4000); pages--; offset -= PAGE; continue; }
+                if (!res.ok) break;
+                const j = await res.json().catch(() => ({}));
+                const page = j.items || j.leads || j.data || (Array.isArray(j) ? j : []);
+                out.push(...page);
+                if (page.length < PAGE) break;
+            }
+            return out;
+        }
         async function loadLiveContentIndex(apiKey, campaignIds) {
-            const maps = await Promise.all(campaignIds.map(id => fetchLiveCampaignStatusMapForContent(apiKey, id)));
             const idx = new Map();
             let sampleLead = null, readable = 0;
-            maps.forEach(m => m.forEach((v, u) => {
-                const content = extractLiveLeadContent(v.lead);
-                if (content) readable++;
-                if (!sampleLead) sampleLead = v.lead;
-                idx.set(u, { content, lead: v.lead });
-            }));
+            for (const cId of campaignIds) {
+                const lid = await listIdForCampaign(apiKey, cId);
+                if (lid) {
+                    const leads = await fetchListLeads(apiKey, lid);
+                    console.log(`[LiveContent] campaign ${cId} → list ${lid}: ${leads.length} leads`);
+                    for (const lead of leads) {
+                        const u = canonicalLinkedInUrl(extractLeadProfileUrl(lead));
+                        if (!u) continue;
+                        const content = extractLiveLeadContent(lead);
+                        if (content) readable++;
+                        if (!sampleLead) sampleLead = lead;
+                        idx.set(u, { content, lead });
+                    }
+                } else {
+                    console.warn(`[LiveContent] campaign ${cId}: no lead list resolved — falling back to campaign lead view (no message text available)`);
+                    const m = await fetchLiveCampaignStatusMapForContent(apiKey, cId);
+                    m.forEach((v, u) => { if (!idx.has(u)) idx.set(u, { content: extractLiveLeadContent(v.lead), lead: v.lead }); });
+                }
+            }
             return { idx, total: idx.size, readable, sampleLead };
         }
 
@@ -5079,7 +5131,21 @@
                 r = await pushDirectToHeyReach(item, newMessage);
             }
             if (!r.ok) return r;
-            // Bulk runs verify everything in ONE campaign read afterwards (bulkVerifyPass) instead of per lead.
+
+            // Sanity check: the queue record we just pushed must be for THIS contact.
+            const pushedUrl = r.linkedinUrl ? canonicalLinkedInUrl(r.linkedinUrl) : '';
+            const cardUrl = canonicalLinkedInUrl(item.queueLiUrl || item.contact.profileUrl || '');
+            if (pushedUrl && cardUrl && pushedUrl !== cardUrl) {
+                console.error('[SyncMessage] queue record / contact mismatch', { queueId, pushedUrl, cardUrl });
+                return { ok: false, error: `The saved queue record (${queueId}) points at a different LinkedIn profile (${r.linkedinUrl}) than this contact — the wrong lead would be updated. Not pushed further.` };
+            }
+
+            // The server already read the lead back from the HeyReach list after updating it.
+            if (r.serverVerified) return { ok: true, error: null, verified: true };
+            if (r.serverMismatch) {
+                return { ok: false, needsReadd: true, live: r.live, error: 'HeyReach accepted the update but still shows the OLD message — it did not change.' };
+            }
+            // Bulk runs verify everything in ONE list read afterwards (bulkVerifyPass) instead of per lead.
             if (opts.skipVerify) return { ok: true, error: null, verified: false, pushed: true };
 
             const v = await verifyLiveMessage(item, newMessage);
