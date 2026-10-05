@@ -1713,6 +1713,39 @@
             return [...map.values()];
         }
 
+        // ── Inbox message helpers ─────────────────────────────────────────────
+        // heyreach_inbox stores the thread in different places/shapes depending on how the
+        // conversation was synced: `messages`, `rawData.messages` (sender: ME / CORRESPONDENT,
+        // body/text), or webhook `rawData.recent_messages` (message / is_reply / creation_time).
+        // Normalise all of them to { text, timestamp: Date|null, isFromLead: true|false|null }.
+        function inboxMessageIsFromLead(m) {
+            if (typeof m.isSentByConnectedAccount === 'boolean') return !m.isSentByConnectedAccount;
+            if (typeof m.isFromLead === 'boolean') return m.isFromLead;
+            if (typeof m.is_reply === 'boolean') return m.is_reply;
+            const sender = String(m.sender || '').toLowerCase();
+            if (sender === 'correspondent' || sender === 'lead') return true;
+            if (sender === 'me' || sender === 'account') return false;
+            const dir = String(m.direction || '').toLowerCase();
+            if (dir === 'incoming') return true;
+            if (dir === 'outgoing') return false;
+            return null;
+        }
+
+        function normalizeInboxMessages(d) {
+            const pick = (arr) => Array.isArray(arr) && arr.length > 0 ? arr : null;
+            const raw = pick(d?.messages) || pick(d?.rawData?.messages) || pick(d?.rawData?.recent_messages) || [];
+            const out = raw.map(m => ({
+                text: String(m.text || m.body || m.message || m.content || '').trim(),
+                timestamp: safeToDate(m.timestamp || m.createdAt || m.creation_time || m.date),
+                isFromLead: inboxMessageIsFromLead(m)
+            }));
+            // Oldest first when every message has a usable timestamp
+            if (out.length > 1 && out.every(m => m.timestamp)) out.sort((a, b) => a.timestamp - b.timestamp);
+            return out;
+        }
+
+        const inboxFromLead = (m) => m.isFromLead;
+
         function extractLeadProfileFields(data) {
             const corr = data?.rawData?.correspondentProfile || {};
             return {
@@ -2431,10 +2464,9 @@
                             meetingDate = safeToDate(data.lastManualUpdateAt);
                         }
                         if (!meetingDate) {
-                            const msgs = data.messages || [];
+                            const msgs = normalizeInboxMessages(data);
                             if (msgs.length > 0) {
-                                const lastMsg = msgs[msgs.length - 1];
-                                meetingDate = safeToDate(lastMsg.timestamp || lastMsg.createdAt || lastMsg.date);
+                                meetingDate = msgs[msgs.length - 1].timestamp;
                             }
                         }
                         const timestampWasFallback = !data.meetingWillingnessDate && meetingDate;
@@ -2478,7 +2510,7 @@
                             }
                             // Weekly list: past 7 days
                             if (meetingMs >= sinceDateMs) {
-                                const messages = data.messages || [];
+                                const messages = normalizeInboxMessages(data);
                                 const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
                                 const candidate = {
                                     name: leadName,
@@ -2551,24 +2583,16 @@
                         const threadMap = new Map();
                         for (const docSnap of inboxSnap.docs) {
                             const d = docSnap.data();
-                            const msgs = d.messages || [];
+                            const msgs = normalizeInboxMessages(d);
                             if (msgs.length === 0) continue;
 
-                            // Helper: is this message from the lead (not the BDR)?
-                            const fromLead = (m) => {
-                                if (typeof m.isSentByConnectedAccount === 'boolean') return !m.isSentByConnectedAccount;
-                                if (typeof m.isFromLead === 'boolean') return m.isFromLead;
-                                if (m.sender === 'lead' || m.sender === 'LEAD') return true;
-                                if (m.sender === 'account' || m.sender === 'ACCOUNT') return false;
-                                if (m.direction === 'incoming' || m.direction === 'INCOMING') return true;
-                                return null; // unknown
-                            };
+                            // Is this message from the lead (not the BDR)?
+                            const fromLead = inboxFromLead;
 
                             // Only include conversations where a lead replied this week
                             const hasWeeklyReply = msgs.some(m => {
                                 if (!fromLead(m)) return false;
-                                const t = m.timestamp ? safeToDate(m.timestamp) : (m.date ? safeToDate(m.date) : null);
-                                return t && t.getTime() >= sinceDateMs;
+                                return m.timestamp && m.timestamp.getTime() >= sinceDateMs;
                             });
                             if (!hasWeeklyReply) continue;
 
@@ -2697,18 +2721,8 @@
                 snaps.forEach(addDocs);
             }
 
-            const fromLead = (m) => {
-                if (typeof m.isSentByConnectedAccount === 'boolean') return !m.isSentByConnectedAccount;
-                if (typeof m.isFromLead === 'boolean') return m.isFromLead;
-                if (m.sender === 'lead' || m.sender === 'LEAD') return true;
-                if (m.sender === 'account' || m.sender === 'ACCOUNT') return false;
-                if (m.direction === 'incoming' || m.direction === 'INCOMING') return true;
-                return null;
-            };
-            const msgTime = (m) => {
-                const t = safeToDate(m.timestamp || m.date || m.createdAt);
-                return t ? t.getTime() : null;
-            };
+            const fromLead = inboxFromLead;
+            const msgTime = (m) => (m.timestamp ? m.timestamp.getTime() : null);
 
             const results = [];
             for (const docSnap of docs) {
@@ -2720,21 +2734,24 @@
                     if (!accountEmail || (accountEmail !== primaryEmail && accountEmail !== linkedInEmail)) continue;
                 }
 
-                const msgs = d.messages || [];
+                const msgs = normalizeInboxMessages(d);
 
                 // When did the lead last reply?
                 let lastLeadMs = null;
                 let lastLeadText = '';
                 for (const m of msgs) {
                     if (fromLead(m) !== true) continue;
+                    if (m.text) lastLeadText = m.text; // thread is oldest-first → ends as the newest lead text
                     const t = msgTime(m);
-                    if (t !== null && (lastLeadMs === null || t >= lastLeadMs)) {
-                        lastLeadMs = t;
-                        lastLeadText = (m.text || m.message || m.content || '').trim();
-                    }
+                    if (t !== null && (lastLeadMs === null || t >= lastLeadMs)) lastLeadMs = t;
                 }
-                // Fallback only when message direction/timestamps can't be determined:
-                // use the moment the conversation was marked.
+                // Lead messages exist but carry no timestamp: trust the conversation's last-message time
+                // when the final message in the thread is from the lead.
+                if (lastLeadMs === null && msgs.length > 0 && msgs[msgs.length - 1].isFromLead === true) {
+                    const lm = safeToDate(d.lastMessageAt) || safeToDate(d.timestamp);
+                    if (lm) lastLeadMs = lm.getTime();
+                }
+                // Last resort (direction/timestamps unknown): the moment the conversation was marked.
                 if (lastLeadMs === null) {
                     const marked = safeToDate(d.meetingWillingnessDate) || safeToDate(d.lastManualUpdateAt);
                     if (marked) lastLeadMs = marked.getTime();
@@ -2861,7 +2878,7 @@
                             return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td bgcolor="#fffbeb" style="background-color:#fffbeb;border:1px solid #fde68a;border-radius:10px 10px 10px 2px;padding:9px 12px;"><div style="font-size:9px;font-weight:700;color:#b45309;text-transform:uppercase;letter-spacing:0.8px;${FONT}margin-bottom:3px;">${esc(contact.name.split(' ')[0])}</div><div style="font-size:13px;color:#1c1917;line-height:1.55;${FONT}">${body}</div></td></tr></table>`;
                         } else if (isLead === false) {
                             // BDR's outbound message — navy-tinted bubble, right-aligned feel
-                            return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td width="12%"></td><td bgcolor="#eef4fb" style="background-color:#eef4fb;border:1px solid #cfe0f3;border-radius:10px 10px 2px 10px;padding:9px 12px;"><div style="font-size:9px;font-weight:700;color:#12314C;text-transform:uppercase;letter-spacing:0.8px;${FONT}margin-bottom:3px;">You</div><div style="font-size:13px;color:#1c1917;line-height:1.55;${FONT}">${body}</div></td></tr></table>`;
+                            return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td width="12%"></td><td bgcolor="#eef4fb" style="background-color:#eef4fb;border:1px solid #cfe0f3;border-radius:10px 10px 2px 10px;padding:9px 12px;"><div style="font-size:9px;font-weight:700;color:#12314C;text-transform:uppercase;letter-spacing:0.8px;${FONT}margin-bottom:3px;">${opts.outboundLabel || 'You'}</div><div style="font-size:13px;color:#1c1917;line-height:1.55;${FONT}">${body}</div></td></tr></table>`;
                         } else {
                             // Sender unknown — neutral
                             return `<table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:6px;"><tr><td bgcolor="#f8fafc" style="background-color:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:9px 12px;"><div style="font-size:13px;color:#1c1917;line-height:1.55;${FONT}">${body}</div></td></tr></table>`;
@@ -3005,7 +3022,7 @@
                     || contactTimestampMs(b) - contactTimestampMs(a));
 
                 const responsesHTML = orderedResponses
-                    .map(c => renderConversation(c, { ...(categoryStyles[c.responseCategory] || {}), maxMessages: 6 }))
+                    .map(c => renderConversation(c, { ...(categoryStyles[c.responseCategory] || {}), maxMessages: 12, outboundLabel: 'Pando' }))
                     .join('');
 
                 const showConnections = includeRecentConnections && accepted > 0;
@@ -3021,9 +3038,9 @@
                     + `<tr><td height="4" bgcolor="#B9A77E" style="background-color:#B9A77E;background-image:linear-gradient(90deg,#B9A77E 0%,#94AD82 50%,#B9A77E 100%);font-size:0;line-height:0;">&nbsp;</td></tr>`
                     + `<tr><td bgcolor="#ffffff" style="background-color:#ffffff;padding:26px 26px 10px;">`
                     + `<p style="font-size:20px;font-weight:800;color:#12314C;margin:0 0 6px 0;${FONT}letter-spacing:-0.3px;">Hi ${esc(firstName)} &#128075;</p>`
-                    + `<p style="font-size:14px;color:#475569;line-height:1.6;margin:0 0 20px 0;${FONT}">${plural(responses.length, 'A contact has', `${responses.length} contacts have`)} replied and ${plural(responses.length, 'is', 'are')} worth a look today.</p>`
+                    + `<p style="font-size:14px;color:#475569;line-height:1.6;margin:0 0 20px 0;${FONT}">Just keeping you in the loop: ${plural(responses.length, 'a contact has', `${responses.length} contacts have`)} replied to our LinkedIn outreach. We handle all of the outreach for you, so there is nothing you need to do.</p>`
                     + strategyHTML
-                    + section('&#128276;', `${plural(responses.length, 'Response', 'Responses')} to follow up on`, responses.length, '#7c3aed', '#ede9fe', responsesHTML)
+                    + section('&#128276;', `Recent replies - don't worry, we are following up`, responses.length, '#7c3aed', '#ede9fe', responsesHTML)
                     + (showConnections
                         ? section('&#129309;', `Recent ${plural(accepted, 'connection', 'connections')}`, accepted, '#10b981', '#d1fae5', connectionsHTML)
                         : '')
