@@ -107,6 +107,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Coverage Analytics', href: 'contact_coverage_analytics.html', icon: 'fa-chart-pie' },
                 { label: 'Overall Trends', href: 'overall_trends.html', icon: 'fa-chart-line' },
                 { label: 'Message History', href: 'message_history.html', icon: 'fa-history' },
+                { label: 'Outbound Approvals', href: 'outbound_approvals.html', icon: 'fa-user-check' },
                 { label: 'Message Outcomes', href: 'outcomes.html', icon: 'fa-bullseye' },
                 { label: 'A/B Outcome Comparison', href: 'ab_outcomes_comparison.html', icon: 'fa-balance-scale-left' },
                 { label: 'Connect Success Analysis', href: 'analysis_results.html', icon: 'fa-lightbulb' },
