@@ -176,18 +176,33 @@
     let _conferencesCache = null;
     let _conferencesCacheAt = 0;
 
+    // In-flight de-duplication: pages mount one widget per contact card and every
+    // widget calls loadConferences() at once, so on a cold/expired cache a single
+    // render used to fire one identical `conferences` query PER CARD (~90 on the
+    // LinkedIn alerts list). Share one in-flight promise instead.
+    let _conferencesInFlight = null;
+
     async function loadConferences(forceRefresh) {
         if (_conferencesCache && !forceRefresh && (Date.now() - _conferencesCacheAt) < 60000) {
             return _conferencesCache;
         }
-        const { collection, getDocs } = fx();
-        const snap = await getDocs(collection(dbi(), 'conferences'));
-        const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-            .filter(c => c.status !== 'archived');
-        list.sort((a, b) => (a.startDate || '9999').localeCompare(b.startDate || '9999'));
-        _conferencesCache = list;
-        _conferencesCacheAt = Date.now();
-        return list;
+        if (_conferencesInFlight && !forceRefresh) return _conferencesInFlight;
+        const promise = (async () => {
+            const { collection, getDocs } = fx();
+            const snap = await getDocs(collection(dbi(), 'conferences'));
+            const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+                .filter(c => c.status !== 'archived');
+            list.sort((a, b) => (a.startDate || '9999').localeCompare(b.startDate || '9999'));
+            _conferencesCache = list;
+            _conferencesCacheAt = Date.now();
+            return list;
+        })();
+        _conferencesInFlight = promise;
+        try {
+            return await promise;
+        } finally {
+            if (_conferencesInFlight === promise) _conferencesInFlight = null;
+        }
     }
 
     async function loadAllConferences() {
@@ -211,6 +226,7 @@
             createdBy: data.createdBy || ''
         });
         _conferencesCache = null;
+        _conferencesInFlight = null;
         return ref.id;
     }
 
@@ -218,12 +234,14 @@
         const { doc, updateDoc } = fx();
         await updateDoc(doc(dbi(), 'conferences', id), { ...patch, updatedAt: new Date() });
         _conferencesCache = null;
+        _conferencesInFlight = null;
     }
 
     async function deleteConference(id) {
         const { doc, deleteDoc } = fx();
         await deleteDoc(doc(dbi(), 'conferences', id));
         _conferencesCache = null;
+        _conferencesInFlight = null;
     }
 
     // ── BDR Availability / Slots ────────────────────────────────────────
@@ -250,6 +268,24 @@
         } finally {
             _inFlightAvailability.delete(id);
         }
+    }
+
+    // Short-lived shared cache used ONLY by each widget's background poll (see
+    // the setInterval at the end of mountWidget). A page with ~90 cards used to
+    // fire ~90 availability GETs every 20s per open tab even though they all
+    // point at just a handful of BDR+conference docs. All user-initiated reads
+    // and every write path still call getAvailabilityDoc() directly (always
+    // fresh); this is invalidated whenever a widget notifies of a slot change.
+    const _availPollCache = new Map(); // availabilityDocId -> { at, promise }
+    const AVAIL_POLL_CACHE_TTL_MS = 15000;
+    function getAvailabilityDocForPoll(conferenceId, bdrEmail) {
+        const id = availabilityDocId(conferenceId, bdrEmail);
+        const hit = _availPollCache.get(id);
+        if (hit && (Date.now() - hit.at) < AVAIL_POLL_CACHE_TTL_MS) return hit.promise;
+        const promise = getAvailabilityDoc(conferenceId, bdrEmail);
+        _availPollCache.set(id, { at: Date.now(), promise });
+        promise.catch(() => { if (_availPollCache.get(id) && _availPollCache.get(id).promise === promise) _availPollCache.delete(id); });
+        return promise;
     }
 
     async function getAllAvailabilityForConference(conferenceId) {
@@ -447,6 +483,7 @@
 
     function _notifyAvailabilityChanged(conferenceId, bdrEmail, skipContainerEl) {
         if (!bdrEmail) return;
+        _availPollCache.clear(); // a slot just changed — never let the poll cache serve pre-change data
         const key = availabilityDocId(conferenceId, bdrEmail);
         const set = _widgetSubscriptions.get(key);
         if (!set) return;
@@ -1134,14 +1171,25 @@
 
         let currentSub = null; // this widget's active cross-widget refresh subscription (see below)
 
-        async function refreshForConference() {
+        // opts.poll = true for the background poll only: reuses the shared
+        // short-lived availability cache, and re-reads this card's own meeting
+        // request only every Nth poll (it rarely changes; the availability doc
+        // is what other users' actions actually change). Every other caller
+        // (mount, dropdown change, save/clear, cross-widget notify) is fresh.
+        let _pollTick = 0;
+        const MEETING_REQUEST_POLL_EVERY_N = 6; // ~2 min at the 20s poll interval
+        async function refreshForConference(opts) {
+            const isPoll = !!(opts && opts.poll);
+            const skipRequestFetch = isPoll && (++_pollTick % MEETING_REQUEST_POLL_EVERY_N !== 0);
             state.conferenceId = confSelect.value;
             slotSelect.innerHTML = `<option value="">Loading time slots…</option>`;
             saveBtn.disabled = true;
 
             const [req, avail] = await Promise.all([
-                getMeetingRequest(state.conferenceId, ctx).catch(() => null),
-                ctx.bdrEmail ? getAvailabilityDoc(state.conferenceId, ctx.bdrEmail).catch(() => null) : Promise.resolve(null)
+                skipRequestFetch ? Promise.resolve(state.request) : getMeetingRequest(state.conferenceId, ctx).catch(() => null),
+                ctx.bdrEmail
+                    ? (isPoll ? getAvailabilityDocForPoll(state.conferenceId, ctx.bdrEmail) : getAvailabilityDoc(state.conferenceId, ctx.bdrEmail)).catch(() => null)
+                    : Promise.resolve(null)
             ]);
             state.request = req;
             const allSlots = (avail && avail.slots) || [];
@@ -1279,7 +1327,10 @@
         // once this card's DOM is gone (re-rendered away or removed).
         const pollTimer = setInterval(() => {
             if (!containerEl.isConnected) { clearInterval(pollTimer); return; }
-            refreshForConference().catch(() => {});
+            // Don't hit the backend for a tab nobody is looking at; the next tick
+            // after the tab becomes visible again refreshes it within ~20s.
+            if (typeof document !== 'undefined' && document.hidden) return;
+            refreshForConference({ poll: true }).catch(() => {});
         }, 20000);
     }
 
