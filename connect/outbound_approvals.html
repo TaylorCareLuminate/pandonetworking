@@ -206,7 +206,7 @@
 
         await window.firebaseReady;
         const auth = window.auth;
-        const { collection, getDocs, getAllDocs, getDoc, query, where, doc, limit } = window.clemailFirestore;
+        const { collection, getDocs, getAllDocs, query, where, limit } = window.clemailFirestore;
         const emailDB = window.clemailDb;
 
         const TEAM = [
@@ -316,15 +316,6 @@
                 .replace(/"/g, '&quot;');
         }
 
-        async function loadCollection(q) {
-            try {
-                return await getAllDocs(q, { pageSize: 3000, maxRetries: 2 });
-            } catch (err) {
-                console.warn('Paged query failed, retrying a single page:', err.message);
-                return getDocs(query(q, limit(8000)));
-            }
-        }
-
         function snapshotRows(snap) {
             const rows = [];
             snap.forEach(docSnap => {
@@ -334,29 +325,60 @@
             return rows;
         }
 
-        async function fetchMissingQueues(ids, onProgress) {
+        function slimQueue(row) {
+            return {
+                id: row.id,
+                generated_by_system: row.generated_by_system,
+                generated_via: row.generated_via,
+                adminApprovedBy: row.adminApprovedBy,
+                pushed_by: row.pushed_by
+            };
+        }
+
+        async function fetchQueuesByIds(ids, onProgress) {
             const found = new Map();
-            const cap = 500;
-            const targets = ids.slice(0, cap);
-            let cursor = 0;
-            const workers = Math.min(8, targets.length);
+            const unique = [...new Set(ids)];
+            let chunkSize = 30;
+            let index = 0;
+            let done = 0;
+
+            async function fetchChunk(chunk) {
+                const snap = await getDocs(query(
+                    collection(emailDB, 'connect_queue'),
+                    where('__name__', 'in', chunk),
+                    limit(chunk.length)
+                ), { timeoutMs: 90000 });
+                snapshotRows(snap).forEach(row => found.set(row.id, slimQueue(row)));
+            }
+
             async function worker() {
-                while (cursor < targets.length) {
-                    const idx = cursor++;
-                    const id = targets[idx];
+                while (index < unique.length) {
+                    const size = chunkSize;
+                    const startAt = index;
+                    index += size;
+                    const chunk = unique.slice(startAt, startAt + size);
+                    if (!chunk.length) return;
                     try {
-                        const snap = await getDoc(doc(emailDB, 'connect_queue', id));
-                        if (snap && snap.exists) {
-                            found.set(id, { id: snap.id, ...snap.data() });
-                        }
+                        await fetchChunk(chunk);
                     } catch (err) {
-                        console.warn('Queue lookup failed for', id, err.message);
+                        console.warn('Queue batch failed, retrying in smaller groups:', err.message);
+                        chunkSize = 10;
+                        for (let i = 0; i < chunk.length; i += 10) {
+                            try {
+                                await fetchChunk(chunk.slice(i, i + 10));
+                            } catch (err2) {
+                                console.warn('Queue batch failed:', err2.message);
+                            }
+                        }
                     }
-                    if (idx % 25 === 0) onProgress(idx + 1, targets.length);
+                    done += chunk.length;
+                    onProgress(Math.min(done, unique.length), unique.length);
                 }
             }
-            if (targets.length) await Promise.all(Array.from({ length: workers }, () => worker()));
-            return { found, skipped: Math.max(0, ids.length - cap) };
+
+            const workers = Math.min(2, Math.ceil(unique.length / 30) || 0);
+            if (workers) await Promise.all(Array.from({ length: workers }, () => worker()));
+            return { found, missed: unique.filter(id => !found.has(id)).length };
         }
 
         function emptyBucket() {
@@ -385,35 +407,33 @@
             statusEl.textContent = 'Loading messages pushed to HeyReach…';
 
             try {
-                const activityQuery = query(
-                    collection(emailDB, 'connect_activity'),
+                const activityOptions = {
+                    pageSize: 1500,
+                    timeoutMs: 120000,
+                    maxRetries: 1,
+                    onPage: (count) => {
+                        statusEl.textContent = `Loading messages pushed to HeyReach… ${count.toLocaleString()} so far`;
+                    }
+                };
+                const activityBase = [
                     where('actionType', 'in', ['push_to_heyreach', 'auto_push_to_heyreach']),
                     where('timestamp', '>=', start)
-                );
-                const queueByPush = query(
-                    collection(emailDB, 'connect_queue'),
-                    where('heyreach_push_date', '>=', start.toISOString())
-                );
-                const queueByPushedAt = query(
-                    collection(emailDB, 'connect_queue'),
-                    where('pushed_at', '>=', start.toISOString())
-                );
-
-                const [activitySnap, pushSnap, pushedAtSnap] = await Promise.all([
-                    loadCollection(activityQuery),
-                    loadCollection(queueByPush).catch(err => {
-                        console.warn('heyreach_push_date query failed:', err.message);
-                        return { forEach() {} };
-                    }),
-                    loadCollection(queueByPushedAt).catch(err => {
-                        console.warn('pushed_at query failed:', err.message);
-                        return { forEach() {} };
-                    })
-                ]);
-
-                const queueById = new Map();
-                for (const row of [...snapshotRows(pushSnap), ...snapshotRows(pushedAtSnap)]) {
-                    queueById.set(row.id, row);
+                ];
+                let activitySnap;
+                try {
+                    activitySnap = await getAllDocs(query(
+                        collection(emailDB, 'connect_activity'),
+                        ...activityBase,
+                        where('timestamp', '<=', end)
+                    ), activityOptions);
+                } catch (err) {
+                    const message = String(err.message || '');
+                    if (!message.includes('index') && !message.includes('INDEX')) throw err;
+                    console.warn('Retrying the activity query without an end date:', message);
+                    activitySnap = await getAllDocs(query(
+                        collection(emailDB, 'connect_activity'),
+                        ...activityBase
+                    ), activityOptions);
                 }
 
                 const byKey = new Map();
@@ -430,20 +450,21 @@
                     if (!prev || when > prev.when) byKey.set(key, { ...activity, when, key });
                 });
 
-                const missingIds = [];
+                const queueIds = [];
                 byKey.forEach(activity => {
                     const queueId = activity.contactId || activity.connect_queue_id;
-                    if (queueId && !queueById.has(queueId)) missingIds.push(queueId);
+                    if (queueId) queueIds.push(queueId);
                 });
 
-                let queueLookupsSkipped = 0;
-                if (missingIds.length) {
-                    statusEl.textContent = `Matching ${missingIds.length.toLocaleString()} queue records…`;
-                    const extra = await fetchMissingQueues(missingIds, (done, total) => {
+                let queueLookupsMissed = 0;
+                const queueById = new Map();
+                if (queueIds.length) {
+                    statusEl.textContent = `Matching ${new Set(queueIds).size.toLocaleString()} queue records…`;
+                    const extra = await fetchQueuesByIds(queueIds, (done, total) => {
                         statusEl.textContent = `Matching queue records… ${done.toLocaleString()} of ${total.toLocaleString()}`;
                     });
                     extra.found.forEach((row, id) => queueById.set(id, row));
-                    queueLookupsSkipped = extra.skipped;
+                    queueLookupsMissed = extra.missed;
                 }
 
                 const rows = [];
@@ -482,7 +503,7 @@
                     unmarked,
                     missingQueue,
                     failedSkipped,
-                    queueLookupsSkipped,
+                    queueLookupsMissed,
                     otherEmails,
                     start,
                     end
@@ -559,7 +580,7 @@
                 'Approved by uses adminApprovedBy. When that field is empty, a push recorded under Taylor, Joe, or Sam counts for them. Auto-push with no person is No team approval.'
             ];
             if (otherList) notes.push('Someone else: ' + otherList + '.');
-            if (report.queueLookupsSkipped) notes.push(`${fmt(report.queueLookupsSkipped)} queue records were not opened individually, so those rows may be under Not generated and No team approval.`);
+            if (report.queueLookupsMissed) notes.push(`${fmt(report.queueLookupsMissed)} queue records could not be loaded, so those rows may be under Not generated and No team approval.`);
             document.getElementById('approverNote').innerHTML = notes.join(' ');
 
             const weeks = [...byWeek.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1);
