@@ -656,24 +656,61 @@
 const API = 'https://railwayclemail-production.up.railway.app';
 const BASE_URL = 'https://pandonetworking.com';
 
-const TEAM = {
+// Fallback used only if GET /api/calendar/types can't be reached. Normally the
+// full team (the 3 curated leaders PLUS every other internal Microsoft mailbox
+// connected via OAuth, e.g. through the org-wide connect) is loaded from the
+// backend by loadTeamData() so new team members get links automatically.
+const FALLBACK_TEAM = {
   taylor: { name: 'Taylor Davis',    email: 'taylordavis@pandonetworking.com',  color: '#12314C', initials: 'TD' },
   joe:    { name: 'Joe Annoreno',    email: 'joeannoreno@pandonetworking.com',  color: '#94AD82', initials: 'JN' },
   sam:    { name: 'Sam Ellsworth',   email: 'samellsworth@pandonetworking.com', color: '#4E6E4A', initials: 'SE' },
 };
-
-const INDIVIDUAL_TYPES = {
-  taylor: ['taylor-15','taylor-30','taylor-60'],
-  joe:    ['joe-15','joe-30','joe-60'],
-  sam:    ['sam-15','sam-30','sam-60'],
-};
-
-const JOINT_TYPES = [
+const FALLBACK_JOINT_TYPES = [
   { key: 'taylor-joe-30', label: '30 min',  hosts: ['taylor','joe'],  hostLabel: 'Taylor & Joe' },
   { key: 'taylor-joe-60', label: '60 min',  hosts: ['taylor','joe'],  hostLabel: 'Taylor & Joe' },
   { key: 'taylor-sam-30', label: '30 min',  hosts: ['taylor','sam'],  hostLabel: 'Taylor & Sam' },
   { key: 'taylor-sam-60', label: '60 min',  hosts: ['taylor','sam'],  hostLabel: 'Taylor & Sam' },
 ];
+
+let TEAM = { ...FALLBACK_TEAM };
+let JOINT_TYPES = [...FALLBACK_JOINT_TYPES];
+let INDIVIDUAL_TYPES = {};
+const rebuildIndividualTypes = () => {
+  INDIVIDUAL_TYPES = Object.fromEntries(Object.keys(TEAM).map(k => [k, [`${k}-15`, `${k}-30`, `${k}-60`]]));
+};
+rebuildIndividualTypes();
+
+let _teamReady = null;
+function loadTeamData() {
+  if (_teamReady) return _teamReady;
+  _teamReady = (async () => {
+    try {
+      const res  = await fetch(`${API}/api/calendar/types`);
+      const data = await res.json();
+      if (!data.success || !data.team) throw new Error(data.error || 'Bad response');
+      // Keep the 3 curated leaders first, then everyone else alphabetically.
+      const leaders = Object.keys(FALLBACK_TEAM);
+      const keys = Object.keys(data.team).sort((a, b) => {
+        const ia = leaders.indexOf(a), ib = leaders.indexOf(b);
+        if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+        return (data.team[a].name || a).localeCompare(data.team[b].name || b);
+      });
+      TEAM = Object.fromEntries(keys.map(k => [k, data.team[k]]));
+      JOINT_TYPES = (data.types || [])
+        .filter(t => !t.anyAvailable && Array.isArray(t.hosts) && t.hosts.length > 1)
+        .map(t => ({
+          key: t.key,
+          label: `${t.duration} min`,
+          hosts: t.hosts.map(h => h.key),
+          hostLabel: t.hosts.map(h => h.name).join(' & '),
+        }));
+      rebuildIndividualTypes();
+    } catch (err) {
+      console.error('Failed to load team from /api/calendar/types, using fallback:', err);
+    }
+  })();
+  return _teamReady;
+}
 
 function bookingUrl(type) {
   return `${BASE_URL}/public/schedule/book.html?type=${type}`;
@@ -930,6 +967,7 @@ async function loadAvailabilitySettings() {
   const container = document.getElementById('availabilityCards');
   container.innerHTML = '<div class="spinner"><i class="fas fa-circle-notch"></i><p>Loading…</p></div>';
   try {
+    await loadTeamData();
     const data = await apiFetch('/api/calendar/settings');
     currentSettings = data.settings;
     renderAvailabilityCards(data.settings);
@@ -1786,8 +1824,9 @@ function extCopyOutputText() {
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   initDateFilters();
+  await loadTeamData();
   buildOverview();
   refreshConnectionStatus();
 });
