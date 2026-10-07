@@ -308,8 +308,8 @@
                 <div id="fpDupeStatus" style="font-size: 12.5px; font-weight: 600;"></div>
                 <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                     <span id="fpOrgActivityStatus" style="font-size: 12px; color: var(--gray-500);"></span>
-                    <button class="btn" id="fpExportOrgReportBtn" onclick="fpExportOrgActivityReport()" disabled title="Download a CSV of contacts scanned and messages sent for every organization in this preview">
-                        <i class="fas fa-file-csv"></i> Export Organization Report
+                    <button class="btn" id="fpExportOrgReportBtn" onclick="fpExportOrgActivityReport()" disabled title="Download a customer-ready Excel report: summary, every organization in this preview, and every contact scanned (included / excluded / message created / sent)">
+                        <i class="fas fa-file-excel"></i> Export Organization Report
                     </button>
                 </div>
             </div>
@@ -3891,51 +3891,558 @@
             }
         }
 
-        function fpCsvEscape(v) {
-            const s = String(v ?? '');
-            return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        // ════════════════════════════════════════════════════════════════════
+        // Organization Report (Excel) — customer-shareable workbook:
+        //   Summary       headline numbers + outcome breakdown
+        //   Organizations one row per organization in the preview
+        //   Contacts      one row per contact scanned/found, with whether they were
+        //                 included/excluded and whether a message was created/sent
+        // ════════════════════════════════════════════════════════════════════
+
+        // Plain-language wording for the internal "why no message" buckets (fpNoMsgReasonBucket).
+        const FP_REPORT_NO_MSG_LABELS = {
+            build_message_empty_text:          'A message could not be generated for this contact',
+            profile_message_generation_empty:  'Not enough profile information to write a personalized message',
+            maverick_check_failed:             'Draft message did not pass the quality check',
+            below_connection_floor:            'Below the minimum LinkedIn connection count',
+            org_30day_limit:                   'Organization contact limit reached — saved for a later month',
+            already_connected_or_queued:       'Already connected, or a message is already queued',
+            no_profile_data:                   'No LinkedIn profile data available',
+            no_fallback_available:             'No suitable message source available for this contact',
+            campaign_settings_missing:         'Message could not be generated (technical issue)',
+            network_error:                     'Message could not be generated (technical issue)',
+            profile_message_exception:         'Message could not be generated (technical issue)',
+            other:                             'Message could not be generated',
+            unknown:                           'Message could not be generated'
+        };
+
+        // Outcome label -> display priority (sort order) + colours for the Excel cell.
+        const FP_REPORT_OUTCOMES = {
+            'Message Sent':                          { order: 1, bg: '059669', fg: 'FFFFFF' },
+            'Message Created':                       { order: 2, bg: 'D1FAE5', fg: '065F46' },
+            'Message Created – Removed in Review':   { order: 3, bg: 'FEF3C7', fg: '92400E' },
+            'Included – Awaiting Message':           { order: 4, bg: 'DBEAFE', fg: '1E40AF' },
+            'Included – Held for Later':             { order: 5, bg: 'DBEAFE', fg: '1E40AF' },
+            'Included – No Message Created':         { order: 6, bg: 'FEF3C7', fg: '92400E' },
+            'Excluded – Not a Target Contact':       { order: 7, bg: 'FEE2E2', fg: '991B1B' },
+            'Excluded – Removed from List':          { order: 8, bg: 'FEE2E2', fg: '991B1B' },
+            'Not Advanced – Company Mismatch':       { order: 9, bg: 'E5E7EB', fg: '374151' },
+            'Not Advanced – Already Connected':      { order: 10, bg: 'E5E7EB', fg: '374151' }
+        };
+
+        // Gathers every contact scanned/found for the group's organizations and works out what
+        // happened to each one. Sources (all already persisted by the pipeline):
+        //   connect_contact_search_log   scan jobs (which org / scan name / date)
+        //   prospect_contacts            contacts saved by those scans (+ tagged "included" ones)
+        //   prospect_contacts_deleted    contacts the Target Contact rules excluded (with reason)
+        //   connect_queue                messages created (and whether pushed to HeyReach = sent)
+        //   full_pipeline_runs           per-contact "no message" reasons, held-for-later, org errors
+        async function fpLoadContactReportData(groupId, rows, setStatus) {
+            const warnings = [];
+            const scopeIds = new Set(rows.map(o => o.id));
+            const byName = new Map(), byLi = new Map(), byId = new Map();
+            fpGroupOrgs.forEach(o => {
+                byId.set(o.id, o);
+                const n = fpNormOrgName(o.company_name);
+                if (n && !byName.has(n)) byName.set(n, o.id);
+                const li = fpNormOrgLinkedIn(o.company_linkedin_url);
+                if (li && !byLi.has(li)) byLi.set(li, o.id);
+            });
+            const urlKey = u => fpNormContactUrlForLimit(String(u || '').split('?')[0].split('#')[0]);
+            const safe = (label, p) => p.catch(e => { console.warn(`Org report: could not load ${label}:`, e); warnings.push(`${label}: ${e.message}`); return null; });
+
+            setStatus('<i class="fas fa-spinner fa-spin"></i> Loading scan history, contacts and messages…');
+            const [scanSnap, tagSnap, delSnap, msgSnap, runSnap] = await Promise.all([
+                safe('scan jobs',          getDocs(query(collection(db, 'connect_contact_search_log'), where('hypothesisGroupId', '==', groupId)))),
+                safe('tagged contacts',    getDocs(query(collection(db, 'prospect_contacts'),          where('hypothesisGroupId', '==', groupId)))),
+                safe('excluded contacts',  getDocs(query(collection(db, 'prospect_contacts_deleted'),  where('hypothesisGroupId', '==', groupId)))),
+                safe('messages',           getDocs(query(collection(db, 'connect_queue'),              where('hypothesisGroupId', '==', groupId)))),
+                safe('pipeline run reports', getDocs(query(collection(db, 'full_pipeline_runs'),       where('hypothesisGroupId', '==', groupId))))
+            ]);
+
+            // ── Scan jobs ──
+            const jobs = new Map(); // jobId -> { orgId, scanName, date }
+            if (scanSnap) scanSnap.forEach(d => {
+                const j = d.data();
+                if (j.status && j.status !== 'completed') return;
+                jobs.set(d.id, {
+                    orgId: fpScanJobOrgId(j, byName),
+                    scanName: j.scanLabel || '',
+                    date: String(j.submittedAt || '').slice(0, 10)
+                });
+            });
+
+            // ── Every contact those jobs saved (including ones that never got tagged to the group,
+            //    e.g. already-connected contacts) + everything tagged to the group ──
+            const liveDocs = new Map();
+            if (tagSnap) tagSnap.forEach(d => liveDocs.set(d.id, { id: d.id, ...d.data() }));
+            const jobIds = [...jobs.keys()];
+            const CHUNK = 10, PARALLEL = 4;
+            const chunks = [];
+            for (let i = 0; i < jobIds.length; i += CHUNK) chunks.push(jobIds.slice(i, i + CHUNK));
+            let chunksDone = 0, chunkFailures = 0;
+            for (let i = 0; i < chunks.length; i += PARALLEL) {
+                await Promise.all(chunks.slice(i, i + PARALLEL).map(async chunk => {
+                    try {
+                        const snap = await getDocs(query(collection(db, 'prospect_contacts'), where('sourceJobId', 'in', chunk)));
+                        snap.forEach(d => { if (!liveDocs.has(d.id)) liveDocs.set(d.id, { id: d.id, ...d.data() }); });
+                    } catch (e) {
+                        chunkFailures++;
+                        console.warn('Org report: contact batch failed', e);
+                    }
+                    chunksDone++;
+                }));
+                setStatus(`<i class="fas fa-spinner fa-spin"></i> Loading scanned contacts… ${chunksDone.toLocaleString()} / ${chunks.length.toLocaleString()} batches`);
+            }
+            if (chunkFailures) warnings.push(`${chunkFailures} scan batch(es) could not be loaded — some scanned contacts may be missing`);
+
+            // ── Pipeline run reports (per-contact detail the contact docs don't carry) ──
+            const runNoMsg = new Map();        // urlKey -> reason bucket
+            const runHeld = new Set();         // urlKey (matched, but over the Top Contacts cap)
+            const runDropReason = new Map();   // urlKey -> rules reason (fallback if the archived doc lacks one)
+            const jobError = new Map();        // scanJobId -> org-level error (e.g. company_mismatch)
+            if (runSnap) runSnap.forEach(d => {
+                (d.data().orgs || []).forEach(o => {
+                    if (o.scanJobId && o.error) jobError.set(o.scanJobId, o.error);
+                    (o.noMessageContacts || []).forEach(n => { const k = urlKey(n.linkedInUrl); if (k) runNoMsg.set(k, n.reasonBucket || 'other'); });
+                    ((o.topContactsCap || {}).savedForLaterContacts || []).forEach(n => { const k = urlKey(n.linkedInUrl); if (k) runHeld.add(k); });
+                    (o.droppedContacts || []).forEach(n => { const k = urlKey(n.linkedInUrl); if (k && n.reason) runDropReason.set(k, n.reason); });
+                });
+            });
+
+            // ── Messages, grouped per contact ──
+            const msgByKey = new Map();
+            if (msgSnap) msgSnap.forEach(d => {
+                const m = { id: d.id, ...d.data() };
+                const k = urlKey(m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '');
+                if (!k) return;
+                if (!msgByKey.has(k)) msgByKey.set(k, []);
+                msgByKey.get(k).push(m);
+            });
+
+            // ── Merge everything into one record per person ──
+            const people = new Map();
+            const orgForContact = c => {
+                const j = jobs.get(c.sourceJobId);
+                if (j && j.orgId) return j.orgId;
+                if (c.orgId && byId.has(c.orgId)) return c.orgId;
+                const li = fpNormOrgLinkedIn(c.searchedOrganizationLinkedInUrl || '');
+                if (li && byLi.has(li)) return byLi.get(li);
+                for (const n of [c.searchedOrganization, c.company, c.companyName]) {
+                    const k = fpNormOrgName(n || '');
+                    if (k && byName.has(k)) return byName.get(k);
+                }
+                return null;
+            };
+            const connCountOf = c => {
+                const n = parseInt(c.linkedInConnectionCount ?? c.connectionCount ?? c.connectionsCount);
+                return Number.isFinite(n) ? n : null;
+            };
+            const upsert = (key, rec) => {
+                const cur = people.get(key);
+                if (!cur) { people.set(key, rec); return; }
+                ['orgId', 'name', 'title', 'company', 'url', 'connections', 'scanName', 'ruleReason', 'jobId'].forEach(f => {
+                    if ((cur[f] === '' || cur[f] == null) && rec[f] !== '' && rec[f] != null) cur[f] = rec[f];
+                });
+                cur.kept = cur.kept || rec.kept;
+                cur.dropped = cur.dropped || rec.dropped;
+                cur.removed = cur.removed || rec.removed;
+                if (rec.scanDate && (!cur.scanDate || rec.scanDate > cur.scanDate)) { cur.scanDate = rec.scanDate; if (rec.scanName) cur.scanName = rec.scanName; }
+            };
+            const nameOf = c => `${c.firstName || ''} ${c.lastName || ''}`.trim() || c.name || c.fullName || '';
+
+            liveDocs.forEach(c => {
+                const url = c.linkedInUrl || c.li_url || c.linkedin_url || c.profile_url || '';
+                const key = urlKey(url);
+                if (!key) return;
+                const j = jobs.get(c.sourceJobId) || {};
+                upsert(key, {
+                    key, orgId: orgForContact(c), name: nameOf(c), title: c.title || '', company: c.company || c.companyName || c.searchedOrganization || '',
+                    url, connections: connCountOf(c), jobId: c.sourceJobId || '',
+                    scanName: j.scanName || '', scanDate: j.date || '',
+                    kept: c.hypothesisGroupId === groupId && !c.excludedFromCampaign,
+                    dropped: false, removed: false, ruleReason: ''
+                });
+            });
+            if (delSnap) delSnap.forEach(d => {
+                const c = d.data();
+                const url = c.linkedInUrl || c.li_url || c.linkedin_url || c.profile_url || '';
+                const key = urlKey(url);
+                if (!key) return;
+                const isRules = c.deletedReason === 'rules_exclude';
+                upsert(key, {
+                    key, orgId: orgForContact(c), name: nameOf(c), title: c.title || '', company: c.company || c.companyName || c.orgName || '',
+                    url, connections: connCountOf(c), jobId: c.scanJobId || c.sourceJobId || '',
+                    scanName: c.scanName || '', scanDate: String(c.deletedAt || '').slice(0, 10),
+                    kept: false, dropped: isRules, removed: !isRules,
+                    ruleReason: isRules ? (c.ruleReason || '') : ''
+                });
+            });
+            // Contacts that only exist as a message (e.g. the contact doc was later cleaned up).
+            msgByKey.forEach((msgs, key) => {
+                if (people.has(key)) return;
+                const m = msgs[0];
+                const orgId = fpMatchMessageToOrgId(m, byName, byLi);
+                people.set(key, {
+                    key, orgId, name: m.prospect_name || `${m.contactFirstName || ''} ${m.contactLastName || ''}`.trim(),
+                    title: m.prospect_title || m.contactTitle || '', company: m.prospect_company || m.contactCompany || '',
+                    url: m.prospect_li_url || m.linkedin_url || '', connections: null, jobId: '', scanName: '', scanDate: '',
+                    kept: true, dropped: false, removed: false, ruleReason: ''
+                });
+            });
+
+            // ── Decide the outcome for each person ──
+            const contacts = [];
+            let outOfScope = 0;
+            people.forEach(p => {
+                if (!p.orgId || !scopeIds.has(p.orgId)) { outOfScope++; return; }
+                const msgs = (msgByKey.get(p.key) || []).slice().sort((a, b) => {
+                    const ra = (a.pushed_to_heyreach === true ? 2 : 0) + (a.opusExclude ? 0 : 1);
+                    const rb = (b.pushed_to_heyreach === true ? 2 : 0) + (b.opusExclude ? 0 : 1);
+                    return rb - ra || String(b.uploaded_date || '').localeCompare(String(a.uploaded_date || ''));
+                });
+                const msg = msgs[0] || null;
+                const rec = { ...p, msgCount: msgs.length, msg, targetMatch: '', outcome: '', notes: '' };
+                if (msg) {
+                    rec.targetMatch = 'Included';
+                    const sent = msg.pushed_to_heyreach === true;
+                    rec.sent = sent;
+                    if (sent) { rec.outcome = 'Message Sent'; rec.notes = 'Message sent to this contact.'; }
+                    else if (msg.opusExclude) { rec.outcome = 'Message Created – Removed in Review'; rec.notes = msg.opusExcludeReason || 'Removed during message review.'; }
+                    else { rec.outcome = 'Message Created'; rec.notes = 'Message created and ready to send.'; }
+                } else if (p.kept) {
+                    rec.targetMatch = 'Included';
+                    const bucket = runNoMsg.get(p.key);
+                    if (bucket) { rec.outcome = 'Included – No Message Created'; rec.notes = FP_REPORT_NO_MSG_LABELS[bucket] || FP_REPORT_NO_MSG_LABELS.other; }
+                    else if (runHeld.has(p.key)) { rec.outcome = 'Included – Held for Later'; rec.notes = 'Matches the target criteria; saved for a later round (per-organization contact cap).'; }
+                    else { rec.outcome = 'Included – Awaiting Message'; rec.notes = 'Matches the target criteria; no message created yet.'; }
+                } else if (p.dropped) {
+                    rec.targetMatch = 'Excluded';
+                    rec.outcome = 'Excluded – Not a Target Contact';
+                    rec.notes = p.ruleReason || runDropReason.get(p.key) || 'Did not match the target contact criteria.';
+                } else if (p.removed) {
+                    rec.targetMatch = 'Excluded';
+                    rec.outcome = 'Excluded – Removed from List';
+                    rec.notes = 'Removed from the contact list.';
+                } else if (jobError.get(p.jobId) === 'company_mismatch') {
+                    rec.targetMatch = 'Not Reviewed';
+                    rec.outcome = 'Not Advanced – Company Mismatch';
+                    rec.notes = 'The scan resolved to a different company than the target organization, so these contacts were not reviewed.';
+                } else {
+                    rec.targetMatch = 'Not Reviewed';
+                    rec.outcome = 'Not Advanced – Already Connected';
+                    rec.notes = 'Found in the scan but not advanced — already connected to the sending BDR, or filtered before review.';
+                }
+                contacts.push(rec);
+            });
+
+            const orgOrder = new Map(rows.map((o, i) => [o.id, i]));
+            contacts.sort((a, b) =>
+                (orgOrder.get(a.orgId) ?? 1e9) - (orgOrder.get(b.orgId) ?? 1e9)
+                || FP_REPORT_OUTCOMES[a.outcome].order - FP_REPORT_OUTCOMES[b.outcome].order
+                || a.name.localeCompare(b.name));
+            return { contacts, warnings, outOfScope };
         }
-        window.fpExportOrgActivityReport = function() {
+
+        async function fpLoadXlsxLib() {
+            if (typeof XLSX !== 'undefined' && XLSX.utils) return;
+            await new Promise((resolve, reject) => {
+                const s = document.createElement('script');
+                s.src = 'https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.min.js';
+                s.onload = resolve;
+                s.onerror = () => reject(new Error('Could not load the Excel library (xlsx-js-style) — check your internet connection.'));
+                document.head.appendChild(s);
+            });
+        }
+
+        function fpBuildOrgReportWorkbook({ rows, contacts, meta }) {
+            // ── Palette & style helpers ──
+            const C = { navy: '0F2340', navyMid: '1E3A5F', blue: '1D4ED8', hdrBg: '1E3A5F', hdrFg: 'FFFFFF',
+                        altRow: 'F8FAFC', white: 'FFFFFF', border: 'D1D5DB', text: '111827', muted: '6B7280', link: '1D4ED8' };
+            const side = (c = C.border) => ({ style: 'thin', color: { rgb: c } });
+            const S = (bg, fg, o = {}) => ({
+                fill: { patternType: 'solid', fgColor: { rgb: bg } },
+                font: { name: 'Calibri', sz: o.sz || 10, color: { rgb: fg }, bold: !!o.bold, italic: !!o.italic, underline: !!o.underline },
+                border: { top: side(o.bc), bottom: side(o.bc), left: side(o.bc), right: side(o.bc) },
+                alignment: { horizontal: o.h || 'left', vertical: o.v || 'top', wrapText: !!o.wrap }
+            });
+            const cell = (v, s, extra) => ({ v: v ?? '', t: typeof v === 'number' ? 'n' : 's', s, ...(extra || {}) });
+            const ST = {
+                title:    S(C.navy,    C.white,  { sz: 16, bold: true, v: 'center', bc: C.navy }),
+                subtitle: S(C.navyMid, 'A5C3E8', { sz: 10, v: 'center', bc: C.navyMid }),
+                stats:    S(C.blue,    C.white,  { sz: 10, bold: true, v: 'center', bc: C.blue }),
+                hdr:      S(C.hdrBg,   C.hdrFg,  { sz: 11, bold: true, h: 'center', v: 'center', wrap: true, bc: '2D4A6B' }),
+                hdrL:     S(C.hdrBg,   C.hdrFg,  { sz: 11, bold: true, h: 'left',   v: 'center', wrap: true, bc: '2D4A6B' }),
+                section:  S(C.navyMid, C.white,  { sz: 11, bold: true, v: 'center', bc: C.navyMid }),
+                key:      S('EFF6FF',  C.navyMid,{ sz: 10, bold: true, v: 'center', bc: C.border }),
+                total:    S('E2E8F0',  C.navy,   { sz: 10, bold: true, v: 'center', bc: C.border }),
+                blank:    S(C.white,   C.white,  { bc: C.white })
+            };
+            const rowStyle = (i, o = {}) => S(i % 2 === 0 ? C.white : C.altRow, o.fg || C.text, { sz: 10, h: o.h, v: o.v || 'top', wrap: o.wrap, bold: o.bold, underline: o.underline });
+            const emptyRow = n => Array.from({ length: n }, () => cell('', ST.blank));
+            const titleBlock = (n, title, subtitle, stats) => {
+                const mk = (txt, st) => Array.from({ length: n }, (_, i) => cell(i === 0 ? txt : '', st));
+                return [mk(title, ST.title), mk(subtitle, ST.subtitle), mk(stats, ST.stats)];
+            };
+            const toSheet = (grid, { cols, rowHeights, merges, freezeRow, filterRow }) => {
+                const ws = {};
+                const nCols = cols.length;
+                grid.forEach((row, r) => row.forEach((c, ci) => { ws[XLSX.utils.encode_cell({ r, c: ci })] = c; }));
+                ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: grid.length - 1, c: nCols - 1 } });
+                ws['!cols'] = cols.map(c => ({ wch: c.wch }));
+                ws['!rows'] = rowHeights;
+                ws['!merges'] = merges;
+                if (freezeRow) ws['!freeze'] = { ySplit: String(freezeRow), topLeftCell: `A${freezeRow + 1}`, activePane: 'bottomLeft', state: 'frozen' };
+                if (filterRow != null) ws['!autofilter'] = { ref: `A${filterRow + 1}:${XLSX.utils.encode_col(nCols - 1)}${grid.length}` };
+                return ws;
+            };
+            const pct = (n, d) => d ? `${Math.round((n / d) * 1000) / 10}%` : '–';
+
+            // ── Aggregates ──
+            const count = (pred) => contacts.filter(pred).length;
+            const nFound = contacts.length;
+            const nIncluded = count(c => c.targetMatch === 'Included');
+            const nExcluded = count(c => c.targetMatch === 'Excluded');
+            const nNotReviewed = count(c => c.targetMatch === 'Not Reviewed');
+            const nMsg = count(c => c.msg);
+            const nSent = count(c => c.sent);
+            const perOrg = new Map();
+            contacts.forEach(c => {
+                const o = perOrg.get(c.orgId) || { found: 0, included: 0, excluded: 0, msg: 0, sent: 0 };
+                o.found++;
+                if (c.targetMatch === 'Included') o.included++;
+                if (c.targetMatch === 'Excluded') o.excluded++;
+                if (c.msg) o.msg++;
+                if (c.sent) o.sent++;
+                perOrg.set(c.orgId, o);
+            });
+            const orgTotals = fpOrgActivityTotals(rows);
+            const orgsScanned = rows.filter(o => fpOrgActivityEnsure(o.id).contactsScanned > 0).length;
+            const heading = [meta.customer, meta.groupName].filter(Boolean).join('  ·  ') || 'Organization Report';
+            const subtitle = `Generated ${meta.dateLabel}${meta.scanName ? `  ·  Scan: ${meta.scanName}` : ''}`;
+
+            // ═══════════ Sheet 1: Summary ═══════════
+            const SUM_COLS = [{ wch: 44 }, { wch: 16 }, { wch: 14 }];
+            const sg = [];
+            titleBlock(3, `Organization Report  ·  ${heading}`, subtitle,
+                `   ${rows.length.toLocaleString()} organizations   ·   ${nFound.toLocaleString()} contacts found   ·   ${orgTotals.messagesGenerated.toLocaleString()} messages created   ·   ${orgTotals.messagesSent.toLocaleString()} sent`).forEach(r => sg.push(r));
+            const sMerges = [0, 1, 2].map(r => ({ s: { r, c: 0 }, e: { r, c: 2 } }));
+            const section = label => { sMerges.push({ s: { r: sg.length, c: 0 }, e: { r: sg.length, c: 2 } }); sg.push([cell(label, ST.section), cell('', ST.section), cell('', ST.section)]); };
+            const kv = (k, v, p) => sg.push([cell(k, ST.key), cell(v, S(C.white, C.text, { h: 'center', v: 'center', bold: true, bc: C.border })), cell(p || '', S(C.white, C.muted, { h: 'center', v: 'center', bc: C.border }))]);
+            const tableHdr = (a, b, c) => sg.push([cell(a, ST.hdrL), cell(b, ST.hdr), cell(c, ST.hdr)]);
+            const gap = () => sg.push(emptyRow(3));
+
+            gap();
+            section('Overview');
+            kv('Organizations in this report', rows.length);
+            kv('Organizations scanned', orgsScanned, pct(orgsScanned, rows.length));
+            kv('Contacts scanned (all scan results)', orgTotals.contactsScanned);
+            kv('Unique contacts found (Contacts tab)', nFound);
+            kv('Contacts included (match target criteria)', nIncluded, pct(nIncluded, nFound));
+            kv('Contacts excluded (not a target contact / removed)', nExcluded, pct(nExcluded, nFound));
+            kv('Contacts not advanced (e.g. already connected)', nNotReviewed, pct(nNotReviewed, nFound));
+            kv('Contacts with a message created', nMsg, pct(nMsg, nIncluded));
+            kv('Messages created (total)', orgTotals.messagesGenerated);
+            kv('Messages sent (total)', orgTotals.messagesSent);
+            gap();
+
+            section('What happened to each contact');
+            tableHdr('Outcome', 'Contacts', '% of found');
+            Object.keys(FP_REPORT_OUTCOMES).sort((a, b) => FP_REPORT_OUTCOMES[a].order - FP_REPORT_OUTCOMES[b].order).forEach(label => {
+                const n = count(c => c.outcome === label);
+                if (!n) return;
+                const o = FP_REPORT_OUTCOMES[label];
+                sg.push([cell(label, S(o.bg, o.fg, { bold: true, v: 'center', bc: C.border })),
+                         cell(n, S(C.white, C.text, { h: 'center', v: 'center', bc: C.border })),
+                         cell(pct(n, nFound), S(C.white, C.muted, { h: 'center', v: 'center', bc: C.border }))]);
+            });
+            gap();
+
+            const tally = (items, keyFn) => {
+                const m = new Map();
+                items.forEach(i => { const k = keyFn(i); if (k) m.set(k, (m.get(k) || 0) + 1); });
+                return [...m.entries()].sort((a, b) => b[1] - a[1]);
+            };
+            const noMsg = tally(contacts.filter(c => c.outcome === 'Included – No Message Created'), c => c.notes);
+            if (noMsg.length) {
+                section('Included contacts without a message — why');
+                tableHdr('Reason', 'Contacts', '% of group');
+                const tot = noMsg.reduce((s, [, n]) => s + n, 0);
+                noMsg.forEach(([k, n]) => sg.push([cell(k, S(C.white, C.text, { v: 'center', wrap: true, bc: C.border })), cell(n, S(C.white, C.text, { h: 'center', v: 'center', bc: C.border })), cell(pct(n, tot), S(C.white, C.muted, { h: 'center', v: 'center', bc: C.border }))]));
+                gap();
+            }
+            const topExcluded = tally(contacts.filter(c => c.outcome === 'Excluded – Not a Target Contact'), c => (c.title || '(no title)').trim()).slice(0, 10);
+            if (topExcluded.length) {
+                section('Most common titles excluded (top 10)');
+                tableHdr('Job title', 'Contacts', '% of excluded');
+                topExcluded.forEach(([k, n]) => sg.push([cell(k, S(C.white, C.text, { v: 'center', wrap: true, bc: C.border })), cell(n, S(C.white, C.text, { h: 'center', v: 'center', bc: C.border })), cell(pct(n, nExcluded), S(C.white, C.muted, { h: 'center', v: 'center', bc: C.border }))]));
+                gap();
+            }
+            section('Notes');
+            [
+                '"Contacts scanned" counts every scan result; the Contacts tab lists each person once, even if they appeared in more than one scan.',
+                'Included = matched the target contact criteria. Excluded = did not match (or was removed). Not advanced = found, but filtered before review.',
+                '"Message sent" means the message was pushed to the sending BDR\'s outreach campaign.',
+                ...(meta.warnings.length ? [`Some data could not be loaded, so figures may be incomplete: ${meta.warnings.join('; ')}.`] : [])
+            ].forEach(t => { sMerges.push({ s: { r: sg.length, c: 0 }, e: { r: sg.length, c: 2 } }); sg.push([cell(t, S(C.white, C.muted, { italic: true, wrap: true, v: 'top', bc: C.white })), cell('', ST.blank), cell('', ST.blank)]); });
+            const noteStart = sg.length - (meta.warnings.length ? 4 : 3);
+            const sRows = sg.map((_, r) => ({ hpt: r === 0 ? 38 : r === 1 || r === 2 ? 20 : r >= noteStart ? 32 : 20 }));
+            const wsSum = toSheet(sg, { cols: SUM_COLS, rowHeights: sRows, merges: sMerges });
+
+            // ═══════════ Sheet 2: Organizations ═══════════
+            const OCOLS = [
+                { label: '#',                  wch: 5,  h: 'center' },
+                { label: 'Organization',       wch: 34, h: 'left' },
+                { label: 'State',              wch: 8,  h: 'center' },
+                { label: 'LinkedIn Page',      wch: 44, h: 'left' },
+                { label: 'Scan Names',         wch: 30, h: 'left' },
+                { label: 'Contacts Scanned',   wch: 12, h: 'center' },
+                { label: 'Unique Contacts Found', wch: 13, h: 'center' },
+                { label: 'Included',           wch: 11, h: 'center' },
+                { label: 'Excluded',           wch: 11, h: 'center' },
+                { label: 'Messages Created',   wch: 12, h: 'center' },
+                { label: 'Messages Sent',      wch: 11, h: 'center' }
+            ];
+            const og = titleBlock(OCOLS.length, `Organizations  ·  ${heading}`, subtitle,
+                `   ${rows.length.toLocaleString()} organizations   ·   ${orgTotals.contactsScanned.toLocaleString()} contacts scanned   ·   ${orgTotals.messagesSent.toLocaleString()} messages sent`);
+            og.push(OCOLS.map(c => cell(c.label, c.h === 'left' ? ST.hdrL : ST.hdr)));
+            rows.forEach((o, i) => {
+                const a = fpOrgActivityEnsure(o.id);
+                const s = perOrg.get(o.id) || { found: 0, included: 0, excluded: 0, msg: 0, sent: 0 };
+                const li = o.company_linkedin_url || '';
+                og.push([
+                    cell(i + 1, rowStyle(i, { h: 'center' })),
+                    cell(o.company_name || '', rowStyle(i, { bold: true, wrap: true })),
+                    cell(o.company_state || '', rowStyle(i, { h: 'center' })),
+                    cell(li, rowStyle(i, { fg: li ? C.link : C.text, underline: !!li }), li ? { l: { Target: li } } : undefined),
+                    cell(fpOrgScanLabels(o).join('; '), rowStyle(i, { wrap: true })),
+                    cell(a.contactsScanned, rowStyle(i, { h: 'center' })),
+                    cell(s.found, rowStyle(i, { h: 'center' })),
+                    cell(s.included, rowStyle(i, { h: 'center' })),
+                    cell(s.excluded, rowStyle(i, { h: 'center' })),
+                    cell(a.messagesGenerated, rowStyle(i, { h: 'center' })),
+                    cell(a.messagesSent, rowStyle(i, { h: 'center' }))
+                ]);
+            });
+            og.push(OCOLS.map((c, ci) => {
+                const vals = {
+                    1: 'TOTAL',
+                    5: orgTotals.contactsScanned,
+                    6: nFound, 7: nIncluded, 8: nExcluded,
+                    9: orgTotals.messagesGenerated,
+                    10: orgTotals.messagesSent
+                };
+                return cell(vals[ci] ?? '', S('E2E8F0', C.navy, { bold: true, h: ci === 1 ? 'left' : 'center', v: 'center', bc: C.border }));
+            }));
+            const oMerges = [0, 1, 2].map(r => ({ s: { r, c: 0 }, e: { r, c: OCOLS.length - 1 } }));
+            const wsOrg = toSheet(og, {
+                cols: OCOLS, merges: oMerges, freezeRow: 4, filterRow: 3,
+                rowHeights: og.map((_, r) => ({ hpt: r === 0 ? 38 : r < 3 ? 20 : r === 3 ? 34 : 20 }))
+            });
+
+            // ═══════════ Sheet 3: Contacts ═══════════
+            const CCOLS = [
+                { label: '#',                 wch: 6,  h: 'center' },
+                { label: 'Organization',      wch: 30, h: 'left' },
+                { label: 'Contact Name',      wch: 24, h: 'left' },
+                { label: 'Title',             wch: 34, h: 'left' },
+                { label: 'LinkedIn Profile',  wch: 40, h: 'left' },
+                { label: 'LinkedIn Connections', wch: 12, h: 'center' },
+                { label: 'Scan Name',         wch: 22, h: 'left' },
+                { label: 'Scan Date',         wch: 12, h: 'center' },
+                { label: 'Target Match',      wch: 14, h: 'center' },
+                { label: 'Outcome',           wch: 34, h: 'center' },
+                { label: 'Details',           wch: 52, h: 'left' },
+                { label: 'Message Created',   wch: 11, h: 'center' },
+                { label: 'Message Sent',      wch: 10, h: 'center' },
+                { label: 'Message Type',      wch: 16, h: 'center' },
+                { label: 'Message Created On', wch: 13, h: 'center' },
+                { label: 'Message',           wch: 70, h: 'left' }
+            ];
+            const orgName = new Map(rows.map(o => [o.id, o.company_name || '']));
+            const cg = titleBlock(CCOLS.length, `Contact Detail  ·  ${heading}`, subtitle,
+                `   ${nFound.toLocaleString()} contacts found   ·   ${nIncluded.toLocaleString()} included   ·   ${nExcluded.toLocaleString()} excluded   ·   ${nNotReviewed.toLocaleString()} not advanced   ·   ${nMsg.toLocaleString()} messages created   ·   ${nSent.toLocaleString()} sent`);
+            cg.push(CCOLS.map(c => cell(c.label, c.h === 'left' ? ST.hdrL : ST.hdr)));
+            const heights = [38, 20, 20, 34];
+            const matchColors = { Included: ['D1FAE5', '065F46'], Excluded: ['FEE2E2', '991B1B'], 'Not Reviewed': ['E5E7EB', '374151'] };
+            contacts.forEach((c, i) => {
+                const oc = FP_REPORT_OUTCOMES[c.outcome];
+                const mc = matchColors[c.targetMatch];
+                const msgText = c.msg ? (c.msg.message_to_contact || '') : '';
+                const li = c.url ? (/^https?:\/\//i.test(c.url) ? c.url : `https://${c.url}`) : '';
+                const msgDate = c.msg ? String(c.msg.uploaded_date || '').slice(0, 10) : '';
+                cg.push([
+                    cell(i + 1, rowStyle(i, { h: 'center' })),
+                    cell(orgName.get(c.orgId) || c.company || '', rowStyle(i, { wrap: true })),
+                    cell(c.name || '(unknown)', rowStyle(i, { bold: true, wrap: true })),
+                    cell(c.title, rowStyle(i, { wrap: true })),
+                    cell(li, rowStyle(i, { fg: li ? C.link : C.text, underline: !!li }), li ? { l: { Target: li } } : undefined),
+                    cell(c.connections == null ? '' : (c.connections >= 500 ? '500+' : c.connections), rowStyle(i, { h: 'center' })),
+                    cell(c.scanName, rowStyle(i, { wrap: true })),
+                    cell(c.scanDate, rowStyle(i, { h: 'center' })),
+                    cell(c.targetMatch, S(mc[0], mc[1], { bold: true, h: 'center', bc: C.border })),
+                    cell(c.outcome, S(oc.bg, oc.fg, { bold: true, h: 'center', wrap: true, bc: C.border })),
+                    cell(c.notes, rowStyle(i, { wrap: true })),
+                    cell(c.msg ? 'Yes' : 'No', rowStyle(i, { h: 'center', bold: !!c.msg })),
+                    cell(c.sent ? 'Yes' : 'No', rowStyle(i, { h: 'center', bold: !!c.sent })),
+                    cell(c.msg ? (c.msg.source || '') : '', rowStyle(i, { h: 'center', wrap: true })),
+                    cell(msgDate, rowStyle(i, { h: 'center' })),
+                    cell(msgText, rowStyle(i, { wrap: true }))
+                ]);
+                const lines = Math.max(Math.ceil(msgText.length / 78), Math.ceil((c.notes || '').length / 56), 1);
+                heights.push(Math.min(Math.max(lines * 13.5 + 6, 20), 230));
+            });
+            const cMerges = [0, 1, 2].map(r => ({ s: { r, c: 0 }, e: { r, c: CCOLS.length - 1 } }));
+            const wsCon = toSheet(cg, {
+                cols: CCOLS, merges: cMerges, freezeRow: 4, filterRow: 3,
+                rowHeights: heights.map(h => ({ hpt: h }))
+            });
+
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, wsSum, 'Summary');
+            XLSX.utils.book_append_sheet(wb, wsOrg, 'Organizations');
+            XLSX.utils.book_append_sheet(wb, wsCon, 'Contacts');
+            return wb;
+        }
+
+        window.fpExportOrgActivityReport = async function() {
             if (!fpGroupOrgs.length) { alert('Select a hypothesis group first.'); return; }
             const groupId = document.getElementById('fpGroupSelect')?.value || '';
             const group = fpGroups.find(g => g.id === groupId) || {};
-            const customer = document.getElementById('fpCustomerSelect')?.value || '';
+            const custSel = document.getElementById('fpCustomerSelect');
+            const customer = custSel && custSel.value ? (custSel.options[custSel.selectedIndex]?.text || custSel.value).trim() : '';
             const scanName = (document.getElementById('fpScanName')?.value || '').trim();
             const rows = fpOrgActivityPreviewRows();
-            const cols = [
-                { label: 'Queue #', get: (o, i) => i + 1 },
-                { label: 'Priority', get: o => o.hypothesis_priority ?? '' },
-                { label: 'Organization', get: o => o.company_name || '' },
-                { label: 'State', get: o => o.company_state || '' },
-                { label: 'LinkedIn URL', get: o => o.company_linkedin_url || '' },
-                { label: 'Total Scans', get: o => fpOrgTotalScanCount(o) },
-                { label: 'Scan Names', get: o => fpOrgScanLabels(o).join('; ') },
-                { label: 'Contacts Scanned', get: o => fpOrgActivityEnsure(o.id).contactsScanned },
-                { label: 'Messages Generated', get: o => fpOrgActivityEnsure(o.id).messagesGenerated },
-                { label: 'Messages Sent', get: o => fpOrgActivityEnsure(o.id).messagesSent }
-            ];
-            const header = cols.map(c => fpCsvEscape(c.label)).join(',');
-            const body = rows.map((o, i) => cols.map(c => fpCsvEscape(c.get(o, i))).join(',')).join('\n');
-            const totals = fpOrgActivityTotals(rows);
-            const totalLine = [
-                '', '', 'TOTAL', '', '', '', '',
-                totals.contactsScanned, totals.messagesGenerated, totals.messagesSent
-            ].map(fpCsvEscape).join(',');
-            const stamp = new Date().toISOString().slice(0, 10);
-            const safeGroup = (group.name || groupId || 'group').replace(/[^\w\-]+/g, '_').slice(0, 40);
-            const blob = new Blob(['\uFEFF' + header + '\n' + body + '\n' + totalLine + '\n'], { type: 'text/csv;charset=utf-8;' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `org_scan_report_${safeGroup}_${stamp}.csv`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
+            const btn = document.getElementById('fpExportOrgReportBtn');
             const statusEl = document.getElementById('fpOrgActivityStatus');
-            if (statusEl) {
+            const setStatus = html => { if (statusEl) statusEl.innerHTML = html; };
+            const idleHtml = btn ? btn.innerHTML : '';
+            if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Building report…'; }
+            try {
+                await fpLoadXlsxLib();
+                const { contacts, warnings, outOfScope } = await fpLoadContactReportData(groupId, rows, setStatus);
+                setStatus('<i class="fas fa-spinner fa-spin"></i> Formatting Excel workbook…');
+                const now = new Date();
+                const wb = fpBuildOrgReportWorkbook({
+                    rows, contacts,
+                    meta: {
+                        customer, groupName: group.name || groupId, scanName, warnings,
+                        dateLabel: now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+                    }
+                });
+                const stamp = now.toISOString().slice(0, 10);
+                const safeGroup = (group.name || groupId || 'group').replace(/[^\w\-]+/g, '_').slice(0, 40);
+                XLSX.writeFile(wb, `organization_report_${safeGroup}_${stamp}.xlsx`);
                 const extra = [customer, group.name || groupId, scanName ? `scan "${scanName}"` : ''].filter(Boolean).join(' · ');
-                statusEl.innerHTML = `<span style="color: var(--success);"><i class="fas fa-check"></i> Exported ${rows.length.toLocaleString()} organization(s)${extra ? ` (${escHtml(extra)})` : ''}.</span>`;
+                const warn = warnings.length ? ` <span style="color: var(--warning);">⚠ ${escHtml(warnings.join('; '))}</span>` : '';
+                const skipped = outOfScope ? ` <span style="color: var(--gray-500);">(${outOfScope.toLocaleString()} contact(s) at organizations outside this preview were left out.)</span>` : '';
+                setStatus(`<span style="color: var(--success);"><i class="fas fa-check"></i> Exported ${rows.length.toLocaleString()} organization(s) and ${contacts.length.toLocaleString()} contact(s)${extra ? ` (${escHtml(extra)})` : ''}.</span>${skipped}${warn}`);
+            } catch (e) {
+                console.error('Organization report export failed:', e);
+                setStatus(`<span style="color: var(--danger);">Export failed: ${escHtml(e.message)}</span>`);
+                alert('Organization report export failed: ' + e.message);
+            } finally {
+                if (btn) { btn.innerHTML = idleHtml; btn.disabled = !fpOrgActivityLoaded; }
             }
         };
 
