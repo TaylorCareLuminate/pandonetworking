@@ -89,6 +89,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Elion Batch Review', href: 'elion_batch_review.html', icon: 'fa-file-import' },
                 { label: 'Repurpose Messages for New BDR', href: 'repurpose_messages.html', icon: 'fa-people-arrows' },
                 { label: 'Auto BDR Connections', href: 'auto_bdr_connections.html', icon: 'fa-robot' },
+                { label: 'BDR Hypothesis Hand-off', href: 'bdr_hypothesis_handoff.html', icon: 'fa-right-left' },
                 { label: 'Reserve Queue', href: 'reserve_queue.html', icon: 'fa-boxes-stacked' },
                 { label: 'Mass Messages to Group', href: 'fast_prospect_message.html', icon: 'fa-users-between-lines' },
                 { label: 'Mass Messages to Connections', href: 'mass_messages_to_connections.html', icon: 'fa-paper-plane' },
