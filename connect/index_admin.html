@@ -7153,6 +7153,42 @@ Rules:
 
         // ── BDR quick-insert profiles (LinkedIn URL / Calendar Link / custom text snippets) ──
         // Shared with company_review_replies.html via the `contact_profiles` collection.
+        // Default booking link for BDRs who haven't saved their own calendarLink.
+        // Every internal Microsoft mailbox connected via OAuth / org-wide consent gets an
+        // auto-generated 30-min booking page (GET /api/calendar/types -> team), so new
+        // team members get a working Calendar Link / Insert Times button with no setup.
+        // A calendarLink saved in contact_profiles always wins over this default.
+        const LI_DEFAULT_BOOKING_BASE = 'https://pandonetworking.com/public/schedule/book.html?type=';
+        const LI_ORG_EMAIL_DOMAINS = ['pandonetworking.com', 'healthluminate.com', 'careluminate.com'];
+        let _liCalendarTeamPromise = null;
+        function _liGetCalendarTeam() {
+            if (_liCalendarTeamPromise) return _liCalendarTeamPromise;
+            _liCalendarTeamPromise = fetch(`${RAILWAY_BASE}/api/calendar/types`)
+                .then(r => r.json())
+                .then(d => (d && d.success && d.team) ? d.team : {})
+                .catch(err => {
+                    console.warn('[LiAlerts] Could not load calendar team for default booking links:', err.message);
+                    _liCalendarTeamPromise = null; // allow retry on next load
+                    return {};
+                });
+            return _liCalendarTeamPromise;
+        }
+        const _liNormName = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+        function _liDefaultBookingLinkFor(canonicalEmail, team) {
+            const email = String(canonicalEmail || '').toLowerCase();
+            const [local, domain] = email.split('@');
+            if (!local || !LI_ORG_EMAIL_DOMAINS.includes(domain)) return '';
+            const entries = Object.entries(team || {});
+            // 1) same mailbox name on any of the org's interchangeable domains
+            let hit = entries.find(([, h]) => String(h.email || '').toLowerCase().split('@')[0] === local);
+            // 2) fall back to matching the BDR's display name (bdr_leaders) to the host's name
+            if (!hit && _liCanonicalEmailToName) {
+                const n = _liNormName(_liCanonicalEmailToName.get(email));
+                if (n) hit = entries.find(([, h]) => _liNormName(h.name) === n);
+            }
+            return hit ? `${LI_DEFAULT_BOOKING_BASE}${encodeURIComponent(hit[0])}-30` : '';
+        }
+
         async function _liPreloadBdrProfiles(alerts) {
             if (!window.clemailFirestore || !window.clemailDb) return;
             const { doc, getDoc } = window.clemailFirestore;
@@ -7187,6 +7223,15 @@ Rules:
                     _liBdrProfileCache.set(canonicalEmail, { linkedInUrl: '', calendarLink: '', textInserts: [] });
                 }
             }));
+
+            // Fill in the auto-generated booking link for anyone without a saved calendarLink.
+            const team = await _liGetCalendarTeam();
+            for (const email of emailsToLoad) {
+                const profile = _liBdrProfileCache.get(email);
+                if (!profile || (profile.calendarLink && profile.calendarLink.trim())) continue;
+                const def = _liDefaultBookingLinkFor(email, team);
+                if (def) { profile.calendarLink = def; profile.calendarLinkIsDefault = true; }
+            }
         }
 
         // Resolves the best email to key the profile cache / write target off of for a given
@@ -7246,8 +7291,8 @@ Rules:
                 </button>`;
 
             const setCalendarBtn = `
-                <button type="button" class="btn-li-insert btn-li-set-calendar" onclick="window.liShowSetCalendarModal('${_liEscHtml(id)}', '${encodedEmail}')" title="${hasCalendar ? 'Edit' : 'Set'} this BDR's calendar link">
-                    <i class="fas fa-calendar-plus"></i> ${hasCalendar ? 'Edit' : 'Set'} Calendar Link
+                <button type="button" class="btn-li-insert btn-li-set-calendar" onclick="window.liShowSetCalendarModal('${_liEscHtml(id)}', '${encodedEmail}')" title="${hasCalendar && !profile.calendarLinkIsDefault ? 'Edit' : 'Set'} this BDR's calendar link${profile && profile.calendarLinkIsDefault ? ' (currently using their auto-generated booking page)' : ''}">
+                    <i class="fas fa-calendar-plus"></i> ${hasCalendar && !profile.calendarLinkIsDefault ? 'Edit' : 'Set'} Calendar Link
                 </button>`;
 
             return `
@@ -7657,7 +7702,7 @@ Rules:
             const normalizedEmail = _liSetCalendarBdrEmail.toLowerCase();
             const profile = _liBdrProfileCache.get(normalizedEmail);
 
-            document.getElementById('liSetCalendarInput').value = (profile && profile.calendarLink) || '';
+            document.getElementById('liSetCalendarInput').value = (profile && !profile.calendarLinkIsDefault && profile.calendarLink) || '';
             document.getElementById('liSetCalendarBdrName').textContent = _liSetCalendarBdrEmail;
 
             const statusEl = document.getElementById('liSetCalendarStatus');
@@ -7720,6 +7765,12 @@ Rules:
 
                 const cached = _liBdrProfileCache.get(normalizedEmail) || { linkedInUrl: '', calendarLink: '', textInserts: [] };
                 cached.calendarLink = calendarLink;
+                cached.calendarLinkIsDefault = false;
+                if (!calendarLink) {
+                    // Removed their custom link -> fall back to the auto-generated booking page.
+                    const def = _liDefaultBookingLinkFor(normalizedEmail, await _liGetCalendarTeam());
+                    if (def) { cached.calendarLink = def; cached.calendarLinkIsDefault = true; }
+                }
                 _liBdrProfileCache.set(normalizedEmail, cached);
 
                 if (_liSetCalendarId) {
