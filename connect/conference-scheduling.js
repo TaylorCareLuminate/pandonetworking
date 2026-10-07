@@ -1325,7 +1325,10 @@
         // periodically as a fallback so a slot someone else holds/books never
         // stays stuck showing as open here for more than ~20s. Stops itself
         // once this card's DOM is gone (re-rendered away or removed).
-        const pollTimer = setInterval(() => {
+        // Re-mounting onto the SAME container (without it being re-created) used
+        // to stack an extra interval per mount; keep exactly one per container.
+        if (containerEl._csPollTimer) clearInterval(containerEl._csPollTimer);
+        const pollTimer = containerEl._csPollTimer = setInterval(() => {
             if (!containerEl.isConnected) { clearInterval(pollTimer); return; }
             // Don't hit the backend for a tab nobody is looking at; the next tick
             // after the tab becomes visible again refreshes it within ~20s.
