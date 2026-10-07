@@ -79,6 +79,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Catch Missed Meetings (AI)', href: 'catch_meetings.html', icon: 'fa-magnifying-glass-chart' },
                 { label: 'Scan Conversations (AI)', href: 'scan_conversations.html', icon: 'fa-search-plus' },
                 { label: 'Follow-Up Needed (AI)', href: 'followup_needed.html', icon: 'fa-reply-all' },
+                { label: 'LinkedIn → Email & Phone Follow-ups', href: 'linkedin_followups.html', icon: 'fa-envelope-open-text' },
                 { label: 'Engagement Score', href: 'profile_enrichment.html', icon: 'fa-star-half-stroke' },
                 { label: 'divider' },
                 // Message Generation & Content
@@ -113,6 +114,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'A/B Outcome Comparison', href: 'ab_outcomes_comparison.html', icon: 'fa-balance-scale-left' },
                 { label: 'Connect Success Analysis', href: 'analysis_results.html', icon: 'fa-lightbulb' },
                 { label: 'Analysis Dataset (Probit)', href: 'analysis_data.html', icon: 'fa-database' },
+                { label: 'Phrase Explorer', href: 'phrase_explorer.html', icon: 'fa-spell-check' },
                 { label: 'Research Hypotheses', href: 'connect_hypothesis_documentation.html', icon: 'fa-flask' },
                 { label: 'Target Contact / Exclude Rules', href: 'hypothesis_target_rules.html', icon: 'fa-crosshairs' },
                 { label: 'Monthly Research Plan', href: 'monthly_research_plan.html', icon: 'fa-calendar-check' },

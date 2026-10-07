@@ -1946,6 +1946,96 @@
         return norm ? set.has(norm) : false;
     }
 
+    // ── Per-BDR contact tracking ────────────────────────────────────────────
+    // The same prospect can be contacted by several BDRs (each from their own LinkedIn
+    // account). Each BDR's outreach to that prospect is its own connection: two BDRs
+    // reaching out to one contact = two sent, and — if both are accepted — two accepted.
+    // So Sent/Accepted/Replied/Scheduled are all counted per (BDR, contact) pair rather
+    // than per unique LinkedIn URL.
+    //
+    // _emailToBdrKey maps every email known to belong to a target BDR (primary email and
+    // linked LinkedIn email) → that BDR's canonical key (their primary email), so a sent
+    // record stamped with the LinkedIn email and an event stamped with the primary email
+    // still resolve to the same BDR. Anything that can't be resolved gets the wildcard
+    // key '*', which matches any BDR for that contact (the previous URL-only behaviour).
+    let _emailToBdrKey = new Map();
+
+    function resolveBdrKey(candidates) {
+        for (const c of candidates) {
+            const e = (c || '').toString().toLowerCase().trim();
+            if (e && _emailToBdrKey.has(e)) return _emailToBdrKey.get(e);
+        }
+        return '*';
+    }
+
+    // BDR key for a raw event/inbox/activity doc: prefer the true sender (HeyReach
+    // account id → email), then the various email fields these collections use.
+    function eventBdrKey(data) {
+        const mapped = data.linkedInAccountId != null
+            ? linkedInAccountIdMapping.get(String(data.linkedInAccountId)) : null;
+        return resolveBdrKey([mapped, data.bdrEmail, data.bdr_email, data.accountEmail,
+            data.linkedInAccountEmail, data.uploadedByEmail]);
+    }
+
+    function contactSlugKey(rawUrl) { return liSlug(rawUrl) || normalizeUrl(rawUrl); }
+    function pairKeyOf(bdrKey, rawUrl) {
+        const k = contactSlugKey(rawUrl);
+        return k ? `${bdrKey}|${k}` : '';
+    }
+    function sentItemUrl(item) {
+        return item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
+    }
+
+    // Record a (BDR, contact) event on an outcome collection (accepted Map / replied or
+    // scheduled Set). The plain URL-keyed collection is kept for URL-level consumers;
+    // `.pairs` carries the per-BDR view.
+    function addEventPair(coll, bdrKey, rawUrl) {
+        const k = contactSlugKey(rawUrl);
+        if (!k) return '';
+        if (!coll.pairs) { coll.pairs = new Set(); coll.pairSlugs = new Set(); }
+        const pk = `${bdrKey}|${k}`;
+        coll.pairs.add(pk);
+        coll.pairSlugs.add(k);
+        return pk;
+    }
+
+    // Did this BDR have this event with this contact?
+    function eventMatches(coll, bdrKey, rawUrl) {
+        if (!coll) return false;
+        const k = contactSlugKey(rawUrl);
+        if (!k) return false;
+        if (!coll.pairs) return coll.has(normalizeUrl(rawUrl));
+        return coll.pairs.has(`${bdrKey}|${k}`) ||
+               coll.pairs.has(`*|${k}`) ||
+               (bdrKey === '*' && coll.pairSlugs.has(k));
+    }
+
+    // Unique (BDR, contact) pairs among sent items → Map<pairKey, {key, bdrKey, raw}>
+    function uniqueContactPairs(items) {
+        const m = new Map();
+        (items || []).forEach(item => {
+            const raw = sentItemUrl(item);
+            const bdrKey = resolveBdrKey([item.account_email]);
+            const key = pairKeyOf(bdrKey, raw);
+            if (key && !m.has(key)) m.set(key, { key, bdrKey, raw });
+        });
+        return m;
+    }
+
+    // Funnel counts per (BDR, contact) pair. `items` (windowed) drives Sent;
+    // `allTimeItems` (unbounded superset, defaults to items) is the universe that
+    // Accepted/Replied/Scheduled events are matched against.
+    function countContactFunnel(items, allTimeItems, acceptedColl, repliedColl, scheduledColl) {
+        const sent = uniqueContactPairs(items).size;
+        let accepted = 0, replied = 0, scheduled = 0;
+        uniqueContactPairs(allTimeItems || items).forEach(({ bdrKey, raw }) => {
+            if (eventMatches(acceptedColl,  bdrKey, raw)) accepted++;
+            if (eventMatches(repliedColl,   bdrKey, raw)) replied++;
+            if (eventMatches(scheduledColl, bdrKey, raw)) scheduled++;
+        });
+        return { sent, accepted, replied, scheduled };
+    }
+
     function pct(num, den) {
         if (!den || den === 0) return null;
         return Math.round((num / den) * 100);
@@ -1981,8 +2071,14 @@
             const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
             const slug = liSlug(raw);
             const url  = normalizeUrl(raw);
-            if (slug && actuallySentUrls.has(slug)) return false;
-            if (url  && actuallySentUrls.has(url))  return false;
+            if (actuallySentUrls.pairs && actuallySentUrls.pairs.size) {
+                // Per-BDR: another BDR's confirmed send to the same contact doesn't
+                // confirm THIS BDR's request went out.
+                if (eventMatches(actuallySentUrls, resolveBdrKey([item.account_email]), raw)) return false;
+            } else {
+                if (slug && actuallySentUrls.has(slug)) return false;
+                if (url  && actuallySentUrls.has(url))  return false;
+            }
             const pushDate = safeToDate(
                 item.heyreach_push_date || item.pushed_date ||
                 item.adminApprovedAt || item.customerApprovedAt ||
@@ -2238,21 +2334,23 @@
         // Map every sent contact's normalised/slug URL → the variation id stamped on their
         // connect_queue doc (if any), so accepted/replied/scheduled URLs (which come from other
         // collections without the variation field) can be attributed back to a variation.
+        // Keyed per (BDR, contact) pair so two BDRs who sent different variations to the
+        // same contact are each attributed to their own variation; the slug-only key is a
+        // fallback for events whose BDR couldn't be resolved.
         const urlToVariation = new Map();
         groupItems.forEach(m => {
             const vId = m.hypothesisVariationId;
             if (!vId) return;
-            const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-            const slug = liSlug(raw);
-            const norm = normalizeUrl(raw);
-            if (slug) urlToVariation.set(slug, vId);
-            if (norm) urlToVariation.set(norm, vId);
+            const raw = sentItemUrl(m);
+            const pk = pairKeyOf(resolveBdrKey([m.account_email]), raw);
+            if (pk) urlToVariation.set(pk, vId);
+            const k = contactSlugKey(raw);
+            if (k) urlToVariation.set(k, vId);
         });
-        const variationOf = (url) => {
-            const slug = liSlug(url);
-            if (slug && urlToVariation.has(slug)) return urlToVariation.get(slug);
-            const norm = normalizeUrl(url);
-            return norm ? (urlToVariation.get(norm) || null) : null;
+        // `entry` is a {key, raw} pair entry from filterEventSetsToGroup()
+        const variationOf = (entry) => {
+            if (urlToVariation.has(entry.key)) return urlToVariation.get(entry.key);
+            return urlToVariation.get(contactSlugKey(entry.raw)) || null;
         };
 
         const NO_VARIATION = '__none__';
@@ -2263,8 +2361,7 @@
         };
 
         groupItems.forEach(m => {
-            const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-            const key = liSlug(raw) || normalizeUrl(raw);
+            const key = pairKeyOf(resolveBdrKey([m.account_email]), sentItemUrl(m));
             if (!key) return;
             ensure(m.hypothesisVariationId || NO_VARIATION).sentUrls.add(key);
         });
@@ -2520,31 +2617,11 @@
                 return (hasUrls && urlInSet(raw, urlSet)) || (hasBatches && batchSet.has(m.source_batch_id));
             };
 
-            const buildSlugNorms = (list) => {
-                const slugs = new Set(), norms = new Set();
-                list.forEach(m => {
-                    if (!inGroupFilter(m)) return;
-                    const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-                    const slug = liSlug(raw);
-                    const norm = normalizeUrl(raw);
-                    if (slug) slugs.add(slug);
-                    if (norm) norms.add(norm);
-                });
-                return { slugs, norms };
-            };
-
-            const { slugs: sentSlugs, norms: sentNorms } = buildSlugNorms(sentItems);
-            const { slugs: allSlugs, norms: allNorms }    = buildSlugNorms(sentItemsAllTime || sentItems);
-
-            const inAllTimeSent = (u) => {
-                const s = liSlug(u); if (s && allSlugs.has(s)) return true;
-                const n = normalizeUrl(u); return n ? allNorms.has(n) : false;
-            };
-
-            const sent      = sentSlugs.size || sentNorms.size;
-            const accepted  = [...(acceptedUrls?.keys?.() || [])].filter(inAllTimeSent).length;
-            const replied   = [...repliedUrls].filter(inAllTimeSent).length;
-            const scheduled = [...scheduledUrls].filter(inAllTimeSent).length;
+            // Counted per (BDR, contact) pair — two BDRs reaching the same contact = 2.
+            const { sent, accepted, replied, scheduled } = countContactFunnel(
+                sentItems.filter(inGroupFilter),
+                (sentItemsAllTime || sentItems).filter(inGroupFilter),
+                acceptedUrls, repliedUrls, scheduledUrls);
             const tagged    = group._chunked ? (group._totalContactCount || (group.contactLinkedInUrls || []).length) : (group.contactLinkedInUrls || []).length;
 
             return { sent, accepted, replied, scheduled, tagged };
@@ -2649,22 +2726,12 @@
 
     // Compute funnel metrics from a pre-filtered set of sentItems
     function funnelFromItems(items, acceptedUrls, repliedUrls, scheduledUrls) {
-        const sentSlugs = new Set();
-        const sentNorms = new Set();
-        items.forEach(m => {
-            const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-            const s = liSlug(raw);      if (s) sentSlugs.add(s);
-            const n = normalizeUrl(raw); if (n) sentNorms.add(n);
-        });
-        const inSent = u => {
-            const s = liSlug(u);      if (s && sentSlugs.has(s)) return true;
-            const n = normalizeUrl(u); return n ? sentNorms.has(n) : false;
-        };
+        const f = countContactFunnel(items, items, acceptedUrls, repliedUrls, scheduledUrls);
         return {
-            sent:      sentSlugs.size || sentNorms.size,
-            accepted:  [...(acceptedUrls?.keys?.() || [])].filter(inSent).length,
-            replied:   [...repliedUrls].filter(inSent).length,
-            scheduled: [...scheduledUrls].filter(inSent).length,
+            sent:      f.sent,
+            accepted:  f.accepted,
+            replied:   f.replied,
+            scheduled: f.scheduled,
         };
     }
 
@@ -2896,20 +2963,18 @@
     // URL sets themselves (not just counts) so computeGroupVariationRows() can attribute
     // each one back to a specific message variation.
     function filterEventSetsToGroup(groupItems, acceptedUrls, repliedUrls, scheduledUrls) {
-        const sentSlugs = new Set(), sentNorms = new Set();
-        groupItems.forEach(m => {
-            const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-            const s = liSlug(raw);       if (s) sentSlugs.add(s);
-            const n = normalizeUrl(raw); if (n) sentNorms.add(n);
-        });
-        const inGroup = u => {
-            const s = liSlug(u);       if (s && sentSlugs.has(s)) return true;
-            const n = normalizeUrl(u); return n ? sentNorms.has(n) : false;
+        // Per (BDR, contact) pair: each entry is {key, bdrKey, raw} for a group contact
+        // that has the event with that BDR (so two BDRs on one contact = two entries).
+        const pairs = uniqueContactPairs(groupItems);
+        const pick = coll => {
+            const out = [];
+            pairs.forEach(e => { if (eventMatches(coll, e.bdrKey, e.raw)) out.push(e); });
+            return out;
         };
         return {
-            acceptedUrlSet:  new Set([...(acceptedUrls?.keys?.() || [])].filter(inGroup)),
-            repliedUrlSet:   new Set([...repliedUrls].filter(inGroup)),
-            scheduledUrlSet: new Set([...scheduledUrls].filter(inGroup)),
+            acceptedUrlSet:  pick(acceptedUrls),
+            repliedUrlSet:   pick(repliedUrls),
+            scheduledUrlSet: pick(scheduledUrls),
         };
     }
 
@@ -3091,19 +3156,31 @@
     // the first Compare and cached, so changing the period only re-queries the window.
     let _periodCmpCtx = null;
 
+    // Compare is keyed per (BDR, contact) pair: "bdr|slug".
     function pcItemSlug(item) {
         const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
-        return liSlug(raw) || normalizeUrl(raw);
+        return pairKeyOf(resolveBdrKey([item.account_email]), raw);
     }
-    function pcSlugSet(urls) {
+    // Event pair keys ("bdr|slug") from a loaded outcome collection. Unresolved-BDR
+    // events ("*|slug") are expanded to every eligible pair for that contact.
+    function pcEventKeys(coll, eligibleBySlug) {
         const s = new Set();
-        for (const u of urls) { const k = liSlug(u) || normalizeUrl(u); if (k) s.add(k); }
+        for (const pk of (coll.pairs || [])) {
+            if (pk.startsWith('*|')) {
+                (eligibleBySlug.get(pk.slice(2)) || []).forEach(k => s.add(k));
+            } else {
+                s.add(pk);
+            }
+        }
         return s;
     }
     // Dates a connection request went out: HeyReach send events if known, else push/created date.
     function pcItemDates(item, sentAtMap) {
         const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
-        const m = sentAtMap && sentAtMap.size ? (sentAtMap.get(liSlug(raw)) || sentAtMap.get(normalizeUrl(raw))) : null;
+        const m = sentAtMap && sentAtMap.size
+            ? (sentAtMap.get(pairKeyOf(resolveBdrKey([item.account_email]), raw)) ||
+               sentAtMap.get(liSlug(raw)) || sentAtMap.get(normalizeUrl(raw)))
+            : null;
         if (m && m.size) return [...m.values()];
         const d = safeToDate(
             item.heyreach_push_date || item.pushed_date || item.pushed_at ||
@@ -3161,37 +3238,43 @@
                 const acc   = await loadAcceptedConnections(emails, null, null);
                 const inbox = await loadInboxReplies(emails, null, null);
                 const sched = await loadScheduledMeetings(emails, inbox.inboxConversations, null, null);
-                ctx.allTime = {
-                    accepted:  pcSlugSet(acc.keys()),
-                    replied:   pcSlugSet(inbox.repliedUrls),
-                    scheduled: pcSlugSet(sched)
-                };
+                ctx.allTime = { accepted: acc, replied: inbox.repliedUrls, scheduled: sched };
             }
             // Outcomes whose own event date falls inside the period
             const accW   = await loadAcceptedConnections(emails, since, until);
             const inboxW = await loadInboxReplies(emails, since, until);
             const schedW = await loadScheduledMeetings(emails, inboxW.inboxConversations, since, until);
-            const win = {
-                accepted:  pcSlugSet(accW.keys()),
-                replied:   pcSlugSet(inboxW.repliedUrls),
-                scheduled: pcSlugSet(schedW)
-            };
 
-            // Split sends into inside / outside the period
+            // Split sends into inside / outside the period (per BDR + contact pair)
             const inWin = d => (!since || d >= since) && (!until || d < until);
             const insideSlugs = new Set(), outsideSlugs = new Set(), eligible = new Set();
+            const eligibleBySlug = new Map();
             let earliest = null;
             ctx.sentItems.forEach(item => {
                 const slug = pcItemSlug(item);
                 if (!slug) return;
                 eligible.add(slug);
+                const cs = slug.slice(slug.indexOf('|') + 1);
+                if (!eligibleBySlug.has(cs)) eligibleBySlug.set(cs, []);
+                if (!eligibleBySlug.get(cs).includes(slug)) eligibleBySlug.get(cs).push(slug);
                 const dates = pcItemDates(item, ctx.sentAtMap);
                 dates.forEach(d => { if (!earliest || d < earliest) earliest = d; });
                 if (dates.some(inWin)) insideSlugs.add(slug);
                 if (!dates.length || dates.some(d => !inWin(d))) outsideSlugs.add(slug);
             });
 
-            // Outcome counts: contacts we sent to, with the event inside vs. outside the period
+            const win = {
+                accepted:  pcEventKeys(accW, eligibleBySlug),
+                replied:   pcEventKeys(inboxW.repliedUrls, eligibleBySlug),
+                scheduled: pcEventKeys(schedW, eligibleBySlug)
+            };
+            const allTimeKeys = {
+                accepted:  pcEventKeys(ctx.allTime.accepted,  eligibleBySlug),
+                replied:   pcEventKeys(ctx.allTime.replied,   eligibleBySlug),
+                scheduled: pcEventKeys(ctx.allTime.scheduled, eligibleBySlug)
+            };
+
+            // Outcome counts: (BDR, contact) pairs we sent to, with the event inside vs. outside the period
             const countIn  = set => { let n = 0; set.forEach(s => { if (eligible.has(s)) n++; }); return n; };
             const countOut = (allSet, winSet) => { let n = 0; allSet.forEach(s => { if (eligible.has(s) && !winSet.has(s)) n++; }); return n; };
             const period = {
@@ -3200,9 +3283,9 @@
             };
             const rest = {
                 sent: outsideSlugs.size,
-                accepted: countOut(ctx.allTime.accepted, win.accepted),
-                replied:  countOut(ctx.allTime.replied,  win.replied),
-                scheduled: countOut(ctx.allTime.scheduled, win.scheduled)
+                accepted: countOut(allTimeKeys.accepted, win.accepted),
+                replied:  countOut(allTimeKeys.replied,  win.replied),
+                scheduled: countOut(allTimeKeys.scheduled, win.scheduled)
             };
 
             // Days covered (for per-day averages)
@@ -3380,11 +3463,20 @@
                 bdr._linkedInEmail = linkedInEmailAssociations.get(primary) || null;
             });
 
-            // Build flat list of all emails to match against
+            // Build flat list of all emails to match against, and map each email to its
+            // BDR's canonical key so per-BDR (BDR, contact) counting resolves consistently.
             const allEmails = new Set();
+            _emailToBdrKey = new Map();
             targetBdrs.forEach(bdr => {
+                const primary = (bdr.primaryEmail || bdr.id || '').toLowerCase();
+                const canonical = primary || (bdr._linkedInEmail || '').toLowerCase();
                 if (bdr.primaryEmail) allEmails.add(bdr.primaryEmail.toLowerCase());
                 if (bdr._linkedInEmail) allEmails.add(bdr._linkedInEmail.toLowerCase());
+                if (canonical) {
+                    if (primary) _emailToBdrKey.set(primary, canonical);
+                    if (bdr.primaryEmail) _emailToBdrKey.set(bdr.primaryEmail.toLowerCase(), canonical);
+                    if (bdr._linkedInEmail) _emailToBdrKey.set(bdr._linkedInEmail.toLowerCase(), canonical);
+                }
             });
             const allEmailsArr = Array.from(allEmails);
 
@@ -3467,7 +3559,9 @@
             function sentEventDates(item) {
                 if (!sentAtMap.size) return null;
                 const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
-                const m = sentAtMap.get(liSlug(raw)) || sentAtMap.get(normalizeUrl(raw));
+                // Prefer this BDR's own send events; fall back to any-BDR (slug-level) dates.
+                const m = sentAtMap.get(pairKeyOf(resolveBdrKey([item.account_email]), raw)) ||
+                          sentAtMap.get(liSlug(raw)) || sentAtMap.get(normalizeUrl(raw));
                 return m ? [...m.values()] : null;
             }
 
@@ -3492,7 +3586,8 @@
                 '| dated by send event:', byEvent, '| dated by push date (no send event):', byPushDate);
             if (sentAtMap.size && (_since || _until)) {
                 let eventLeadsInWindow = 0;
-                sentAtMap.forEach(m => { if ([...m.values()].some(inWindow)) eventLeadsInWindow++; });
+                // Pair keys ("bdr|slug") are the per-BDR entries; one per (BDR, contact) sent.
+                sentAtMap.forEach((m, k) => { if (k.includes('|') && [...m.values()].some(inWindow)) eventLeadsInWindow++; });
                 console.log('[outcomes] HeyReach send events in window (unique leads):', eventLeadsInWindow,
                     '— these should roughly match HeyReach\'s "Connections sent". Any not in the Sent count have no matching connect_queue record.');
             }
@@ -3532,7 +3627,7 @@
             const acceptedUrls = await loadAcceptedConnections(allEmailsArr, _since, _until);
             console.log('[outcomes] acceptedUrls size:', acceptedUrls.size,
                 '| sample keys (first 5):', [...acceptedUrls.keys()].slice(0, 5));
-            updateLoadingStep(s3, `${acceptedUrls.size} accepted connections found`, 'done');
+            updateLoadingStep(s3, `${acceptedUrls.pairs ? acceptedUrls.pairs.size : acceptedUrls.size} accepted connections found`, 'done');
 
             // ── Step 4: Load HeyReach inbox (replies) ──
             // Replied is scoped by the reply's own date (see loadInboxReplies), not by
@@ -3541,7 +3636,7 @@
             const { repliedUrls, inboxConversations, bdrReplyMessages, conversationsByUrl } = await loadInboxReplies(allEmailsArr, _since, _until);
             console.log('[outcomes] repliedUrls size:', repliedUrls.size,
                 '| sample (first 5):', [...repliedUrls].slice(0, 5));
-            updateLoadingStep(s4, `${repliedUrls.size} contacts replied`, 'done');
+            updateLoadingStep(s4, `${repliedUrls.pairs ? repliedUrls.pairs.size : repliedUrls.size} contacts replied`, 'done');
 
             // ── Step 5: Load scheduled meetings ──
             // Scheduled is scoped by the scheduling event's own date (see
@@ -3550,7 +3645,7 @@
             // inside it is still counted here.
             let s5 = setLoadingStep('Loading scheduled meeting data…', 'active');
             const scheduledUrls = await loadScheduledMeetings(allEmailsArr, inboxConversations, _since, _until);
-            updateLoadingStep(s5, `${scheduledUrls.size} meetings scheduled`, 'done');
+            updateLoadingStep(s5, `${scheduledUrls.pairs ? scheduledUrls.pairs.size : scheduledUrls.size} meetings scheduled`, 'done');
 
             // ── Build results ──
             const results = buildResults(sentItems, sentItemsAllTime, acceptedUrls, repliedUrls, scheduledUrls, targetBdrs);
@@ -3722,15 +3817,24 @@
                 const url = normalizeUrl(data.leadProfileUrl || '');
                 if (!url) return;
                 const ts = data.timestamp?.toDate ? data.timestamp.toDate() : null;
+                const meta = {
+                    acceptedAt:   ts,
+                    firstName:    data.leadFirstName || data.firstName || '',
+                    lastName:     data.leadLastName  || data.lastName  || '',
+                    accountEmail: (data.accountEmail || data.bdrEmail || '').toLowerCase(),
+                    profileUrl:   data.leadProfileUrl || '',
+                };
+                // Per-BDR record: each BDR's accepted connection to a contact counts
+                // separately. Keep the most-recent event per (BDR, contact).
+                const pk = addEventPair(accepted, eventBdrKey(data), data.leadProfileUrl || url);
+                if (pk) {
+                    if (!accepted.pairMeta) accepted.pairMeta = new Map();
+                    const prev = accepted.pairMeta.get(pk);
+                    if (!prev || (ts && ts > (prev.acceptedAt || 0))) accepted.pairMeta.set(pk, meta);
+                }
                 // Keep the most-recent event if the same URL appears twice
                 if (!accepted.has(url) || (ts && ts > (accepted.get(url).acceptedAt || 0))) {
-                    accepted.set(url, {
-                        acceptedAt:   ts,
-                        firstName:    data.leadFirstName || data.firstName || '',
-                        lastName:     data.leadLastName  || data.lastName  || '',
-                        accountEmail: (data.accountEmail || data.bdrEmail || '').toLowerCase(),
-                        profileUrl:   data.leadProfileUrl || '',
-                    });
+                    accepted.set(url, meta);
                 }
             });
         };
@@ -3796,16 +3900,23 @@
         // Attached to the returned Set as `.sentAt`.
         const sentAtByKey = new Map();
 
-        function addUrl(leadProfileUrl, ts) {
+        function addUrl(leadProfileUrl, ts, bdrKey) {
+            bdrKey = bdrKey || '*';
             const url = normalizeUrl(leadProfileUrl || '');
             if (url) sentByHeyreach.add(url);
             const slug = liSlug(leadProfileUrl || '');
             if (slug) sentByHeyreach.add(slug);
             const d = safeToDate(ts);
             const key = slug || url;
+            // Per-BDR (BDR, contact) record, so one BDR's confirmed send doesn't
+            // stand in for another BDR's request to the same contact.
+            addEventPair(sentByHeyreach, bdrKey, leadProfileUrl || '');
             if (key && d && !isNaN(d.getTime())) {
-                if (!sentAtByKey.has(key)) sentAtByKey.set(key, new Map());
-                sentAtByKey.get(key).set(d.getTime(), d);
+                const mapKeys = bdrKey !== '*' ? [key, `${bdrKey}|${key}`] : [key];
+                mapKeys.forEach(mk => {
+                    if (!sentAtByKey.has(mk)) sentAtByKey.set(mk, new Map());
+                    sentAtByKey.get(mk).set(d.getTime(), d);
+                });
             }
         }
 
@@ -3849,7 +3960,7 @@
             snap.forEach(d => {
                 const data = d.data();
                 if ((data.eventType || '') !== 'CONNECTION_REQUEST_SENT') return;
-                addUrl(data.leadProfileUrl, data.timestamp || data.createdAt || data.eventTimestamp);
+                addUrl(data.leadProfileUrl, data.timestamp || data.createdAt || data.eventTimestamp, eventBdrKey(data));
             });
         });
 
@@ -3871,7 +3982,7 @@
                         const evId    = ev.linkedInAccountId ? String(ev.linkedInAccountId) : null;
                         const match   = (evEmail && emailSet.has(evEmail)) ||
                                         (evId    && heyreachAccountIds.includes(evId));
-                        if (match) addUrl(ev.leadProfileUrl, ev.timestamp || ev.createdAt || ev.eventTimestamp);
+                        if (match) addUrl(ev.leadProfileUrl, ev.timestamp || ev.createdAt || ev.eventTimestamp, eventBdrKey(ev));
                     }
                 }
             } else {
@@ -3960,6 +4071,7 @@
 
                 if (hasLeadReply && leadUrl && dateInWindow(lastLeadReplyAt || lastMessageAt)) {
                     repliedUrls.add(leadUrl);
+                    addEventPair(repliedUrls, eventBdrKey(data), leadUrl);
                 }
 
                 // Collect BDR-authored messages for word-count (uses same sender logic as review_replies.html)
@@ -3988,7 +4100,8 @@
                     followUpCategory: data.followUpCategory || '',
                     hasLeadReply,
                     lastMessageAt,
-                    accountEmail: convAccountEmail
+                    accountEmail: convAccountEmail,
+                    bdrKey: eventBdrKey(data)
                 });
             });
         });
@@ -4058,6 +4171,7 @@
                     const url = normalizeUrl(data.contact_linkedin_url || '');
                     if (!url) { noUrl++; return; }
                     scheduledUrls.add(url);
+                    addEventPair(scheduledUrls, eventBdrKey(data), url);
                 });
                 console.log('[outcomes] loadScheduledMeetings Source 1 (activity_tracking) — raw:', rawCount,
                     '| out of window:', outOfWindow, '| no URL:', noUrl,
@@ -4076,6 +4190,7 @@
                 src2Candidates++;
                 if (dateInWindow(c.lastMessageAt)) {
                     scheduledUrls.add(c.leadProfileUrl);
+                    addEventPair(scheduledUrls, c.bdrKey || '*', c.leadProfileUrl);
                     src2Added++;
                 } else {
                     src2OutOfWindow++;
@@ -4116,7 +4231,10 @@
                         const slug = slugFromWebhookConvId(d.id) || slugFromWebhookConvId(data.conversationId);
                         if (slug) url = `https://www.linkedin.com/in/${slug}`;
                     }
-                    if (url) scheduledUrls.add(normalizeUrl(url));
+                    if (url) {
+                        scheduledUrls.add(normalizeUrl(url));
+                        addEventPair(scheduledUrls, eventBdrKey(data), url);
+                    }
                 });
             }
         } catch(e) { flagDataIssue('Scheduled meetings', `conversation_category_overrides load failed: ${e.message || e}`); }
@@ -4137,12 +4255,37 @@
             }
         });
         let correctionRemoved = 0;
+        const removedSlugKeys = new Set();
         inboxConversations.forEach(conv => {
             if (conv.leadProfileUrl && conv.responseCategory && conv.responseCategory !== 'Scheduled'
                 && !currentlyScheduledUrls.has(conv.leadProfileUrl)) {
                 if (scheduledUrls.delete(conv.leadProfileUrl)) correctionRemoved++;
+                removedSlugKeys.add(contactSlugKey(conv.leadProfileUrl));
             }
         });
+        // Same correction at (BDR, contact) level: each BDR's meeting stands or falls on
+        // that BDR's own conversation, not on another BDR's thread with the same contact.
+        if (scheduledUrls.pairs) {
+            const currentlyScheduledPairs = new Set();
+            inboxConversations.forEach(conv => {
+                if (conv.leadProfileUrl && conv.responseCategory === 'Scheduled') {
+                    currentlyScheduledPairs.add(pairKeyOf(conv.bdrKey || '*', conv.leadProfileUrl));
+                }
+            });
+            inboxConversations.forEach(conv => {
+                if (!conv.leadProfileUrl || !conv.responseCategory || conv.responseCategory === 'Scheduled') return;
+                if (!conv.bdrKey || conv.bdrKey === '*') return;
+                const pk = pairKeyOf(conv.bdrKey, conv.leadProfileUrl);
+                if (!currentlyScheduledPairs.has(pk)) scheduledUrls.pairs.delete(pk);
+            });
+            // URL-level removals above apply to every BDR's pair for that contact.
+            if (removedSlugKeys.size) {
+                [...scheduledUrls.pairs].forEach(pk => {
+                    if (removedSlugKeys.has(pk.slice(pk.indexOf('|') + 1))) scheduledUrls.pairs.delete(pk);
+                });
+            }
+            scheduledUrls.pairSlugs = new Set([...scheduledUrls.pairs].map(pk => pk.slice(pk.indexOf('|') + 1)));
+        }
         console.log('[outcomes] loadScheduledMeetings — correction step removed:', correctionRemoved);
 
         console.log('[outcomes] loadScheduledMeetings — final scheduledUrls:', scheduledUrls.size,
@@ -4202,76 +4345,22 @@
         const types = ['post', 'org_news', 'contact_news', 'story_search', 'recovered_post', 'news', 'profile', 'complement', 'fast_prospect', 'about_me_connect', 'other'];
         const rows = [];
 
-        // Pre-build slug-indexed lookup sets for accepted/replied/scheduled so that
-        // computeRow can match via slug (robust) OR normalised URL (fallback), matching
-        // the same two-path logic used in the groups-flow inSentSet() function.
-        function buildSlugSet(urlIterable) {
-            const s = new Set();
-            for (const url of urlIterable) {
-                const slug = liSlug(url);
-                if (slug) s.add(slug);
-                s.add(normalizeUrl(url)); // fallback
-            }
-            return s;
-        }
-        const acceptedSlugSet  = buildSlugSet(acceptedUrls.keys());
-        const repliedSlugSet   = buildSlugSet(repliedUrls);
-        const scheduledSlugSet = buildSlugSet(scheduledUrls);
+        console.log('[outcomes] buildResults — accepted (BDR,contact) pairs:', acceptedUrls.pairs?.size,
+            '| replied pairs:', repliedUrls.pairs?.size,
+            '| scheduled pairs:', scheduledUrls.pairs?.size);
 
-        console.log('[outcomes] buildResults — acceptedSlugSet size:', acceptedSlugSet.size,
-            '| repliedSlugSet size:', repliedSlugSet.size,
-            '| scheduledSlugSet size:', scheduledSlugSet.size);
-
-        // Build per-sent-item slug/norm sets. `items` (windowed) determines the "sent"
-        // count; `allTimeItems` (unbounded superset) determines which contacts are
-        // eligible to match against accepted/replied/scheduled — since those are now
-        // scoped by their own event date rather than requiring the original connection
+        // Counted per (BDR, contact) pair: two BDRs reaching out to the same contact are
+        // two connections sent, and (if both accept) two accepted. `items` (windowed)
+        // determines the "sent" count; `allTimeItems` (unbounded superset) determines which
+        // contacts are eligible to match against accepted/replied/scheduled — since those
+        // are scoped by their own event date rather than requiring the original connection
         // to fall in the same window, this is what stops legitimate meetings from a
         // contact connected before the window from disappearing.
         function computeRow(items, allTimeItems) {
-            const sentSlugs = new Set();
-            const sentNorms = new Set();
-            items.forEach(item => {
-                const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
-                const slug = liSlug(raw);
-                const norm = normalizeUrl(raw);
-                if (slug) sentSlugs.add(slug);
-                if (norm) sentNorms.add(norm);
-            });
-
-            const allSlugs = new Set();
-            const allNorms = new Set();
-            (allTimeItems || items).forEach(item => {
-                const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
-                const slug = liSlug(raw);
-                const norm = normalizeUrl(raw);
-                if (slug) allSlugs.add(slug);
-                if (norm) allNorms.add(norm);
-            });
-
-            let accepted = 0, replied = 0, scheduled = 0;
-            // Iterate unique all-time slugs (plus norms for items without a slug) and match
-            allSlugs.forEach(slug => {
-                if (acceptedSlugSet.has(slug))  accepted++;
-                if (repliedSlugSet.has(slug))   replied++;
-                if (scheduledSlugSet.has(slug)) scheduled++;
-            });
-            // Also check norms for items whose URL had no extractable slug
-            allNorms.forEach(norm => {
-                const slug = liSlug(norm);
-                if (!slug) { // only count norms not already covered by slug
-                    if (acceptedSlugSet.has(norm))  accepted++;
-                    if (repliedSlugSet.has(norm))   replied++;
-                    if (scheduledSlugSet.has(norm)) scheduled++;
-                }
-            });
-
-            console.log('[outcomes] computeRow — sent slugs:', sentSlugs.size,
-                '| all-time slugs:', allSlugs.size,
-                '| accepted:', accepted, '| replied:', replied, '| scheduled:', scheduled,
-                '| sample sent slugs:', [...sentSlugs].slice(0, 3));
-
-            return { sent: sentSlugs.size || sentNorms.size, accepted, replied, scheduled };
+            const row = countContactFunnel(items, allTimeItems, acceptedUrls, repliedUrls, scheduledUrls);
+            console.log('[outcomes] computeRow — sent (BDR,contact) pairs:', row.sent,
+                '| accepted:', row.accepted, '| replied:', row.replied, '| scheduled:', row.scheduled);
+            return row;
         }
 
         // A type is shown if it had sends in the window OR any outcome events (accepted /
@@ -4285,7 +4374,8 @@
             rows.push(row);
         });
 
-        // Compute grand total across ALL sent items (deduped by LinkedIn URL) to avoid double-counting
+        // Compute grand total across ALL sent items, deduped per (BDR, contact) — the same
+        // contact reached by two BDRs counts as two connections
         const grandTotal = computeRow(sentItems, sentItemsAllTime);
         grandTotal.type = 'total';
 
@@ -4301,7 +4391,7 @@
                 if (slug) allSlugs.add(slug);
                 allSlugs.add(normalizeUrl(raw));
             });
-            const unmatched = [...scheduledSlugSet].filter(s => s && !allSlugs.has(s));
+            const unmatched = [...(scheduledUrls.pairSlugs || [])].filter(s => s && !allSlugs.has(s) && !allSlugs.has(normalizeUrl(s)));
             console.log('[outcomes] Scheduled contacts with NO matching sent item (raw scheduledUrls:',
                 scheduledUrls.size, '):', unmatched.length, unmatched);
         })();
@@ -4365,20 +4455,8 @@
         // Compute funnel for each group
         const rows = [];
         groups.forEach(({ prefix, suffix, items }) => {
-            const sentUrls = new Set();
-            items.forEach(item => {
-                const url = normalizeUrl(item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '');
-                if (url) sentUrls.add(url);
-            });
-
-            let accepted = 0, replied = 0, scheduled = 0;
-            sentUrls.forEach(url => {
-                if (acceptedUrls.has(url))  accepted++;
-                if (repliedUrls.has(url))   replied++;
-                if (scheduledUrls.has(url)) scheduled++;
-            });
-
-            rows.push({ prefix, suffix, sent: sentUrls.size, accepted, replied, scheduled });
+            const f = countContactFunnel(items, items, acceptedUrls, repliedUrls, scheduledUrls);
+            rows.push({ prefix, suffix, sent: f.sent, accepted: f.accepted, replied: f.replied, scheduled: f.scheduled });
         });
 
         // Sort by most sent
@@ -4665,20 +4743,8 @@
 
         const rows = [];
         groups.forEach(({ suffix, items }) => {
-            const sentUrls = new Set();
-            items.forEach(item => {
-                const url = normalizeUrl(item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '');
-                if (url) sentUrls.add(url);
-            });
-
-            let accepted = 0, replied = 0, scheduled = 0;
-            sentUrls.forEach(url => {
-                if (acceptedUrls.has(url))  accepted++;
-                if (repliedUrls.has(url))   replied++;
-                if (scheduledUrls.has(url)) scheduled++;
-            });
-
-            rows.push({ suffix, sent: sentUrls.size, accepted, replied, scheduled });
+            const f = countContactFunnel(items, items, acceptedUrls, repliedUrls, scheduledUrls);
+            rows.push({ suffix, sent: f.sent, accepted: f.accepted, replied: f.replied, scheduled: f.scheduled });
         });
 
         rows.sort((a, b) => b.sent - a.sent);
@@ -4792,18 +4858,8 @@
 
         function makeRow(items, label, editedFlag) {
             if (!items.length) return null;
-            const sentUrls = new Set();
-            items.forEach(item => {
-                const url = normalizeUrl(item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '');
-                if (url) sentUrls.add(url);
-            });
-            let accepted = 0, replied = 0, scheduled = 0;
-            sentUrls.forEach(url => {
-                if (acceptedUrls.has(url))  accepted++;
-                if (repliedUrls.has(url))   replied++;
-                if (scheduledUrls.has(url)) scheduled++;
-            });
-            return { label, edited: editedFlag, sent: sentUrls.size, accepted, replied, scheduled };
+            const f = countContactFunnel(items, items, acceptedUrls, repliedUrls, scheduledUrls);
+            return { label, edited: editedFlag, sent: f.sent, accepted: f.accepted, replied: f.replied, scheduled: f.scheduled };
         }
 
         const r1 = makeRow(editedItems,    'Edited by BDR',                  true);
@@ -5173,17 +5229,20 @@
             if (bdr._linkedInEmail) emailToBdrName.set(bdr._linkedInEmail.toLowerCase(), name);
         });
 
-        // Build list: sentItems whose URL is in acceptedUrls (deduplicated by URL)
+        // Build list: sentItems whose (BDR, contact) pair was accepted (deduplicated per
+        // pair — a contact accepted by two BDRs shows up once for each BDR)
         const seen = new Set();
         const items = [];
         sentItems.forEach(item => {
             const raw = item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || '';
             const url = normalizeUrl(raw);
-            if (!url || seen.has(url)) return;
-            if (!acceptedUrls.has(url)) return;
-            seen.add(url);
+            const bdrKey = resolveBdrKey([item.account_email]);
+            const pk = pairKeyOf(bdrKey, raw);
+            if (!url || !pk || seen.has(pk)) return;
+            if (!eventMatches(acceptedUrls, bdrKey, raw)) return;
+            seen.add(pk);
 
-            const evtMeta = acceptedUrls.get(url) || {};
+            const evtMeta = acceptedUrls.pairMeta?.get(pk) || acceptedUrls.get(url) || {};
             const nameFromEvent = [evtMeta.firstName, evtMeta.lastName].filter(Boolean).join(' ');
             const nameFromQueue = (item.prospect_name || item.contact_name ||
                                    item.contact_first_name || item.first_name || '').trim();
