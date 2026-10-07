@@ -11288,7 +11288,7 @@
             let countErrors = 0;
             for (const spec of MERGE_RELATED_SPECS) {
                 try {
-                    const snap = await getDocs(_mergeQuery(spec, absorb.id));
+                    const snap = await getDocs(_mergeQuery(spec, absorb.id), { pageSize: 500, timeoutMs: 120000, maxRetries: 4 });
                     counts[spec.key] = snap.size;
                 } catch (e) {
                     countErrors++;
@@ -11373,6 +11373,51 @@
         return { ok, failed };
     }
 
+    // ── Paged "drain" of one collection ──────────────────────────────
+    // Loading every record for a group in one request can exceed the backend's 60s timeout on
+    // big/heavy collections (e.g. prospect_contacts_deleted). Instead: fetch a small page of
+    // records still pointing at the absorbed group, re-stamp them, repeat until none are left.
+    // Re-stamped records stop matching the query, so no cursor is needed, and a half-finished
+    // run simply resumes where it left off. On a timeout the page size is halved and retried.
+    const MERGE_PAGE_SIZE      = 500;
+    const MERGE_MIN_PAGE_SIZE  = 25;
+    const MERGE_REQ_TIMEOUT_MS = 120000;
+
+    async function _mergeGetPage(spec, groupId, size) {
+        let lastErr;
+        for (let attempt = 0; attempt < 6; attempt++) {
+            try {
+                const snap = await getDocs(_mergeQuery(spec, groupId, size), { timeoutMs: MERGE_REQ_TIMEOUT_MS });
+                return { snap, size };
+            } catch (e) {
+                lastErr = e;
+                if (e.code !== 'TIMEOUT') throw e;
+                size = Math.max(MERGE_MIN_PAGE_SIZE, Math.floor(size / 2));
+                _mergeLog(`  …${spec.coll} request timed out — retrying with smaller pages (${size})`, 'warn');
+                await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+            }
+        }
+        throw lastErr;
+    }
+
+    async function _mergeDrainSpec(spec, ctx) {
+        let moved = 0, failed = 0, size = MERGE_PAGE_SIZE;
+        const seen = new Set();   // ids already attempted — if only those come back, writes aren't sticking
+        for (;;) {
+            const page = await _mergeGetPage(spec, ctx.fromId, size);
+            size = page.size;
+            const docs = page.snap.docs;
+            if (!docs.length) break;
+            const fresh = docs.filter(d => !seen.has(d.id));
+            if (!fresh.length) { failed += docs.length; break; }
+            fresh.forEach(d => seen.add(d.id));
+            const res = await _mergeApplyUpdates(spec.coll, fresh.map(d => ({ id: d.id, data: _mergeBuildUpdate(spec, d.data(), ctx) })));
+            moved += res.ok; failed += res.failed;
+            _mergeLog(`  ${moved.toLocaleString()} moved so far…`);
+        }
+        return { moved, failed };
+    }
+
     function _mergeBuildUpdate(spec, data, ctx) {
         if (spec.key === 'orgs') {
             const ids = (Array.isArray(data.hypothesis_group_ids) ? data.hypothesis_group_ids : []).filter(id => id !== ctx.fromId);
@@ -11435,23 +11480,16 @@
             const moved = {};
             for (const spec of MERGE_RELATED_SPECS) {
                 _mergeLog(`Moving ${spec.label.toLowerCase()} (${spec.coll})…`);
-                let snap;
                 try {
-                    snap = await getDocs(_mergeQuery(spec, absorb.id));
+                    const res = await _mergeDrainSpec(spec, ctx);
+                    moved[spec.key] = res.moved;
+                    if (res.failed) { problems++; _mergeLog(`✗ ${res.failed.toLocaleString()} ${spec.coll} record(s) failed to update.`, 'err'); }
+                    else if (!res.moved) _mergeLog('  nothing to move.');
+                    else _mergeLog(`✓ ${res.moved.toLocaleString()} moved.`, 'ok');
                 } catch (e) {
                     problems++;
-                    _mergeLog(`✗ Could not read ${spec.coll}: ${e.message}`, 'err');
-                    continue;
+                    _mergeLog(`✗ Could not move ${spec.coll}: ${e.message}`, 'err');
                 }
-                const items = snap.docs.map(d => ({ id: d.id, data: _mergeBuildUpdate(spec, d.data(), ctx) }));
-                if (!items.length) { moved[spec.key] = 0; _mergeLog('  nothing to move.'); continue; }
-                let lastLogged = 0;
-                const res = await _mergeApplyUpdates(spec.coll, items, (done, total) => {
-                    if (done === total || done - lastLogged >= 2000) { lastLogged = done; _mergeLog(`  ${done.toLocaleString()} / ${total.toLocaleString()}`); }
-                });
-                moved[spec.key] = res.ok;
-                if (res.failed) { problems++; _mergeLog(`✗ ${res.failed.toLocaleString()} ${spec.coll} record(s) failed to update.`, 'err'); }
-                else _mergeLog(`✓ ${res.ok.toLocaleString()} moved.`, 'ok');
             }
 
             // 2b ── if the merged name differs from the kept group's old name, re-label the kept
@@ -11460,7 +11498,7 @@
                 _mergeLog(`Re-labelling the kept group's existing records as "${plan.name}"…`);
                 for (const spec of MERGE_RELATED_SPECS) {
                     try {
-                        const snap = await getDocs(_mergeQuery(spec, keep.id));
+                        const snap = await getDocs(_mergeQuery(spec, keep.id), { pageSize: 500, timeoutMs: 120000, maxRetries: 4 });
                         const items = [];
                         snap.forEach(d => {
                             const data = d.data();
@@ -11485,7 +11523,7 @@
             _mergeLog('Verifying nothing still points at the merged-in group…');
             for (const spec of MERGE_RELATED_SPECS) {
                 try {
-                    const left = await getDocs(_mergeQuery(spec, absorb.id, 1));
+                    const left = await getDocs(_mergeQuery(spec, absorb.id, 1), { timeoutMs: MERGE_REQ_TIMEOUT_MS });
                     if (!left.empty) { problems++; _mergeLog(`✗ ${spec.coll} still has records pointing at "${absorb.name}".`, 'err'); }
                 } catch (e) {
                     problems++;
