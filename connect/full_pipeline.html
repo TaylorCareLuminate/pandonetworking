@@ -4155,7 +4155,216 @@
             });
         }
 
-        function fpBuildOrgReportWorkbook({ rows, contacts, meta }) {
+        // ── Scan configuration (for the report's "Scan Configuration" tab) ──
+        // Returns the Step 4 rule sets to document, each as
+        //   { name, updatedAt, criteria, secondScan, orgTypeMode }
+        // A typed Scan Name shows that scan's saved preset (or, if it has none yet, the current Step 4
+        // form). With no Scan Name, every saved preset on the group is listed (newest first), falling
+        // back to the current Step 4 form when none exist.
+        function fpCollectScanConfigs(group, scanName) {
+            const presets = group.scanNamePresets || {};
+            const fromForm = () => ({
+                name: scanName || 'Current settings',
+                updatedAt: null,
+                criteria: fpBuildScanCriteria(''),
+                secondScan: document.getElementById('fpSecondScanEnabled').checked
+                    ? { threshold: parseInt(document.getElementById('fpSecondScanThreshold').value) || 5, criteria: fpBuildScanCriteria('2') }
+                    : null,
+                orgTypeMode: fpReadOrgTypesConfig()
+            });
+            if (scanName) {
+                return presets[scanName] ? [{ name: scanName, ...presets[scanName] }] : [fromForm()];
+            }
+            const list = Object.entries(presets)
+                .map(([name, p]) => ({ name, ...p }))
+                .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+            return list.length ? list : [fromForm()];
+        }
+
+        // Small grid builder shared by the two detail tabs (Hypothesis Group / Scan Configuration).
+        function fpDetailSheetBuilder(kit, widths, title, subtitle, stats) {
+            const { C, S, cell, ST, titleBlock, toSheet } = kit;
+            const n = widths.length;
+            const grid = [], heights = [], merges = [];
+            titleBlock(n, title, subtitle, stats).forEach((r, i) => {
+                grid.push(r); heights.push({ hpt: i === 0 ? 38 : 20 });
+                merges.push({ s: { r: i, c: 0 }, e: { r: i, c: n - 1 } });
+            });
+            // Rough wrapped-text height. Excel caps a row at 409pt.
+            const estH = (text, cpl) => {
+                const lines = String(text ?? '').split('\n').reduce((t, l) => t + Math.max(1, Math.ceil(l.length / cpl)), 0);
+                return Math.min(409, Math.max(20, lines * 13.5 + 6));
+            };
+            const dash = v => (v === '' || v == null) ? '—' : v;
+            const valStyle = S(C.white, C.text, { wrap: true, v: 'top', bc: C.border });
+            const mutedStyle = S(C.white, C.muted, { wrap: true, italic: true, v: 'top', bc: C.border });
+            const keyStyle = S('EFF6FF', C.navyMid, { bold: true, wrap: true, v: 'top', bc: C.border });
+            const b = {
+                gap() { grid.push(Array.from({ length: n }, () => cell('', ST.blank))); heights.push({ hpt: 10 }); },
+                merged(text, style, hpt) {
+                    merges.push({ s: { r: grid.length, c: 0 }, e: { r: grid.length, c: n - 1 } });
+                    grid.push(Array.from({ length: n }, (_, i) => cell(i === 0 ? text : '', style)));
+                    heights.push({ hpt });
+                },
+                section(label) { b.merged(label, ST.section, 22); },
+                subhead(label) { b.merged(label, S('DBEAFE', '1E3A5F', { bold: true, sz: 10.5, v: 'center', bc: C.border }), 20); },
+                note(text) { b.merged(text, S(C.white, C.text, { wrap: true, v: 'top', bc: C.border }), estH(text, widths.reduce((a, w) => a + w, 0) * 1.05)); },
+                header(labels) { grid.push(labels.map(l => cell(l, ST.hdrL))); heights.push({ hpt: 22 }); },
+                // One row: first cell is the label; remaining cells are values (last is the muted "how it works" note when 3 columns).
+                kv(label, ...vals) {
+                    const cells = [cell(label, keyStyle), ...vals.map((v, i) => {
+                        const isNote = n === 3 && vals.length === 2 && i === 1;
+                        return cell(isNote ? (v || '') : dash(v), isNote ? mutedStyle : valStyle);
+                    })];
+                    while (cells.length < n) cells.push(cell('', valStyle));
+                    grid.push(cells);
+                    heights.push({ hpt: Math.max(...[label, ...vals].map((t, i) => estH(dash(t), widths[i] * 1.05))) });
+                },
+                // Long free text (prompts, instructions): split across rows so no single row exceeds Excel's height cap.
+                longKv(label, text) {
+                    const t = String(text || '').trim();
+                    if (!t) { b.kv(label, ''); return; }
+                    const cpl = Math.floor(widths[1] * 1.05), MAX_LINES = 26, parts = [];
+                    const linesOf = s => Math.max(1, Math.ceil(s.length / cpl));
+                    let cur = '', curLines = 0;
+                    t.split('\n').forEach(line => {
+                        while (linesOf(line) > MAX_LINES) {           // one enormous paragraph
+                            if (cur) { parts.push(cur); cur = ''; curLines = 0; }
+                            parts.push(line.slice(0, MAX_LINES * cpl)); line = line.slice(MAX_LINES * cpl);
+                        }
+                        if (cur && curLines + linesOf(line) > MAX_LINES) { parts.push(cur); cur = ''; curLines = 0; }
+                        cur += (cur ? '\n' : '') + line;
+                        curLines += linesOf(line);
+                    });
+                    if (cur) parts.push(cur);
+                    parts.forEach((p, i) => b.kv(i === 0 ? label : '', p));
+                },
+                finish() {
+                    return toSheet(grid, { cols: widths.map(w => ({ wch: w })), rowHeights: heights, merges, freezeRow: 4 });
+                }
+            };
+            return b;
+        }
+
+        function fpBuildDetailSheets(kit, { group, scanConfigs, jobFnLabels, seniorityLabels, bdrNames, heading, subtitle }) {
+            const toDate = v => {
+                if (!v) return null;
+                if (typeof v.toDate === 'function') return v.toDate();
+                const secs = v.seconds ?? v._seconds;
+                if (secs != null) return new Date(secs * 1000);
+                const d = new Date(v);
+                return isNaN(d) ? null : d;
+            };
+            const fmtDate = v => { const d = toDate(v); return d ? d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : ''; };
+
+            // ═══ Hypothesis Group tab ═══
+            const variations = group.messageVariations || [];
+            const prompts = (group.sourcePrompts || []).filter(p => p && (p.prompt || p.label));
+            const contactCount = group._totalContactCount ?? (group.contactLinkedInUrls || []).length;
+            const h = fpDetailSheetBuilder(kit, [32, 112],
+                `Hypothesis Group  ·  ${group.name || heading}`, subtitle,
+                `   ${variations.length} message variation(s)   ·   ${prompts.length} source prompt(s)   ·   ${Number(contactCount || 0).toLocaleString()} contacts in group`);
+            h.gap();
+            h.section('Overview');
+            h.kv('Group Name', group.name || '');
+            h.longKv('Hypothesis Statement', group.description);
+            h.kv('Assigned BDRs', (fpGroupBdrEmails(group) || []).map(e => bdrNames.get(String(e).toLowerCase()) || e).join(', '));
+            h.kv('Contacts in Group', contactCount != null ? Number(contactCount).toLocaleString() : '');
+            h.kv('Created', fmtDate(group.createdAt));
+            h.kv('Last Updated', fmtDate(group.updatedAt));
+            h.gap();
+            h.section('Contact Source');
+            h.longKv('Source Description', group.contactSource);
+            h.kv('Tagged Workspace', group.workspaceName || '');
+            h.gap();
+            h.section('Source Prompts — AI prompts used to find these contacts');
+            if (prompts.length) prompts.forEach((p, i) => h.longKv(p.label || `Prompt ${i + 1}`, p.prompt));
+            else h.kv('Source Prompts', 'None documented');
+            h.gap();
+            h.section('Review Instructions');
+            h.longKv('Target Contact / Title Instructions', group.targetContactInstructions);
+            h.longKv('Message Creation Instructions', group.messageCreationInstructions);
+            h.longKv('Message Review Instructions', group.messageReviewInstructions);
+            h.gap();
+            h.section('Message Variations — different message approaches tested within this hypothesis');
+            if (!variations.length) h.kv('Message Variations', 'None defined');
+            variations.forEach((v, i) => {
+                h.subhead(`Variation ${i + 1}  ·  ${v.label || '(unnamed)'}`);
+                h.kv('Status', v.inactive ? `Stopped${v.inactiveAt ? ` (${fmtDate(v.inactiveAt)})` : ''}` : 'Active');
+                if (parseFloat(v.sharePercent) > 0) h.kv('Random Selection Share %', `${parseFloat(v.sharePercent)}%`);
+                if ((v.aiCriteria || '').trim()) h.longKv('AI Selection Criteria', v.aiCriteria);
+                h.longKv('Writing Prompt / Instructions', v.prompt);
+                h.longKv('Example Message', v.exampleMessage);
+            });
+            const wsHyp = h.finish();
+
+            // ═══ Scan Configuration tab ═══
+            const namesOf = (ids, map) => (ids || []).map(id => map.get(String(id)) || String(id));
+            const orgTypesActive = cfg => !!(cfg && cfg.enabled && (cfg.types || []).length);
+            const anyOrgTypes = scanConfigs.some(c => orgTypesActive(c.orgTypeMode));
+            const sc = fpDetailSheetBuilder(kit, [34, 64, 66],
+                `Employee Contact Scan Configuration  ·  ${group.name || heading}`, subtitle,
+                `   ${scanConfigs.length} scan configuration(s)${anyOrgTypes ? '   ·   Organizations classified by type' : ''}`);
+            sc.gap();
+            sc.section('How to read these settings');
+            sc.note('•  Job Title Keywords look at more than the job title — each keyword is matched against a person\'s title, About statement and headline. A long list of terms would return nearly everyone in an organization, so we use the smallest number of words that lead us to the right people: words that appear in those people\'s titles, About statements and headlines, but not in others\'.');
+            sc.note('•  Job Title Keywords can be combined with the Job Functions and/or Seniority Levels filters to narrow the results further.');
+            sc.note('•  Search Query is not typically used. It casts an even broader net than the title keyword search.');
+            sc.note('•  Max Contacts per Organization caps how many people are pulled from each organization; the Location Filter (if any) limits results to those places.');
+
+            const ruleRows = (criteria, prefix) => {
+                const c = criteria || {};
+                const p = prefix || '';
+                sc.kv(`${p}Job Functions`, namesOf(c.function_ids, jobFnLabels).join(', ') || 'All job functions (no filter)', 'Can be combined with Job Title Keywords.');
+                sc.kv(`${p}Seniority Levels`, namesOf(c.seniority_level_ids, seniorityLabels).join(', ') || 'All seniority levels (no filter)', 'Can be combined with Job Title Keywords.');
+                sc.kv(`${p}Job Title Keywords`, (c.job_titles || []).length ? c.job_titles.map(t => `•  ${t}`).join('\n') : 'None',
+                    'Matched against title, About statement and headline — the fewest words that find the right people.');
+                sc.kv(`${p}Search Query`, c.search_query || 'Not used', 'Not typically used — broader than the title keyword search.');
+                sc.kv(`${p}Location Filter`, (c.locations || []).join(', ') || 'Any location', '');
+                sc.kv(`${p}Max Contacts per Organization`, c.max_employees != null ? String(c.max_employees) : '', '');
+            };
+            const fallbackRows = (second, prefix) => {
+                const p = prefix || '';
+                if (!second) { sc.kv(`${p}Fallback (Second) Scan`, 'Not enabled', ''); return; }
+                sc.kv(`${p}Fallback (Second) Scan`, `Enabled — runs when the first scan saves fewer than ${second.threshold || 5} contacts`, 'Uses its own rules, listed below.');
+                ruleRows(second.criteria, `${p}Fallback — `);
+            };
+
+            scanConfigs.forEach(cfg => {
+                sc.gap();
+                const when = cfg.updatedAt ? fmtDate(cfg.updatedAt) : '';
+                sc.section(`Scan: ${cfg.name}${when ? `   ·   last used ${when}` : ''}`);
+                const ot = orgTypesActive(cfg.orgTypeMode) ? cfg.orgTypeMode : null;
+                sc.kv('Organization Classification',
+                    ot ? `Enabled — organizations are classified into ${ot.types.length} type(s), each with its own scan rules`
+                       : 'Not used — one set of scan rules applies to every organization',
+                    ot ? 'See the type definitions and per-type rules below.' : '');
+                if (ot) {
+                    sc.gap();
+                    sc.subhead('Organization Type Classification');
+                    sc.note('Before scanning, an AI agent looked at each organization (name, industry, state, description and LinkedIn URL — whatever was on file) and assigned it to one of the types below. Each type has its own complete set of employee contact scan rules (including its own fallback scan), so different kinds of organizations can be scanned very differently. Organizations that did not confidently match any type used the Default Rules.');
+                    sc.header(['Organization Type', 'How the AI recognizes it', '']);
+                    ot.types.forEach(t => sc.kv(t.name, t.description || '', ''));
+                    ot.types.forEach(t => {
+                        sc.gap();
+                        sc.subhead(`Scan rules for type: ${t.name}`);
+                        ruleRows(t.criteria);
+                        fallbackRows(t.secondScan);
+                    });
+                    sc.gap();
+                    sc.subhead('Default Rules — used for organizations that did not match any type');
+                } else {
+                    sc.gap();
+                    sc.subhead('Scan Rules');
+                }
+                ruleRows(cfg.criteria);
+                fallbackRows(cfg.secondScan);
+            });
+            const wsScan = sc.finish();
+            return { wsHyp, wsScan };
+        }
+
+        function fpBuildOrgReportWorkbook({ rows, contacts, meta, detail }) {
             // ── Palette & style helpers ──
             const C = { navy: '0F2340', navyMid: '1E3A5F', blue: '1D4ED8', hdrBg: '1E3A5F', hdrFg: 'FFFFFF',
                         altRow: 'F8FAFC', white: 'FFFFFF', border: 'D1D5DB', text: '111827', muted: '6B7280', link: '1D4ED8' };
@@ -4398,8 +4607,15 @@
                 rowHeights: heights.map(h => ({ hpt: h }))
             });
 
+            const { wsHyp, wsScan } = fpBuildDetailSheets(
+                { C, S, cell, ST, titleBlock, toSheet },
+                { ...detail, heading, subtitle }
+            );
+
             const wb = XLSX.utils.book_new();
             XLSX.utils.book_append_sheet(wb, wsSum, 'Summary');
+            XLSX.utils.book_append_sheet(wb, wsHyp, 'Hypothesis Group');
+            XLSX.utils.book_append_sheet(wb, wsScan, 'Scan Configuration');
             XLSX.utils.book_append_sheet(wb, wsOrg, 'Organizations');
             XLSX.utils.book_append_sheet(wb, wsCon, 'Contacts');
             return wb;
@@ -4423,8 +4639,28 @@
                 const { contacts, warnings, outOfScope } = await fpLoadContactReportData(groupId, rows, setStatus);
                 setStatus('<i class="fas fa-spinner fa-spin"></i> Formatting Excel workbook…');
                 const now = new Date();
+
+                // Fresh copy of the hypothesis group (the cached one may predate recent edits).
+                let groupDoc = group;
+                try {
+                    const gSnap = await getDoc(doc(db, 'hypothesis_groups', groupId));
+                    const gExists = typeof gSnap.exists === 'function' ? gSnap.exists() : !!gSnap.exists;
+                    if (gExists) groupDoc = { id: groupId, ...gSnap.data() };
+                } catch (e) { console.warn('Org report: using cached hypothesis group —', e); }
+
+                const optionLabels = selId => new Map([...document.querySelectorAll(`#${selId} option`)].map(o => [o.value, o.textContent.trim()]));
+                const bdrNames = new Map();
+                fpBdrs.forEach(b => [b.primaryEmail, b.email].filter(Boolean).forEach(e => bdrNames.set(String(e).toLowerCase(), b.name || e)));
+
                 const wb = fpBuildOrgReportWorkbook({
                     rows, contacts,
+                    detail: {
+                        group: groupDoc,
+                        scanConfigs: fpCollectScanConfigs(groupDoc, scanName),
+                        jobFnLabels: optionLabels('fpScanFunctions'),
+                        seniorityLabels: optionLabels('fpScanSeniority'),
+                        bdrNames
+                    },
                     meta: {
                         customer, groupName: group.name || groupId, scanName, warnings,
                         dateLabel: now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
