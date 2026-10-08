@@ -17,7 +17,7 @@
     <script src="../js/auth.js?v=2.1"></script>
     <script src="../js/folder-protection.js?v=2.1"></script>
     <!-- CLEmail Secure API Wrapper -->
-    <script src="../js/clemail-firestore-wrapper.js"></script>
+    <script src="../js/clemail-firestore-wrapper.js?v=select1"></script>
     <!-- Shared AI Model Catalog (ai_models_admin.html) -->
     <script src="../js/ai-model-catalog.js"></script>
     <script src="variation-performance.js?v=1"></script>
@@ -15522,10 +15522,39 @@
         // "Failed to fetch" (or a 502/503/504) for a few seconds while the process comes back
         // up. Retrying a couple of times with a short delay lets a run ride through that
         // instead of silently losing whichever message's Opus/Final AI Review was in flight.
+        // ── Heavy-API routing ───────────────────────────────────────────────────
+        // Slow/AI-heavy endpoints (Harvest openers, message variations, harvest-pool
+        // eligible-contacts, Full AI) run on a SEPARATE Railway service ("heavy-api",
+        // same code, same database, SERVICE_ROLE=web) so a long-running request can't
+        // block the main API that serves dashboards / CRM / review pages.
+        // heavyFetch() takes the normal main-API URL and swaps in the heavy-API origin.
+        // Safety net: if the heavy service is unreachable (fails within 5s — e.g. down
+        // or mid-deploy), it transparently retries on the main API and keeps using the
+        // main API for 5 minutes. Failures after 5s are NOT retried (avoids duplicating
+        // work that may already be running on the server).
+        const MAIN_API_ORIGIN  = 'https://railwayclemail-production.up.railway.app';
+        const HEAVY_API_ORIGIN = 'https://heavy-api-production.up.railway.app';
+        let _heavyApiBadUntil = 0;
+        async function heavyFetch(url, options) {
+            if (typeof url !== 'string' || !url.startsWith(MAIN_API_ORIGIN) || Date.now() < _heavyApiBadUntil) {
+                return fetch(url, options);
+            }
+            const started = Date.now();
+            try {
+                return await fetch(HEAVY_API_ORIGIN + url.slice(MAIN_API_ORIGIN.length), options);
+            } catch (err) {
+                if (err && err.name === 'AbortError') throw err;
+                if (Date.now() - started > 5000) throw err;
+                _heavyApiBadUntil = Date.now() + 5 * 60 * 1000;
+                console.warn('[heavy-api] unreachable — falling back to main API for 5 min:', err && err.message);
+                return fetch(url, options);
+            }
+        }
+
         async function fetchWithRetry(url, options, { retries = 2, delayMs = 4000, addLog, label = 'request' } = {}) {
             for (let attempt = 0; attempt <= retries; attempt++) {
                 try {
-                    const res = await fetch(url, options);
+                    const res = await heavyFetch(url, options);
                     if (!res.ok && [502, 503, 504].includes(res.status) && attempt < retries) {
                         addLog?.(`   ⏳ ${label} got HTTP ${res.status} (Railway may be restarting) — retrying in ${Math.round(delayMs / 1000)}s...`, 'warning');
                         await new Promise(r => setTimeout(r, delayMs));
@@ -18828,7 +18857,7 @@
                         let singleRes;
                         for (let _attempt = 1; _attempt <= 2; _attempt++) {
                             try {
-                                singleRes = await fetch('https://railwayclemail-production.up.railway.app/api/connect/full-ai-generate-single', {
+                                singleRes = await heavyFetch('https://railwayclemail-production.up.railway.app/api/connect/full-ai-generate-single', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
                                     body: _singleBody
@@ -19552,7 +19581,7 @@
             if (poolId) qs.set('poolId', poolId);
             if (onlyOurConnections) qs.set('onlyOurConnections', 'true');
             const url = `${HARVEST_RAILWAY_API}/api/connect/harvest-pool/eligible-contacts/${encodeURIComponent(bdrEmail)}?${qs}`;
-            const r = await fetch(url, { headers: h });
+            const r = await heavyFetch(url, { headers: h });
             const j = await r.json();
             if (!j.success) throw new Error(j.error || 'Failed to load harvest pool contacts');
             return j;
@@ -22814,8 +22843,12 @@
             };
 
             for (const email of emailsToCheck) {
-                try { addFromSnap(await gd(q(col(db, 'connect_queue'), wh('account_email',  '==', email)), { timeoutMs: 180000 })); } catch (_) {}
-                try { addFromSnap(await gd(q(col(db, 'connect_queue'), wh('bdr_auth_email', '==', email)), { timeoutMs: 180000 })); } catch (_) {}
+                // Only these fields are read below, so request just them (big server-load saver;
+                // falls back to full docs if select isn't supported by the loaded wrapper).
+                const sel = qr => (qr && typeof qr.select === 'function')
+                    ? qr.select('deleted', 'prospect_li_url', 'contact_linkedin_url', 'linkedin_url') : qr;
+                try { addFromSnap(await gd(sel(q(col(db, 'connect_queue'), wh('account_email',  '==', email))), { timeoutMs: 180000 })); } catch (_) {}
+                try { addFromSnap(await gd(sel(q(col(db, 'connect_queue'), wh('bdr_auth_email', '==', email))), { timeoutMs: 180000 })); } catch (_) {}
             }
             return contactedUrls;
         }
@@ -23219,7 +23252,7 @@
                     company:   c.company   || ''
                 }));
 
-                const resp = await fetch('https://railwayclemail-production.up.railway.app/api/connect/diversify-messages', {
+                const resp = await heavyFetch('https://railwayclemail-production.up.railway.app/api/connect/diversify-messages', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -23260,7 +23293,7 @@
 
                             for (let attempt = 1; attempt <= 5; attempt++) {
                                 try {
-                                    const retryResp = await fetch('https://railwayclemail-production.up.railway.app/api/connect/diversify-messages', {
+                                    const retryResp = await heavyFetch('https://railwayclemail-production.up.railway.app/api/connect/diversify-messages', {
                                         method: 'POST',
                                         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
                                         body: JSON.stringify({
@@ -24288,18 +24321,63 @@
         let hfpConversationsCache = { bdrEmail: null, map: null };
 
         /**
+         * Server-load reducer: asks Railway to return ONLY the listed fields for each
+         * document (Firestore field projection) instead of full documents. HFP queries
+         * pull a BDR's entire history from big collections (heyreach_inbox,
+         * heyreach_activity, connect_queue, heyreach_contacts) just to read a few
+         * fields, so full documents made each request tens of MB. Safe fallback: if
+         * the loaded wrapper/server doesn't support select, the original full query runs.
+         */
+        function hfpSelect(queryRef, fields) {
+            return (queryRef && typeof queryRef.select === 'function') ? queryRef.select(...fields) : queryRef;
+        }
+        const HFP_INBOX_FIELDS    = ['leadProfileUrl', 'rawData.correspondentProfile.profileUrl', 'conversationId', 'linkedInAccountId', 'customerId'];
+        const HFP_ACTIVITY_CONV_FIELDS = ['leadProfileUrl', 'conversationId', 'linkedInAccountId', 'customerId'];
+        const HFP_CONTACT_FIELDS  = ['linkedin_url', 'profileUrl', 'leadProfileUrl', 'linkedInUrl',
+            'firstName', 'first_name', 'leadFirstName', 'lastName', 'last_name', 'leadLastName',
+            'title', 'position', 'occupation', 'headline', 'leadTitle',
+            'company', 'companyName', 'currentCompany', 'leadCompanyName',
+            'conversationId', 'linkedInAccountId', 'customerId'];
+        const HFP_QUEUE_URL_FIELDS = ['deleted', 'connection_only', 'created_at', 'generated_at', 'uploaded_date',
+            'pushed_to_heyreach', 'reviewStatus', 'rejected',
+            'prospect_li_url', 'contact_linkedin_url', 'linkedin_url'];
+        const HFP_SENT_ACTIVITY_FIELDS = ['accountEmail', 'bdrEmail', 'timestamp', 'leadProfileUrl', 'linkedin_url'];
+        const HFP_THREAD_QUEUE_FIELDS  = ['status', 'createdAt', 'scheduledTime', 'recipientLinkedInUrl'];
+
+        /**
          * Builds a Map of normalized LinkedIn URL → { conversationId, linkedInAccountId,
          * customerId } for every existing conversation this BDR has. Same two sources
          * as Current Connections Fast Outreach: heyreach_inbox (canonical synced
          * conversations) first, then heyreach_activity webhooks to fill gaps.
          */
+        /**
+         * Every email spelling to try when matching a BDR in HeyReach-synced collections
+         * (heyreach_contacts / heyreach_inbox / heyreach_activity). Firestore '==' is
+         * case-sensitive, and bdr_leaders can hold a mixed-case address (e.g.
+         * "derek.Moore@keybenefit.com") while HeyReach stores the account email in a
+         * different case — or the linkedin_email_associations authEmail is cased
+         * differently so the exact-case map lookup misses. So: look the LinkedIn email
+         * up case-insensitively and query original-case + lowercase of both emails.
+         */
+        function hfpEmailVariants(bdrEmail) {
+            const lower = (bdrEmail || '').toLowerCase();
+            let linkedInEmail = linkedInEmailMap.get(bdrEmail) || null;
+            if (!linkedInEmail) {
+                for (const [authEmail, liEmail] of linkedInEmailMap) {
+                    if ((authEmail || '').toLowerCase() === lower) { linkedInEmail = liEmail; break; }
+                }
+            }
+            const variants = [bdrEmail, lower];
+            if (linkedInEmail) variants.push(linkedInEmail, linkedInEmail.toLowerCase());
+            return [...new Set(variants.filter(Boolean))];
+        }
+
         async function hfpFetchConversationsMap(bdrEmail) {
             if (hfpConversationsCache.bdrEmail === bdrEmail && hfpConversationsCache.map) {
                 return hfpConversationsCache.map;
             }
             await ensureLinkedInEmailMapLoaded();
-            const linkedInEmail = linkedInEmailMap.get(bdrEmail) || null;
-            const emailsToCheck = [...new Set([bdrEmail, linkedInEmail].filter(Boolean))];
+            const emailsToCheck = hfpEmailVariants(bdrEmail);
             const map = new Map();
             const { collection: col, query: q, where: wh, getDocs: gd } = window.clemailFirestore;
 
@@ -24307,7 +24385,7 @@
             for (const email of emailsToCheck) {
                 for (const field of ['accountEmail', 'bdrEmail', 'linkedInAccountEmail']) {
                     try {
-                        const snap = await gd(q(col(db, 'heyreach_inbox'), wh(field, '==', email)), { timeoutMs: 90000 });
+                        const snap = await gd(hfpSelect(q(col(db, 'heyreach_inbox'), wh(field, '==', email)), HFP_INBOX_FIELDS), { timeoutMs: 90000 });
                         snap.forEach(d => {
                             const data = d.data();
                             const correspondent = data.rawData?.correspondentProfile || {};
@@ -24328,7 +24406,7 @@
             // Source 2: heyreach_activity webhooks — conversations not yet synced to inbox
             for (const email of emailsToCheck) {
                 try {
-                    const snap = await gd(q(col(db, 'heyreach_activity'), wh('bdrEmail', '==', email)), { timeoutMs: 90000 });
+                    const snap = await gd(hfpSelect(q(col(db, 'heyreach_activity'), wh('bdrEmail', '==', email)), HFP_ACTIVITY_CONV_FIELDS), { timeoutMs: 90000 });
                     snap.forEach(d => {
                         const data = d.data();
                         const norm = fpmNormalizeUrl(data.leadProfileUrl || '');
@@ -24391,11 +24469,11 @@
             const { collection: col, query: q, where: wh, getDocs: gd } = window.clemailFirestore;
             for (const email of emailsToCheck) {
                 try {
-                    const snap = await gd(q(
+                    const snap = await gd(hfpSelect(q(
                         col(db, 'linkedin_message_queue'),
                         wh('bdrEmail', '==', email),
                         wh('status', '==', 'pending')
-                    ), { timeoutMs: 60000 });
+                    ), ['recipientLinkedInUrl']), { timeoutMs: 60000 });
                     snap.forEach(d => {
                         const norm = fpmNormalizeUrl(d.data().recipientLinkedInUrl || '');
                         if (norm) urls.add(norm);
@@ -24428,12 +24506,12 @@
                 let existingCount = 0;
                 const occupied = new Set();
                 try {
-                    const snap = await gd(q(
+                    const snap = await gd(hfpSelect(q(
                         col(db, 'linkedin_message_queue'),
                         wh('bdrEmail', '==', bdrEmail),
                         wh('scheduledTime', '>=', Timestamp.fromDate(startOfDay)),
                         wh('scheduledTime', '<=', Timestamp.fromDate(endOfDay))
-                    ), { timeoutMs: 60000 });
+                    ), ['scheduledTime']), { timeoutMs: 60000 });
                     snap.forEach(d => {
                         existingCount++;
                         const raw = d.data().scheduledTime;
@@ -24530,15 +24608,15 @@
          */
         async function hfpFetchConnectionsMap(bdrEmail) {
             await ensureLinkedInEmailMapLoaded();
-            const linkedInEmail = linkedInEmailMap.get(bdrEmail) || null;
-            const emailsToCheck = [...new Set([bdrEmail, linkedInEmail].filter(Boolean))];
+            const emailsToCheck = hfpEmailVariants(bdrEmail);
             const map = new Map();
             const { collection: col, query: q, where: wh, getDocs: gd } = window.clemailFirestore;
+            console.log(`[HFP] Looking up connections for ${bdrEmail} using email variants:`, emailsToCheck);
 
             for (const email of emailsToCheck) {
                 for (const field of ['accountEmail', 'bdrEmail', 'linkedInAccountEmail']) {
                     try {
-                        const snap = await gd(q(col(db, 'heyreach_contacts'), wh(field, '==', email)), { timeoutMs: 60000 });
+                        const snap = await gd(hfpSelect(q(col(db, 'heyreach_contacts'), wh(field, '==', email)), HFP_CONTACT_FIELDS), { timeoutMs: 60000 });
                         if (!snap.empty) {
                             snap.forEach(d => {
                                 const data = d.data();
@@ -24560,9 +24638,10 @@
                                 });
                             });
                         }
-                    } catch (_) { /* field may not be indexed */ }
+                    } catch (e) { console.warn(`[HFP] heyreach_contacts ${field}=${email} lookup failed:`, e?.message || e); }
                 }
             }
+            console.log(`[HFP] Connections map for ${bdrEmail}: ${map.size} connection(s) found`);
             return map;
         }
 
@@ -24615,11 +24694,11 @@
             // Source 1: heyreach_activity — real MESSAGE_SENT / INMAIL_SENT events
             for (const eventType of ['MESSAGE_SENT', 'INMAIL_SENT']) {
                 try {
-                    const snap = await gd(q(
+                    const snap = await gd(hfpSelect(q(
                         col(db, 'heyreach_activity'),
                         wh('eventType', '==', eventType),
                         wh('timestamp', '>=', Timestamp.fromDate(new Date(cutoffMs)))
-                    ), { timeoutMs: 120000 });
+                    ), HFP_SENT_ACTIVITY_FIELDS), { timeoutMs: 120000 });
                     snap.forEach(d => {
                         const data = d.data();
                         const owner = String(data.accountEmail || data.bdrEmail || '').toLowerCase();
@@ -24638,7 +24717,7 @@
             for (const email of emailsToCheck) {
                 for (const field of ['account_email', 'bdr_auth_email']) {
                     try {
-                        const snap = await gd(q(col(db, 'connect_queue'), wh(field, '==', email)), { timeoutMs: 180000 });
+                        const snap = await gd(hfpSelect(q(col(db, 'connect_queue'), wh(field, '==', email)), HFP_QUEUE_URL_FIELDS), { timeoutMs: 180000 });
                         snap.forEach(d => {
                             if (seenQueueDocs.has(d.id)) return;
                             seenQueueDocs.add(d.id);
@@ -24662,7 +24741,7 @@
             // Source 3: linkedin_message_queue — scheduled / sent conversation-thread messages
             for (const email of emailsToCheck) {
                 try {
-                    const snap = await gd(q(col(db, 'linkedin_message_queue'), wh('bdrEmail', '==', email)), { timeoutMs: 120000 });
+                    const snap = await gd(hfpSelect(q(col(db, 'linkedin_message_queue'), wh('bdrEmail', '==', email)), HFP_THREAD_QUEUE_FIELDS), { timeoutMs: 120000 });
                     snap.forEach(d => {
                         const data = d.data();
                         const status = String(data.status || '').toLowerCase();
@@ -24825,6 +24904,21 @@
             try {
                 const connectionsMap = await hfpFetchConnectionsMap(bdrEmail);
                 if (progressBar) progressBar.style.width = '55%';
+
+                // An empty map means we found NO synced connections for this BDR at all —
+                // that's a lookup/sync problem, not proof that every URL is a non-connection.
+                if (connectionsMap.size === 0) {
+                    if (reportEl) reportEl.style.display = 'none';
+                    if (progressLbl) progressLbl.textContent = 'No synced connections found for this BDR';
+                    hfpShowAlert(
+                        `No synced LinkedIn connections were found for ${escHtml(bdrEmail)} in heyreach_contacts, ` +
+                        `so the ${requestedUrls.length} URL(s) could not be checked. This usually means the BDR's email ` +
+                        `doesn't match the HeyReach account email (check linkedin_email_associations) or their network ` +
+                        `hasn't been synced yet. See the browser console ([HFP] lines) for the emails tried.`,
+                        'danger'
+                    );
+                    return;
+                }
 
                 const matched = [];
                 const notConnected = [];
@@ -25043,7 +25137,7 @@
                     title:     c.title     || '',
                     company:   c.company   || ''
                 }));
-                const resp = await fetch('https://railwayclemail-production.up.railway.app/api/connect/diversify-messages', {
+                const resp = await heavyFetch('https://railwayclemail-production.up.railway.app/api/connect/diversify-messages', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
                     body: JSON.stringify({
@@ -25083,7 +25177,7 @@
         async function hfpGetOpenerForContact(contact, bdrEmail, messageStyle) {
             try {
                 const token = await auth.currentUser.getIdToken();
-                const resp = await fetch(`${HARVEST_RAILWAY_API}/api/connect/generate-harvest-opener-single`, {
+                const resp = await heavyFetch(`${HARVEST_RAILWAY_API}/api/connect/generate-harvest-opener-single`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
                     body: JSON.stringify({
