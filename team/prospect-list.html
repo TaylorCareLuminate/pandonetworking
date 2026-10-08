@@ -532,7 +532,7 @@
         <div class="page-header">
             <div>
                 <h1><i class="fas fa-users"></i> Prospect List</h1>
-                <p>View and manage contacts from your campaigns</p>
+                <p>Choose a campaign, then search its contacts</p>
             </div>
             <a href="index.html" class="btn btn-secondary">
                 <i class="fas fa-arrow-left"></i> Back to Dashboard
@@ -558,8 +558,8 @@
             <div class="filters-grid">
                 <div class="form-group">
                     <label class="form-label">Campaign</label>
-                    <select id="campaignFilter" class="form-select" onchange="applyFilters()">
-                        <option value="all">All Campaigns</option>
+                    <select id="campaignFilter" class="form-select" onchange="loadProspects()">
+                        <option value="">Select a campaign</option>
                     </select>
                 </div>
 
@@ -697,9 +697,8 @@
             const hasAccess = await window.protectFolder('team');
             if (!hasAccess) return;
             
-            // Load campaigns and prospects
             await loadCampaigns();
-            await loadProspects();
+            renderCampaignPrompt();
         }
 
         // Load campaigns
@@ -709,7 +708,7 @@
                 
                 campaignsMap.clear();
                 const campaignFilter = document.getElementById('campaignFilter');
-                campaignFilter.innerHTML = '<option value="all">All Campaigns</option>';
+                campaignFilter.innerHTML = '<option value="">Select a campaign</option>';
                 
                 campaignsSnapshot.docs.forEach((doc) => {
                     const campaign = doc.data();
@@ -727,27 +726,76 @@
             }
         }
 
-        // Load prospects from outreach_sets
+        let prospectLoadId = 0;
+        const campaignQueryOptions = { pageSize: 500, timeoutMs: 45000, maxRetries: 1 };
+
+        function renderCampaignPrompt() {
+            allProspects = [];
+            filteredProspects = [];
+            document.getElementById('prospectsList').innerHTML = `
+                <div class="empty-state">
+                    <i class="fas fa-bullhorn"></i>
+                    <h3>Select a Campaign</h3>
+                    <p>Prospects load one campaign at a time so the page does not download every contact at once.</p>
+                </div>
+            `;
+            document.getElementById('pagination').style.display = 'none';
+            updateStats();
+        }
+
+        // Load prospects for the selected campaign only.
         window.loadProspects = async function() {
+            const campaignId = document.getElementById('campaignFilter').value;
             const container = document.getElementById('prospectsList');
+            if (!campaignId) {
+                renderCampaignPrompt();
+                return;
+            }
+
+            const loadId = ++prospectLoadId;
+            const campaignName = campaignsMap.get(campaignId) || 'this campaign';
             container.innerHTML = `
                 <div class="loading">
                     <i class="fas fa-spinner fa-spin"></i>
-                    <p>Loading prospects...</p>
+                    <p>Loading ${escapeHtml(campaignName)}...</p>
                 </div>
             `;
 
             try {
-                console.log('📋 Loading outreach sets...');
-                
-                // Load contacts, call history, and campaign-scoped organization blocks together.
-                const [outreachSnapshot, callsSnapshot, blockSnapshot] = await Promise.all([
-                    getDocs(collection(db, 'outreach_sets')),
-                    getDocs(collection(db, 'campaign_call_tracking')),
-                    getDocs(collection(db, 'campaign_call_organization_blocks'))
-                ]);
+                console.log(`📋 Loading prospects for campaign ${campaignId}...`);
+                const outreachQuery = query(
+                    collection(db, 'outreach_sets'),
+                    where('campaignId', '==', campaignId)
+                );
+                const outreachSnapshot = await getDocs(outreachQuery, campaignQueryOptions);
+                if (loadId !== prospectLoadId) return;
 
-                campaignOrganizationBlocks = blockSnapshot.docs.map(blockDoc => ({ id: blockDoc.id, ...blockDoc.data() }));
+                let callsSnapshot = { docs: [] };
+                let callHistoryWarning = '';
+                try {
+                    const callsQuery = query(
+                        collection(db, 'campaign_call_tracking'),
+                        where('campaignId', '==', campaignId)
+                    );
+                    callsSnapshot = await getDocs(callsQuery, campaignQueryOptions);
+                } catch (callError) {
+                    console.warn('⚠️ Call history did not load:', callError);
+                    callHistoryWarning = 'Contacts loaded, but call history timed out. Refresh to try that again.';
+                }
+                if (loadId !== prospectLoadId) return;
+
+                try {
+                    const blockQuery = query(
+                        collection(db, 'campaign_call_organization_blocks'),
+                        where('campaignId', '==', campaignId)
+                    );
+                    const blockSnapshot = await getDocs(blockQuery, { pageSize: 200, timeoutMs: 20000, maxRetries: 1 });
+                    campaignOrganizationBlocks = blockSnapshot.docs.map(blockDoc => ({ id: blockDoc.id, ...blockDoc.data() }));
+                } catch (blockError) {
+                    console.warn('⚠️ Organization blocks did not load:', blockError);
+                    campaignOrganizationBlocks = [];
+                }
+                if (loadId !== prospectLoadId) return;
                 
                 // Create a map of outreach sets with their call history
                 const prospectsMap = new Map();
@@ -822,10 +870,10 @@
                     return new Date(b.lastCall.timestamp) - new Date(a.lastCall.timestamp);
                 });
                 
-                console.log(`✅ Loaded ${allProspects.length} prospects`);
+                console.log(`✅ Loaded ${allProspects.length} prospects for ${campaignName}`);
                 
                 applyFilters();
-                showAlert(`Loaded ${allProspects.length} prospects successfully`, 'success');
+                showAlert(callHistoryWarning || `Loaded ${allProspects.length} prospects from ${campaignName}`, callHistoryWarning ? 'warning' : 'success');
                 
             } catch (error) {
                 console.error('❌ Error loading prospects:', error);
@@ -841,15 +889,15 @@
 
         // Apply filters
         window.applyFilters = function() {
-            const campaignFilter = document.getElementById('campaignFilter').value;
             const searchTerm = document.getElementById('searchInput').value.toLowerCase();
             const outcomeFilter = document.getElementById('outcomeFilter').value;
             const calledByFilter = document.getElementById('calledByFilter').value;
+            if (!document.getElementById('campaignFilter').value) {
+                renderCampaignPrompt();
+                return;
+            }
 
             filteredProspects = allProspects.filter(prospect => {
-                // Campaign filter
-                if (campaignFilter !== 'all' && prospect.campaignId !== campaignFilter) return false;
-                
                 // Outcome filter
                 if (outcomeFilter !== 'all') {
                     if (!prospect.lastCall || prospect.lastCall.outcome !== outcomeFilter) return false;
@@ -1057,7 +1105,6 @@
 
         // Clear filters
         window.clearFilters = function() {
-            document.getElementById('campaignFilter').value = 'all';
             document.getElementById('searchInput').value = '';
             document.getElementById('outcomeFilter').value = 'all';
             document.getElementById('calledByFilter').value = 'all';
