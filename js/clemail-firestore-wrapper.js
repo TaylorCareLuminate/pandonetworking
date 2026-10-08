@@ -505,6 +505,17 @@ class Query {
     const newConstraints = [...this._constraints, { type: 'startAfter', value: doc.id }];
     return new Query(this._collectionName, newConstraints);
   }
+
+  // Optional field projection: only these fields (nested paths like
+  // "customFields.phone" are allowed) are returned for each document. Use on
+  // list pages that render just a few fields of a fat collection. Requires the
+  // Railway backend's `select` support; an older backend simply ignores it and
+  // returns full documents, so results stay correct either way.
+  select(...fields) {
+    const flat = fields.flat().filter(Boolean);
+    const newConstraints = [...this._constraints.filter(c => c.type !== 'select'), { type: 'select', fields: flat }];
+    return new Query(this._collectionName, newConstraints);
+  }
   
   async get(options = {}) {
     // No explicit limit() → fetch via cursor pagination (getAllDocs) instead of
@@ -551,7 +562,7 @@ class Query {
     
     const result = await apiRequest(`/query/${this._collectionName}`, {
       method: 'POST',
-      body: JSON.stringify({ where: whereFilters, orderBy, limit, startAfter }),
+      body: JSON.stringify({ where: whereFilters, orderBy, limit, startAfter, select: (this._constraints.find(c => c.type === 'select') || {}).fields }),
       ...(options.timeoutMs != null ? { timeoutMs: options.timeoutMs } : {})
     });
     
