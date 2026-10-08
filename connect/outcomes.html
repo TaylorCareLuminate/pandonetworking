@@ -3143,7 +3143,9 @@
             default: {
                 const days = parseInt(value) || 0;
                 return days > 0
-                    ? { since: new Date(Date.now() - days * 86400000), until: null, label: `Last ${days} Days` }
+                    // Align to local midnight (not a rolling now-minus-N-days cutoff), so the
+                    // oldest day isn't clipped partway through — matches HeyReach's day-based ranges.
+                    ? { since: new Date(y, mo, now.getDate() - days), until: null, label: `Last ${days} Days` }
                     : { since: null, until: null, label: 'All Time' };
             }
         }
@@ -3250,18 +3252,49 @@
             const insideSlugs = new Set(), outsideSlugs = new Set(), eligible = new Set();
             const eligibleBySlug = new Map();
             let earliest = null;
-            ctx.sentItems.forEach(item => {
-                const slug = pcItemSlug(item);
-                if (!slug) return;
+            const registerEligible = slug => {
                 eligible.add(slug);
                 const cs = slug.slice(slug.indexOf('|') + 1);
                 if (!eligibleBySlug.has(cs)) eligibleBySlug.set(cs, []);
                 if (!eligibleBySlug.get(cs).includes(slug)) eligibleBySlug.get(cs).push(slug);
+            };
+            const queuePairs = new Set();   // pairs that have a connect_queue record
+            const queueSlugs = new Set();   // contact slugs that have a connect_queue record
+            ctx.sentItems.forEach(item => {
+                const slug = pcItemSlug(item);
+                if (!slug) return;
+                queuePairs.add(slug);
+                queueSlugs.add(slug.slice(slug.indexOf('|') + 1));
+                registerEligible(slug);
                 const dates = pcItemDates(item, ctx.sentAtMap);
                 dates.forEach(d => { if (!earliest || d < earliest) earliest = d; });
                 if (dates.some(inWin)) insideSlugs.add(slug);
                 if (!dates.length || dates.some(d => !inWin(d))) outsideSlugs.add(slug);
             });
+
+            // HeyReach send events with NO matching connect_queue record (sent from a
+            // campaign/list not pushed through this tool, or a URL that doesn't match).
+            // HeyReach counts these as "Connections sent", so count them here too —
+            // otherwise the window is silently narrowed to connect_queue records only.
+            if (ctx.sentAtMap && ctx.sentAtMap.size) {
+                const bdrKeys = new Set(_emailToBdrKey.values());
+                const soleBdr = bdrKeys.size === 1 ? [...bdrKeys][0] : '*';
+                const pairSlugs = new Set();
+                ctx.sentAtMap.forEach((m, k) => { if (k.includes('|')) pairSlugs.add(k.slice(k.indexOf('|') + 1)); });
+                ctx.sentAtMap.forEach((m, k) => {
+                    let pair;
+                    if (k.includes('|')) pair = k;
+                    else if (!pairSlugs.has(k)) pair = `${soleBdr}|${k}`;   // event with no resolved BDR
+                    else return;
+                    const cs = pair.slice(pair.indexOf('|') + 1);
+                    if (queuePairs.has(pair) || queueSlugs.has(cs)) return; // already counted via connect_queue
+                    const dates = [...m.values()];
+                    registerEligible(pair);
+                    dates.forEach(d => { if (!earliest || d < earliest) earliest = d; });
+                    if (dates.some(inWin)) insideSlugs.add(pair);
+                    if (dates.some(d => !inWin(d))) outsideSlugs.add(pair);
+                });
+            }
 
             const win = {
                 accepted:  pcEventKeys(accW, eligibleBySlug),
