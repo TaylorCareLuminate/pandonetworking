@@ -733,6 +733,7 @@
         let allProspects = [];
         let filteredProspects = [];
         let campaignsMap = new Map();
+        let campaignTypesMap = new Map();
         let campaignOrganizationBlocks = [];
         let currentPage = 1;
         let prospectMode = 'find';
@@ -756,23 +757,40 @@
         // Load campaigns
         async function loadCampaigns() {
             try {
-                const campaignsSnapshot = await getDocs(collection(db, 'campaigns'));
+                const [campaignsSnapshot, phoneCampaignsSnapshot] = await Promise.all([
+                    getDocs(collection(db, 'campaigns')),
+                    getDocs(collection(db, 'phone_campaigns'))
+                ]);
                 
                 campaignsMap.clear();
+                campaignTypesMap.clear();
                 const campaignFilter = document.getElementById('campaignFilter');
                 campaignFilter.innerHTML = '<option value="">Select a campaign</option>';
                 
                 campaignsSnapshot.docs.forEach((doc) => {
                     const campaign = doc.data();
                     campaignsMap.set(doc.id, campaign.name || doc.id);
+                    campaignTypesMap.set(doc.id, 'standard');
                     
                     const option = document.createElement('option');
                     option.value = doc.id;
                     option.textContent = campaign.name || doc.id;
                     campaignFilter.appendChild(option);
                 });
+
+                phoneCampaignsSnapshot.docs.forEach((doc) => {
+                    const campaign = doc.data();
+                    const name = campaign.campaignName || campaign.name || doc.id;
+                    campaignsMap.set(doc.id, name);
+                    campaignTypesMap.set(doc.id, 'phone_only');
+
+                    const option = document.createElement('option');
+                    option.value = doc.id;
+                    option.textContent = `${name} (Phone Campaign)`;
+                    campaignFilter.appendChild(option);
+                });
                 
-                console.log(`✅ Loaded ${campaignsMap.size} campaigns`);
+                console.log(`✅ Loaded ${campaignsMap.size} campaigns (${phoneCampaignsSnapshot.docs.length} phone-only)`);
             } catch (error) {
                 console.error('❌ Error loading campaigns:', error);
             }
@@ -891,6 +909,17 @@
                 userEmail: call.userEmail || call.completedBy || '',
                 notes: call.notes || ''
             });
+        }
+
+        function phoneCampaignProspectKey(data) {
+            const phone10 = String(data?.phoneNumber || data?.contactPhone || data?.phone || '')
+                .replace(/\D/g, '')
+                .slice(-10);
+            const company = String(
+                data?.companyName || data?.contactCompany || data?.company || data?.orgName || ''
+            ).trim().toLowerCase();
+            const name = String(data?.contactName || '').trim().toLowerCase();
+            return `phone:${phone10 || 'none'}:${company || name || 'unknown'}`;
         }
 
         window.searchCallbacks = async function() {
@@ -1051,11 +1080,12 @@
 
             try {
                 console.log(`📋 Loading prospects for campaign ${campaignId}...`);
-                const outreachQuery = query(
-                    collection(db, 'outreach_sets'),
+                const isPhoneCampaign = campaignTypesMap.get(campaignId) === 'phone_only';
+                const sourceQuery = query(
+                    collection(db, isPhoneCampaign ? 'phone_activities' : 'outreach_sets'),
                     where('campaignId', '==', campaignId)
                 );
-                const outreachSnapshot = await getDocs(outreachQuery, campaignQueryOptions);
+                const outreachSnapshot = await getDocs(sourceQuery, campaignQueryOptions);
                 if (loadId !== prospectLoadId) return;
 
                 let callsSnapshot = { docs: [] };
@@ -1088,9 +1118,35 @@
                 // Create a map of outreach sets with their call history
                 const prospectsMap = new Map();
                 
-                // Process outreach sets
+                // Process contact records. Phone-only campaigns have no outreach_sets,
+                // so their phone activities are grouped into one row per caller/org.
                 outreachSnapshot.docs.forEach((doc) => {
                     const data = doc.data();
+                    if (isPhoneCampaign) {
+                        const key = phoneCampaignProspectKey(data);
+                        let prospect = prospectsMap.get(key);
+                        if (!prospect) {
+                            const contactName = data.contactName || data.orgName || data.companyName || 'Unknown';
+                            prospect = {
+                                id: `activity-${doc.id}`,
+                                firstName: '',
+                                lastName: '',
+                                fullName: contactName,
+                                email: data.contactEmail || data.email || '',
+                                phone: data.phoneNumber || data.phone || '',
+                                company: data.companyName || data.company || data.orgName || '',
+                                title: '',
+                                campaignId,
+                                calls: [],
+                                dncEntry: null,
+                                isOutreachRecord: false
+                            };
+                            prospectsMap.set(key, prospect);
+                        }
+                        if (data.outcome || data.status === 'completed') addCall(prospect, doc.id, data);
+                        return;
+                    }
+
                     const email = data.email || '';
                     const phone = data.phone || data.customFields?.phone || '';
                     const firstName = data.firstName || data.customFields?.first_name || '';
@@ -1124,13 +1180,10 @@
                     
                     if (outreachSetId && prospectsMap.has(outreachSetId)) {
                         const prospect = prospectsMap.get(outreachSetId);
-                        prospect.calls.push({
-                            id: doc.id,
-                            timestamp: call.timestamp,
-                            outcome: call.outcome,
-                            userEmail: call.userEmail,
-                            notes: call.notes || ''
-                        });
+                        addCall(prospect, doc.id, call);
+                    } else if (isPhoneCampaign) {
+                        const prospect = prospectsMap.get(phoneCampaignProspectKey(call));
+                        if (prospect) addCall(prospect, doc.id, call);
                     }
                 });
                 
@@ -1526,6 +1579,12 @@
                             where('outreachSetId', '==', prospect.id),
                             limit(40)
                         ), { timeoutMs: 20000 });
+                    } else if (phoneNumber) {
+                        activitySnapshot = await getDocs(query(
+                            collection(db, 'phone_activities'),
+                            where('phoneNumber', '==', phoneNumber),
+                            limit(40)
+                        ), { timeoutMs: 20000 });
                     }
                 } catch (activityError) {
                     console.warn('⚠️ Open call lookup failed:', activityError);
@@ -1557,7 +1616,7 @@
                     await addDoc(collection(db, 'phone_activities'), {
                         ...activityUpdate,
                         campaignId: prospect.campaignId,
-                        outreachSetId: prospect.id,
+                        ...(prospect.isOutreachRecord !== false ? { outreachSetId: prospect.id } : {}),
                         contactName: prospect.fullName,
                         contactEmail: prospect.email || '',
                         phoneNumber,
