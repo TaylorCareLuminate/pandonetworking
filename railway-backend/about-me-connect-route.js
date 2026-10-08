@@ -407,10 +407,10 @@ ${prospectSpecific}
 
 PRIMARY COMMONALITY TO BUILD ON:
 ${bestCommonality}
-${secondCommonality && rankingResult?.secondScore >= 4 ? `\nSECONDARY COMMONALITY (include if it fits naturally under 200 chars):\n${secondCommonality}` : ''}
+${secondCommonality && rankingResult?.secondScore >= 4 ? `\nSECONDARY COMMONALITY (include if it fits naturally under 275 chars):\n${secondCommonality}` : ''}
 
 RULES:
-- The ENTIRE message must be under 200 characters total
+- The ENTIRE message must be under 275 characters total
 - Be specific — use real details from the profiles, not generic phrases
 - Do NOT mention selling or business value
 - Do NOT say "I'd love to connect" (use the specified closing instead)
@@ -420,7 +420,7 @@ RULES:
 
 Return JSON:
 {
-  "message": "the complete message under 200 chars",
+  "message": "the complete message under 275 chars",
   "prospectReference": "what specific thing you referenced about the prospect",
   "bdrReference": "what personal thing you shared about the BDR",
   "includedSecondary": true or false

@@ -539,7 +539,7 @@ POST (${dateQualifier}): "${(post.text || '').substring(0, 400)}"
 ${strategy.companyValueProposition ? `\nOUR CONTEXT (use subtly if helpful): ${strategy.companyValueProposition.substring(0, 150)}` : ''}
 
 RULES:
-1. The ENTIRE message must be under 200 characters.
+1. The ENTIRE message must be under 275 characters.
 2. Reference the post naturally and specifically — don't just say "I saw your recent post".
 3. Warm, peer-to-peer tone. No pitch, no demo, no calendar asks.
 4. Do NOT use em dashes or en dashes.
@@ -551,10 +551,10 @@ Return ONLY a valid JSON object:
     try {
         const result = await callLlama(prompt, 'post_reply_message');
         if (result && typeof result.message === 'string') {
-            return sanitizeMessageDashes(result.message).substring(0, 200);
+            return sanitizeMessageDashes(result.message).substring(0, 275);
         }
         // Fallback: try parsing a raw string response
-        if (typeof result === 'string') return sanitizeMessageDashes(result).substring(0, 200);
+        if (typeof result === 'string') return sanitizeMessageDashes(result).substring(0, 275);
         return null;
         } catch (err) {
         console.error('[Full AI] Post reply message generation error:', err.message);
@@ -759,7 +759,7 @@ ${newsContext}
 ${strategy.companyValueProposition ? `OUR CONTEXT (use subtly if it fits): ${strategy.companyValueProposition.substring(0, 150)}` : ''}
 
 RULES:
-1. The ENTIRE message must be under 200 characters.
+1. The ENTIRE message must be under 275 characters.
 2. Lead with something specific from the news — don't use generic phrases like "I've been following your work".
 3. Warm, peer tone. No sales pitch, no demo, no calendar asks.
 4. Do NOT use em dashes or en dashes.
@@ -771,9 +771,9 @@ Return ONLY a valid JSON object:
     try {
         const result = await callLlama(prompt, 'internet_search_message');
         if (result && typeof result.message === 'string') {
-            return sanitizeMessageDashes(result.message).substring(0, 200);
+            return sanitizeMessageDashes(result.message).substring(0, 275);
         }
-        if (typeof result === 'string') return sanitizeMessageDashes(result).substring(0, 200);
+        if (typeof result === 'string') return sanitizeMessageDashes(result).substring(0, 275);
         return null;
     } catch (err) {
         console.error('[Full AI] Internet search message generation error:', err.message);
@@ -935,7 +935,7 @@ ${bestCommonality}
 ${secondCommonality ? `\nSECONDARY COMMONALITY (include as "Plus we both …" if it fits naturally):\n${secondCommonality}` : ''}
 
 RULES:
-- ENTIRE message must be under 200 characters
+- ENTIRE message must be under 275 characters
 - Specific — use real details, not generic phrases
 - Do NOT mention selling, business value, or job titles in a salesy way
 - Natural, warm, human tone
@@ -957,7 +957,7 @@ Return JSON: {"message": "...", "prospectReference": "...", "bdrReference": "...
     }
 
     addJobLog(job, `   → AMC: message generated (${generatedMessage.length} chars)`, 'info');
-    return { message: generatedMessage.substring(0, 200) };
+    return { message: generatedMessage.substring(0, 275) };
 }
 
 // ── About Me Connect endpoint (kept for the standalone About Me Connect tab) ───
@@ -1093,7 +1093,7 @@ ${bestCommonality}
 ${secondCommonality ? `\nSECONDARY COMMONALITY (include as "Plus we both …" if it fits naturally):\n${secondCommonality}` : ''}
 
 RULES:
-- ENTIRE message must be under 200 characters
+- ENTIRE message must be under 275 characters
 - Specific — use real details, not generic phrases
 - Do NOT mention selling, business value, or job titles in a salesy way
 - Natural, warm, human tone

@@ -1602,7 +1602,7 @@ RULES:
 - Do not ask a question
 - Only add it if it's genuinely relevant to the POST CONTENT (don't force it)
 - Integrate it naturally into the message flow
-- Keep the message concise (under 200 characters if possible)
+- Keep the message concise (under 275 characters if possible)
 - The focus should remain on THEIR post, not on you
 
 THEIR POST (for context):
@@ -2010,7 +2010,7 @@ Return ONLY the final message text. No quotes, no explanations.")
                 }
                 
                 # Process invitations in batch (only for messages under 180 chars)
-                needs_invite <- li_data_prospects$invite_strategy %in% c("soft", "strong") & nchar(li_data_prospects$message_with_i_statement) < 180
+                needs_invite <- li_data_prospects$invite_strategy %in% c("soft", "strong") & nchar(li_data_prospects$message_with_i_statement) < 255
                 
                 if (any(needs_invite)) {
                   needs_invite_df <- li_data_prospects[needs_invite, ]
@@ -2024,38 +2024,38 @@ MESSAGE:
                   li_data_prospects$final_message[needs_invite] <- needs_invite_df$final_message
                 }
                 
-                # STEP 4: AI-based shortening for messages over 200 characters
-                over_limit <- nchar(li_data_prospects$final_message) > 200
+                # STEP 4: AI-based shortening for messages over 275 characters
+                over_limit <- nchar(li_data_prospects$final_message) > 275
                 if (any(over_limit, na.rm = TRUE)) {
-                  cat(sprintf("  %d prospect message(s) over 200 characters — shortening with AI...\n",
+                  cat(sprintf("  %d prospect message(s) over 275 characters — shortening with AI...\n",
                               sum(over_limit, na.rm = TRUE)))
                   needs_shortening <- li_data_prospects[over_limit, ]
                   needs_shortening$final_message <- openrouter_batch(
                     needs_shortening,
-                    "This LinkedIn connection message is too long for LinkedIn's 200-character limit. Rewrite it to be under 200 characters while keeping it natural, complete, and effective. Do not cut it off mid-sentence — write a complete, coherent message. Do not add new content. Keep the same tone and core idea.
+                    "This LinkedIn connection message is too long for LinkedIn's 275-character limit. Rewrite it to be under 275 characters while keeping it natural, complete, and effective. Do not cut it off mid-sentence — write a complete, coherent message. Do not add new content. Keep the same tone and core idea.
 
 ORIGINAL MESSAGE:
 [final_message]
 
-Return ONLY the shortened message (under 200 characters). No quotes, no explanations."
+Return ONLY the shortened message (under 275 characters). No quotes, no explanations."
                   )
                   li_data_prospects$final_message[over_limit] <- needs_shortening$final_message
                   
-                  # Safety fallback: if AI still returned >200 chars, truncate at last space before 197
-                  still_over <- nchar(li_data_prospects$final_message) > 200
+                  # Safety fallback: if AI still returned >275 chars, truncate at last space before 272
+                  still_over <- nchar(li_data_prospects$final_message) > 275
                   if (any(still_over, na.rm = TRUE)) {
-                    cat(sprintf("  Warning: %d message(s) still over 200 chars after AI shortening — applying word-boundary trim\n",
+                    cat(sprintf("  Warning: %d message(s) still over 275 chars after AI shortening — applying word-boundary trim\n",
                                 sum(still_over, na.rm = TRUE)))
                     for (i in which(still_over)) {
                       msg <- li_data_prospects$final_message[i]
-                      trimmed <- substr(msg, 1, 197)
+                      trimmed <- substr(msg, 1, 272)
                       last_space <- max(gregexpr(" ", trimmed)[[1]])
                       if (last_space > 100) trimmed <- substr(trimmed, 1, last_space - 1)
                       li_data_prospects$final_message[i] <- trimmed
                     }
                   }
-                  cat(sprintf("  Shortening complete. Messages over 200 chars: %d\n",
-                              sum(nchar(li_data_prospects$final_message) > 200, na.rm = TRUE)))
+                  cat(sprintf("  Shortening complete. Messages over 275 chars: %d\n",
+                              sum(nchar(li_data_prospects$final_message) > 275, na.rm = TRUE)))
                 }
                 
                 # Prepare for upload
@@ -2637,13 +2637,13 @@ if (total_all > 0) {
   cat(sprintf("    Min/Max:  %d / %d characters\n\n", 
               min(all_lengths, na.rm = TRUE), max(all_lengths, na.rm = TRUE)))
   
-  # Connection messages over 200 chars warning
+  # Connection messages over 275 chars warning
   if (total_prospect_msgs > 0) {
     connect_messages <- all_uploads_combined[all_uploads_combined$message_type == "connect", ]
     connect_lengths <- nchar(connect_messages$message_to_contact)
-    over_200 <- sum(connect_lengths > 200, na.rm = TRUE)
+    over_200 <- sum(connect_lengths > 275, na.rm = TRUE)
     if (over_200 > 0) {
-      cat(sprintf("  ⚠ WARNING: %d connection message(s) exceed 200 characters (LinkedIn limit)\n\n", over_200))
+      cat(sprintf("  ⚠ WARNING: %d connection message(s) exceed 275 characters (LinkedIn limit)\n\n", over_200))
     }
   }
 }
