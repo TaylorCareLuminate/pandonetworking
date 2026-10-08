@@ -187,6 +187,78 @@
     return false;
   }
 
+  function getOrganizationName(record) {
+    return String(
+      record?.companyName ||
+      record?.company ||
+      record?.orgName ||
+      record?.organizationName ||
+      record?.prospectOrgName ||
+      record?.customFields?.company_name ||
+      record?.contactData?.company_name ||
+      ''
+    ).trim();
+  }
+
+  // Keep this aligned with the organization DNC matching used by Connect.
+  function normalizeOrganizationName(name) {
+    return String(name || '')
+      .toLowerCase()
+      .replace(/\bcorporation\b/g, 'corp')
+      .replace(/\bincorporated\b/g, 'inc')
+      .replace(/\blimited liability company\b/g, 'llc')
+      .replace(/\bl\.l\.c\./g, 'llc')
+      .replace(/\binc\.\b/g, 'inc')
+      .replace(/\bcorp\.\b/g, 'corp')
+      .replace(/\bltd\.\b/g, 'ltd')
+      .replace(/\blimited\b/g, 'ltd')
+      .replace(/\band\b/g, '&')
+      .replace(/^\s*the\s+/i, '')
+      .replace(/[^\w\s&]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function matchDncOrganization(recordOrName, dncEntries) {
+    if (!Array.isArray(dncEntries) || dncEntries.length === 0) return null;
+    const companyName = typeof recordOrName === 'string'
+      ? recordOrName
+      : getOrganizationName(recordOrName);
+    const normalized = normalizeOrganizationName(companyName);
+    if (!normalized) return null;
+
+    const stopWords = new Set([
+      'the', 'and', 'for', 'llc', 'inc', 'corp', 'ltd', 'co', 'group',
+      'health', 'care', 'healthcare', 'systems', 'services', 'solutions',
+    ]);
+
+    for (const entry of dncEntries) {
+      const allNames = [entry?.original_name, ...(Array.isArray(entry?.variations) ? entry.variations : [])]
+        .filter(Boolean);
+      for (const name of allNames) {
+        const candidate = normalizeOrganizationName(name);
+        if (!candidate) continue;
+        if (normalized === candidate) return entry;
+        if (normalized.length >= 5 && candidate.length >= 5 &&
+            (normalized.includes(candidate) || candidate.includes(normalized))) {
+          return entry;
+        }
+
+        const firstWords = normalized.split(' ').filter((word) => word.length > 2 && !stopWords.has(word));
+        const secondWords = candidate.split(' ').filter((word) => word.length > 2 && !stopWords.has(word));
+        // Require at least three meaningful words for fuzzy overlap. Organization DNC
+        // is a hard call block, so generic two-word names must not create false positives.
+        if (firstWords.length >= 3 && secondWords.length >= 3) {
+          const shorter = firstWords.length <= secondWords.length ? firstWords : secondWords;
+          const longer = firstWords.length <= secondWords.length ? secondWords : firstWords;
+          const overlap = shorter.filter((word) => longer.includes(word)).length;
+          if (overlap >= Math.ceil(shorter.length * 0.7)) return entry;
+        }
+      }
+    }
+    return null;
+  }
+
   window.CallFiltering = {
     PERMANENT_BLOCK_OUTCOMES,
     getNotesText,
@@ -199,6 +271,9 @@
     extractContactIdentifiers,
     buildBlockedContactSets,
     isBlockedBySets,
+    getOrganizationName,
+    normalizeOrganizationName,
+    matchDncOrganization,
   };
 })();
 

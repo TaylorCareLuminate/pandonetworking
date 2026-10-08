@@ -4955,6 +4955,8 @@
                 const assignDeclinedIds = new Set();
                 const assignDeclinedEmails = new Set();
                 const assignDeclinedPhones = new Set();
+                const assignDncOrganizations = (await loadCampaignOrganizationBlocks())
+                    .filter(entry => entry.campaignId === campaignId);
                 try {
                     const assignPermanentOutcomes = ['spoke-declined', 'declined', 'contact-left-no-replacement', 'bad-number-wrong-person'];
                     for (const outcomeType of assignPermanentOutcomes) {
@@ -5015,6 +5017,7 @@
                     if (candEmail && candEmail.includes('@') && assignDeclinedEmails.has(candEmail)) return;
                     const candPhone10 = String(data.phoneNumber || data.phone || '').replace(/\D/g, '').slice(-10);
                     if (candPhone10.length >= 10 && assignDeclinedPhones.has(candPhone10)) return;
+                    if (window.CallFiltering?.matchDncOrganization(data, assignDncOrganizations)) return;
                     
                     // COOLDOWN CHECK: phoneLastCalledAt fast path + completed-call/session sets
                     if (isActivityInCooldown(data, null, cooldownThreshold)) {
@@ -5860,6 +5863,8 @@
                 const declinedContactsSet = new Set(); // Stores IDs
                 const declinedContactsByEmail = new Map(); // Maps email -> contactId for fallback
                 const declinedContactsByPhone = new Map(); // Maps phone -> contactId for fallback
+                const campaignOrganizationBlocks = (await loadCampaignOrganizationBlocks(true))
+                    .filter(entry => entry.campaignId === selectedCampaign);
                 
                 // SINGLE SOURCE OF TRUTH: Query phone_activities for permanent failures
                 // All decline/bad number data comes from phone_activities outcomes
@@ -5982,7 +5987,7 @@
                 if (!callbackDeclineBypass && dueCallbacks.length > 0) {
                     const staleDeclinedCallbacks = [];
                     dueCallbacks = dueCallbacks.filter((cb) => {
-                        const declinedMatch = getDeclinedMatch(cb, declinedContactsSet, declinedContactsByEmail, declinedContactsByPhone);
+                        const declinedMatch = getDeclinedMatch(cb, declinedContactsSet, declinedContactsByEmail, declinedContactsByPhone, campaignOrganizationBlocks);
                         if (declinedMatch) {
                             console.log(`🚫 Removing callback for ${cb.contactName || cb.orgName || 'Unknown'} - contact marked as declined (matched by ${declinedMatch.matchType}: "${declinedMatch.matchedValue}")`);
                             staleDeclinedCallbacks.push(cb);
@@ -6088,7 +6093,7 @@
                     if (!skipDeclinedFilter) {
                         // Shared matcher: outreachSetId primary, email/phone fallbacks
                         // (org-level campaigns and duplicate outreach_set records)
-                        const declinedMatch = getDeclinedMatch(data, declinedContactsSet, declinedContactsByEmail, declinedContactsByPhone);
+                        const declinedMatch = getDeclinedMatch(data, declinedContactsSet, declinedContactsByEmail, declinedContactsByPhone, campaignOrganizationBlocks);
                         if (declinedMatch) {
                             console.log(`🚫 Skipping ${data.contactName || 'Unknown'} - contact marked as declined (matched by ${declinedMatch.matchType}: "${declinedMatch.matchedValue}")`);
                             callsFilteredDeclined++;
@@ -12017,13 +12022,15 @@ Would you have 15 minutes available this week or next for a quick call?`;
         let declinedContactsCache = null;
         let declinedContactsLastLoaded = 0;
         const DECLINED_CONTACTS_CACHE_DURATION = 300000; // 5 minutes (declined status changes infrequently)
+        let campaignOrganizationBlocksCache = null;
+        let campaignOrganizationBlocksLastLoaded = 0;
         
         // SHARED DECLINED MATCHING: checks a phone_activities record against the declined
         // identifier collections (outreachSetId, contact email, normalized phone).
         // The email/phone fallbacks are essential for org-level phone campaigns (which have
         // no outreachSetId or email) and for duplicate outreach_sets records for the same person.
         // Accepts Sets or Maps (both expose .has()). Returns { matchType, matchedValue } or null.
-        function getDeclinedMatch(data, declinedIds, declinedEmails, declinedPhones) {
+        function getDeclinedMatch(data, declinedIds, declinedEmails, declinedPhones, declinedOrganizations = null) {
             const outreachSetId = (data.outreachSetId && typeof data.outreachSetId === 'string') ? data.outreachSetId.trim() : '';
             if (outreachSetId && declinedIds && declinedIds.has(outreachSetId)) {
                 return { matchType: 'outreachSetId', matchedValue: outreachSetId };
@@ -12045,8 +12052,40 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     return { matchType: outreachSetId ? 'phone (cross-record)' : 'phone', matchedValue: rawPhone };
                 }
             }
+
+            const recordCampaignId = String(data.campaignId || '').trim();
+            const organizationBlocks = (declinedOrganizations || campaignOrganizationBlocksCache || [])
+                .filter(entry => recordCampaignId && entry.campaignId === recordCampaignId);
+            const organizationMatch = window.CallFiltering?.matchDncOrganization(data, organizationBlocks);
+            if (organizationMatch) {
+                return {
+                    matchType: 'campaign organization block',
+                    matchedValue: organizationMatch.original_name || window.CallFiltering.getOrganizationName(data)
+                };
+            }
             
             return null;
+        }
+
+        async function loadCampaignOrganizationBlocks(forceRefresh = false) {
+            const nowTimestamp = Date.now();
+            if (!forceRefresh && campaignOrganizationBlocksCache &&
+                nowTimestamp - campaignOrganizationBlocksLastLoaded < DECLINED_CONTACTS_CACHE_DURATION) {
+                return campaignOrganizationBlocksCache;
+            }
+
+            try {
+                const snapshot = await getDocs(collection(db, 'campaign_call_organization_blocks'));
+                campaignOrganizationBlocksCache = snapshot.docs
+                    .map(docSnap => ({ id: docSnap.id, ...docSnap.data() }))
+                    .filter(entry => entry.campaignId && entry.original_name);
+                campaignOrganizationBlocksLastLoaded = nowTimestamp;
+                console.log(`🚫 Loaded ${campaignOrganizationBlocksCache.length} campaign organization blocks`);
+                return campaignOrganizationBlocksCache;
+            } catch (error) {
+                console.error('⚠️ Error loading campaign organization blocks:', error);
+                return campaignOrganizationBlocksCache || [];
+            }
         }
         
         // Load declined contacts (with caching for performance)
@@ -12065,7 +12104,8 @@ Would you have 15 minutes available this week or next for a quick call?`;
             const declinedContacts = {
                 ids: new Set(),
                 emails: new Set(),
-                phones: new Set()
+                phones: new Set(),
+                organizations: await loadCampaignOrganizationBlocks(forceRefresh)
             };
             
             try {
@@ -12103,7 +12143,7 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     });
                 }
                 
-                console.log(`✅ Loaded declined contacts from phone_activities: ${declinedContacts.ids.size} ids, ${declinedContacts.emails.size} emails, ${declinedContacts.phones.size} phones (cached for 5 minutes)`);
+                console.log(`✅ Loaded declined contacts: ${declinedContacts.ids.size} ids, ${declinedContacts.emails.size} emails, ${declinedContacts.phones.size} phones, ${declinedContacts.organizations.length} campaign organization blocks (cached for 5 minutes)`);
                 
                 // Cache the results
                 declinedContactsCache = declinedContacts;
@@ -12113,7 +12153,12 @@ Would you have 15 minutes available this week or next for a quick call?`;
             } catch (error) {
                 console.error('⚠️ Error loading declined contacts:', error);
                 // Return empty collections on error (don't filter anything)
-                return { ids: new Set(), emails: new Set(), phones: new Set() };
+                return {
+                    ids: new Set(),
+                    emails: new Set(),
+                    phones: new Set(),
+                    organizations: campaignOrganizationBlocksCache || []
+                };
             }
         }
         

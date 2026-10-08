@@ -118,6 +118,25 @@
             background: #059669;
         }
 
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+
+        .btn-muted {
+            background: #fee2e2;
+            color: #991b1b;
+            cursor: default;
+        }
+
+        .btn-muted:hover {
+            transform: none;
+        }
+
         .btn-sm {
             padding: 0.5rem 1rem;
             font-size: 0.85rem;
@@ -333,11 +352,58 @@
             color: #6b7280;
         }
 
+        .outcome-badge.dnc {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
         .prospect-actions {
             display: flex;
             flex-direction: column;
             gap: 0.5rem;
-            min-width: 150px;
+            min-width: 180px;
+        }
+
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.55);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1100;
+            padding: 1rem;
+        }
+
+        .modal-card {
+            background: white;
+            border-radius: 12px;
+            width: min(560px, 100%);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+            padding: 1.5rem;
+        }
+
+        .modal-card h2 {
+            font-size: 1.25rem;
+            margin-bottom: 0.35rem;
+        }
+
+        .modal-card p {
+            color: var(--gray);
+            margin-bottom: 1rem;
+        }
+
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.75rem;
+            margin-top: 1rem;
+        }
+
+        .modal-card .btn-secondary {
+            background: white;
+            color: var(--secondary);
+            border: 1px solid var(--border);
         }
 
         /* Loading & Empty States */
@@ -570,17 +636,43 @@
         </div>
     </div>
 
+    <div id="returnCallModal" class="modal-overlay">
+        <div class="modal-card">
+            <h2><i class="fas fa-phone-volume"></i> Record Return Call</h2>
+            <p id="returnCallSummary"></p>
+            <div class="form-group" style="margin-bottom: 1rem;">
+                <label class="form-label" for="returnCallOutcome">Outcome</label>
+                <select id="returnCallOutcome" class="form-select"></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="returnCallNotes">What happened on the call?</label>
+                <textarea id="returnCallNotes" class="form-input" placeholder="Example: They returned the voicemail and declined a meeting."></textarea>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="closeReturnCallModal()">Cancel</button>
+                <button id="saveReturnCallBtn" class="btn btn-primary" onclick="saveReturnCallOutcome()">Save Outcome</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Load centralized auth system -->
     <script src="../js/auth.js"></script>
     <script src="../js/folder-protection.js"></script>
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <script src="../js/call-filtering.js"></script>
 
     <script type="module">
         // Wait for Firebase to be ready
         await window.firebaseReady;
         
         // Use CLEmail secure wrapper
-        const { collection, getDocs, getDoc, doc, query, where, orderBy } = window.clemailFirestore;
+        const { collection, getDocs, getDoc, doc, addDoc, updateDoc, query, where, orderBy } = window.clemailFirestore;
+        const { PAYMENT_STRUCTURE: PAYMENT_RATES } = await import('../js/payment-config.js');
+        const RETURN_CALL_OUTCOMES = [
+            { value: 'spoke-declined', label: 'Declined Meeting ($1.50)' },
+            { value: 'spoke-email-followup', label: 'Asked for Email ($0.50)' },
+            { value: 'spoke-referred', label: 'Gave Referral ($0.50)' }
+        ];
         const db = window.clemailDb;
         
         console.log('🔒 Using CLEmail secure wrapper for Prospect List');
@@ -590,6 +682,7 @@
         let allProspects = [];
         let filteredProspects = [];
         let campaignsMap = new Map();
+        let campaignOrganizationBlocks = [];
         let currentPage = 1;
         const prospectsPerPage = 25;
 
@@ -647,11 +740,14 @@
             try {
                 console.log('📋 Loading outreach sets...');
                 
-                // Load all outreach sets
-                const outreachSnapshot = await getDocs(collection(db, 'outreach_sets'));
-                
-                // Load all call tracking records
-                const callsSnapshot = await getDocs(collection(db, 'campaign_call_tracking'));
+                // Load contacts, call history, and campaign-scoped organization blocks together.
+                const [outreachSnapshot, callsSnapshot, blockSnapshot] = await Promise.all([
+                    getDocs(collection(db, 'outreach_sets')),
+                    getDocs(collection(db, 'campaign_call_tracking')),
+                    getDocs(collection(db, 'campaign_call_organization_blocks'))
+                ]);
+
+                campaignOrganizationBlocks = blockSnapshot.docs.map(blockDoc => ({ id: blockDoc.id, ...blockDoc.data() }));
                 
                 // Create a map of outreach sets with their call history
                 const prospectsMap = new Map();
@@ -675,10 +771,12 @@
                         fullName: `${firstName} ${lastName}`.trim() || 'Unknown',
                         email,
                         phone,
-                        company: data.prospectOrgName || data.customFields?.company_name || '',
+                        company: data.prospectOrgName || data.companyName || data.company ||
+                            data.orgName || data.organizationName || data.customFields?.company_name || '',
                         title: data.title || data.customFields?.title || '',
                         campaignId: data.campaignId || '',
-                        calls: []
+                        calls: [],
+                        dncEntry: null
                     });
                 });
                 
@@ -711,6 +809,7 @@
                     if (prospect.calls.length > 0) {
                         prospect.lastCall = prospect.calls[0];
                     }
+                    prospect.dncEntry = organizationBlockForProspect(prospect);
                 });
                 
                 allProspects = Array.from(prospectsMap.values());
@@ -855,6 +954,7 @@
                             <div class="prospect-name">
                                 ${escapeHtml(prospect.fullName)}
                                 ${outcomeBadge}
+                                ${prospect.dncEntry ? '<span class="outcome-badge dnc"><i class="fas fa-ban"></i> Blocked in Campaign</span>' : ''}
                             </div>
                             
                             <div class="prospect-meta">
@@ -896,6 +996,18 @@
                                     <i class="fas fa-history"></i> Call History (${callCount})
                                 </button>
                             ` : ''}
+                            <button class="btn btn-primary btn-sm" onclick="openReturnCallModal('${prospect.id}')">
+                                <i class="fas fa-phone-volume"></i> Record Return Call
+                            </button>
+                            ${prospect.company && prospect.campaignId ? (prospect.dncEntry ? `
+                                <button class="btn btn-muted btn-sm" disabled title="Matching contacts are excluded from this campaign only">
+                                    <i class="fas fa-ban"></i> Blocked in Campaign
+                                </button>
+                            ` : `
+                                <button class="btn btn-danger btn-sm" onclick="markOrganizationDnc('${prospect.id}')">
+                                    <i class="fas fa-ban"></i> Do Not Call in Campaign
+                                </button>
+                            `) : ''}
                         </div>
                     </div>
                 `;
@@ -983,6 +1095,227 @@
             });
             
             alert(historyText);
+        };
+
+        let returnCallProspectId = null;
+        let isSavingReturnCall = false;
+
+        window.openReturnCallModal = function(prospectId) {
+            const prospect = allProspects.find(item => item.id === prospectId);
+            if (!prospect) return;
+            if (!prospect.campaignId) {
+                showAlert('This prospect is not assigned to a campaign.', 'warning');
+                return;
+            }
+
+            returnCallProspectId = prospectId;
+            const campaignName = campaignsMap.get(prospect.campaignId) || prospect.campaignId;
+            document.getElementById('returnCallSummary').textContent =
+                `${prospect.fullName}${prospect.company ? ` at ${prospect.company}` : ''} · ${campaignName}`;
+            const outcomeSelect = document.getElementById('returnCallOutcome');
+            outcomeSelect.innerHTML = RETURN_CALL_OUTCOMES
+                .map(outcome => `<option value="${outcome.value}">${outcome.label}</option>`)
+                .join('');
+            document.getElementById('returnCallNotes').value = '';
+            document.getElementById('returnCallModal').style.display = 'flex';
+        };
+
+        window.closeReturnCallModal = function() {
+            returnCallProspectId = null;
+            document.getElementById('returnCallModal').style.display = 'none';
+        };
+
+        window.saveReturnCallOutcome = async function() {
+            if (isSavingReturnCall) return;
+            const prospect = allProspects.find(item => item.id === returnCallProspectId);
+            const outcome = document.getElementById('returnCallOutcome').value;
+            const notes = document.getElementById('returnCallNotes').value.trim();
+            if (!prospect?.campaignId || !RETURN_CALL_OUTCOMES.some(item => item.value === outcome)) return;
+            if (notes.length < 8) {
+                showAlert('Add a short note describing the return call.', 'warning');
+                return;
+            }
+
+            const phoneNumber = prospect.phone || '';
+            const payable = window.CallFiltering?.hasUsablePhone({ phoneNumber }) === true;
+            const basePayment = payable ? (PAYMENT_RATES[outcome] || 0) : 0;
+            const outcomeLabel = RETURN_CALL_OUTCOMES.find(item => item.value === outcome).label;
+            const campaignName = campaignsMap.get(prospect.campaignId) || prospect.campaignId;
+            const paymentText = payable
+                ? `This records ${outcomeLabel} for payroll.`
+                : 'This contact has no usable phone number, so payroll will record $0.';
+            const removalText = outcome === 'spoke-declined'
+                ? `\n\n${prospect.fullName} will be removed from ${campaignName}, the same way a Declined Meeting is.`
+                : '';
+            if (!confirm(`${paymentText}${removalText}`)) return;
+
+            const saveButton = document.getElementById('saveReturnCallBtn');
+            isSavingReturnCall = true;
+            saveButton.disabled = true;
+            try {
+                const now = new Date();
+                const userEmail = currentUser?.email || '';
+                const callTracking = {
+                    callId: `${prospect.campaignId}_${userEmail}_${now.getTime()}`,
+                    campaignId: prospect.campaignId,
+                    outreachSetId: prospect.id,
+                    userEmail,
+                    callerName: currentUser?.displayName || userEmail,
+                    outcome,
+                    basePayment,
+                    achievementPoolAwarded: 0,
+                    totalPayment: basePayment,
+                    timestamp: now.toISOString(),
+                    contactName: prospect.fullName,
+                    contactPhone: phoneNumber,
+                    phoneNumber,
+                    contactEmail: prospect.email || '',
+                    contactCompany: prospect.company || '',
+                    companyName: prospect.company || '',
+                    notes,
+                    outcomeSource: 'prospect-list-return-call'
+                };
+                await addDoc(collection(db, 'campaign_call_tracking'), callTracking);
+
+                const activitySnapshot = await getDocs(query(
+                    collection(db, 'phone_activities'),
+                    where('outreachSetId', '==', prospect.id)
+                ));
+                const openActivities = activitySnapshot.docs.filter(activityDoc => {
+                    const activity = activityDoc.data();
+                    return activity.campaignId === prospect.campaignId &&
+                        ['pending', 'scheduled', 'callback-scheduled'].includes(activity.status);
+                });
+                const activityUpdate = {
+                    status: 'completed',
+                    outcome,
+                    completedAt: now.toISOString(),
+                    completedBy: userEmail,
+                    notes,
+                    basePayment: 0,
+                    achievementPoolAwarded: 0,
+                    totalPayment: 0,
+                    outcomeSource: 'prospect-list-return-call',
+                    claimedBy: null,
+                    claimedAt: null,
+                    claimedByName: null
+                };
+                if (openActivities.length > 0) {
+                    await Promise.all(openActivities.map(activityDoc =>
+                        updateDoc(doc(db, 'phone_activities', activityDoc.id), activityUpdate)
+                    ));
+                } else {
+                    await addDoc(collection(db, 'phone_activities'), {
+                        ...activityUpdate,
+                        campaignId: prospect.campaignId,
+                        outreachSetId: prospect.id,
+                        contactName: prospect.fullName,
+                        contactEmail: prospect.email || '',
+                        phoneNumber,
+                        companyName: prospect.company || '',
+                        createdAt: now.toISOString(),
+                        createdBy: userEmail
+                    });
+                }
+
+                if (outcome === 'spoke-declined') {
+                    await updateDoc(doc(db, 'outreach_sets', prospect.id), {
+                        outcomeStatus: 'declined',
+                        outcomeDate: now,
+                        outcomeNotes: notes,
+                        updatedAt: now,
+                        permanentFailureReason: outcome
+                    });
+                }
+
+                prospect.calls.unshift({
+                    id: `local-${now.getTime()}`,
+                    timestamp: now.toISOString(),
+                    outcome,
+                    userEmail,
+                    notes
+                });
+                prospect.lastCall = prospect.calls[0];
+                closeReturnCallModal();
+                displayProspects();
+                updateStats();
+                showAlert(
+                    payable
+                        ? `${outcomeLabel} saved for ${prospect.fullName}.`
+                        : `${outcomeLabel} saved, but payroll will show $0 because no usable phone number was found.`,
+                    payable ? 'success' : 'warning'
+                );
+            } catch (error) {
+                console.error('❌ Error recording return call:', error);
+                showAlert(`Could not record the return call: ${error.message}`, 'danger');
+            } finally {
+                isSavingReturnCall = false;
+                saveButton.disabled = false;
+            }
+        };
+
+        function organizationBlockForProspect(prospect) {
+            const campaignBlocks = campaignOrganizationBlocks.filter(entry => entry.campaignId === prospect?.campaignId);
+            return window.CallFiltering?.matchDncOrganization(prospect?.company, campaignBlocks) || null;
+        }
+
+        window.markOrganizationDnc = async function(prospectId) {
+            const prospect = allProspects.find(item => item.id === prospectId);
+            const companyName = (prospect?.company || '').trim();
+            const campaignId = prospect?.campaignId || '';
+            const campaignName = campaignsMap.get(campaignId) || campaignId;
+            if (!companyName) {
+                showAlert('This prospect does not have an organization name.', 'warning');
+                return;
+            }
+            if (!campaignId) {
+                showAlert('This prospect is not assigned to a campaign.', 'warning');
+                return;
+            }
+
+            const existingEntry = organizationBlockForProspect(prospect);
+            if (existingEntry) {
+                prospect.dncEntry = existingEntry;
+                displayProspects();
+                showAlert(`${companyName} is already blocked in ${campaignName}.`, 'info');
+                return;
+            }
+
+            const confirmed = confirm(
+                `Block "${companyName}" in ${campaignName}?\n\n` +
+                'Matching contacts will be skipped in this campaign only, the same way a declined call is kept out of that campaign.'
+            );
+            if (!confirmed) return;
+
+            try {
+                const variations = [];
+                if (companyName.includes('&')) variations.push(companyName.replace(/&/g, 'and'));
+                if (/\band\b/i.test(companyName)) variations.push(companyName.replace(/\band\b/gi, '&'));
+
+                const newDoc = await addDoc(collection(db, 'campaign_call_organization_blocks'), {
+                    campaignId,
+                    original_name: companyName,
+                    variations: Array.from(new Set(variations)),
+                    added_at: new Date().toISOString(),
+                    added_by: currentUser?.email || '',
+                    source: 'team-prospect-list'
+                });
+
+                campaignOrganizationBlocks.push({
+                    id: newDoc.id,
+                    campaignId,
+                    original_name: companyName,
+                    variations
+                });
+                allProspects.forEach(item => {
+                    if (item.campaignId === campaignId) item.dncEntry = organizationBlockForProspect(item);
+                });
+                displayProspects();
+                showAlert(`${companyName} was blocked in ${campaignName}.`, 'success');
+            } catch (error) {
+                console.error('❌ Error blocking organization in campaign:', error);
+                showAlert(`Could not block organization: ${error.message}`, 'danger');
+            }
         };
 
         // Show alert
