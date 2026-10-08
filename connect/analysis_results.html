@@ -860,7 +860,8 @@ const STYLE_EXAMPLE_KEYS = [
     'audience_org_type', 'bdr_performance', 'ai_feel', 'company_vs_prospect',
     'personal_sharing', 'connect_phrasing', 'exclamation_use', 'emoji_use', 'abbreviation_use',
     'request_day_of_week', 'request_time_of_day', 'request_day_time',
-    'message_variation'
+    'message_variation',
+    'rhetorical_question_timing', 'about_us_timing', 'meeting_ask_timing'
 ];
 
 // Fixed chronological order for the day_time heatmap's rows/columns — the raw level
@@ -880,10 +881,14 @@ const RESEARCH_DIMENSIONS = [
     // display-ready (rawLevels) and the panel only renders when the segment actually has
     // a variation test running (hideWhenEmpty) — most hypothesis groups don't.
     { group: 'Message Craft', key: 'message_variation', title: 'Message Angles Tested (A/B)', icon: 'fa-flask', rawLevels: true, hideWhenEmpty: true },
-    // "A 'No' is a 'Yes'" has no research node of its own — it's built from the neg_question_*
-    // items in keys.working / keys.not_working (see renderReverseAsk). Always shown, with an
-    // explicit "not enough data yet" state when a placement hasn't cleared the bar.
-    { group: 'Message Craft', key: 'neg_question', title: '\u201CA No is a Yes\u201D (Reverse-Ask)', icon: 'fa-arrows-rotate', special: 'reverse_ask' },
+    // "WHEN does it first happen" timing breakdowns (research.*_timing) — one row per position
+    // (Never / First half of message 1 / ... / Message 3+). Each is paired with its signal
+    // family's per-position KeyItems (keys.working / keys.not_working, ids like
+    // neg_question_half1) — see SIGNAL_FAMILIES / renderSignalFamily. Always shown, with an
+    // explicit "not enough data yet" state when a position hasn't cleared the bar.
+    { group: 'Message Craft', key: 'rhetorical_question_timing', title: '\u201CA No is a Yes\u201D (Reverse-Ask) \u2014 When', icon: 'fa-arrows-rotate', special: 'signal_timing', family: 'neg_question', ordinal: true },
+    { group: 'Message Craft', key: 'about_us_timing', title: 'When We Talk About Ourselves', icon: 'fa-building-user', special: 'signal_timing', family: 'about_us', ordinal: true },
+    { group: 'Message Craft', key: 'meeting_ask_timing', title: 'When We Ask for the Meeting', icon: 'fa-calendar-check', special: 'signal_timing', family: 'meeting_ask', ordinal: true },
     { group: 'Message Craft', key: 'reason_to_connect', title: 'Reason for Connecting', icon: 'fa-link' },
     { group: 'Message Craft', key: 'hook_type', title: 'Opening Hook', icon: 'fa-magnet' },
     { group: 'Message Craft', key: 'tone', title: 'Tone', icon: 'fa-comment-dots' },
@@ -926,7 +931,7 @@ const GLOSSARY = [
     ['Confidence', 'High = strong statistical significance (p<0.05) with a solid sample. Medium = suggestive (p<0.10). Low = weak signal — treat as a hint, not a rule.'],
     ['Shrunk effect', 'Small segments are statistically pulled toward the overall average so a tiny sample can\'t produce a wild, untrustworthy claim. The number shown is this trustworthy, "shrunk" version; the benchmark across all data is shown alongside it where relevant.'],
     ['Conditional rates', '"Reply rate among connected" and "meeting rate among replied" — i.e. how well each stage converts once a prospect has cleared the previous one.'],
-    ['Sufficient data', 'Segments need at least 40 contacts before we trust deeper patterns. Below that, only the basic funnel and trend are shown.']
+    ['Sufficient data', 'Segments need at least 40 driver-eligible contacts (surround connections don\'t count, since they require a teammate who is already connected) before we trust deeper patterns. Below that, only the basic funnel, trend, and message-type overview are shown.']
 ];
 
 /* ══════════════════════════════════════════════════════════════════
@@ -987,7 +992,8 @@ let PAYLOAD = null;
 let RUN_CANDIDATES = []; // [{run_date, source: 'firebase'|'local', file?}]
 let CURRENT_RUN_DATE = null;
 let CURRENT_SOURCE = null;
-let CURRENT_KEYS = null; // keys object (working / not_working) for the currently-rendered segment; used by the Reverse-Ask panel
+let CURRENT_KEYS = null; // keys object (working / not_working) for the currently-rendered segment; used by the positional-signal panels (reverse-ask / about-us / meeting-ask)
+let CURRENT_MESSAGE_TYPE_OVERVIEW = null; // segment.message_type_overview (ALL rows, surround_connections included)
 let CURRENT_RESEARCH = null; // research object for the currently-rendered segment; used by the "compare styles" widget
 
 async function fetchLocalManifest() {
@@ -1220,7 +1226,7 @@ function renderModelStrip() {
     strip.innerHTML = `
         <summary><i class="fas fa-wand-magic-sparkles"></i> What predicts success, overall (model insights) <i class="fas fa-chevron-down"></i></summary>
         <div class="model-strip-body">
-            <p class="card-subtitle" style="margin-bottom:1rem;">Across ${fmtNum(mq.n_total)} contacts, a random-forest model ranked these factors as the strongest predictors of each funnel stage. This is a global view — not specific to the client or group selected above.</p>
+            <p class="card-subtitle" style="margin-bottom:1rem;">Across ${fmtNum(mq.n_total)} contacts${isNum(mq.n_driver_rows) ? ` (${fmtNum(mq.n_driver_rows)} used for the driver model${isNum(mq.n_surround_excluded) && mq.n_surround_excluded > 0 ? `; ${fmtNum(mq.n_surround_excluded)} surround connections excluded` : ''})` : ''}, a random-forest model ranked these factors as the strongest predictors of each funnel stage. This is a global view — not specific to the client or group selected above.</p>
             <div class="driver-groups">
                 ${['connected', 'replied', 'scheduled'].filter(o => byOutcome[o]).map(outcome => `
                     <div class="driver-col">
@@ -1443,9 +1449,11 @@ function resolveKeyLink(item) {
     const category = (item.category || '').trim().toLowerCase();
     if (category.includes('follow')) return { targetId: 'followupCard', label: 'See in Follow-Up Behavior' };
 
-    // "A 'No' is a 'Yes'" reverse-ask signals are about the kind of question asked.
-    if (/^neg_question_/.test(item.id || '')) {
-        return { targetId: 'research-dim-neg_question', label: 'See "Reverse-Ask" data' };
+    // Positional signal families (reverse-ask / about-us / meeting-ask) link to their
+    // "when does it first happen" timing panel.
+    const fam = signalFamilyOf(item.id);
+    if (fam) {
+        return { targetId: `research-dim-${fam.timingKey}`, label: `See "${fam.shortTitle}" data` };
     }
 
     // "Personalization" is an umbrella category covering both company_vs_prospect
@@ -1501,24 +1509,64 @@ function hasUnstableSignFlip(item) {
     return (rawDiff > 0.5 && item.effect_pp < -0.5) || (rawDiff < -0.5 && item.effect_pp > 0.5);
 }
 
-// "A 'No' is a 'Yes'" — negative/rhetorical-question signals ("Wouldn't it help to grab 15
-// minutes?"), exposed as ordinary KeyItems distinguished only by id. Each id is checked in
-// a different part of the sequence, so the badge tooltip says where.
-const REVERSE_ASK_WHERE = {
-    neg_question_first: 'Checked in the opening / first message',
-    neg_question_second: 'Checked in the pre-reply follow-up (2nd message, before any reply)',
-    neg_question_followup: 'Checked in the follow-up sent right after the prospect\u2019s first reply (outcome: meeting scheduled)',
-    neg_question_any: 'Checked anywhere in the sequence (any of the three spots)'
+// Positional signal families. Each is tested at FOUR message positions plus "anywhere":
+//   <prefix>_half1 / _half2 / _msg2 / _msg3plus / _any
+// and exposed as ordinary KeyItems distinguished only by id (only when they clear the
+// segment's significance/sample bar). research.<timingKey> is the matching "WHEN does it
+// first happen" breakdown (one bucket per contact: Never / First half of message 1 / ...).
+//   neg_question - "A No is a Yes" negative/rhetorical question ("Wouldn't it help to...?")
+//   about_us     - segment is mainly about the sender/BDR or their company, not the prospect
+//   meeting_ask  - segment explicitly asks for a call/meeting/time
+const SIGNAL_POSITIONS = [
+    { suffix: 'any',      short: 'Anywhere in the sequence',   where: 'Checked anywhere in the sequence (any message)' },
+    { suffix: 'half1',    short: 'First half of message 1',    where: 'Checked in the first half of the opening message' },
+    { suffix: 'half2',    short: 'Second half of message 1',   where: 'Checked in the second half of the opening message' },
+    { suffix: 'msg2',     short: 'Message 2',                  where: 'Checked in the second message' },
+    { suffix: 'msg3plus', short: 'Message 3 or later',         where: 'Checked in the third message or later' }
+];
+const SIGNAL_FAMILIES = {
+    neg_question: {
+        prefix: 'neg_question', timingKey: 'rhetorical_question_timing',
+        shortTitle: 'Reverse-Ask', chipLabel: '\u{1F504} Reverse-ask', icon: 'fa-arrows-rotate',
+        noteHtml: '<strong>&ldquo;A No is a Yes.&rdquo;</strong> Phrasing like &ldquo;Wouldn&rsquo;t it help to grab 15 minutes?&rdquo; &mdash; where answering &ldquo;no&rdquo; actually means agreeing.',
+        intro: 'Negative or rhetorical questions where &ldquo;no&rdquo; actually means &ldquo;yes&rdquo; &mdash; e.g. &ldquo;Wouldn&rsquo;t it help to grab 15 minutes?&rdquo; or &ldquo;Would it not help to find a time and meet?&rdquo;',
+        usage: 'Uses a negative/rhetorical question'
+    },
+    about_us: {
+        prefix: 'about_us', timingKey: 'about_us_timing',
+        shortTitle: 'About Us Timing', chipLabel: '\u{1F3E2} About us', icon: 'fa-building-user',
+        noteHtml: '<strong>&ldquo;When do we talk about ourselves?&rdquo;</strong> This part of the message is mainly about the sender or their company/product rather than the prospect.',
+        intro: 'When the conversation pivots to being mainly about the sender/BDR or their own company or product rather than the prospect &mdash; and whether doing it earlier or later matters.',
+        usage: 'Talks mainly about us/our company'
+    },
+    meeting_ask: {
+        prefix: 'meeting_ask', timingKey: 'meeting_ask_timing',
+        shortTitle: 'Meeting-Ask Timing', chipLabel: '\u{1F4C5} Meeting ask', icon: 'fa-calendar-check',
+        noteHtml: '<strong>&ldquo;When do we ask for the meeting?&rdquo;</strong> This part of the message explicitly asks for a call, meeting, or time.',
+        intro: 'When a call/meeting/time is first explicitly asked for &mdash; and whether asking earlier or later changes results.',
+        usage: 'Explicitly asks for a call/meeting'
+    }
 };
+// Resolves a KeyItem id like "neg_question_half1" to { family, position } (or null).
+function signalInfoOf(id) {
+    if (!id) return null;
+    for (const fam of Object.values(SIGNAL_FAMILIES)) {
+        if (id.indexOf(fam.prefix + '_') !== 0) continue;
+        const pos = SIGNAL_POSITIONS.find(p => id === `${fam.prefix}_${p.suffix}`);
+        if (pos) return { family: fam, position: pos };
+    }
+    return null;
+}
+function signalFamilyOf(id) { const i = signalInfoOf(id); return i ? i.family : null; }
 function reverseAskBadge(item) {
-    const where = REVERSE_ASK_WHERE[item && item.id];
-    if (!where) return '';
-    return `<span class="chip reverse-ask" title="${escapeHtml(where)}">\u{1F504} Reverse-ask</span>`;
+    const info = signalInfoOf(item && item.id);
+    if (!info) return '';
+    return `<span class="chip reverse-ask" title="${escapeHtml(info.position.where)}">${escapeHtml(info.family.chipLabel)}</span>`;
 }
 function reverseAskNote(item) {
-    const where = REVERSE_ASK_WHERE[item && item.id];
-    if (!where) return '';
-    return `<div class="reverse-ask-note"><strong>&ldquo;A No is a Yes.&rdquo;</strong> Phrasing like &ldquo;Wouldn&rsquo;t it help to grab 15 minutes?&rdquo; &mdash; where answering &ldquo;no&rdquo; actually means agreeing. ${escapeHtml(where)}.</div>`;
+    const info = signalInfoOf(item && item.id);
+    if (!info) return '';
+    return `<div class="reverse-ask-note">${info.family.noteHtml} ${escapeHtml(info.position.where)}.</div>`;
 }
 
 function renderKeyCard(item, working) {
@@ -1963,33 +2011,33 @@ function renderAiFeel(data) {
     `;
 }
 
-// "A No is a Yes" (reverse-ask) panel for Deep-Dive Research. The backend exposes this
-// only through keys.working / keys.not_working as ordinary KeyItems, so this gathers the
-// four neg_question_* items for the current segment and shows each placement — opening
-// message, pre-reply follow-up, follow-up after the first reply, or anywhere — as a normal
-// key card. A placement that's missing isn't "doesn't work": it just hasn't had enough
-// uses (n_with < 12) or hasn't cleared the effect-size bar yet.
-const REVERSE_ASK_PLACEMENTS = [
-    { id: 'neg_question_any', label: 'Uses a negative/rhetorical question anywhere in the sequence' },
-    { id: 'neg_question_first', label: 'Uses a negative/rhetorical question in the opening message' },
-    { id: 'neg_question_second', label: 'Uses a negative/rhetorical question in the pre-reply follow-up (2nd message)' },
-    { id: 'neg_question_followup', label: 'Uses a negative/rhetorical question in the follow-up right after the prospect\u2019s first reply' }
-];
-// Side-by-side trend table for the four Reverse-Ask placements: this segment vs. ALL data
-// (payload.overall). Overall numbers come from the overall segment's own neg_question_*
-// keys; if the overall segment doesn't surface a placement but this segment's item carries
-// overall_effect_pp, that benchmark effect is shown instead. When viewing Overall itself,
-// only one set of columns is shown.
-function reverseAskOverview() {
+// Positional-signal panel for Deep-Dive Research (reverse-ask / about-us / meeting-ask).
+// Three parts, all driven by SIGNAL_FAMILIES:
+//   1. research.<timingKey> - "WHEN does it first happen" rate table (one bucket per contact),
+//      in fixed chronological order.
+//   2. A segment-vs-overall trend table for the five per-position KeyItems
+//      (<prefix>_half1/_half2/_msg2/_msg3plus/_any) - the backend only emits these in
+//      keys.working / keys.not_working when they clear the sample/significance bar.
+//   3. The KeyItems themselves as normal key cards (or an explicit "not enough data" card).
+// A position that's missing isn't "doesn't work": it just hasn't had enough uses or hasn't
+// cleared the effect-size bar yet.
+const SIGNAL_TIMING_ORDER = ['Never', 'First half of message 1', 'Second half of message 1', 'Message 2', 'Message 3+'];
+function sortSignalTiming(rows) {
+    const rank = r => { const i = SIGNAL_TIMING_ORDER.indexOf(String(r.level)); return i < 0 ? 99 : i; };
+    return (rows || []).map((r, i) => ({ r, i })).sort((a, b) => rank(a.r) - rank(b.r) || a.i - b.i).map(x => x.r);
+}
+
+function findSignalKey(keys, id) {
+    if (!keys) return null;
+    const w = (keys.working || []).find(k => k.id === id);
+    if (w) return { item: w, working: true };
+    const n = (keys.not_working || []).find(k => k.id === id);
+    return n ? { item: n, working: false } : null;
+}
+
+function signalOverview(fam) {
     const overallKeys = PAYLOAD && PAYLOAD.overall && PAYLOAD.overall.keys;
     const isOverall = !!overallKeys && CURRENT_KEYS === overallKeys;
-    const find = (keys, id) => {
-        if (!keys) return null;
-        const w = (keys.working || []).find(k => k.id === id);
-        if (w) return { item: w, working: true };
-        const n = (keys.not_working || []).find(k => k.id === id);
-        return n ? { item: n, working: false } : null;
-    };
     const effectHtml = v => isNum(v)
         ? `<strong style="font-size:1.05rem;color:${v >= 0 ? 'var(--success-dark)' : 'var(--danger-dark)'};">${fmtPP(v)}</strong>`
         : '<span style="color:var(--gray-400);">—</span>';
@@ -2008,15 +2056,16 @@ function reverseAskOverview() {
         }
         return '<td style="padding:0.6rem 0.7rem;vertical-align:top;color:var(--gray-400);font-size:0.8rem;">Not enough data yet</td>';
     };
-    const shortLabel = { neg_question_any: 'Anywhere in the sequence', neg_question_first: 'Opening message', neg_question_second: 'Pre-reply follow-up (2nd message)', neg_question_followup: 'Follow-up after first reply' };
-    const outcomeOf = { neg_question_any: 'reply rate', neg_question_first: 'reply rate', neg_question_second: 'reply rate', neg_question_followup: 'meeting rate' };
 
-    const rows = REVERSE_ASK_PLACEMENTS.map(p => {
-        const seg = isOverall ? null : find(CURRENT_KEYS, p.id);
-        const ov = find(overallKeys, p.id);
+    const rows = SIGNAL_POSITIONS.map(p => {
+        const id = `${fam.prefix}_${p.suffix}`;
+        const seg = isOverall ? null : findSignalKey(CURRENT_KEYS, id);
+        const ov = findSignalKey(overallKeys, id);
         const benchmark = seg && seg.item ? seg.item.overall_effect_pp : null;
+        // The outcome each position is measured against comes from the KeyItem itself.
+        const outcome = (seg && seg.item && seg.item.outcome) || (ov && ov.item && ov.item.outcome) || null;
         return `<tr style="border-top:1px solid var(--gray-200);">
-            <td style="padding:0.6rem 0.7rem;vertical-align:top;font-weight:600;">${shortLabel[p.id]}<div style="font-size:0.74rem;font-weight:500;color:var(--gray-500);">effect on ${outcomeOf[p.id]}</div></td>
+            <td style="padding:0.6rem 0.7rem;vertical-align:top;font-weight:600;">${escapeHtml(p.short)}${outcome ? `<div style="font-size:0.74rem;font-weight:500;color:var(--gray-500);">effect on ${escapeHtml(OUTCOME_LABEL[outcome] || outcome)}</div>` : ''}</td>
             ${isOverall ? '' : cell(seg)}
             ${cell(ov, ov ? null : benchmark)}
         </tr>`;
@@ -2035,28 +2084,33 @@ function reverseAskOverview() {
         </div>`;
 }
 
-function renderReverseAsk() {
+function renderSignalFamily(fam, timingRows) {
     const working = (CURRENT_KEYS && CURRENT_KEYS.working) || [];
     const notWorking = (CURRENT_KEYS && CURRENT_KEYS.not_working) || [];
     let found = 0;
-    const cards = REVERSE_ASK_PLACEMENTS.map(p => {
-        const w = working.find(k => k.id === p.id);
-        const nw = notWorking.find(k => k.id === p.id);
+    const cards = SIGNAL_POSITIONS.map(p => {
+        const id = `${fam.prefix}_${p.suffix}`;
+        const w = working.find(k => k.id === id);
+        const nw = notWorking.find(k => k.id === id);
         const item = w || nw;
         if (item) { found++; return renderKeyCard(item, !!w); }
         return `
             <div class="key-card" style="opacity:0.7;">
-                <div class="key-card-top"><div class="key-card-label">${escapeHtml(p.label)}</div></div>
+                <div class="key-card-top"><div class="key-card-label">${escapeHtml(fam.usage)} &mdash; ${escapeHtml(p.short.toLowerCase())}</div></div>
                 <div class="key-card-meta">
                     <span class="chip">Message Craft</span>
-                    ${reverseAskBadge({ id: p.id })}
+                    ${reverseAskBadge({ id })}
                 </div>
-                <p class="empty-note" style="margin:0.6rem 0 0;">Not enough data yet for this segment — this tactic is used in too few messages (under 12) or hasn&rsquo;t cleared the effect-size bar. That means &ldquo;not enough data,&rdquo; not &ldquo;doesn&rsquo;t work.&rdquo;</p>
+                <p class="empty-note" style="margin:0.6rem 0 0;">Not enough data yet for this segment &mdash; this tactic is used in too few messages or hasn&rsquo;t cleared the effect-size bar. That means &ldquo;not enough data,&rdquo; not &ldquo;doesn&rsquo;t work.&rdquo;</p>
             </div>`;
     }).join('');
+    const sorted = sortSignalTiming(timingRows);
+    const hasTiming = sorted.length > 0;
     return `
-        <p class="card-subtitle" style="margin-bottom:0.9rem;"><i class="fas fa-arrows-rotate"></i> Negative or rhetorical questions where &ldquo;no&rdquo; actually means &ldquo;yes&rdquo; &mdash; e.g. &ldquo;Wouldn&rsquo;t it help to grab 15 minutes?&rdquo; or &ldquo;Would it not help to find a time and meet?&rdquo; Compares reply (or, for the post-reply follow-up, meeting) rates with vs. without the tactic at each point in the sequence.${found ? '' : ' None of the placements have enough data for this segment yet.'}</p>
-        ${reverseAskOverview()}
+        <p class="card-subtitle" style="margin-bottom:0.9rem;"><i class="fas ${fam.icon}"></i> ${fam.intro}${hasTiming ? ' Each contact is counted once, in the <em>earliest</em> spot it first happens (or &ldquo;Never&rdquo;).' : ''}</p>
+        ${hasTiming ? renderRateTable(sorted, true, fam.timingKey) : '<p class="empty-note">No timing breakdown available for this segment.</p>'}
+        <p class="card-subtitle" style="margin:1.1rem 0 0.9rem;">Effect of using it at each position (with vs. without), controlled for network size where marked.${found ? '' : ' None of the positions have enough data for this segment yet.'}</p>
+        ${signalOverview(fam)}
         <div style="display:grid;gap:0.8rem;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));">${cards}</div>
     `;
 }
@@ -2073,6 +2127,38 @@ function renderMessageVariation(rows) {
     return `
         <p class="card-subtitle" style="margin-bottom:0.9rem;"><i class="fas fa-flask"></i> Each row is one A/B message angle being tested, ranked by reply rate — i.e. which angle is winning. Messages not tagged with an angle are left out. Angles with fewer than ${RATE_LOW_N} sends are faded: too early to call.</p>
         ${renderRateTable(list, false, 'message_variation', 'reply_rate', hasLeader, 'Leading angle')}
+    `;
+}
+
+// research.message_type excludes surround_connections (they need a teammate already
+// connected, so they aren't comparable for driver analysis). segment.message_type_overview
+// covers ALL rows including surround_connections — shown below the driver-eligible table so
+// the full picture is still visible.
+function renderMessageType(rows) {
+    const main = renderRateTable(rows, false, 'message_type');
+    const overview = CURRENT_MESSAGE_TYPE_OVERVIEW;
+    if (!overview || !overview.length) return main;
+    const maxes = {
+        connect: Math.max(...overview.map(r => r.connect_rate || 0), 0.001),
+        reply: Math.max(...overview.map(r => r.reply_rate || 0), 0.001),
+        meeting: Math.max(...overview.map(r => r.meeting_rate || 0), 0.001)
+    };
+    const maxN = Math.max(...overview.map(r => r.n || 0), 1);
+    const list = overview.slice().sort((a, b) => (b.n || 0) - (a.n || 0));
+    return `
+        ${main}
+        <details class="more-rows" style="margin-top:1rem;">
+            <summary>All message types, including surround connections</summary>
+            <p class="card-subtitle" style="margin:0.6rem 0 0.8rem;">Funnel rates across <strong>all</strong> rows. The table above leaves out <em>surround_connections</em> (they require a teammate who is already connected, so they can&rsquo;t be compared fairly); they&rsquo;re included here.</p>
+            ${list.map(row => `
+                <div class="rate-row${(row.n || 0) < RATE_LOW_N ? ' rate-row-low-n' : ''}">
+                    <div class="rate-row-top">
+                        <span class="rate-row-level">${escapeHtml(humanizeLevel(row.level))}</span>
+                        <span class="rate-row-n">n=${fmtNum(row.n)}</span>
+                    </div>
+                    ${rateBarsHtml(row, maxes, maxN)}
+                </div>`).join('')}
+        </details>
     `;
 }
 
@@ -2093,8 +2179,9 @@ function renderResearch(research) {
                 if (dim.special === 'company_vs_prospect') innerHtml = renderCompanyVsProspect(data);
                 else if (dim.special === 'ai_feel') innerHtml = renderAiFeel(data);
                 else if (dim.special === 'day_time') innerHtml = renderDayTimeHeatmap(data, dim.key, 'reply_rate');
-                else if (dim.special === 'reverse_ask') innerHtml = renderReverseAsk();
+                else if (dim.special === 'signal_timing') innerHtml = renderSignalFamily(SIGNAL_FAMILIES[dim.family], data);
                 else if (dim.key === 'message_variation') innerHtml = renderMessageVariation(data);
+                else if (dim.key === 'message_type') innerHtml = renderMessageType(data);
                 else innerHtml = renderRateTable(data, dim.ordinal, dim.key);
                 // These three track first-message/outreach dates, which largely follow
                 // acceptance/reply timing rather than when the request was actually sent —
@@ -2336,6 +2423,7 @@ function renderAll() {
     });
     CURRENT_RESEARCH = suff ? segment.research : null;
     CURRENT_KEYS = suff ? segment.keys : null;
+    CURRENT_MESSAGE_TYPE_OVERVIEW = segment.message_type_overview || null;
     CURRENT_COMPARE_ROWS = {};
     DAY_TIME_ROWS_BY_KEY = {};
     if (suff) {
