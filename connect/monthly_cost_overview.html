@@ -362,6 +362,14 @@
     <script type="module">
         import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
 
+        // The date dropdown and export button use inline handlers, which look up
+        // globals. This module doesn't assign the real functions until after
+        // Firebase is ready, and a restored or early change event fires before
+        // that — leaving refreshAll undefined. No-op stand-ins cover that gap;
+        // initialize() still loads whatever range is selected once auth is ready.
+        window.refreshAll = () => {};
+        window.exportCsv = () => {};
+
         const { collection, getDocs, getAllDocs, query, where } = window.clemailFirestore;
         const db = window.clemailDb;
 
@@ -463,7 +471,7 @@
 
         window.refreshAll = async function () {
             document.getElementById('loadingBox').style.display = 'block';
-            document.getElementById('loadingBox').innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading ledger, pipeline runs, and message queue…';
+            document.getElementById('loadingBox').innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading ledger, pipeline runs, and message queue…<div id="loadingDetail" class="small muted" style="margin-top:0.5rem;"></div>';
             document.getElementById('reportSections').style.display = 'none';
             document.getElementById('statsGrid').style.display = 'none';
             try {
@@ -641,7 +649,12 @@
         async function loadFullPipelineAiCost(since, until) {
             let snap;
             try {
-                snap = await getDocs(query(collection(db, 'full_pipeline_runs'), where('startedAt', '>=', since.toISOString())));
+                // Project only the fields this page reads. Run docs also store the
+                // full log, and pulling that for every run is what makes this query slow.
+                snap = await getDocs(query(collection(db, 'full_pipeline_runs'), where('startedAt', '>=', since.toISOString())).select(
+                    'startedAt', 'hypothesisGroupName', 'bdrPlan',
+                    'totals.messages', 'totals.realCostBreakdown.aiEstimate.totalUsd'
+                ));
             } catch (e) {
                 console.warn('full_pipeline_runs query failed:', e.message);
                 return { runs: [], totalAiUsd: 0, byBdr: {} };
@@ -675,12 +688,23 @@
         // tabs, plus a handful of other manual tools) doesn't.
         async function loadMessages(since, until) {
             const sinceIso = since.toISOString();
+            // connect_queue docs carry the full message, post text, and news body.
+            // This page only counts them, so project those few fields — a 3,000-doc
+            // page of complete messages is what was timing out the Railway query.
+            const messageQuery = query(collection(db, 'connect_queue'), where('uploaded_date', '>=', sinceIso)).select(
+                'uploaded_date', 'pushed_to_heyreach', 'bdr_auth_email', 'account_email',
+                'pipelineRunId', 'bdr_name', 'source'
+            );
+            const onPage = (n) => {
+                const el = document.getElementById('loadingDetail');
+                if (el) el.textContent = `${n.toLocaleString()} messages loaded…`;
+            };
             let docs;
             try {
-                docs = await getAllDocs(query(collection(db, 'connect_queue'), where('uploaded_date', '>=', sinceIso)), { pageSize: 3000, maxRetries: 3 });
+                docs = await getAllDocs(messageQuery, { pageSize: 1000, maxRetries: 2, onPage });
             } catch (e) {
                 console.warn('getAllDocs failed, falling back to getDocs:', e.message);
-                const snap = await getDocs(query(collection(db, 'connect_queue'), where('uploaded_date', '>=', sinceIso)));
+                const snap = await getDocs(messageQuery);
                 docs = { docs: snap.docs };
             }
             let rows = (docs.docs || docs).map(d => (d.data ? { id: d.id, ...d.data() } : d));

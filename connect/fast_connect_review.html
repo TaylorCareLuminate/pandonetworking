@@ -6840,7 +6840,7 @@
                                     passesSourceTypeFilter = source === 'Full AI Generate';
                                     break;
                                 case 'harvest_questions':
-                                    passesSourceTypeFilter = source === 'Harvest Questions';
+                                    passesSourceTypeFilter = source === 'Harvest Questions' || isHarvestQuickMessageRow(data);
                                     break;
                                 case 'surround_connections':
                                     passesSourceTypeFilter = source === 'Surround Connections' || data.generated_via === 'surround_connections';
@@ -9764,6 +9764,26 @@
                 console.error('❌ Error loading HeyReach contacts:', error);
                 return {};
             }
+        }
+
+        // ── Harvest → Quick Message routing ───────────────────────────────────────
+        // Every Harvest message must go to the BDR's Quick Message campaign, NEVER to
+        // linkedin_message_queue slots or the normal connect campaign. Harvest rows come from
+        // more than one generator, with different source values:
+        //   • 'Harvest Questions'                  (generated_via 'harvest_questions…')
+        //   • 'harvest_fast_prospect'              (generated_via 'harvest_fast_prospect_generate_messages'
+        //                                           / 'harvest_fast_prospect_batch_run')
+        // The old check only matched the first, so Harvest Fast Prospect messages that had a
+        // HeyReach conversation ID were scheduled as direct slots instead of Quick Messages.
+        // Harvest Questions always count (any message_type, as before); any other
+        // harvest-generated row counts only when it is a follow-up message (message_type 'message').
+        function isHarvestQuickMessageRow(message) {
+            if (!message) return false;
+            const source = String(message.source || '');
+            const via = String(message.generated_via || '');
+            if (source === 'Harvest Questions' || via.startsWith('harvest_questions')) return true;
+            const harvestish = /harvest/i.test(source) || /harvest/i.test(via);
+            return harvestish && (message.message_type || 'connect') === 'message';
         }
 
         // ── Quick Message Campaign helper ─────────────────────────────────────────
@@ -13636,9 +13656,7 @@ Rules:
                     if (!message) continue;
                     
                     if (action === 'approve') {
-                        const isHarvestQuestionsRow =
-                            message.source === 'Harvest Questions' ||
-                            (message.generated_via || '').startsWith('harvest_questions');
+                        const isHarvestQuestionsRow = isHarvestQuickMessageRow(message);
 
                         // Log routing decision for every approved message so the console
                         // always shows where each message is headed.
@@ -13875,7 +13893,22 @@ Rules:
                         }
 
                         const addData = await addResp.json();
-                        console.log(`✅ Harvest Question for ${firstName} ${lastName} added to Quick Message campaign:`, addData);
+
+                        // The server can answer HTTP 200 with success:false (e.g. alreadyInCampaign — HeyReach
+                        // only updated an existing lead and will NOT send a new message). Treat that as NOT sent:
+                        // leave the connect_queue doc in place and surface the error, instead of marking it
+                        // routed/deleted and recording a send that never happens.
+                        if (addData && addData.success === false) {
+                            throw new Error(addData.error || 'HeyReach did not add this lead to the Quick Message campaign (success:false)');
+                        }
+                        const hrResult = {
+                            added:   addData?.added   ?? null,
+                            updated: addData?.updated ?? null,
+                            failed:  addData?.failed  ?? null,
+                            // true when AddLeadsToCampaignV2 added nothing and the server fell back to the lead list
+                            usedListFallback: !!addData?.meta?.fallbackResults
+                        };
+                        console.log(`✅ Harvest message for ${firstName} ${lastName} added to Quick Message campaign:`, addData);
 
                         // Mark connect_queue record as processed to prevent double-send
                         const docRef = doc(emailDB, 'connect_queue', messageId);
@@ -13885,6 +13918,7 @@ Rules:
                             deleted_reason: 'Routed to Quick Message campaign (Harvest Question)',
                             routed_via: 'quick_message_campaign',
                             routed_campaign_id: String(campaign.id),
+                            routed_hr_result: hrResult,
                             routed_at: new Date().toISOString(),
                             routed_by: currentUser.email,
                             adminApprovedBy: currentUser.email,
@@ -13918,6 +13952,7 @@ Rules:
                                 bdrEmail:           effectiveBDR,
                                 account_email:      effectiveBDR,
                                 campaignId:         String(campaign.id),
+                                hrResult:           hrResult,
                                 source:             'Harvest Questions',
                                 connect_queue_id:   messageId,
                                 timestamp:          new Date(),
@@ -14696,7 +14731,7 @@ Rules:
                 case 'mass_upload':         return source.includes('mass_upload') && !source.includes('single');
                 case 'single_contact':      return source.includes('mass_upload_single');
                 case 'full_ai':             return source === 'Full AI Generate';
-                case 'harvest_questions':   return source === 'Harvest Questions';
+                case 'harvest_questions':   return source === 'Harvest Questions' || isHarvestQuickMessageRow(data);
                 default: return false;
             }
         }
@@ -15002,8 +15037,7 @@ Rules:
                 if (!message) continue;
 
                 if (action === 'approve') {
-                    const isHarvestQuestionsRow =
-                        message.source === 'Harvest Questions' || message.generated_via === 'harvest_questions';
+                    const isHarvestQuestionsRow = isHarvestQuickMessageRow(message);
                     const isFollowUpMessage = (message.message_type || 'connect') === 'message';
                     if (!isHarvestQuestionsRow && !isFollowUpMessage && hasApprovedMessageInPast45Days(message.prospect_li_url)) {
                         console.log(`⚠️ Blocked reserve move - contact has message in past 75 days: ${message.prospect_li_url}`);
