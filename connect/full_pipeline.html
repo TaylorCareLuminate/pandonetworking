@@ -4091,18 +4091,98 @@
                 });
             });
 
+            // ── What Fast Connect Review can actually see ──
+            // The "Message Created" outcome only means "a connect_queue doc exists that was never
+            // pushed" — it says nothing about whether that doc is still reviewable. These two lookups
+            // let us tell the difference (see fpClassifyQueueState). They mirror fast_connect_review.html:
+            //   • its Hypothesis Group filter keeps a message only if the contact's URL is in the group's
+            //     contactLinkedInUrls list (NOT the hypothesisGroupId stamped on the message), and
+            //   • it only queries connect_queue docs whose account_email is the selected BDR's primary
+            //     email or the LinkedIn email from linkedin_email_associations (exact-case key lookup).
+            const reviewNorm = u => String(u || '').toLowerCase().replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/g, '');
+            let groupUrlSet = null;
+            try {
+                const gRef = doc(db, 'hypothesis_groups', groupId);
+                const gSnap = await getDoc(gRef);
+                if (typeof gSnap.exists === 'function' ? gSnap.exists() : gSnap.exists) {
+                    const { urls } = await fpReadGroupContacts(gRef, gSnap.data() || {});
+                    groupUrlSet = new Set(urls.map(reviewNorm).filter(Boolean));
+                }
+            } catch (e) { warnings.push(`group contact list: ${e.message}`); }
+            const reviewEmails = new Set();
+            try {
+                const assoc = new Map();
+                const aSnap = await getDocs(collection(db, 'linkedin_email_associations'));
+                aSnap.forEach(d => { const x = d.data(); if (x.authEmail && x.linkedInEmail) assoc.set(x.authEmail, x.linkedInEmail); });
+                fpBdrs.forEach(b => {
+                    const pe = b.primaryEmail;
+                    if (!pe) return;
+                    [pe, pe.toLowerCase(), assoc.get(pe), (assoc.get(pe) || '').toLowerCase()].filter(Boolean).forEach(e => reviewEmails.add(e));
+                });
+            } catch (e) { warnings.push(`BDR email associations: ${e.message}`); }
+            const REVIEW_DUP_DAYS = 75;
+            const approvedAtOf = m => m.adminApprovedAt || m.customerApprovedAt || m.review_date || '';
+            const isApprovedMsg = m => m.reviewed === true || m.reviewStatus === 'approved' || m.reviewStatus === 'pending_customer_review';
+
+            // Where is this message right now, and would Fast Connect Review show it?
+            const fpClassifyQueueState = (msg, allMsgs) => {
+                const acct = String(msg.account_email || '');
+                const out = { state: '', visible: '', detail: '', account: acct, reviewStatus: msg.reviewStatus || '' };
+                if (msg.pushed_to_heyreach === true) {
+                    out.state = 'Pushed to HeyReach'; out.visible = 'n/a (already sent)'; return out;
+                }
+                if (msg.deleted) {
+                    out.state = 'Deleted';
+                    out.visible = 'No';
+                    out.detail = [msg.deleted_reason || 'no reason recorded', msg.deleted_by ? `by ${msg.deleted_by}` : '', msg.deleted_date ? String(msg.deleted_date).slice(0, 10) : ''].filter(Boolean).join(' · ');
+                    return out;
+                }
+                if (isApprovedMsg(msg)) {
+                    const reserve = /reserve/i.test(String(msg.approvalMethod || ''));
+                    out.state = reserve ? 'Approved – in Reserve Queue (not pushed yet)'
+                        : msg.reviewStatus === 'pending_customer_review' ? 'Approved – waiting in Queue 2 (customer review)'
+                        : 'Approved – waiting to be pushed to HeyReach';
+                    out.visible = 'No (already past Queue 1)';
+                    out.detail = `Approved ${String(approvedAtOf(msg)).slice(0, 10) || '(no date)'}${msg.adminApprovedBy ? ' by ' + msg.adminApprovedBy : ''}`;
+                    return out;
+                }
+                // Still pending admin review (Queue 1) — figure out if the review page can see it.
+                out.state = 'Pending in Queue 1';
+                const problems = [];
+                let onlyWithoutGroupFilter = false;
+                if (!acct) problems.push('message has no account_email');
+                else if (reviewEmails.size && !reviewEmails.has(acct) && !reviewEmails.has(acct.toLowerCase())) {
+                    problems.push(`account_email "${acct}" is not a BDR primary email or LinkedIn email the review page queries`);
+                }
+                if (msg.message_type && msg.message_type !== 'connect') problems.push(`message_type is "${msg.message_type}" (review defaults to connect)`);
+                const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - REVIEW_DUP_DAYS);
+                const dupOf = allMsgs.find(o => o.id !== msg.id && !o.deleted && isApprovedMsg(o) && approvedAtOf(o) && new Date(approvedAtOf(o)) >= cutoff);
+                if (dupOf) problems.push(`hidden by the ${REVIEW_DUP_DAYS}-day duplicate rule — this contact already has an approved message (${String(approvedAtOf(dupOf)).slice(0, 10)})`);
+                if (groupUrlSet && !groupUrlSet.has(reviewNorm(msg.prospect_li_url || msg.contact_linkedin_url || msg.linkedin_url || ''))) {
+                    onlyWithoutGroupFilter = true;
+                    problems.push('contact URL is missing from the hypothesis group\'s contact list — hidden whenever the Hypothesis Group filter is used');
+                }
+                if (!problems.length) out.visible = 'Yes';
+                else if (onlyWithoutGroupFilter && problems.length === 1) out.visible = 'Only with Hypothesis Group filter off';
+                else out.visible = 'No';
+                out.detail = problems.join('; ');
+                return out;
+            };
+
             // ── Decide the outcome for each person ──
             const contacts = [];
             let outOfScope = 0;
             people.forEach(p => {
                 if (!p.orgId || !scopeIds.has(p.orgId)) { outOfScope++; return; }
                 const msgs = (msgByKey.get(p.key) || []).slice().sort((a, b) => {
-                    const ra = (a.pushed_to_heyreach === true ? 2 : 0) + (a.opusExclude ? 0 : 1);
-                    const rb = (b.pushed_to_heyreach === true ? 2 : 0) + (b.opusExclude ? 0 : 1);
+                    // Sent beats everything; then a live message beats a deleted one (a contact's deleted
+                    // duplicate must not mask a live pending one); then not-removed-by-Opus; then newest.
+                    const ra = (a.pushed_to_heyreach === true ? 4 : 0) + (a.deleted ? 0 : 2) + (a.opusExclude ? 0 : 1);
+                    const rb = (b.pushed_to_heyreach === true ? 4 : 0) + (b.deleted ? 0 : 2) + (b.opusExclude ? 0 : 1);
                     return rb - ra || String(b.uploaded_date || '').localeCompare(String(a.uploaded_date || ''));
                 });
                 const msg = msgs[0] || null;
-                const rec = { ...p, msgCount: msgs.length, msg, targetMatch: '', outcome: '', notes: '' };
+                const rec = { ...p, msgCount: msgs.length, msg, targetMatch: '', outcome: '', notes: '', queue: msg ? fpClassifyQueueState(msg, msgs) : null };
                 if (msg) {
                     rec.targetMatch = 'Included';
                     const sent = msg.pushed_to_heyreach === true;
@@ -4472,6 +4552,36 @@
                 items.forEach(i => { const k = keyFn(i); if (k) m.set(k, (m.get(k) || 0) + 1); });
                 return [...m.entries()].sort((a, b) => b[1] - a[1]);
             };
+            // Contacts whose message was created but not sent — where each one actually is right now.
+            const unsentQ = contacts.filter(c => c.msg && !c.sent && c.queue);
+            if (unsentQ.length) {
+                section('Messages created but not sent — where are they now?');
+                tableHdr('Queue state', 'Contacts', '% of unsent');
+                tally(unsentQ, c => c.queue.state).forEach(([k, n]) => sg.push([cell(k, S(C.white, C.text, { v: 'center', wrap: true, bc: C.border })), cell(n, S(C.white, C.text, { h: 'center', v: 'center', bc: C.border })), cell(pct(n, unsentQ.length), S(C.white, C.muted, { h: 'center', v: 'center', bc: C.border }))]));
+                gap();
+                const pend = unsentQ.filter(c => c.queue.state === 'Pending in Queue 1');
+                if (pend.length) {
+                    section('Pending in Queue 1 — visible in Fast Connect Review?');
+                    tableHdr('Visible?', 'Contacts', '% of pending');
+                    tally(pend, c => c.queue.visible).forEach(([k, n]) => sg.push([cell(k, S(C.white, C.text, { v: 'center', wrap: true, bc: C.border })), cell(n, S(C.white, C.text, { h: 'center', v: 'center', bc: C.border })), cell(pct(n, pend.length), S(C.white, C.muted, { h: 'center', v: 'center', bc: C.border }))]));
+                    gap();
+                    const why = tally(pend.filter(c => c.queue.visible !== 'Yes'), c => c.queue.detail);
+                    if (why.length) {
+                        section('Pending but hidden from review — why');
+                        tableHdr('Reason', 'Contacts', '% of hidden');
+                        const totHidden = why.reduce((s, [, n]) => s + n, 0);
+                        why.forEach(([k, n]) => sg.push([cell(k, S(C.white, C.text, { v: 'center', wrap: true, bc: C.border })), cell(n, S(C.white, C.text, { h: 'center', v: 'center', bc: C.border })), cell(pct(n, totHidden), S(C.white, C.muted, { h: 'center', v: 'center', bc: C.border }))]));
+                        gap();
+                    }
+                }
+                const del = unsentQ.filter(c => c.queue.state === 'Deleted');
+                if (del.length) {
+                    section('Deleted messages — reason');
+                    tableHdr('Reason', 'Contacts', '% of deleted');
+                    tally(del, c => String(c.queue.detail).split(' · ')[0]).forEach(([k, n]) => sg.push([cell(k, S(C.white, C.text, { v: 'center', wrap: true, bc: C.border })), cell(n, S(C.white, C.text, { h: 'center', v: 'center', bc: C.border })), cell(pct(n, del.length), S(C.white, C.muted, { h: 'center', v: 'center', bc: C.border }))]));
+                    gap();
+                }
+            }
             const noMsg = tally(contacts.filter(c => c.outcome === 'Included – No Message Created'), c => c.notes);
             if (noMsg.length) {
                 section('Included contacts without a message — why');
@@ -4566,6 +4676,10 @@
                 { label: 'Message Sent',      wch: 10, h: 'center' },
                 { label: 'Message Type',      wch: 16, h: 'center' },
                 { label: 'Message Created On', wch: 13, h: 'center' },
+                { label: 'Queue State',       wch: 30, h: 'center' },
+                { label: 'Visible in Fast Connect Review?', wch: 20, h: 'center' },
+                { label: 'Queue Detail',      wch: 52, h: 'left' },
+                { label: 'Message Account Email', wch: 30, h: 'left' },
                 { label: 'Message',           wch: 70, h: 'left' }
             ];
             const orgName = new Map(rows.map(o => [o.id, o.company_name || '']));
@@ -4596,9 +4710,13 @@
                     cell(c.sent ? 'Yes' : 'No', rowStyle(i, { h: 'center', bold: !!c.sent })),
                     cell(c.msg ? (c.msg.source || '') : '', rowStyle(i, { h: 'center', wrap: true })),
                     cell(msgDate, rowStyle(i, { h: 'center' })),
+                    cell(c.queue ? c.queue.state : '', rowStyle(i, { h: 'center', wrap: true })),
+                    cell(c.queue ? c.queue.visible : '', rowStyle(i, { h: 'center', wrap: true, bold: !!(c.queue && c.queue.visible !== 'Yes' && !/^n\/a/.test(c.queue.visible)) })),
+                    cell(c.queue ? c.queue.detail : '', rowStyle(i, { wrap: true })),
+                    cell(c.queue ? c.queue.account : '', rowStyle(i, { wrap: true })),
                     cell(msgText, rowStyle(i, { wrap: true }))
                 ]);
-                const lines = Math.max(Math.ceil(msgText.length / 78), Math.ceil((c.notes || '').length / 56), 1);
+                const lines = Math.max(Math.ceil(msgText.length / 78), Math.ceil((c.notes || '').length / 56), Math.ceil(((c.queue && c.queue.detail) || '').length / 56), 1);
                 heights.push(Math.min(Math.max(lines * 13.5 + 6, 20), 230));
             });
             const cMerges = [0, 1, 2].map(r => ({ s: { r, c: 0 }, e: { r, c: CCOLS.length - 1 } }));
