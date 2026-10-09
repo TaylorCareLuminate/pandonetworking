@@ -175,7 +175,10 @@
                     plus the pre-existing Full Pipeline AI estimate (<code>full_pipeline_runs.totals.realCostBreakdown.aiEstimate</code>).
                     Ledger tracking only started recording the day it was instrumented, so <strong>historical data from before
                     that point won't show any AI $</strong> for those tools even though generations happened — this is a startup
-                    gap, not a display bug. See <a href="ai_cost_tracking.html">AI Cost Tracking</a> for full per-generation detail.
+                    gap, not a display bug. <strong>Automatic capture</strong> now records every OpenRouter and Brave call the
+                    server makes, even from call sites that never opted in (tagged <code>auto:&lt;route&gt;</code>), so untagged spend
+                    appears from the day it went live. Anything earlier — and Apify, Brave and OpenRouter spend that still isn't
+                    attributed — is covered by the vendor-billed totals in the panel above. See <a href="ai_cost_tracking.html">AI Cost Tracking</a> for full per-generation detail.
                 </div>
             </div>
             <div class="note">
@@ -199,6 +202,16 @@
             </div>
         </div>
 
+        <!-- Vendor billed vs tracked — the ledgers only see calls we recorded, so this is the source of truth for totals -->
+        <div class="section">
+            <div class="section-title"><i class="fas fa-scale-balanced"></i> Billed by Vendors vs Tracked in Ledgers</div>
+            <p class="section-sub">
+                What each vendor actually charged versus what our per-call ledgers captured. The difference is spend that
+                happened but wasn't recorded against a call — it is shown explicitly below instead of being left out of the totals.
+            </p>
+            <div id="vendorCostPanel"></div>
+        </div>
+
         <!-- Stats -->
         <div class="stats-grid" id="statsGrid" style="display:none;">
             <div class="stat-card green">
@@ -217,9 +230,14 @@
                 <div class="stat-sub" id="statBraveSub"></div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Combined Cost (shown)</div>
+                <div class="stat-label">Combined Cost <span title="Vendor-billed total where billed amounts are entered/synced for the whole range; otherwise the ledger total for that vendor">ⓘ</span></div>
                 <div class="stat-value" id="statCombined">$0.00</div>
-                <div class="stat-sub">Apify + tracked AI + Brave — may still understate true total</div>
+                <div class="stat-sub" id="statCombinedSub">Apify + tracked AI + Brave — may still understate true total</div>
+            </div>
+            <div class="stat-card" style="border-left-color:#dc2626;">
+                <div class="stat-label">Untracked Spend <span title="Vendor-billed total minus what the ledgers captured. Only computed for vendors with billed amounts for every month in the range.">ⓘ</span></div>
+                <div class="stat-value" id="statUntracked">—</div>
+                <div class="stat-sub" id="statUntrackedSub">Enter vendor billed totals above</div>
             </div>
             <div class="stat-card gray">
                 <div class="stat-label">Total Messages Generated</div>
@@ -248,11 +266,19 @@
                     matching each account's canonical BDR email against the ledger / pipeline-run data — some accounts will show costs
                     as "—" simply because that spend wasn't attributable (see note above), not because it was zero.
                 </p>
+                <div class="filters-row" style="margin-bottom:0.75rem;">
+                    <label style="display:flex; gap:8px; align-items:center; font-size:0.9rem; cursor:pointer;">
+                        <input type="checkbox" id="allocateUntracked" onchange="rerenderCostViews()">
+                        Spread untracked spend (billed − tracked) across accounts by message share
+                        <span class="muted small">— an estimate; off by default so only measured costs are attributed</span>
+                    </label>
+                </div>
                 <div class="table-scroll">
                     <table id="byAccountTable">
                         <thead>
                             <tr>
                                 <th data-sort="account">Account</th>
+                                <th data-sort="client">Client</th>
                                 <th class="num" data-sort="totalMessages">Total Messages</th>
                                 <th class="num" data-sort="sentMessages">Sent to HeyReach</th>
                                 <th class="num" data-sort="fpMessages">Full Pipeline</th>
@@ -260,10 +286,39 @@
                                 <th class="num" data-sort="apifyUsd">Apify $</th>
                                 <th class="num" data-sort="aiUsd">AI $</th>
                                 <th class="num" data-sort="braveUsd">Brave $</th>
+                                <th class="num" data-sort="untrackedShareUsd">Untracked Share $</th>
                                 <th class="num" data-sort="combinedUsd">Combined $</th>
                             </tr>
                         </thead>
                         <tbody id="byAccountBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- By client -->
+            <div class="section">
+                <div class="section-title"><i class="fas fa-building"></i> By Client <span class="muted small" style="font-weight:400;">(accounts rolled up to their client company)</span></div>
+                <p class="section-sub">
+                    Each account is mapped to its client company through <code>bdr_leaders</code> → <code>customerList</code>.
+                    Accounts with no client assigned, workspace-tagged spend, and untracked vendor spend are kept as their own rows so
+                    nothing drops out of the total.
+                </p>
+                <div class="table-scroll">
+                    <table id="byClientTable">
+                        <thead>
+                            <tr>
+                                <th>Client</th>
+                                <th class="num">Accounts</th>
+                                <th class="num">Messages</th>
+                                <th class="num">Apify $</th>
+                                <th class="num">AI $</th>
+                                <th class="num">Brave $</th>
+                                <th class="num">Untracked Share $</th>
+                                <th class="num">Combined $</th>
+                                <th class="num">$ / Message</th>
+                            </tr>
+                        </thead>
+                        <tbody id="byClientBody"></tbody>
                     </table>
                 </div>
             </div>
@@ -358,6 +413,7 @@
     <script src="../js/clemail-firestore-wrapper.js"></script>
     <!-- Load PandoConnect common header -->
     <script src="healthconnect-header.js?v=3.4"></script>
+    <script src="vendor-cost-panel.js?v=1"></script>
 
     <script type="module">
         import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
@@ -369,6 +425,7 @@
         // initialize() still loads whatever range is selected once auth is ready.
         window.refreshAll = () => {};
         window.exportCsv = () => {};
+        window.rerenderCostViews = () => {};
 
         const { collection, getDocs, getAllDocs, query, where } = window.clemailFirestore;
         const db = window.clemailDb;
@@ -382,6 +439,9 @@
         let bdrNameMap = {};       // normalized bdrEmail -> display name
         let byAccountRows = [];    // last computed rows, for sort + CSV
         let sortState = { key: 'combinedUsd', dir: 'desc' };
+        let clientMap = {};        // normalized bdrEmail -> client company name
+        let vendorTotals = null;   // billed-vs-tracked result from VendorCostPanel (null until it loads)
+        let lastData = null;       // { apify, aiLedger, braveLedger, fp, msgs } for the current range
 
         const SESSION_MARKER_KEY = 'hl_active_session';
         let _authFirstFire = true;
@@ -413,7 +473,7 @@
 
         async function initialize() {
             try {
-                await loadNameMap();
+                await Promise.all([loadNameMap(), loadClientMap()]);
                 await refreshAll();
             } catch (error) {
                 console.error('Error initializing:', error);
@@ -430,6 +490,27 @@
                     if (a.bdrEmail) bdrNameMap[a.bdrEmail.toLowerCase()] = a.accountName || a.bdrEmail;
                 });
             } catch (e) { console.warn('Could not load linkedin_accounts name map:', e.message); }
+        }
+
+        // Client company per account: bdr_leaders.customerId -> customerList name (same mapping
+        // cost_revenue_tracking.html uses). Inactive BDRs are kept — their historical spend still counts.
+        async function loadClientMap() {
+            try {
+                const customerNames = {};
+                try {
+                    const cs = await getDocs(collection(db, 'customerList'));
+                    cs.forEach(d => { const c = d.data(); customerNames[d.id] = c.name || c.shortName || d.id; });
+                } catch (e) { console.warn('Could not load customerList:', e.message); }
+                const bs = await getDocs(collection(db, 'bdr_leaders'));
+                bs.forEach(d => {
+                    const b = d.data();
+                    const company = b.customerId && customerNames[b.customerId];
+                    if (!company) return;
+                    [b.primaryEmail, b.email, b.linkedInEmail].forEach(e => {
+                        if (typeof e === 'string' && e) clientMap[e.toLowerCase()] = company;
+                    });
+                });
+            } catch (e) { console.warn('Could not load client map (By Client will group everything as "No client assigned"):', e.message); }
         }
 
         // Same "since" semantics as apify_cost_tracking.html / full_pipeline_dashboard.html's
@@ -463,6 +544,7 @@
             return String(str ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
         }
         function displayName(emailKey) {
+            if (emailKey === '__untracked__') return '<span class="badge badge-amber">Untracked</span> <span class="muted small">vendor billed − ledger tracked</span>';
             if (!emailKey || emailKey === 'unattributed') return '<span class="badge badge-gray">Unattributed</span>';
             if (emailKey.startsWith('workspace:')) return `<span class="badge badge-purple">WS</span> ${escapeHtml(emailKey.slice(10))}`;
             const name = bdrNameMap[emailKey];
@@ -488,8 +570,10 @@
                     loadMessages(since, until)
                 ]);
 
-                renderStats(apify, aiLedger, braveLedger, fp, msgs);
-                renderByAccount(apify, aiLedger, braveLedger, fp, msgs);
+                lastData = { apify, aiLedger, braveLedger, fp, msgs };
+                vendorTotals = null; // stale until the panel reports billed totals for this range
+                rerenderCostViews();
+                updateVendorPanel();
                 renderBySource(msgs);
                 renderByActor(apify);
                 renderAiLedgerBreakdown(aiLedger);
@@ -663,10 +747,21 @@
             if (until) runs = runs.filter(r => r.startedAt && new Date(r.startedAt).getTime() < until.getTime());
             runs.sort((a, b) => new Date(b.startedAt || 0) - new Date(a.startedAt || 0));
 
+            // Since automatic capture went live, every OpenRouter call a Full Pipeline run makes is
+            // recorded with its real cost in the AI ledger. Counting the run's saved estimate as well
+            // would double-count, so the estimate is only used for runs that started before that.
+            let captureStartMs = null;
+            try {
+                const info = await authedFetch('/api/vendor-costs/capture-info');
+                if (info.autoCaptureStartedAt) captureStartMs = new Date(info.autoCaptureStartedAt).getTime();
+            } catch (e) { console.warn('capture-info unavailable, using Full Pipeline estimates for all runs:', e.message); }
+
             const byBdr = {};
             let totalAiUsd = 0;
             for (const r of runs) {
-                const aiUsd = r?.totals?.realCostBreakdown?.aiEstimate?.totalUsd || 0;
+                const coveredByLedger = captureStartMs != null && r.startedAt && new Date(r.startedAt).getTime() >= captureStartMs;
+                r._coveredByLedger = !!coveredByLedger;
+                const aiUsd = coveredByLedger ? 0 : (r?.totals?.realCostBreakdown?.aiEstimate?.totalUsd || 0);
                 r._aiUsd = aiUsd;
                 totalAiUsd += aiUsd;
                 if (aiUsd <= 0) continue;
@@ -737,19 +832,80 @@
             };
         }
 
+        // ── Billed-aware cost per vendor ────────────────────────────────────────────────────
+        // When the vendor's billed total is known for every month in the range it is the truth:
+        // use it, and the gap versus the ledger is "untracked". Otherwise fall back to the ledger
+        // (which can under-state spend — the panel above says so).
+        function trackedFor(vendor) {
+            if (!lastData) return 0;
+            if (vendor === 'apify') return lastData.apify.totalUsd || 0;
+            if (vendor === 'openrouter') return (lastData.aiLedger.totalUsd || 0) + (lastData.fp.totalAiUsd || 0);
+            return lastData.braveLedger.totalUsd || 0;
+        }
+        function vendorView(vendor) {
+            const tracked = trackedFor(vendor);
+            const t = vendorTotals && vendorTotals.vendors && vendorTotals.vendors[vendor];
+            if (t && t.complete) return { vendor, tracked, billed: t.billed, cost: t.billed, gap: Math.max(0, t.billed - tracked), complete: true };
+            return { vendor, tracked, billed: null, cost: tracked, gap: 0, complete: false };
+        }
+        const VENDOR_LABEL = { apify: 'Apify', openrouter: 'AI', brave: 'Brave' };
+
+        window.rerenderCostViews = function () {
+            if (!lastData) return;
+            const { apify, aiLedger, braveLedger, fp, msgs } = lastData;
+            renderStats(apify, aiLedger, braveLedger, fp, msgs);
+            renderByAccount(apify, aiLedger, braveLedger, fp, msgs);
+            renderByClient();
+        };
+
+        // Hand the tracked totals to the shared panel; it reports billed totals back via onChange.
+        function updateVendorPanel() {
+            if (!window.VendorCostPanel || !lastData) return;
+            const since = rangeSinceDate();
+            const until = rangeUntilDate();
+            window.VendorCostPanel.mount({
+                container: 'vendorCostPanel',
+                vendors: ['apify', 'openrouter', 'brave'],
+                onChange: (totals) => { vendorTotals = totals; rerenderCostViews(); }
+            });
+            window.VendorCostPanel.update({
+                since, until,
+                tracked: {
+                    apify:      { usd: trackedFor('apify'),      count: lastData.apify.totalRuns || 0 },
+                    openrouter: { usd: trackedFor('openrouter'), count: lastData.aiLedger.totalRuns || 0 },
+                    brave:      { usd: trackedFor('brave'),      count: lastData.braveLedger.totalSearches || 0 }
+                }
+            });
+        }
+
         function renderStats(apify, aiLedger, braveLedger, fp, msgs) {
+            const va = vendorView('apify'), vi = vendorView('openrouter'), vb = vendorView('brave');
             const total = apify.totalUsd || 0;
             const unattributed = apify.unattributedUsd || 0;
             const totalAi = (aiLedger.totalUsd || 0) + (fp.totalAiUsd || 0);
             const totalBrave = braveLedger.totalUsd || 0;
             document.getElementById('statApify').textContent = money(total, 2);
-            document.getElementById('statApifySub').textContent = `${(apify.totalRuns || 0).toLocaleString()} Apify run(s)`;
+            document.getElementById('statApifySub').textContent = `${(apify.totalRuns || 0).toLocaleString()} Apify run(s) in ledger` + (va.complete ? ` · billed ${money(va.billed, 2)}` : '');
             document.getElementById('statAi').textContent = money(totalAi, 2);
             document.getElementById('statAiSub').textContent =
-                `${(aiLedger.totalRuns || 0).toLocaleString()} ledger generation(s) + ${fp.runs.filter(r => r._aiUsd > 0).length} Full Pipeline run(s)`;
+                `${(aiLedger.totalRuns || 0).toLocaleString()} ledger generation(s) + ${fp.runs.filter(r => r._aiUsd > 0).length} Full Pipeline run(s)` + (vi.complete ? ` · billed ${money(vi.billed, 2)}` : '');
             document.getElementById('statBrave').textContent = money(totalBrave, 2);
-            document.getElementById('statBraveSub').textContent = `${(braveLedger.totalSearches || 0).toLocaleString()} Brave search(es)`;
-            document.getElementById('statCombined').textContent = money(total + totalAi + totalBrave, 2);
+            document.getElementById('statBraveSub').textContent = `${(braveLedger.totalSearches || 0).toLocaleString()} Brave search(es) in ledger` + (vb.complete ? ` · billed ${money(vb.billed, 2)}` : '');
+
+            const views = [va, vi, vb];
+            const combined = views.reduce((s, v) => s + v.cost, 0);
+            const billedFor = views.filter(v => v.complete).map(v => VENDOR_LABEL[v.vendor]);
+            const ledgerFor = views.filter(v => !v.complete).map(v => VENDOR_LABEL[v.vendor]);
+            document.getElementById('statCombined').textContent = money(combined, 2);
+            document.getElementById('statCombinedSub').textContent = billedFor.length
+                ? `Vendor-billed: ${billedFor.join(', ')}${ledgerFor.length ? ` · ledger only: ${ledgerFor.join(', ')} (may understate)` : ''}`
+                : 'Ledger totals only — enter vendor billed totals above; this may understate true spend';
+
+            const gap = views.reduce((s, v) => s + v.gap, 0);
+            document.getElementById('statUntracked').textContent = billedFor.length ? money(gap, 2) : '—';
+            document.getElementById('statUntrackedSub').textContent = billedFor.length
+                ? views.filter(v => v.complete).map(v => `${VENDOR_LABEL[v.vendor]} ${money(v.gap, 2)}`).join(' · ')
+                : 'Enter vendor billed totals above';
             document.getElementById('statMessages').textContent = msgs.total.toLocaleString();
             document.getElementById('statMessagesSub').textContent = `${msgs.sent.toLocaleString()} sent to HeyReach`;
             document.getElementById('statUnattributed').textContent = money(unattributed, 2);
@@ -776,8 +932,10 @@
                 const braveUsd = braveLedgerByBdr[key] ?? null;
                 const combinedUsd = (apifyUsd || 0) + (aiUsd || 0) + (braveUsd || 0);
                 return {
-                    account: key, name: m.name, totalMessages: m.total, sentMessages: m.sent,
-                    fpMessages: m.fp, otherMessages: m.other, apifyUsd, aiUsd, braveUsd, combinedUsd
+                    account: key, name: m.name, client: clientMap[key] || null,
+                    totalMessages: m.total, sentMessages: m.sent,
+                    fpMessages: m.fp, otherMessages: m.other, apifyUsd, aiUsd, braveUsd,
+                    untrackedShareUsd: null, combinedUsd
                 };
             });
 
@@ -787,13 +945,35 @@
                 const aiU = aiLedgerByBdr['unattributed'] || 0;
                 const braveU = braveLedgerByBdr['unattributed'] || 0;
                 byAccountRows.push({
-                    account: 'unattributed', name: null, totalMessages: 0, sentMessages: 0,
+                    account: 'unattributed', name: null, client: null, totalMessages: 0, sentMessages: 0,
                     fpMessages: 0, otherMessages: 0,
                     apifyUsd: apifyByBdr['unattributed'] != null ? apifyU : null,
                     aiUsd: aiLedgerByBdr['unattributed'] != null ? aiU : null,
                     braveUsd: braveLedgerByBdr['unattributed'] != null ? braveU : null,
+                    untrackedShareUsd: null,
                     combinedUsd: apifyU + aiU + braveU
                 });
+            }
+
+            // Untracked spend = what vendors billed beyond what the ledgers captured. Either spread it
+            // across accounts by message share (estimate, opt-in) or keep it as its own row, so the
+            // table total always ties to the billed amount rather than silently leaving it out.
+            const totalGap = ['apify', 'openrouter', 'brave'].map(vendorView).reduce((s, v) => s + v.gap, 0);
+            if (totalGap > 0.005) {
+                const allocate = document.getElementById('allocateUntracked').checked;
+                const totalMsgs = byAccountRows.reduce((s, r) => s + r.totalMessages, 0);
+                if (allocate && totalMsgs > 0) {
+                    byAccountRows.forEach(r => {
+                        r.untrackedShareUsd = r.totalMessages ? totalGap * r.totalMessages / totalMsgs : 0;
+                        r.combinedUsd += r.untrackedShareUsd;
+                    });
+                } else {
+                    byAccountRows.push({
+                        account: '__untracked__', name: null, client: null, totalMessages: 0, sentMessages: 0,
+                        fpMessages: 0, otherMessages: 0, apifyUsd: null, aiUsd: null, braveUsd: null,
+                        untrackedShareUsd: totalGap, combinedUsd: totalGap
+                    });
+                }
             }
 
             sortByAccountRows();
@@ -802,11 +982,12 @@
 
         function sortByAccountRows() {
             const { key, dir } = sortState;
+            const textKey = key === 'account' || key === 'client';
             byAccountRows.sort((a, b) => {
                 let av = a[key], bv = b[key];
                 if (key === 'account') { av = a.name || a.account; bv = b.name || b.account; }
-                if (av == null) av = key === 'account' ? '' : -1;
-                if (bv == null) bv = key === 'account' ? '' : -1;
+                if (av == null) av = textKey ? '' : -1;
+                if (bv == null) bv = textKey ? '' : -1;
                 if (typeof av === 'string') return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
                 return dir === 'asc' ? av - bv : bv - av;
             });
@@ -815,12 +996,13 @@
         function drawByAccountTable() {
             const tbody = document.getElementById('byAccountBody');
             if (!byAccountRows.length) {
-                tbody.innerHTML = '<tr><td colspan="9" class="muted">No messages, Apify spend, or AI/Brave cost in this range.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="11" class="muted">No messages, Apify spend, or AI/Brave cost in this range.</td></tr>';
                 return;
             }
             tbody.innerHTML = byAccountRows.map(r => `
                 <tr>
                     <td>${r.name && r.account !== 'unattributed' ? `${escapeHtml(r.name)} <span class="muted small">(${escapeHtml(r.account)})</span>` : displayName(r.account)}</td>
+                    <td>${r.client ? escapeHtml(r.client) : '<span class="muted">—</span>'}</td>
                     <td class="num"><strong>${r.totalMessages.toLocaleString()}</strong></td>
                     <td class="num">${r.sentMessages.toLocaleString()}</td>
                     <td class="num">${r.fpMessages.toLocaleString()}</td>
@@ -828,8 +1010,59 @@
                     <td class="num">${r.apifyUsd != null ? money(r.apifyUsd) : '<span class="muted">—</span>'}</td>
                     <td class="num">${r.aiUsd != null ? money(r.aiUsd) : '<span class="muted">—</span>'}</td>
                     <td class="num">${r.braveUsd != null ? money(r.braveUsd) : '<span class="muted">—</span>'}</td>
+                    <td class="num">${r.untrackedShareUsd != null ? money(r.untrackedShareUsd) : '<span class="muted">—</span>'}</td>
                     <td class="num"><strong>${r.combinedUsd ? money(r.combinedUsd) : '<span class="muted">—</span>'}</strong></td>
                 </tr>`).join('');
+        }
+
+        // Roll the account rows up to client companies. Rows that can't be tied to a client keep their
+        // own labelled bucket so the By Client total still equals the By Account total.
+        function renderByClient() {
+            const tbody = document.getElementById('byClientBody');
+            const groups = {};
+            byAccountRows.forEach(r => {
+                let label;
+                if (r.account === '__untracked__') label = 'Untracked vendor spend (billed − tracked)';
+                else if (r.account === 'unattributed') label = 'Unattributed spend (no account tag)';
+                else if (r.account.startsWith('workspace:')) label = 'Workspace-tagged spend';
+                else label = r.client || 'No client assigned';
+                const g = (groups[label] ||= { label, accounts: 0, messages: 0, apify: 0, ai: 0, brave: 0, share: 0, combined: 0, special: label !== (r.client || 'No client assigned') });
+                if (r.account !== '__untracked__' && r.account !== 'unattributed' && !r.account.startsWith('workspace:')) g.accounts++;
+                g.messages += r.totalMessages;
+                g.apify += r.apifyUsd || 0; g.ai += r.aiUsd || 0; g.brave += r.braveUsd || 0;
+                g.share += r.untrackedShareUsd || 0;
+                g.combined += r.combinedUsd || 0;
+            });
+            const rows = Object.values(groups).sort((a, b) => (a.special - b.special) || (b.combined - a.combined));
+            if (!rows.length) { tbody.innerHTML = '<tr><td colspan="9" class="muted">No data in this range.</td></tr>'; return; }
+            const tot = rows.reduce((t, g) => {
+                t.accounts += g.accounts; t.messages += g.messages; t.apify += g.apify; t.ai += g.ai;
+                t.brave += g.brave; t.share += g.share; t.combined += g.combined; return t;
+            }, { accounts: 0, messages: 0, apify: 0, ai: 0, brave: 0, share: 0, combined: 0 });
+            const cell = v => v ? money(v) : '<span class="muted">—</span>';
+            tbody.innerHTML = rows.map(g => `
+                <tr>
+                    <td>${g.special ? `<span class="badge badge-gray">${escapeHtml(g.label)}</span>` : `<strong>${escapeHtml(g.label)}</strong>`}</td>
+                    <td class="num">${g.accounts || '<span class="muted">—</span>'}</td>
+                    <td class="num">${g.messages.toLocaleString()}</td>
+                    <td class="num">${cell(g.apify)}</td>
+                    <td class="num">${cell(g.ai)}</td>
+                    <td class="num">${cell(g.brave)}</td>
+                    <td class="num">${cell(g.share)}</td>
+                    <td class="num"><strong>${cell(g.combined)}</strong></td>
+                    <td class="num">${g.messages && g.combined ? money(g.combined / g.messages) : '<span class="muted">—</span>'}</td>
+                </tr>`).join('') + `
+                <tr style="background:var(--light-gray);">
+                    <td><strong>Total</strong></td>
+                    <td class="num"><strong>${tot.accounts}</strong></td>
+                    <td class="num"><strong>${tot.messages.toLocaleString()}</strong></td>
+                    <td class="num"><strong>${money(tot.apify)}</strong></td>
+                    <td class="num"><strong>${money(tot.ai)}</strong></td>
+                    <td class="num"><strong>${money(tot.brave)}</strong></td>
+                    <td class="num"><strong>${money(tot.share)}</strong></td>
+                    <td class="num"><strong>${money(tot.combined)}</strong></td>
+                    <td class="num"><strong>${tot.messages && tot.combined ? money(tot.combined / tot.messages) : '—'}</strong></td>
+                </tr>`;
         }
 
         document.querySelectorAll('#byAccountTable th[data-sort]').forEach(th => {
@@ -913,7 +1146,7 @@
             const tbody = document.getElementById('fpRunsBody');
             const withAi = fp.runs.filter(r => r._aiUsd > 0);
             if (!withAi.length) {
-                tbody.innerHTML = `<tr><td colspan="4" class="muted">${fp.runs.length ? 'No runs in this range have a saved AI-cost estimate.' : 'No Full Pipeline runs in this range.'}</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="4" class="muted">${fp.runs.length ? 'No runs in this range need an AI-cost estimate (runs since automatic capture began are counted from the real AI ledger instead).' : 'No Full Pipeline runs in this range.'}</td></tr>`;
                 return;
             }
             tbody.innerHTML = withAi.map(r => `
@@ -927,13 +1160,15 @@
 
         window.exportCsv = function () {
             if (!byAccountRows.length) { alert('No data loaded to export.'); return; }
-            const headers = ['Account', 'Total Messages', 'Sent to HeyReach', 'Full Pipeline Messages', 'Other Tool Messages', 'Apify USD', 'AI USD (ledger + Full Pipeline)', 'Brave USD', 'Combined USD'];
+            const headers = ['Account', 'Client', 'Total Messages', 'Sent to HeyReach', 'Full Pipeline Messages', 'Other Tool Messages', 'Apify USD', 'AI USD (ledger + Full Pipeline)', 'Brave USD', 'Untracked Share USD', 'Combined USD'];
             const csvEscape = v => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
             const rows = byAccountRows.map(r => [
-                r.name ? `${r.name} (${r.account})` : r.account,
+                r.account === '__untracked__' ? 'Untracked vendor spend (billed - tracked)' : (r.name ? `${r.name} (${r.account})` : r.account),
+                r.client || '',
                 r.totalMessages, r.sentMessages, r.fpMessages, r.otherMessages,
                 r.apifyUsd != null ? r.apifyUsd.toFixed(4) : '', r.aiUsd != null ? r.aiUsd.toFixed(4) : '',
-                r.braveUsd != null ? r.braveUsd.toFixed(4) : '', r.combinedUsd.toFixed(4)
+                r.braveUsd != null ? r.braveUsd.toFixed(4) : '',
+                r.untrackedShareUsd != null ? r.untrackedShareUsd.toFixed(4) : '', r.combinedUsd.toFixed(4)
             ].map(csvEscape).join(','));
             const csv = [headers.join(','), ...rows].join('\n');
             const blob = new Blob([csv], { type: 'text/csv' });
