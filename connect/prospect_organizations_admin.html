@@ -3746,6 +3746,28 @@
                     </div>
                 </div>
 
+                <!-- ── Remove Organizations by Pasted List (mass delete) ── -->
+                <div style="border:2px solid #fca5a5; border-radius:10px; margin-bottom:1.5rem; overflow:hidden;">
+                    <div style="background:#fef2f2; padding:0.75rem 1rem; font-weight:700; color:#991b1b; font-size:0.95rem;">
+                        <i class="fas fa-trash-alt"></i> Remove Organizations from This Group by Pasted List
+                    </div>
+                    <div style="padding:1rem;">
+                        <p style="color:var(--gray); font-size:0.88rem; margin-bottom:0.75rem;">
+                            Paste one organization name per line to remove them from this group in bulk. Names are matched against this group's
+                            organizations (case, punctuation and suffixes like Inc/LLC are ignored). You'll see exactly what will be removed before anything happens.
+                            Organizations owned by a BDR/workspace only lose their group link; organizations that exist only in this group's pool are deleted.
+                        </p>
+                        <textarea id="hypoRemovePasteTextarea" oninput="onHypoRemovePasteChange()"
+                                  placeholder="Acme Health System&#10;Regional Medical Center&#10;St. Mary's Hospital&#10;..."
+                                  style="width:100%; min-height:120px; padding:0.75rem; border:2px solid var(--border); border-radius:8px; font-size:0.95rem; font-family:inherit; resize:vertical; box-sizing:border-box; margin-bottom:0.6rem;"></textarea>
+                        <div id="hypoRemovePreviewBar" style="font-size:0.88rem; color:var(--gray); margin-bottom:0.5rem;">Start typing or pasting names above.</div>
+                        <div id="hypoRemovePreviewDetails" style="display:none; margin-bottom:0.75rem;"></div>
+                        <button class="btn" onclick="hypoRemovePastedOrgs()" id="btnHypoRemovePaste" disabled style="padding:9px 20px; background:var(--danger); color:white;">
+                            <i class="fas fa-trash-alt"></i> Remove Matched Organizations
+                        </button>
+                    </div>
+                </div>
+
                 <!-- ── AI Priority Scorer ──────────────────────────── -->
                 <div style="border:2px solid #c4b5fd; border-radius:10px; margin-bottom:1.5rem; overflow:hidden;">
                     <div style="background:#f5f3ff; padding:0.75rem 1rem; font-weight:700; color:#5b21b6; font-size:0.95rem; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
@@ -15967,6 +15989,8 @@
             document.getElementById('hypoTaggedResults').style.display = 'none';
             _hypoSourceRows = [];
             _hypoTaggedRows = [];
+            document.getElementById('hypoRemovePasteTextarea').value = '';
+            onHypoRemovePasteChange();
 
             // Reset AI Priority Scorer UI so the new group's saved criteria loads fresh
             hypoAiPriorityCriteriaDirty = false;
@@ -17744,6 +17768,125 @@
             } finally {
                 btn.disabled = true;
                 btn.innerHTML = '<i class="fas fa-plus-circle"></i> Add Pasted Organizations';
+            }
+        };
+
+        // ── Remove by pasted list (mass delete) ───────────────────────────
+        let _hypoRemoveMatches = [];   // group org docs matched by the pasted names
+
+        function hypoComputeRemovePreview() {
+            const text = document.getElementById('hypoRemovePasteTextarea').value;
+            const names = [...new Set(text.split(/\r?\n/).map(n => n.trim()).filter(Boolean))];
+
+            // normalized name -> org docs in this group (a name can map to several duplicate records)
+            const byName = new Map();
+            hypoOrgsData.forEach(o => {
+                const key = hypoNormName(o.company_name, true);
+                if (!key) return;
+                if (!byName.has(key)) byName.set(key, []);
+                byName.get(key).push(o);
+            });
+
+            const matched = new Map();   // orgId -> org
+            const unmatched = [];
+            names.forEach(name => {
+                const hits = byName.get(hypoNormName(name, true));
+                if (hits && hits.length) hits.forEach(o => matched.set(o.id, o));
+                else unmatched.push(name);
+            });
+            return { names, matched: [...matched.values()], unmatched };
+        }
+
+        window.onHypoRemovePasteChange = function() {
+            const bar = document.getElementById('hypoRemovePreviewBar');
+            const details = document.getElementById('hypoRemovePreviewDetails');
+            const btn = document.getElementById('btnHypoRemovePaste');
+
+            if (!hypoCurrentGroupId) {
+                _hypoRemoveMatches = [];
+                bar.textContent = 'Select a hypothesis group first.';
+                details.style.display = 'none';
+                btn.disabled = true;
+                return;
+            }
+
+            const { names, matched, unmatched } = hypoComputeRemovePreview();
+            _hypoRemoveMatches = matched;
+
+            if (names.length === 0) {
+                bar.textContent = 'Start typing or pasting names above.';
+                details.style.display = 'none';
+                btn.disabled = true;
+                return;
+            }
+
+            bar.innerHTML = `<strong>${names.length}</strong> name${names.length !== 1 ? 's' : ''} pasted — ` +
+                `<strong style="color:var(--danger);">${matched.length}</strong> matching organization${matched.length !== 1 ? 's' : ''} will be removed` +
+                (unmatched.length ? `, <strong>${unmatched.length}</strong> not found in this group.` : '.');
+
+            const CAP = 200;
+            const listHtml = (items, render) => items.slice(0, CAP).map(render).join('') +
+                (items.length > CAP ? `<div style="color:var(--gray); padding:2px 0;">…and ${items.length - CAP} more</div>` : '');
+            let html = '';
+            if (matched.length) {
+                html += `<details style="margin-bottom:0.4rem;"><summary style="cursor:pointer; font-weight:600; color:#991b1b;">Will be removed (${matched.length})</summary>
+                    <div style="max-height:180px; overflow-y:auto; font-size:0.85rem; padding:6px 10px; border:1px solid var(--border); border-radius:6px; margin-top:4px;">` +
+                    listHtml(matched, o => {
+                        const poolOnly = (o.bdrEmail || '').startsWith(HYPO_SENTINEL_PREFIX) &&
+                            (o.hypothesis_group_ids || []).filter(id => id !== hypoCurrentGroupId).length === 0;
+                        return `<div>${escAdminHtml(o.company_name || '')}${poolOnly ? ' <span style="color:var(--danger); font-size:0.78rem;">(record deleted)</span>' : ''}</div>`;
+                    }) + `</div></details>`;
+            }
+            if (unmatched.length) {
+                html += `<details><summary style="cursor:pointer; font-weight:600; color:#92400e;">Not found in this group (${unmatched.length})</summary>
+                    <div style="max-height:180px; overflow-y:auto; font-size:0.85rem; padding:6px 10px; border:1px solid var(--border); border-radius:6px; margin-top:4px;">` +
+                    listHtml(unmatched, n => `<div>${escAdminHtml(n)}</div>`) + `</div></details>`;
+            }
+            details.innerHTML = html;
+            details.style.display = html ? 'block' : 'none';
+            btn.disabled = matched.length === 0;
+        };
+
+        window.hypoRemovePastedOrgs = async function() {
+            if (!hypoCurrentGroupId) { alert('Select a hypothesis group first.'); return; }
+            // Recompute against the current table data so nothing stale gets removed
+            const { matched } = hypoComputeRemovePreview();
+            if (matched.length === 0) { alert('None of the pasted names match organizations in this group.'); return; }
+            const poolOnlyCount = matched.filter(o => (o.bdrEmail || '').startsWith(HYPO_SENTINEL_PREFIX) &&
+                (o.hypothesis_group_ids || []).filter(id => id !== hypoCurrentGroupId).length === 0).length;
+            if (!confirm(`Remove ${matched.length} organization(s) from "${hypoCurrentGroupName}"?\n\n` +
+                `${poolOnlyCount} exist only in this group's pool and will be deleted.\n` +
+                `${matched.length - poolOnlyCount} are owned by a BDR/workspace (or other group) and only lose their link to this group.`)) return;
+
+            const btn = document.getElementById('btnHypoRemovePaste');
+            let removed = 0, failed = 0;
+            try {
+                btn.disabled = true;
+                for (let i = 0; i < matched.length; i++) {
+                    btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Removing ${i + 1} / ${matched.length}…`;
+                    const org = matched[i];
+                    try {
+                        await hypoUnlinkOrgDoc(org);
+                        hypoOrgsData = hypoOrgsData.filter(o => o.id !== org.id);
+                        hypoSelectedOrgIds.delete(org.id);
+                        removed++;
+                    } catch (e) {
+                        console.error('Error removing org', org.id, e);
+                        failed++;
+                    }
+                }
+                alert(`✅ Removed ${removed} organization(s) from "${hypoCurrentGroupName}".` + (failed ? `\n\n⚠️ ${failed} failed — see console.` : ''));
+                document.getElementById('hypoRemovePasteTextarea').value = '';
+                onHypoRemovePasteChange();
+                hypoUpdateStats();
+                hypoRenderOrgsTable();
+                hypoUpdateSelectionCounts();
+            } catch (error) {
+                console.error('Error removing pasted organizations:', error);
+                alert('Error removing organizations: ' + error.message);
+            } finally {
+                btn.innerHTML = '<i class="fas fa-trash-alt"></i> Remove Matched Organizations';
+                btn.disabled = _hypoRemoveMatches.length === 0;
             }
         };
 
