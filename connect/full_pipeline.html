@@ -542,15 +542,39 @@
                         <option value="low">Low — only clear mismatches</option>
                         <option value="off">Off — text review only</option>
                     </select>
+                    <div class="form-help">Applied to each contact <strong>before</strong> a message is built (excluded contacts never get a message), and again when Opus reviews the finished message.</div>
                 </div>
             </div>
             <div class="grid-2">
                 <div class="form-group">
                     <label style="display: flex; align-items: center; gap: 8px;">
-                        <input type="checkbox" id="fpCrossBdrEnabled" style="width: auto;">
+                        <input type="checkbox" id="fpCrossBdrEnabled" style="width: auto;" onchange="document.getElementById('fpCrossBdrOptions').style.display = this.checked ? 'block' : 'none';">
                         <span><i class="fas fa-people-arrows"></i> Also use existing contacts from other BDRs / workspaces at each organization</span>
                     </label>
-                    <div class="form-help">Before the Apify scan results are used, contacts at the same organization already stored under other BDRs are found, <strong>refreshed with a live LinkedIn check</strong> (so we never work off stale data), and copied to the current BDR.</div>
+                    <div class="form-help">Before the Apify scan results are used, contacts at the same organization already stored under other BDRs are found, <strong>refreshed with a live LinkedIn check</strong> (so we never work off stale data), and handed to the current BDR (moved or copied — see below).</div>
+                    <div id="fpCrossBdrOptions" style="display:none; margin-top:0.6rem; padding:0.7rem 0.9rem; background:#f8fafc; border:1.5px solid var(--border, #e2e8f0); border-radius:8px;">
+                        <div style="display:flex; flex-wrap:wrap; gap:0.9rem; align-items:flex-end;">
+                            <div>
+                                <label for="fpCrossBdrScope" style="display:block; font-size:0.8rem; font-weight:600; margin-bottom:3px;">Pull from</label>
+                                <select id="fpCrossBdrScope" class="form-select" style="min-width:300px;">
+                                    <option value="pool" selected>Other BDRs' pool — any contact at this organization</option>
+                                    <option value="group">Other BDRs' contacts that are in the selected hypothesis group</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label for="fpCrossBdrMode" style="display:block; font-size:0.8rem; font-weight:600; margin-bottom:3px;">Hand-off</label>
+                                <select id="fpCrossBdrMode" class="form-select" style="min-width:230px;">
+                                    <option value="move" selected>Move (reassign to this BDR)</option>
+                                    <option value="copy">Copy (other BDR keeps theirs)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <label style="display:flex; align-items:center; gap:8px; margin-top:0.6rem;">
+                            <input type="checkbox" id="fpCrossBdrUntouchedOnly" checked style="width:auto;">
+                            <span>Only <strong>untouched</strong> contacts — no live outreach from any BDR (no sent, approved, or pending-review message)</span>
+                        </label>
+                        <div class="form-help">With this unchecked, contacts that already have outreach are included too, but they are always <strong>copied</strong>, never moved — a contact with outreach stays with the BDR who contacted them. Deleted / rejected / duplicate messages don't count as outreach. Contacts already connected to this BDR on LinkedIn are always skipped.</div>
+                    </div>
                 </div>
                 <div class="form-group">
                     <label style="display: flex; align-items: center; gap: 8px;">
@@ -1795,6 +1819,85 @@
             } catch (err) {
                 addLog(`   ⚠️ Opus Review error: ${err.message}`, 'warning');
                 return null;
+            }
+        }
+
+        // ── Pre-message exclude check ────────────────────────────────────────────
+        // Decides whether a contact is excluded BEFORE any message is built for them, so no
+        // message-writing AI cost is spent on someone the Target Contact / Exclude Rules
+        // would only have flagged afterward (the exclude half of the old post-message Opus
+        // Review). Uses the same classifier + enriched-profile shape as the rules filter /
+        // Opus Review, and honors the Opus Exclude Sensitivity setting ('off' never runs it;
+        // 'low' raises the bar to clear, unambiguous mismatches). Fails OPEN: any error keeps
+        // the contact, and the post-message Opus Review still applies its own decision.
+        async function fpPreMessageExcludeCheck({ token, prospect, rules, excludeMode, groupName, profile, addLog }) {
+            const baseRules = (rules || '').trim();
+            if (!baseRules || excludeMode === 'off') return { exclude: false, reason: '', skipped: true };
+            const effectiveRules = excludeMode === 'low'
+                ? `${baseRules}\n\nSENSITIVITY: LOW. Use a much higher bar than usual. Only EXCLUDE when there is clear, unambiguous evidence the contact is a poor fit (e.g. they have obviously changed to an unrelated role/industry, are retired, or the rules are violated in a way no reasonable reviewer would dispute). If the evidence is ambiguous, partial, or a matter of interpretation, KEEP the contact.`
+                : baseRules;
+            try {
+                const res = await fetchWithRetry(`${RAILWAY_API}/api/connect/hypothesis-title-classify`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({
+                        contacts: [{
+                            id: String(prospect.id || prospect.linkedInUrl || 'contact'),
+                            title: prospect.title || '',
+                            org: prospect.company || prospect.companyName || '',
+                            ...(profile ? { profile } : {})
+                        }],
+                        rules: effectiveRules,
+                        groupName: groupName || ''
+                    })
+                }, { addLog, label: 'Pre-message exclude check' });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok || !data.success || !Array.isArray(data.results) || !data.results[0]) {
+                    addLog(`   ⚠️ Pre-message exclude check failed (${data.error || `HTTP ${res.status}`}) — continuing to message generation.`, 'warning');
+                    return { exclude: false, reason: '', failed: true };
+                }
+                const r = data.results[0];
+                return { exclude: !!r.exclude, reason: r.reason || '' };
+            } catch (err) {
+                addLog(`   ⚠️ Pre-message exclude check error: ${err.message} — continuing to message generation.`, 'warning');
+                return { exclude: false, reason: '', failed: true };
+            }
+        }
+
+        // Soft-excludes a contact the pre-message check rejected — the same pattern as
+        // hypothesis_target_rules.html's "Exclude selected": a per-BDR prospect_exclusions
+        // record plus excludedFromCampaign on the prospect_contacts doc, so later runs skip
+        // them without re-paying for the check and an admin can still review/undo it.
+        async function fpSoftExcludeProspect({ prospect, bdrEmail, groupId, groupName, reason }) {
+            try {
+                const url = prospect.linkedInUrl || '';
+                const exclusionUrl = url.startsWith('http') ? url : `https://${url}`;
+                const nowIso = new Date().toISOString();
+                await addDoc(collection(db, 'prospect_exclusions'), {
+                    linkedinUrl: exclusionUrl,
+                    excludedByBdr: bdrEmail,
+                    excludedBy: bdrEmail,
+                    excludedAt: nowIso,
+                    messageType: 'prospect',
+                    prospectName: [prospect.firstName, prospect.lastName].filter(Boolean).join(' '),
+                    prospectTitle: prospect.title || '',
+                    prospectCompany: prospect.company || prospect.companyName || '',
+                    excludedReason: `Target Contact / Exclude Rules match (before message build): ${reason || 'no reason given'}`,
+                    hypothesisGroupId: groupId || null,
+                    hypothesisGroupName: groupName || '',
+                    excludedByTool: 'full_pipeline_pre_message_exclude'
+                });
+                if (prospect.id) {
+                    await updateDoc(doc(db, 'prospect_contacts', prospect.id), {
+                        excludedFromCampaign: true,
+                        excludedAt: nowIso,
+                        excludedReason: `Target Contact / Exclude Rules (before message build) — ${reason || 'rule match'}`
+                    });
+                }
+                return true;
+            } catch (e) {
+                console.warn('[Full Pipeline] Could not record pre-message exclusion:', e.message);
+                return false;
             }
         }
 
@@ -3242,6 +3345,7 @@
             if (r.includes('build model returned empty text')) return 'build_message_empty_text';
             if (r.includes('empty message') || r.includes('generation returned empty')) return 'profile_message_generation_empty';
             if (r.includes('maverick check failed')) return 'maverick_check_failed';
+            if (r.includes('excluded by target contact / exclude rules before message build')) return 'excluded_before_message';
             if (r.includes('below') && r.includes('connection')) return 'below_connection_floor';
             if (r.includes('30-day org limit')) return 'org_30day_limit';
             if (r.includes('already') && (r.includes('connect') || r.includes('queue'))) return 'already_connected_or_queued';
@@ -3905,6 +4009,7 @@
             profile_message_generation_empty:  'Not enough profile information to write a personalized message',
             maverick_check_failed:             'Draft message did not pass the quality check',
             below_connection_floor:            'Below the minimum LinkedIn connection count',
+            excluded_before_message:           'Excluded by the target contact rules before a message was built',
             org_30day_limit:                   'Organization contact limit reached — saved for a later month',
             already_connected_or_queued:       'Already connected, or a message is already queued',
             no_profile_data:                   'No LinkedIn profile data available',
@@ -5248,14 +5353,16 @@
             if (label) document.getElementById('fpProgressLabel').textContent = label;
         }
 
-        const fpStats = { orgs: 0, scanned: 0, matched: 0, dropped: 0, messages: 0, excluded: 0, apifyCost: 0, dncSkipped: 0, alreadyConnected: 0 };
+        const fpStats = { orgs: 0, scanned: 0, matched: 0, dropped: 0, messages: 0, excluded: 0, preExcluded: 0, apifyCost: 0, dncSkipped: 0, alreadyConnected: 0 };
         function fpRenderStats() {
             document.getElementById('fpStatOrgs').textContent     = fpStats.orgs;
             document.getElementById('fpStatScanned').textContent  = fpStats.scanned;
             document.getElementById('fpStatMatched').textContent  = fpStats.matched;
             document.getElementById('fpStatDropped').textContent  = fpStats.dropped;
             document.getElementById('fpStatMessages').textContent = fpStats.messages;
-            document.getElementById('fpStatExcluded').textContent = fpStats.excluded;
+            // "Excluded" = contacts excluded before a message was built + messages Opus flagged afterward.
+            // Net Usable below only subtracts the latter — pre-excluded contacts never had a message.
+            document.getElementById('fpStatExcluded').textContent = fpStats.excluded + fpStats.preExcluded;
             document.getElementById('fpStatNetUsable').textContent = Math.max(0, fpStats.messages - fpStats.excluded);
             document.getElementById('fpStatApifyCost').textContent = '$' + fpStats.apifyCost.toFixed(2);
             document.getElementById('fpStatDnc').textContent       = fpStats.dncSkipped;
@@ -5859,11 +5966,75 @@
             throw new Error('Scan job timed out after 30 minutes');
         }
 
+        // ── Cross-BDR helpers ─────────────────────────────────────────────────────
+        // Which of these contacts already have LIVE outreach from ANY BDR? "Live" uses the same
+        // definition as the 30-day org limit (fpQueueDocDeadReason): a connect_queue message that
+        // was sent, approved, or is still pending review. Deleted / rejected / duplicate /
+        // already-connected messages are not outreach. Matches connect_queue docs by the contact's
+        // LinkedIn URL on every field the different code paths write it to.
+        async function fpLoadTouchedUrlSet(contacts) {
+            const touched = new Set(); // fpNormalizeUrl'd
+            const variants = new Set();
+            for (const c of contacts) {
+                const raw = String(c.linkedInUrl || c.li_url || c.linkedin_url || '').trim();
+                if (!raw) continue;
+                const noSlash = raw.replace(/\/+$/, '');
+                [raw, noSlash, noSlash + '/', noSlash.toLowerCase(), noSlash.toLowerCase() + '/'].forEach(v => variants.add(v));
+            }
+            const values = [...variants];
+            const fields = ['prospect_li_url', 'contact_linkedin_url', 'linkedin_url', 'linkedInUrl'];
+            const CHUNK = 10, PARALLEL = 4; // 'in' is capped at 10-30 values depending on backend; stay conservative
+            const jobs = [];
+            for (const field of fields) {
+                for (let i = 0; i < values.length; i += CHUNK) jobs.push({ field, chunk: values.slice(i, i + CHUNK) });
+            }
+            let failures = 0;
+            for (let i = 0; i < jobs.length; i += PARALLEL) {
+                await Promise.all(jobs.slice(i, i + PARALLEL).map(async ({ field, chunk }) => {
+                    try {
+                        const snap = await getDocs(query(collection(db, 'connect_queue'), where(field, 'in', chunk)));
+                        snap.forEach(d => {
+                            const data = d.data();
+                            if (fpQueueDocDeadReason(data)) return;
+                            const u = fpNormalizeUrl(data[field] || '');
+                            if (u) touched.add(u);
+                        });
+                    } catch (e) { failures++; }
+                }));
+            }
+            if (failures > 0) throw new Error(`${failures} outreach lookup(s) failed`);
+            return touched;
+        }
+
+        // Normalized LinkedIn URLs of every contact in a hypothesis group (cached per group per run).
+        let _fpCrossGroupUrlCache = null; // { groupId, urls: Set }
+        async function fpLoadGroupUrlSet(groupId) {
+            if (_fpCrossGroupUrlCache && _fpCrossGroupUrlCache.groupId === groupId) return _fpCrossGroupUrlCache.urls;
+            const ref = doc(db, 'hypothesis_groups', groupId);
+            const snap = await getDoc(ref);
+            const data = (snap.exists || snap.exists?.()) ? (snap.data() || {}) : {};
+            const { urls } = await fpReadGroupContacts(ref, data);
+            const set = new Set((urls || []).map(fpNormalizeUrl).filter(Boolean));
+            _fpCrossGroupUrlCache = { groupId, urls: set };
+            return set;
+        }
+
         // Optional cross-BDR step: find contacts at this org already stored under other
-        // BDRs / workspaces, refresh each one with a live LinkedIn check, and copy it to the
-        // current BDR tagged with this scan job so it flows through the same generation path.
-        async function fpImportCrossBdrContacts({ org, bdrEmail, scanJobId, connectedUrlSet, connectedUsernameSet }) {
+        // BDRs / workspaces, refresh each one with a live LinkedIn check, and hand it to the
+        // current BDR (move or copy), tagged with this scan job so it flows through the same
+        // generation path.
+        //   opts.scope         'pool'  = any contact at this org in another BDR's pool
+        //                      'group' = only those that are part of the selected hypothesis group
+        //   opts.untouchedOnly only contacts with no live outreach from any BDR
+        //   opts.mode          'move' (reassign) or 'copy'. Contacts WITH outreach are always
+        //                      copied, never moved, so they stay with the BDR who contacted them.
+        async function fpImportCrossBdrContacts({ org, bdrEmail, scanJobId, connectedUrlSet, connectedUsernameSet, groupId, opts }) {
+            opts = opts || {};
+            const scope = opts.scope === 'group' ? 'group' : 'pool';
+            const untouchedOnly = opts.untouchedOnly !== false;
+            const mode = opts.mode === 'copy' ? 'copy' : 'move';
             const found = new Map(); // normalized url -> contact doc
+            const ownUrls = new Set(); // contacts this BDR already has at this org (incl. this run's fresh scan)
             const CROSS_BDR_CAP = 100;
 
             const queries = [];
@@ -5874,7 +6045,14 @@
                 queries.push(query(collection(db, 'prospect_contacts'), where('company', '==', org.company_name)));
             }
 
-            let skippedConnected = 0;
+            let groupUrls = null;
+            if (scope === 'group') {
+                if (!groupId) { addLog('   ⚠️ Cross-BDR: no hypothesis group selected — cannot restrict to group members.', 'warning'); return 0; }
+                try { groupUrls = await fpLoadGroupUrlSet(groupId); }
+                catch (e) { addLog(`   ⚠️ Cross-BDR: could not read the hypothesis group's contact list (${e.message}) — skipping cross-BDR for this org.`, 'warning'); return 0; }
+            }
+
+            let skippedConnected = 0, skippedNotInGroup = 0, skippedAlreadyOwn = 0;
             for (const q of queries) {
                 try {
                     const snap = await getDocs(q);
@@ -5883,7 +6061,8 @@
                         const rawUrl = c.linkedInUrl || c.li_url || '';
                         const u = fpNormalizeUrl(rawUrl);
                         if (!u) return;
-                        if ((c.userEmail || c.bdrEmail) === bdrEmail) return; // already this BDR's contact
+                        if ((c.userEmail || c.bdrEmail) === bdrEmail) { ownUrls.add(u); return; } // already this BDR's contact
+                        if (scope === 'group' && !(c.hypothesisGroupId === groupId || groupUrls.has(u))) { skippedNotInGroup++; return; }
                         // Net-new connections only — skip before wasting a refresh scrape on them
                         if (connectedUrlSet && fpIsUrlConnected(connectedUrlSet, connectedUsernameSet || new Set(), rawUrl)) { skippedConnected++; return; }
                         if (!found.has(u)) found.set(u, c);
@@ -5892,16 +6071,44 @@
                     addLog(`   ⚠️ Cross-BDR lookup failed: ${e.message}`, 'warning');
                 }
             }
+            // This BDR already holds the person (e.g. the scan just saved them) — importing would duplicate them.
+            for (const u of [...found.keys()]) if (ownUrls.has(u)) { found.delete(u); skippedAlreadyOwn++; }
             if (skippedConnected > 0) addLog(`   🤝 Cross-BDR: skipped ${skippedConnected} contact(s) already connected to this BDR.`, 'dim');
+            if (skippedNotInGroup > 0) addLog(`   🔬 Cross-BDR: skipped ${skippedNotInGroup} contact(s) not in the selected hypothesis group.`, 'dim');
+            if (skippedAlreadyOwn > 0) addLog(`   ♻️ Cross-BDR: skipped ${skippedAlreadyOwn} contact(s) this BDR already has.`, 'dim');
 
-            const candidates = [...found.values()].slice(0, CROSS_BDR_CAP);
+            let candidates = [...found.values()];
+
+            // Outreach check — always run, so we know which contacts may be MOVED. With "untouched only"
+            // on, touched contacts are dropped; with it off they are kept but forced to copy.
+            let touchedSet = new Set();
+            if (candidates.length > 0) {
+                try {
+                    touchedSet = await fpLoadTouchedUrlSet(candidates);
+                } catch (e) {
+                    if (untouchedOnly) {
+                        addLog(`   ⚠️ Cross-BDR: couldn't verify outreach status (${e.message}) — skipping cross-BDR for this org rather than risk pulling touched contacts.`, 'warning');
+                        return 0;
+                    }
+                    addLog(`   ⚠️ Cross-BDR: couldn't verify outreach status (${e.message}) — treating every contact as touched (copy only, nothing moved).`, 'warning');
+                    touchedSet = null; // null = unknown → treat all as touched
+                }
+            }
+            const isTouched = c => touchedSet === null || touchedSet.has(fpNormalizeUrl(c.linkedInUrl || c.li_url || ''));
+            if (untouchedOnly) {
+                const before = candidates.length;
+                candidates = candidates.filter(c => !isTouched(c));
+                if (before - candidates.length > 0) addLog(`   🔒 Cross-BDR: skipped ${before - candidates.length} contact(s) that already have outreach.`, 'dim');
+            }
+
+            candidates = candidates.slice(0, CROSS_BDR_CAP);
             if (candidates.length === 0) {
-                addLog('   🔎 Cross-BDR: no existing contacts found at this organization under other BDRs.', 'dim');
+                addLog(`   🔎 Cross-BDR: no ${untouchedOnly ? 'untouched ' : ''}contacts ${scope === 'group' ? 'in this hypothesis group ' : ''}found at this organization under other BDRs.`, 'dim');
                 return 0;
             }
-            addLog(`   🔎 Cross-BDR: found ${candidates.length} existing contact(s) under other BDRs — refreshing and importing…`);
+            addLog(`   🔎 Cross-BDR: found ${candidates.length} ${untouchedOnly ? 'untouched ' : ''}contact(s) under other BDRs — refreshing and ${mode === 'move' ? 'moving' : 'copying'}…`);
 
-            let imported = 0;
+            let imported = 0, moved = 0, copied = 0;
             for (const c of candidates) {
                 if (window.fpStopRequested) break;
                 try {
@@ -5915,32 +6122,56 @@
                         addLog(`   ↩️ Skipping ${c.fullName || c.firstName || c.linkedInUrl} — now at "${freshEmployer}"`, 'dim');
                         continue;
                     }
-                    const copy = {
-                        ...c,
-                        userEmail: bdrEmail,
-                        bdrEmail: bdrEmail,
-                        linkedInAccountEmail: bdrEmail,
-                        uploadedAt: new Date().toISOString(),
-                        uploadedBy: currentUser.email,
-                        source: 'full_pipeline_cross_bdr',
-                        sourceJobId: scanJobId,
-                        scanJobId: scanJobId,
-                        crossBdrSourceId: c.id,
-                        crossBdrSourceOwner: c.userEmail || c.bdrEmail || '',
-                        ...(fresh ? {
-                            linkedInConnectionCount: extractConnectionCount(fresh) ?? c.linkedInConnectionCount ?? null,
-                            enrichedAt: new Date().toISOString(),
-                            enrichedBy: 'full_pipeline'
-                        } : {})
-                    };
-                    delete copy.id;
-                    await addDoc(collection(db, 'prospect_contacts'), copy);
+                    const nowIso = new Date().toISOString();
+                    const sourceOwner = c.userEmail || c.bdrEmail || '';
+                    const freshFields = fresh ? {
+                        linkedInConnectionCount: extractConnectionCount(fresh) ?? c.linkedInConnectionCount ?? null,
+                        enrichedAt: nowIso,
+                        enrichedBy: 'full_pipeline'
+                    } : {};
+                    // Contacts with outreach are never moved away from the BDR who contacted them.
+                    const doMove = mode === 'move' && !isTouched(c);
+                    if (doMove) {
+                        await updateDoc(doc(db, 'prospect_contacts', c.id), {
+                            userEmail: bdrEmail,
+                            bdrEmail: bdrEmail,
+                            linkedInAccountEmail: bdrEmail,
+                            movedAt: nowIso,
+                            movedFrom: sourceOwner,
+                            movedBy: currentUser.email,
+                            source: 'full_pipeline_cross_bdr',
+                            sourceJobId: scanJobId,
+                            scanJobId: scanJobId,
+                            previousSourceJobId: c.sourceJobId || c.scanJobId || null,
+                            crossBdrSourceOwner: sourceOwner,
+                            ...freshFields
+                        });
+                        moved++;
+                    } else {
+                        const copy = {
+                            ...c,
+                            userEmail: bdrEmail,
+                            bdrEmail: bdrEmail,
+                            linkedInAccountEmail: bdrEmail,
+                            uploadedAt: nowIso,
+                            uploadedBy: currentUser.email,
+                            source: 'full_pipeline_cross_bdr',
+                            sourceJobId: scanJobId,
+                            scanJobId: scanJobId,
+                            crossBdrSourceId: c.id,
+                            crossBdrSourceOwner: sourceOwner,
+                            ...freshFields
+                        };
+                        delete copy.id;
+                        await addDoc(collection(db, 'prospect_contacts'), copy);
+                        copied++;
+                    }
                     imported++;
                 } catch (e) {
                     addLog(`   ⚠️ Cross-BDR import failed for ${c.linkedInUrl}: ${e.message}`, 'warning');
                 }
             }
-            addLog(`   ✅ Cross-BDR: imported ${imported} refreshed contact(s) into ${bdrEmail}.`, imported ? 'success' : 'dim');
+            addLog(`   ✅ Cross-BDR: brought ${imported} refreshed contact(s) into ${bdrEmail} (${moved} moved, ${copied} copied).`, imported ? 'success' : 'dim');
             return imported;
         }
 
@@ -6538,6 +6769,7 @@
             opusReview:  0.01,  // per-message Opus review/cleanup pass
             finalReview: 0.01,  // per-message final AI review pass
             ruleClassify: 0.02, // batched (up to 50 contacts) Target Contact / Exclude Rules classification
+            preExcludeCheck: 0.01, // per-contact exclude check (with enriched profile), run before a message is built
             storyMatch:  0.01   // batched (per org) story-to-contact relevance matching
         };
         function fpEstimateAiCost(aiCallCounts) {
@@ -6688,6 +6920,15 @@
             const connFilterMin = parseInt(document.getElementById('fpConnFilterMin').value) || 250;
             const opusExcludeMode = document.getElementById('fpOpusExcludeMode').value;
             const crossBdrEnabled = document.getElementById('fpCrossBdrEnabled').checked;
+            const crossBdrOpts = {
+                scope: document.getElementById('fpCrossBdrScope')?.value === 'group' ? 'group' : 'pool',
+                mode: document.getElementById('fpCrossBdrMode')?.value === 'copy' ? 'copy' : 'move',
+                untouchedOnly: document.getElementById('fpCrossBdrUntouchedOnly')?.checked !== false
+            };
+            _fpCrossGroupUrlCache = null; // re-read the group's contact list fresh each run
+            if (crossBdrEnabled) {
+                addLog(`🧑‍🤝‍🧑 Cross-BDR is ON — pulling from ${crossBdrOpts.scope === 'group' ? "other BDRs' contacts in this hypothesis group" : "other BDRs' pool at each organization"}; ${crossBdrOpts.untouchedOnly ? 'untouched contacts only' : 'contacts with outreach included (copy only)'}; hand-off: ${crossBdrOpts.mode}.`, 'info');
+            }
             const finalReviewEnabled = document.getElementById('fpFinalReviewEnabled').checked;
             const topContactsEnabled = document.getElementById('fpTopContactsEnabled').checked;
             const topContactsLimit = Math.max(1, parseInt(document.getElementById('fpTopContactsLimit').value) || 5);
@@ -6948,9 +7189,9 @@
                 // AI review/Opus token costs are not exposed by the endpoints — record call
                 // counts so per-model cost can be estimated later.
                 aiCostTracking: 'call_counts_only',
-                aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0, storyMatch: 0 },
+                aiCallCounts: { generate: 0, opusReview: 0, finalReview: 0, ruleClassify: 0, preExcludeCheck: 0, storyMatch: 0 },
                 orgs: [],
-                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, duplicateSkippedOrgs: 0, noLinkedInUrlSkippedOrgs: 0, urlLookupFailedOrgs: 0, companyMismatchOrgs: 0, orgLimitSkippedOrgs: 0, orgLimitSkippedContacts: 0, backfill: null, hypothesisTally: null, noMessageTally: null, postTypeTally: null, messageSourceTally: null,
+                totals: { contactsScanned: 0, crossBdrImported: 0, matched: 0, dropped: 0, messages: 0, opusApproved: 0, opusNeedsAttention: 0, opusExcluded: 0, opusPreExcluded: 0, finalReviewFlagged: 0, apifyUsd: 0, scanJobHarvestUsd: 0, scanJobBebityUsd: 0, dncSkippedOrgs: 0, alreadyConnected: 0, duplicateSkippedOrgs: 0, noLinkedInUrlSkippedOrgs: 0, urlLookupFailedOrgs: 0, companyMismatchOrgs: 0, orgLimitSkippedOrgs: 0, orgLimitSkippedContacts: 0, backfill: null, hypothesisTally: null, noMessageTally: null, postTypeTally: null, messageSourceTally: null,
                     // Filled in once at the end of the run — see fpFetchRealApifyCosts(). apifyUsd
                     // above only ever reflected the contact-search (scan) job; realCostBreakdown is
                     // the actual apify_run_ledger total across EVERY Apify call this run triggered
@@ -7212,7 +7453,7 @@
                             // text of its own, so a message built from one is reacting to someone
                             // else's words, not the prospect's — see extractFullAiSourceData().
                             postTypeTally: { regular: 0, quote: 0, repost: 0 },
-                            opus: { approved: 0, needsAttention: 0, excluded: 0 },
+                            opus: { approved: 0, needsAttention: 0, excluded: 0, preExcluded: 0 },
                             finalReview: { approved: 0, flagged: 0 },
                             costs: { scanJobHarvestUsd: 0, scanJobBebityUsd: 0, apifyLedgerUsd: 0, ledgerRuns: 0 },
                             error: null
@@ -7477,7 +7718,7 @@
 
                             // ── 3. Optional: cross-BDR contacts (refresh + import) ──
                             if (crossBdrEnabled) {
-                                orgReport.crossBdrImported = await fpImportCrossBdrContacts({ org, bdrEmail, scanJobId: jobId, connectedUrlSet, connectedUsernameSet });
+                                orgReport.crossBdrImported = await fpImportCrossBdrContacts({ org, bdrEmail, scanJobId: jobId, connectedUrlSet, connectedUsernameSet, groupId, opts: crossBdrOpts });
                             }
 
                             // ── 4. Load this job's contacts + Target Contact / Exclude Rules filter ──
@@ -7833,6 +8074,41 @@
                                         }
                                         if (connNum === null && connRaw != null) {
                                             addLog(`   ℹ️ Connection count unreadable (${connRaw}) — not dropping on it`, 'dim');
+                                        }
+                                    }
+
+                                    // ── Exclude check — BEFORE any message is built ──
+                                    // The Target Contact / Exclude Rules (with the contact's enriched
+                                    // profile) are applied here, so no message-writing cost is spent
+                                    // on contacts that would only be flagged "exclude" afterward.
+                                    // Honors the Opus Exclude Sensitivity setting; runs only when
+                                    // Opus Review is on and Target Contact / Exclude Rules exist.
+                                    if (opusReviewEnabled && opusExcludeMode !== 'off' && (targetInstr || '').trim()) {
+                                        addLog('   🔎 Checking Target Contact / Exclude Rules before building a message...', 'dim');
+                                        let preProfile = null;
+                                        try {
+                                            const processedForExclude = existingProfileData ? processProfileData(existingProfileData) : null;
+                                            preProfile = buildOpusProfilePayload(processedForExclude, existingProfileData, {
+                                                currentTitle: prospect.title || '',
+                                                currentCompany: prospect.company || prospect.companyName || ''
+                                            });
+                                        } catch (_pe) { preProfile = null; }
+                                        report.aiCallCounts.preExcludeCheck = (report.aiCallCounts.preExcludeCheck || 0) + 1;
+                                        const pre = await fpPreMessageExcludeCheck({
+                                            token, prospect,
+                                            rules: fpResolveOrgPlaceholders(targetInstr, org),
+                                            excludeMode: opusExcludeMode,
+                                            groupName, profile: preProfile, addLog
+                                        });
+                                        if (pre.exclude) {
+                                            addLog(`   ⛔ Excluded before message build — ${pre.reason || 'no reason given'}`, 'warning');
+                                            const recorded = await fpSoftExcludeProspect({ prospect, bdrEmail, groupId, groupName, reason: pre.reason });
+                                            if (!recorded) addLog('   ⚠️ Could not save this exclusion — the contact may be re-checked in a later run.', 'warning');
+                                            orgReport.opus.preExcluded = (orgReport.opus.preExcluded || 0) + 1;
+                                            fpStats.preExcluded++;
+                                            fpRenderStats();
+                                            fpTallyNoMessage(orgReport, prospect, 'excluded by Target Contact / Exclude Rules before message build', pre.reason || '');
+                                            continue;
                                         }
                                     }
 
@@ -8308,6 +8584,7 @@
                         report.totals.opusApproved     += orgReport.opus.approved;
                         report.totals.opusNeedsAttention += orgReport.opus.needsAttention;
                         report.totals.opusExcluded     += orgReport.opus.excluded;
+                        report.totals.opusPreExcluded  += (orgReport.opus.preExcluded || 0);
                         report.totals.finalReviewFlagged += orgReport.finalReview.flagged;
                         report.totals.apifyUsd         += orgReport.costs.apifyLedgerUsd;
                         report.totals.scanJobHarvestUsd += orgReport.costs.scanJobHarvestUsd;

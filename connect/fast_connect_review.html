@@ -9786,6 +9786,16 @@
             return harvestish && (message.message_type || 'connect') === 'message';
         }
 
+        // STANDARD ROUTING: every follow-up MESSAGE (message_type 'message', from any source) goes to the
+        // BDR's Quick Message campaign — never to linkedin_message_queue slots, the "message" campaign
+        // queue, or the reserve queue. Connection requests (message_type 'connect') keep going through
+        // the connect queue to the BDR's connect campaign. isHarvestQuickMessageRow() is still used for
+        // the source filters; this is the routing decision only.
+        function shouldRouteToQuickMessage(message) {
+            if (!message) return false;
+            return isHarvestQuickMessageRow(message) || (message.message_type || 'connect') === 'message';
+        }
+
         // ── Quick Message Campaign helper ─────────────────────────────────────────
         function getQuickMessageCampaignForBdr(bdrEmail) {
             const normalized = (bdrEmail || '').toLowerCase();
@@ -13489,7 +13499,7 @@ Rules:
                 .filter(([id, action]) => {
                     if (action !== 'approve') return false;
                     const msg = loadedMessages.find(m => m.id === id);
-                    return !!msg?.autoSendToReserve;
+                    return !!msg?.autoSendToReserve && !shouldRouteToQuickMessage(msg);
                 }).length;
             // Count approved messages manually flagged via the "Send to Reserve" checkbox
             // (excluding ones already counted above as auto-routed)
@@ -13498,7 +13508,7 @@ Rules:
                     if (action !== 'approve') return false;
                     if (!manualReserveSelections.has(id)) return false;
                     const msg = loadedMessages.find(m => m.id === id);
-                    return !msg?.autoSendToReserve;
+                    return !msg?.autoSendToReserve && !shouldRouteToQuickMessage(msg);
                 }).length;
             const reserveAutoLine = reserveAutoCount > 0
                 ? `\n  ↳ ${reserveAutoCount} will auto-route to Reserve Queue (low connections <500)`
@@ -13549,8 +13559,14 @@ Rules:
                 }
             }
 
+            const quickMessageCount = Array.from(messageSelections.entries())
+                .filter(([id, action]) => action === 'approve' && shouldRouteToQuickMessage(loadedMessages.find(m => m.id === id))).length;
+            const quickMessageLine = quickMessageCount > 0
+                ? `\n  ↳ ${quickMessageCount} message(s) will be added directly to the BDR's Quick Message campaign`
+                : '';
+
             const confirmMessage = `You are about to process ${messageSelections.size} messages:\n\n` +
-                `Approve: ${approveCount}${reserveAutoLine}${reserveManualLine}${groupLine}\n` +
+                `Approve: ${approveCount}${quickMessageLine}${reserveAutoLine}${reserveManualLine}${groupLine}\n` +
                 `Exclude: ${Array.from(messageSelections.values()).filter(a => a === 'exclude').length}\n` +
                 `Delete: ${Array.from(messageSelections.values()).filter(a => a === 'delete').length}` +
                 `${groupOnlyLine}${queueNote}${queue2ConfirmNote}${flaggedNote}${overrideNote}\n\nThis action cannot be undone. Continue?`;
@@ -13656,14 +13672,17 @@ Rules:
                     if (!message) continue;
                     
                     if (action === 'approve') {
-                        const isHarvestQuestionsRow = isHarvestQuickMessageRow(message);
+                        // Every follow-up message (and every Harvest row) → Quick Message campaign.
+                        const isHarvestQuestionsRow = shouldRouteToQuickMessage(message);
 
                         // Log routing decision for every approved message so the console
                         // always shows where each message is headed.
                         const _autoReserve = !!message.autoSendToReserve;
                         const _manualReserve = manualReserveSelections.has(messageId);
-                        const _reserveRoute = _autoReserve || _manualReserve;
-                        console.log(`📬 Routing [${messageId.slice(0,8)}] source="${message.source}" generated_via="${message.generated_via}" autoSendToReserve=${_autoReserve} manualSendToReserve=${_manualReserve} → ${_reserveRoute ? '📦 RESERVE QUEUE' : isHarvestQuestionsRow ? '🌾 QUICK MESSAGE CAMPAIGN' : '📋 normal campaign'}`);
+                        // Quick Message wins over the reserve flags: reserve exists for low-connection
+                        // connection requests, and messages must not end up in the message campaign queue.
+                        const _reserveRoute = (_autoReserve || _manualReserve) && !isHarvestQuestionsRow;
+                        console.log(`📬 Routing [${messageId.slice(0,8)}] source="${message.source}" type="${message.message_type || 'connect'}" generated_via="${message.generated_via}" autoSendToReserve=${_autoReserve} manualSendToReserve=${_manualReserve} → ${_reserveRoute ? '📦 RESERVE QUEUE' : isHarvestQuestionsRow ? '⚡ QUICK MESSAGE CAMPAIGN' : '📋 connect campaign'}`);
 
                         const isFollowUpMessage = (message.message_type || 'connect') === 'message';
                         if (!isHarvestQuestionsRow && !isFollowUpMessage && hasApprovedMessageInPast45Days(message.prospect_li_url)) {
@@ -13915,7 +13934,7 @@ Rules:
                         await updateDoc(docRef, {
                             deleted: true,
                             deleted_date: new Date().toISOString(),
-                            deleted_reason: 'Routed to Quick Message campaign (Harvest Question)',
+                            deleted_reason: 'Routed to Quick Message campaign (standard routing for all messages)',
                             routed_via: 'quick_message_campaign',
                             routed_campaign_id: String(campaign.id),
                             routed_hr_result: hrResult,
@@ -13953,7 +13972,7 @@ Rules:
                                 account_email:      effectiveBDR,
                                 campaignId:         String(campaign.id),
                                 hrResult:           hrResult,
-                                source:             'Harvest Questions',
+                                source:             message.source || 'Harvest Questions',
                                 connect_queue_id:   messageId,
                                 timestamp:          new Date(),
                                 createdAt:          new Date().toISOString(),

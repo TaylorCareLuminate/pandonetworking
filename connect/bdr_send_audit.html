@@ -103,7 +103,7 @@
 <div class="container">
     <div class="page-header">
         <h1><i class="fas fa-clipboard-check"></i> BDR Send Audit</h1>
-        <p>Everything a BDR submitted in Fast Connect Review (Quick Message, slots, campaign pushes, reserve) — grouped by submit batch or listed individually — checked against HeyReach. Slot messages can be moved to Quick Message.</p>
+        <p>Everything a BDR submitted in Fast Connect Review — messages <b>and</b> connection requests — grouped by submit batch or listed individually and checked against HeyReach. Anything that did not make it can be sent to HeyReach from here: messages go to the BDR's Quick Message campaign, connection requests to the BDR's connect campaign.</p>
     </div>
 
     <div class="card">
@@ -152,14 +152,14 @@
                     <div class="control-group"><label>Route</label>
                         <select id="routeSelect"><option value="">All routes</option></select></div>
                     <div class="control-group"><label>Type</label>
-                        <select id="typeSelect"><option value="">Connect + Message</option><option value="connect">Connect requests</option><option value="message">Messages</option></select></div>
+                        <select id="typeSelect"><option value="">Connections + Messages</option><option value="connect">Connection requests</option><option value="message">Messages</option></select></div>
                     <div class="control-group"><label>Search</label>
                         <input id="searchBox" type="text" placeholder="Name / URL / message…"></div>
                     <label class="check-inline"><input type="checkbox" id="problemsOnly"> Problems only</label>
                 </div>
                 <div class="controls-row">
                     <button class="btn btn-blue" id="checkAllBtn"><i class="fas fa-magnifying-glass"></i> Check shown in HeyReach</button>
-                    <button class="btn btn-accent hidden" id="moveBtn"><i class="fas fa-bolt"></i> <span id="moveBtnLabel">Move to Quick Message</span></button>
+                    <button class="btn btn-accent hidden" id="moveBtn"><i class="fas fa-paper-plane"></i> <span id="moveBtnLabel">Send to HeyReach</span></button>
                     <button class="btn btn-secondary" id="csvBtn"><i class="fas fa-file-csv"></i> Export CSV</button>
                     <button class="btn btn-danger hidden" id="stopBtn"><i class="fas fa-stop"></i> Stop</button>
                 </div>
@@ -181,7 +181,7 @@ import { canonicalLinkedInUrl, classifyHrLead, fetchLiveCampaignStatusMap } from
 
 await window.firebaseReady;
 const auth = window.auth;
-const { collection, getDocs, getDoc, doc, query, where, addDoc, updateDoc, runTransaction, Timestamp } = window.clemailFirestore;
+const { collection, getDocs, getDoc, doc, query, where, addDoc, setDoc, updateDoc, runTransaction, Timestamp } = window.clemailFirestore;
 const emailDB = window.clemailDb;
 const BACKEND = 'https://railwayclemail-production.up.railway.app';
 
@@ -194,6 +194,17 @@ const MOVABLE_SLOT = new Set(['pending', 'failed']);
 const IN_FLIGHT_SLOT = new Set(['processing', 'sending', 'moving_to_quick_message']);
 const NIGHTLY_CLEANUP_DAYS = 40;
 const ROW_CAP = 1000;
+const isMovable = r => !!(r.movableSlot || r.movableQueue || r.sendAction);
+const isConnectType = t => ['connect', 'connection'].includes(String(t || 'connect').toLowerCase());
+// A connection request, as opposed to a message. Harvest rows routed to Quick Message are messages even if typed 'connect'.
+const isConnRow = r => isConnectType(r.type) && r.route !== 'quick_message' && !(r.sends && r.sends.length);
+// What "Send to HeyReach" does for each kind of row
+const SEND_KINDS = {
+    slot:        'Slot → Quick Message',
+    queued:      'Rerouted queue item → Quick Message',
+    qm_add:      'Message → Quick Message',
+    connect_add: 'Connection request → connect campaign'
+};
 
 const ROUTES = {
     campaign:      'Campaign push',
@@ -203,9 +214,12 @@ const ROUTES = {
 };
 
 const VERDICTS = {
-    delivered:       { label: 'Delivered / sent in HeyReach',   cls: 'b-green',  icon: 'fa-check-circle',        stat: 'green' },
+    off_qm:          { label: 'In HeyReach – not Quick Message', cls: 'b-amber', icon: 'fa-shuffle',            stat: 'amber' },
+    delivered:       { label: 'Sent in HeyReach',               cls: 'b-green',  icon: 'fa-check-circle',        stat: 'green' },
     in_hr_pending:   { label: 'In HeyReach – not sent yet',     cls: 'b-blue',   icon: 'fa-hourglass-half',      stat: 'blue' },
     in_hr:           { label: 'In HeyReach (found by lookup)',  cls: 'b-blue',   icon: 'fa-magnifying-glass',    stat: 'blue' },
+    list_pending:    { label: 'In campaign list – HeyReach importing', cls: 'b-blue', icon: 'fa-cloud-arrow-up', stat: 'blue' },
+    queued_msg_camp: { label: 'Slot rerouted to message campaign', cls: 'b-amber', icon: 'fa-share',          stat: 'amber' },
     hr_failed:       { label: 'HeyReach failed this lead',      cls: 'b-red',    icon: 'fa-triangle-exclamation', stat: 'red' },
     missing:         { label: 'MISSING from HeyReach',          cls: 'b-red',    icon: 'fa-circle-xmark',        stat: 'red' },
     push_failed:     { label: 'Push failed',                    cls: 'b-red',    icon: 'fa-ban',                 stat: 'red' },
@@ -332,7 +346,11 @@ async function resolveContext(email) {
         bdr, emails: [...emails].slice(0, 10), customerId, apiKey,
         campaigns: (bdr.heyreachCampaigns || []),
         qmCampaigns: (bdr.heyreachCampaigns || []).filter(c => c.type === 'quick_message'),
-        hr: new Map(), leadCache: new Map(), loadedCampaigns: new Set(), tracking: new Map()
+        connectCampaigns: (bdr.heyreachCampaigns || []).filter(c => ['connect', 'connection'].includes(String(c.type || '').toLowerCase())),
+        connectIds: new Set((bdr.heyreachCampaigns || []).filter(c => ['connect', 'connection'].includes(String(c.type || '').toLowerCase())).map(c => String(c.id))),
+        // hr = leads found in message-type campaigns (Quick Message etc.); hrConn = leads found in connect campaigns.
+        // Kept apart so a contact who is in BOTH is never mistaken for being sent in the wrong one.
+        hr: new Map(), hrConn: new Map(), leadCache: new Map(), loadedCampaigns: new Set(), tracking: new Map()
     };
 }
 
@@ -341,8 +359,9 @@ async function resolveContext(email) {
 const BAD_CAMPAIGN_STATUSES = new Set(['FAILED', 'FINISHED', 'CANCELED', 'CANCELLED', 'DRAFT']);
 async function loadCampaignStatuses() {
     ctx.campaignStatus = new Map();
-    if (!ctx.apiKey || !ctx.qmCampaigns.length) return;
-    const want = new Set(ctx.qmCampaigns.map(c => String(c.id)));
+    const tracked = [...ctx.qmCampaigns, ...ctx.connectCampaigns];
+    if (!ctx.apiKey || !tracked.length) return;
+    const want = new Set(tracked.map(c => String(c.id)));
     try {
         for (let offset = 0; offset < 1000 && want.size; offset += 100) {
             const resp = await fetch(`${BACKEND}/proxy/heyreach/campaigns/getall`, {
@@ -359,31 +378,51 @@ async function loadCampaignStatuses() {
             if (items.length < 100) break;
         }
     } catch (e) { log(`Could not read HeyReach campaign status: ${e.message}`, 'warn'); }
-    ctx.campaignStatus.forEach((v, id) => log(`Quick Message campaign ${id} status in HeyReach: ${v.status}`, BAD_CAMPAIGN_STATUSES.has(v.status) ? 'bad' : 'ok'));
+    ctx.campaignStatus.forEach((v, id) => log(`${ctx.connectIds.has(id) ? 'Connect' : 'Quick Message'} campaign ${id} status in HeyReach: ${v.status}`, BAD_CAMPAIGN_STATUSES.has(v.status) ? 'bad' : 'ok'));
 }
-const badQmCampaigns = () => ctx.qmCampaigns.filter(c => BAD_CAMPAIGN_STATUSES.has(ctx.campaignStatus?.get(String(c.id))?.status));
+const campStatus = c => ctx.campaignStatus?.get(String(c.id))?.status;
+const badCampaigns = list => list.filter(c => BAD_CAMPAIGN_STATUSES.has(campStatus(c)));
+const badQmCampaigns = () => badCampaigns(ctx.qmCampaigns);
+const badConnectCampaigns = () => badCampaigns(ctx.connectCampaigns);
+// Campaign a row would be sent to: connection requests → first connect campaign (same pick as the server's auto-push),
+// messages → first Quick Message campaign (same pick as Fast Connect Review).
+const targetCampaignFor = r => (isConnRow(r) ? ctx.connectCampaigns : ctx.qmCampaigns)[0] || null;
+const campaignLabel = id => {
+    const sid = String(id ?? ''); if (!sid) return '';
+    const c = (ctx.campaigns || []).find(x => String(x.id) === sid);
+    const t = String(c?.type || '').toLowerCase();
+    return `#${sid}${c?.name ? ' ' + c.name : ''}${t ? ' (' + t.replace('_', ' ') + ')' : ' (not a configured campaign for this BDR)'}`;
+};
 
-function renderBdrInfo() {
-    const c = ctx;
-    const camp = c.qmCampaigns.map(x => {
-        const st = c.campaignStatus?.get(String(x.id))?.status;
+function campaignListHtml(list) {
+    return list.map(x => {
+        const st = campStatus(x);
         const stBadge = st ? ` <span class="badge ${BAD_CAMPAIGN_STATUSES.has(st) ? 'b-red' : st === 'PAUSED' ? 'b-amber' : 'b-green'}">${esc(st)}</span>` : '';
         return `#${esc(x.id)}${x.name ? ' – ' + esc(x.name) : ''}${x.listId ? ' (list ' + esc(x.listId) + ')' : ''}${stBadge}`;
     }).join('<br>') || '<span style="color:#dc2626">None</span>';
+}
+
+function renderBdrInfo() {
+    const c = ctx;
     let html = `<div class="info-grid">
         <div><div class="k">BDR</div><div class="v">${esc(c.bdr.name || c.bdr.primaryEmail)} (${esc(c.bdr.primaryEmail)})</div></div>
         <div><div class="k">Customer</div><div class="v">${esc(c.customerId || '—')}</div></div>
-        <div><div class="k">Quick Message campaign(s)</div><div class="v">${camp}</div></div>
+        <div><div class="k">Quick Message campaign(s) — all messages</div><div class="v">${campaignListHtml(c.qmCampaigns)}</div></div>
+        <div><div class="k">Connect campaign(s) — connection requests</div><div class="v">${campaignListHtml(c.connectCampaigns)}</div></div>
         <div><div class="k">HeyReach API key</div><div class="v">${c.apiKey ? 'Found' : '<span style="color:#dc2626">Missing</span>'}</div></div>
     </div>`;
-    badQmCampaigns().forEach(x => {
-        const st = c.campaignStatus.get(String(x.id)).status;
-        html += `<div class="err-box"><i class="fas fa-circle-exclamation"></i> <b>Quick Message campaign #${esc(x.id)} is ${esc(st)} in HeyReach.</b> HeyReach rejects every lead added to it (“You cannot add new leads to a failed campaign”), so nothing submitted to it can reach HeyReach and moving slots into it is disabled. Create or restart a Quick Message campaign in HeyReach, update this BDR's <code>quick_message</code> entry in <code>bdr_leaders.heyreachCampaigns</code> with the new campaign id/list id, then re-run the audit and resubmit.</div>`;
+    const bad = (x, kind) => {
+        const st = campStatus(x);
+        return `<div class="err-box"><i class="fas fa-circle-exclamation"></i> <b>${kind} campaign #${esc(x.id)} is ${esc(st)} in HeyReach.</b> HeyReach rejects every lead added to it (“You cannot add new leads to a failed campaign”), so nothing submitted to it can reach HeyReach and sending to it from this page is disabled. Create or restart the campaign in HeyReach, update this BDR's <code>${kind === 'Quick Message' ? 'quick_message' : 'connect'}</code> entry in <code>bdr_leaders.heyreachCampaigns</code> with the new campaign id/list id, then re-run the audit and resend.</div>`;
+    };
+    badQmCampaigns().forEach(x => { html += bad(x, 'Quick Message'); });
+    badConnectCampaigns().forEach(x => { html += bad(x, 'Connect'); });
+    [...c.qmCampaigns, ...c.connectCampaigns].filter(x => campStatus(x) === 'PAUSED').forEach(x => {
+        html += `<div class="err-box" style="background:#fef3c7;border-color:#fcd34d;color:#92400e"><i class="fas fa-pause"></i> Campaign #${esc(x.id)} is PAUSED — leads can be added but nothing will send until it is resumed.</div>`;
     });
-    const pausedQm = c.qmCampaigns.filter(x => c.campaignStatus?.get(String(x.id))?.status === 'PAUSED');
-    if (pausedQm.length) html += `<div class="err-box" style="background:#fef3c7;border-color:#fcd34d;color:#92400e"><i class="fas fa-pause"></i> Campaign #${esc(pausedQm[0].id)} is PAUSED — leads can be added but no messages will send until it is resumed.</div>`;
-    if (!c.qmCampaigns.length) html += `<div class="err-box"><i class="fas fa-circle-exclamation"></i> No <code>quick_message</code> campaign in <code>bdr_leaders.heyreachCampaigns</code>. Harvest messages cannot be sent or moved until one is set up.</div>`;
-    if (!c.customerId || !c.apiKey) html += `<div class="err-box"><i class="fas fa-circle-exclamation"></i> Missing customerId or HeyReach API key — HeyReach checks and moves are unavailable.</div>`;
+    if (!c.qmCampaigns.length) html += `<div class="err-box"><i class="fas fa-circle-exclamation"></i> No <code>quick_message</code> campaign in <code>bdr_leaders.heyreachCampaigns</code>. Messages cannot be sent until one is set up.</div>`;
+    if (!c.connectCampaigns.length) html += `<div class="err-box" style="background:#fef3c7;border-color:#fcd34d;color:#92400e"><i class="fas fa-circle-exclamation"></i> No <code>connect</code> campaign in <code>bdr_leaders.heyreachCampaigns</code> — connection requests cannot be checked against or sent to a campaign.</div>`;
+    if (!c.customerId || !c.apiKey) html += `<div class="err-box"><i class="fas fa-circle-exclamation"></i> Missing customerId or HeyReach API key — HeyReach checks and sends are unavailable.</div>`;
     $('bdrInfo').innerHTML = html;
     $('bdrInfo').classList.remove('hidden');
 }
@@ -422,7 +461,8 @@ async function loadCampaignLeads(ids) {
         const sid = String(id);
         if (ctx.loadedCampaigns.has(sid) || !ctx.apiKey) continue;
         const m = await fetchLiveCampaignStatusMap({ backendUrl: BACKEND, apiKey: ctx.apiKey, campaignId: sid });
-        m.forEach((v, k) => { v.campaignId = sid; if (!ctx.hr.has(k)) ctx.hr.set(k, v); });
+        const target = ctx.connectIds.has(sid) ? ctx.hrConn : ctx.hr;
+        m.forEach((v, k) => { v.campaignId = sid; if (!target.has(k)) target.set(k, v); });
         ctx.loadedCampaigns.add(sid);
         log(`HeyReach campaign ${sid}: ${m.size} leads loaded`, m.size ? 'ok' : 'warn');
     }
@@ -450,6 +490,14 @@ async function runAudit() {
         const slots = await queryIn('linkedin_message_queue', 'bdrEmail', ctx.emails);
         log(`Slots for this BDR (all time): ${slots.length}`, 'ok');
 
+        // When a slot has no usable HeyReach conversation ID the scheduler marks it "queued_as_campaign" and writes a
+        // NEW connect_queue doc (approvalMethod follow_up_scan_auto, sourceQueueId = slot id) for the message campaign.
+        let followUps = [];
+        try { followUps = await queryIn('connect_queue', 'bdr_auth_email', ctx.emails, [where('approvalMethod', '==', 'follow_up_scan_auto')]); }
+        catch (e) { log(`Could not load rerouted slot messages: ${e.message}`, 'warn'); }
+        const fuBySlot = new Map(followUps.filter(f => f.sourceQueueId).map(f => [f.sourceQueueId, f]));
+        log(`Slot messages rerouted to the message-campaign queue: ${followUps.length}`, followUps.length ? 'warn' : 'ok');
+
         progress(40, 'Loading Quick Message send records…');
         let acts;
         try { acts = await queryIn('connect_activity', 'bdrEmail', ctx.emails, [where('via', '==', 'quick_message_campaign')]); }
@@ -457,8 +505,15 @@ async function runAudit() {
         log(`Quick Message send records (all time): ${acts.length}`, 'ok');
 
         // Campaigns to pull from HeyReach: Quick Message + every campaign a pushed submission names
-        const campIds = new Set(ctx.qmCampaigns.map(c => String(c.id)));
-        subs.forEach(s => { if (s.heyreach_campaign_id) campIds.add(String(s.heyreach_campaign_id)); });
+        // + the BDR's connect campaign(s) and any campaign a pushed submission names (connection requests are
+        // remembered as "connect" campaigns so their leads are never confused with Quick Message leads).
+        const campIds = new Set([...ctx.qmCampaigns, ...ctx.connectCampaigns].map(c => String(c.id)));
+        subs.forEach(s => {
+            if (!s.heyreach_campaign_id) return;
+            const sid = String(s.heyreach_campaign_id);
+            campIds.add(sid);
+            if (isConnectType(s.message_type)) ctx.connectIds.add(sid);
+        });
         const ids = [...campIds].slice(0, 12);
         for (let i = 0; i < ids.length; i++) {
             progress(45 + (i / ids.length) * 35, `Fetching HeyReach leads for campaign ${ids[i]}…`);
@@ -478,12 +533,14 @@ async function runAudit() {
 
         progress(88, 'Comparing…');
         buildRows({ subs, slots, acts, since });
+        rows.forEach(r => { if (r.slot) r.fu = fuBySlot.get(r.slot.id) || null; });
         computeBatches();
         rows.forEach(evaluate);
         const known = new Set(rows.map(r => r.urlKey).filter(Boolean));
-        ctx.hrOnlyCount = [...ctx.hr.keys()].filter(k => !known.has(k)).length;
+        ctx.hrOnlyCount = [...ctx.hr.keys(), ...ctx.hrConn.keys()].filter(k => !known.has(k)).length;
         progress(100, 'Audit complete');
-        log(`Audit complete: ${rows.length} messages in ${batches.size} batch(es).`, 'ok');
+        const nConn = rows.filter(r => isConnRow(r)).length;
+        log(`Audit complete: ${rows.length} item(s) (${rows.length - nConn} message(s), ${nConn} connection request(s)) in ${batches.size} batch(es).`, 'ok');
         populateRouteFilter();
         $('results').classList.remove('hidden');
         renderAll();
@@ -581,7 +638,7 @@ function computeBatches() {
 
 // ── Evaluation ──────────────────────────────────────────────────────────────
 function attachHr(r) {
-    r.hr = ctx.hr.get(r.urlKey) || null;
+    r.hr = (isConnRow(r) ? ctx.hrConn : ctx.hr).get(r.urlKey) || null;
     if (!r.hr && r.urlKey) {
         const c = ctx.leadCache.get(r.urlKey);
         if (c?.found) {
@@ -598,18 +655,34 @@ function hrVerdict(r) {
     return 'in_hr_pending';
 }
 
-function evaluate(r) {
+function evaluateCore(r) {
     attachHr(r);
-    r.note = ''; r.movableSlot = null;
+    r.note = ''; r.movableSlot = null; r.movableQueue = null;
     const sub = r.sub || {}, slot = r.slot;
-    const movedQM = (slot && slot.status === 'moved_to_quick_message') || sub.routed_via === 'quick_message_campaign';
+    const movedQM = (slot && slot.status === 'moved_to_quick_message') || sub.routed_via === 'quick_message_campaign'
+        || (r.fu && r.fu.routed_via === 'quick_message_campaign');
     const isQM = r.route === 'quick_message' || r.sends.length > 0 || movedQM;
+
+    // Slot had no usable conversation ID → scheduler rerouted it to the regular message-campaign queue
+    if (slot && slot.status === 'queued_as_campaign' && !isQM) {
+        const fu = r.fu;
+        const inHistory = !!r.hr; // contact already has a Quick Message lead in the campaign → QM can't send a new message
+        if (!fu) { r.verdict = 'slot_other'; r.note = 'Slot was rerouted to the message-campaign queue, but no matching connect_queue record was found.'; return; }
+        const base = 'Slot had no usable conversation ID, so the scheduler sent it to the regular message-campaign queue instead of Quick Message.';
+        if (fu.push_failed) { r.verdict = 'push_failed'; r.note = `${base} Push failed: ${fu.push_failure_reason || ''}`; return; }
+        if (fu.pushed_to_heyreach) { r.verdict = 'unverified'; r.note = `${base} Already pushed${fu.heyreach_campaign_name ? ' to ' + fu.heyreach_campaign_name : ''} — not moved.`; return; }
+        if (fu.deleted) { r.verdict = 'deleted'; r.note = fu.deleted_reason || base; return; }
+        r.verdict = 'queued_msg_camp';
+        r.note = base + (inHistory ? ' Contact is already in the Quick Message campaign history, so Quick Message cannot send a new message to them.' : ' Waiting for Connect Push — can be moved to Quick Message.');
+        if (!inHistory) r.movableQueue = fu;
+        return;
+    }
 
     if (r.route === 'direct_slot' && !isQM) {
         if (!slot) { r.verdict = 'slot_missing'; r.note = `Slot ${sub.routed_slot_id || ''} not found in linkedin_message_queue — message may never have been scheduled.`; return; }
         if (IN_FLIGHT_SLOT.has(slot.status)) { r.verdict = 'slot_stuck'; r.note = `Slot status "${slot.status}" — another process is working on it`; return; }
         if (MOVABLE_SLOT.has(slot.status)) {
-            if (r.hr) { r.verdict = 'slot_conflict'; r.note = 'Contact is already in the campaign — HeyReach would only update the old lead and NOT send. Left in slot.'; }
+            if (r.hr) { r.verdict = 'slot_conflict'; r.note = 'Contact is already in the Quick Message campaign history — HeyReach would only update the old lead and NOT send a new message. Left in the slot, which will send it as a direct LinkedIn message.'; }
             else { r.verdict = 'needs_move'; r.movableSlot = slot; if (slot.status === 'failed') r.note = slot.lastError || slot.error || 'Slot send failed'; }
             return;
         }
@@ -622,6 +695,12 @@ function evaluate(r) {
         const ageDays = sentAt ? (Date.now() - sentAt.getTime()) / 86400000 : 0;
         const track = ctx.tracking.get(r.urlKey);
         if (r.hr) r.verdict = hrVerdict(r);
+        else if (ageDays < 1 && (r.sends.some(a => a.hrResult?.usedListFallback) || slot?.movedHrResult?.usedListFallback || r.fu?.routed_hr_result?.usedListFallback)) {
+            // HeyReach answered 0/0/0 to the campaign add; the server put the lead on the campaign's LIST instead.
+            // Leads added that way show up in the campaign only after HeyReach next syncs the list (the 11 added on
+            // Oct 8 the same way were delivered by the next day), so don't call these missing yet.
+            r.verdict = 'list_pending'; r.note = 'Added to the campaign\'s lead list (HeyReach had nothing to add directly). Waits for HeyReach to import it into the campaign — re-check later.';
+        }
         else if ((track && track.status && track.status !== 'active') || ageDays > NIGHTLY_CLEANUP_DAYS) { r.verdict = 'purged'; r.note = track ? `Tracking status: ${track.status}` : `Older than ${NIGHTLY_CLEANUP_DAYS} days`; }
         else { r.verdict = 'missing'; r.note = track ? 'Server recorded the add, but HeyReach does not list this lead in the campaign.' : 'No server tracking record and HeyReach does not list the lead.'; }
         if (!r.sends.length && !movedQM) r.note += (r.note ? ' ' : '') + 'No Quick Message send record was written for this submission.';
@@ -643,6 +722,32 @@ function evaluate(r) {
     r.verdict = r.route === 'reserve' ? 'in_reserve' : 'awaiting_push';
 }
 
+// Post-processing shared by every row: flag messages that landed outside Quick Message, and decide whether
+// "Send to HeyReach" is available (and what it would do) for rows that did not make it over.
+const SENDABLE_VERDICTS = new Set(['missing', 'push_failed', 'awaiting_push']);
+function evaluate(r) {
+    evaluateCore(r);
+    r.sendAction = null;
+
+    // Messages must end up in the Quick Message campaign — call out the ones that are in HeyReach elsewhere.
+    if (!isConnRow(r) && r.hr && !r.hr.elsewhere && r.hr.campaignId && (r.verdict === 'delivered' || r.verdict === 'in_hr_pending')) {
+        const isQmCamp = ctx.qmCampaigns.some(c => String(c.id) === String(r.hr.campaignId));
+        if (!isQmCamp) {
+            r.verdict = 'off_qm';
+            r.note = `In HeyReach campaign ${campaignLabel(r.hr.campaignId)} — not the Quick Message campaign. Status: ${r.hr.lead?.leadMessageStatus || r.hr.lead?.leadCampaignStatus || '—'}.`;
+        }
+    }
+
+    if (r.movableSlot || r.movableQueue || !r.sub || !r.urlKey || !SENDABLE_VERDICTS.has(r.verdict)) return;
+    if (r.verdict === 'awaiting_push' && r.time) {
+        const hrs = (Date.now() - r.time.getTime()) / 3600000;
+        if (hrs > 3) r.note = (r.note ? r.note + ' ' : '') + `Approved ${hrs < 48 ? Math.round(hrs) + 'h' : Math.round(hrs / 24) + 'd'} ago and still not pushed — the hourly auto-push has not picked it up.`;
+    }
+    r.sendAction = isConnRow(r) ? 'connect_add' : 'qm_add';
+    if (r.sendAction === 'qm_add' && !r.note) r.note = 'Did not reach HeyReach — can be sent to the Quick Message campaign from here.';
+    if (r.sendAction === 'connect_add' && !r.note) r.note = 'Connection request did not reach HeyReach — can be sent to the connect campaign from here.';
+}
+
 // ── Filtering / rendering ───────────────────────────────────────────────────
 function populateRouteFilter() {
     const sel = $('routeSelect'); const cur = sel.value;
@@ -661,7 +766,12 @@ function routeLabel(r) {
     const moved = (r.slot && r.slot.status === 'moved_to_quick_message');
     return moved ? 'Direct slot → Quick Message' : (ROUTES[r.route] || r.route);
 }
-const verdictBadge = r => { const v = VERDICTS[r.verdict]; return `<span class="badge ${v.cls}"><i class="fas ${v.icon}"></i> ${esc(v.label)}</span>`; };
+const CONNECT_LABELS = { delivered: 'Connection request sent / accepted', in_hr_pending: 'In HeyReach – request not sent yet' };
+const verdictBadge = r => {
+    const v = VERDICTS[r.verdict];
+    const label = (isConnRow(r) && CONNECT_LABELS[r.verdict]) || v.label;
+    return `<span class="badge ${v.cls}"><i class="fas ${v.icon}"></i> ${esc(label)}</span>`;
+};
 
 function renderAll() {
     const base = baseFiltered();
@@ -669,13 +779,13 @@ function renderAll() {
     base.forEach(r => c[r.verdict]++);
     const order = ['all', ...Object.keys(VERDICTS)];
     $('statsRow').innerHTML = order.filter(k => k === 'all' || c[k]).map(k => {
-        const v = k === 'all' ? { label: 'All messages', stat: 'blue' } : VERDICTS[k];
+        const v = k === 'all' ? { label: 'All items', stat: 'blue' } : VERDICTS[k];
         return `<div class="stat-card c-${v.stat} ${activeFilter === k ? 'active' : ''}" data-filter="${k}"><div class="stat-number">${c[k]}</div><div class="stat-label">${esc(v.label)}</div></div>`;
     }).join('');
     document.querySelectorAll('#statsRow .stat-card').forEach(el => el.addEventListener('click', () => { activeFilter = el.dataset.filter; renderAll(); }));
 
     const vis = visibleRows();
-    $('summaryNote').textContent = `${vis.length} message(s) shown · ${ctx.hr.size} lead(s) loaded from HeyReach campaigns (${ctx.hrOnlyCount ?? 0} not tied to a message in this window). “Pushed – not verified” rows need a HeyReach lookup — use “Check shown in HeyReach” or a batch's Check button.`;
+    $('summaryNote').textContent = `${vis.length} item(s) shown · ${ctx.hr.size} message-campaign and ${ctx.hrConn.size} connect-campaign lead(s) loaded from HeyReach (${ctx.hrOnlyCount ?? 0} not tied to an item in this window). “Pushed – not verified” rows need a HeyReach lookup — use “Check shown in HeyReach” or a batch's Check button.`;
     $('viewBatches').classList.toggle('active', view === 'batches');
     $('viewList').classList.toggle('active', view === 'list');
     $('resultsBody').innerHTML = view === 'batches' ? batchesHtml(vis) : `<div class="card"><div class="table-wrap">${tableHtml(vis)}</div></div>`;
@@ -698,7 +808,7 @@ function batchesHtml(vis) {
         const chips = Object.entries(vc).sort((a, b) => b[1] - a[1]).map(([k, n]) => `<span class="badge ${VERDICTS[k].cls}">${n} · ${esc(VERDICTS[k].label)}</span>`).join('')
             + Object.entries(rc).map(([k, n]) => `<span class="badge b-gray" style="background:#fff;border:1px solid var(--border)">${n} ${esc(k)}</span>`).join('');
         const isOpen = expanded.has(b.id);
-        const movable = rs.filter(r => r.movableSlot).length;
+        const movable = rs.filter(isMovable).length;
         const when = b.start ? `${fmt(b.start)}${b.end - b.start > 60000 ? ' → ' + fmt(b.end) : ''}` : 'No timestamp';
         return `<div class="batch-card" data-batch="${esc(b.id)}">
             <div class="batch-head">
@@ -709,7 +819,7 @@ function batchesHtml(vis) {
                 </div>
                 <div class="batch-actions">
                     <button class="btn btn-blue btn-sm" data-act="batch-check"><i class="fas fa-magnifying-glass"></i> Check in HeyReach</button>
-                    ${isAdmin && movable ? `<button class="btn btn-accent btn-sm" data-act="batch-move"><i class="fas fa-bolt"></i> Move ${movable} slot${movable === 1 ? '' : 's'} to Quick Message</button>` : ''}
+                    ${isAdmin && movable ? `<button class="btn btn-accent btn-sm" data-act="batch-move"><i class="fas fa-paper-plane"></i> Send ${movable} to HeyReach</button>` : ''}
                     <button class="btn btn-secondary btn-sm" data-act="batch-toggle"><i class="fas fa-chevron-${isOpen ? 'up' : 'down'}"></i> ${isOpen ? 'Hide' : 'Show'} messages</button>
                 </div>
             </div>
@@ -723,7 +833,7 @@ function tableHtml(list) {
     const shown = list.slice(0, ROW_CAP);
     return `<table><thead><tr>
         <th style="width:28px;"><input type="checkbox" data-act="sel-all" title="Select all movable"></th>
-        <th>Contact</th><th>Verdict</th><th>Submitted</th><th>HeyReach</th><th>Message</th></tr></thead><tbody>
+        <th>Contact</th><th>Verdict</th><th>Submitted</th><th>HeyReach</th><th>Message / note</th></tr></thead><tbody>
         ${shown.map(rowHtml).join('')}</tbody></table>
         ${list.length > shown.length ? `<div class="empty">Showing the first ${ROW_CAP} of ${list.length}. Narrow the filters or export CSV for everything.</div>` : ''}`;
 }
@@ -738,17 +848,18 @@ function rowHtml(r) {
     let hrCell;
     if (r.hr) {
         const l = r.hr.lead || {};
-        hrCell = `<div>${esc(l.leadCampaignStatus || l.status || (r.hr.elsewhere ? 'Found' : '—'))}${r.hr.campaignId ? ` <span class="td-sub">· campaign ${esc(r.hr.campaignId)}</span>` : (r.hr.elsewhere ? ' <span class="td-sub">· found via lookup</span>' : '')}</div>
+        hrCell = `<div>${esc(l.leadCampaignStatus || l.status || (r.hr.elsewhere ? 'Found' : '—'))}${r.hr.campaignId ? ` <span class="td-sub">· campaign ${esc(campaignLabel(r.hr.campaignId))}</span>` : (r.hr.elsewhere ? ' <span class="td-sub">· found via lookup</span>' : '')}</div>
             <div class="td-sub">conn: ${esc(l.leadConnectionStatus || '—')} · msg: ${esc(l.leadMessageStatus || '—')}</div>`;
     } else hrCell = r.checked ? '<span class="td-sub" style="color:#b91c1c;font-weight:700">Not found in HeyReach</span>' : '<span class="td-sub">Not in loaded campaigns (unchecked)</span>';
     if (r.checkError) hrCell += `<div class="td-sub" style="color:#b91c1c">${esc(r.checkError)}</div>`;
-    if (r.urlKey) hrCell += `<div><button class="btn btn-secondary btn-sm" data-act="row-check" data-id="${esc(r.id)}" style="margin-top:.25rem"><i class="fas fa-magnifying-glass"></i> Check</button></div>`;
+    if (r.urlKey) hrCell += `<div style="margin-top:.25rem;display:flex;gap:.35rem;flex-wrap:wrap;"><button class="btn btn-secondary btn-sm" data-act="row-check" data-id="${esc(r.id)}"><i class="fas fa-magnifying-glass"></i> Check</button>${
+        isAdmin && isMovable(r) ? `<button class="btn btn-accent btn-sm" data-act="row-send" data-id="${esc(r.id)}" title="${esc(sendKindOf(r) ? SEND_KINDS[sendKindOf(r)] : '')}"><i class="fas fa-paper-plane"></i> Send</button>` : ''}</div>`;
 
     return `<tr>
-        <td>${r.movableSlot ? `<input type="checkbox" class="rowSel" data-id="${esc(r.id)}" checked>` : ''}</td>
+        <td>${isMovable(r) ? `<input type="checkbox" class="rowSel" data-id="${esc(r.id)}" checked>` : ''}</td>
         <td><div class="td-name">${esc(r.name || '(unknown)')}</div>
             <div class="td-sub">${r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.url.replace(/^https?:\/\/(www\.)?linkedin\.com/, ''))}</a>` : 'no URL'}</div></td>
-        <td>${verdictBadge(r)}${r.note ? `<div class="td-sub" style="margin-top:.25rem;max-width:300px;">${esc(r.note)}</div>` : ''}</td>
+        <td>${verdictBadge(r)}${r.note ? `<div class="td-sub" style="margin-top:.25rem;max-width:300px;">${esc(r.note)}</div>` : ''}${isMovable(r) && sendKindOf(r) ? `<div class="td-sub" style="margin-top:.25rem;color:#7c3aed;font-weight:700;"><i class="fas fa-paper-plane"></i> ${esc(SEND_KINDS[sendKindOf(r)])}</div>` : ''}</td>
         <td class="td-sub">${ours.join('')}</td>
         <td>${hrCell}</td>
         <td class="td-msg"><div>${esc(r.message)}</div></td></tr>`;
@@ -768,24 +879,27 @@ $('resultsBody').addEventListener('click', e => {
     const act = btn.dataset.act;
     if (act === 'sel-all') { btn.closest('table').querySelectorAll('.rowSel').forEach(el => { el.checked = btn.checked; }); updateMoveButton(); return; }
     if (act === 'row-check') { const r = rows.find(x => x.id === btn.dataset.id); if (r) checkRows([r]); return; }
+    if (act === 'row-send') { const r = rows.find(x => x.id === btn.dataset.id); if (r && isMovable(r)) runMove([r]); return; }
     const card = btn.closest('.batch-card'); if (!card) return;
     const id = card.dataset.batch;
     const batchRows = visibleRows().filter(r => r.batchId === id);
     if (act === 'batch-toggle') { expanded.has(id) ? expanded.delete(id) : expanded.add(id); renderAll(); }
     if (act === 'batch-check') checkRows(batchRows);
-    if (act === 'batch-move') runMove(batchRows.filter(r => r.movableSlot));
+    if (act === 'batch-move') runMove(batchRows.filter(isMovable));
 });
 $('resultsBody').addEventListener('change', e => { if (e.target.classList.contains('rowSel')) updateMoveButton(); });
 
 function selectedMovableRows() {
     const ids = new Set([...document.querySelectorAll('.rowSel:checked')].map(el => el.dataset.id));
-    return rows.filter(r => r.movableSlot && ids.has(r.id));
+    return rows.filter(r => isMovable(r) && ids.has(r.id));
 }
+function sendKindOf(r) { return r.movableSlot ? 'slot' : r.movableQueue ? 'queued' : (r.sendAction || null); }
+function canSendRow(r) { const camp = targetCampaignFor(r); return !!camp && !BAD_CAMPAIGN_STATUSES.has(campStatus(camp)); }
 function updateMoveButton() {
-    const canMove = isAdmin && ctx?.qmCampaigns?.length && ctx.customerId && ctx.apiKey && rows.some(r => r.movableSlot) && !badQmCampaigns().some(c => String(c.id) === String(ctx.qmCampaigns[0].id));
+    const canMove = isAdmin && ctx?.customerId && ctx.apiKey && rows.some(r => isMovable(r) && canSendRow(r));
     const sel = selectedMovableRows().length;
     $('moveBtn').classList.toggle('hidden', !canMove);
-    $('moveBtnLabel').textContent = `Move ${sel} selected slot${sel === 1 ? '' : 's'} to Quick Message`;
+    $('moveBtnLabel').textContent = `Send ${sel} selected to HeyReach`;
     $('moveBtn').disabled = busy || sel === 0;
 }
 
@@ -797,7 +911,12 @@ async function checkRows(list) {
     try {
         // 1. Load any campaign a pushed row names that we haven't pulled yet
         const campIds = new Set();
-        list.forEach(r => { if (r.sub?.heyreach_campaign_id) campIds.add(String(r.sub.heyreach_campaign_id)); });
+        list.forEach(r => {
+            if (!r.sub?.heyreach_campaign_id) return;
+            const sid = String(r.sub.heyreach_campaign_id);
+            campIds.add(sid);
+            if (isConnRow(r)) ctx.connectIds.add(sid);
+        });
         const toLoad = [...campIds].filter(id => !ctx.loadedCampaigns.has(id));
         if (toLoad.length) { progress(5, `Loading ${toLoad.length} HeyReach campaign(s)…`); await loadCampaignLeads(toLoad); }
         list.forEach(evaluate);
@@ -850,11 +969,11 @@ async function checkRows(list) {
 // ── CSV ─────────────────────────────────────────────────────────────────────
 $('csvBtn').addEventListener('click', () => {
     const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const lines = [['Batch start', 'Submitted by', 'Approved at', 'Name', 'LinkedIn URL', 'Route', 'Type', 'Verdict', 'Note', 'Slot status', 'Push date', 'HeyReach campaign status', 'Connection status', 'Message status', 'Message'].map(q).join(',')];
+    const lines = [['Batch start', 'Submitted by', 'Approved at', 'Name', 'LinkedIn URL', 'Route', 'Type', 'Verdict', 'Note', 'Slot status', 'Push date', 'HeyReach campaign', 'HeyReach campaign status', 'Connection status', 'Message status', 'Message'].map(q).join(',')];
     visibleRows().forEach(r => {
         const l = r.hr?.lead || {}, b = batches.get(r.batchId);
         lines.push([b?.start?.toISOString() || '', r.approver, r.time?.toISOString() || '', r.name, r.url, routeLabel(r), r.type, VERDICTS[r.verdict].label, r.note,
-            r.slot?.status || '', toDate(r.sub?.heyreach_push_date)?.toISOString() || '', l.leadCampaignStatus || '', l.leadConnectionStatus || '', l.leadMessageStatus || '', r.message].map(q).join(','));
+            r.slot?.status || '', toDate(r.sub?.heyreach_push_date)?.toISOString() || '', r.hr?.campaignId ? campaignLabel(r.hr.campaignId) : '', l.leadCampaignStatus || '', l.leadConnectionStatus || '', l.leadMessageStatus || '', r.message].map(q).join(','));
     });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }));
@@ -862,34 +981,200 @@ $('csvBtn').addEventListener('click', () => {
     a.click();
 });
 
-// ── Move slots → Quick Message ──────────────────────────────────────────────
+// ── Send to HeyReach ────────────────────────────────────────────────────────
+// Messages (slots, rerouted queue items, anything that never arrived) → the BDR's Quick Message campaign.
+// Connection requests → the BDR's connect campaign. Every send locks its source record first so the scheduler /
+// hourly auto-push cannot also send it, and restores it if HeyReach rejects the contact.
 async function runMove(targets) {
     if (!targets.length || busy) return;
-    const camp = ctx.qmCampaigns[0];
-    if (!camp) { alert('This BDR has no Quick Message campaign.'); return; }
-    const st = ctx.campaignStatus?.get(String(camp.id))?.status;
-    if (BAD_CAMPAIGN_STATUSES.has(st)) { alert(`Quick Message campaign #${camp.id} is ${st} in HeyReach — HeyReach will reject every lead. Fix or replace the campaign first.`); return; }
-    const extra = ctx.qmCampaigns.length > 1 ? `\n\nNote: this BDR has ${ctx.qmCampaigns.length} Quick Message campaigns; the first (#${camp.id}) is used, same as Fast Connect Review.` : '';
-    if (!confirm(`Move ${targets.length} pending slot message(s) for ${ctx.bdr.name || ctx.bdr.primaryEmail} into Quick Message campaign #${camp.id}?\n\n` +
-        `Each slot is first locked so the scheduler cannot also send it, then added to HeyReach. ` +
-        `If HeyReach rejects a contact (e.g. already in the campaign) its slot is restored unchanged.${extra}`)) return;
+    const plan = targets.map(r => ({ r, kind: sendKindOf(r), camp: targetCampaignFor(r) }));
+    const blocked = plan.filter(p => !p.kind || !p.camp || BAD_CAMPAIGN_STATUSES.has(campStatus(p.camp)));
+    const go = plan.filter(p => !blocked.includes(p));
+    if (!go.length) {
+        alert(blocked.length ? `Nothing can be sent: the target campaign is missing or ${[...new Set(blocked.map(p => p.camp ? `#${p.camp.id} is ${campStatus(p.camp)}` : 'not configured'))].join(' / ')} in HeyReach. HeyReach rejects every lead added to a failed/finished campaign — fix the campaign first.` : 'Nothing selected.');
+        return;
+    }
+    const tally = new Map();
+    go.forEach(p => { const k = `${SEND_KINDS[p.kind]} (campaign #${p.camp.id})`; tally.set(k, (tally.get(k) || 0) + 1); });
+    const hasConnect = go.some(p => p.kind === 'connect_add');
+    const msg = `Send ${go.length} item(s) for ${ctx.bdr.name || ctx.bdr.primaryEmail} to HeyReach?\n\n` +
+        [...tally.entries()].map(([k, n]) => `  • ${n} × ${k}`).join('\n') +
+        (blocked.length ? `\n\n${blocked.length} selected item(s) will be skipped (campaign missing / failed in HeyReach).` : '') +
+        `\n\nEach item is locked first so nothing else can send it, then added to HeyReach. If HeyReach rejects a contact (e.g. already in the campaign) the item is restored unchanged.` +
+        (hasConnect ? `\n\nConnection requests: this page does not check whether the contact is already one of the BDR's connections (the hourly auto-push does). LinkedIn ignores requests to existing connections.` : '');
+    if (!confirm(msg)) return;
 
     cancelled = false; setBusy(true);
-    let ok = 0, fail = 0, skipped = 0;
-    log(`── Moving ${targets.length} slot message(s) to campaign #${camp.id} ──`);
-    for (let i = 0; i < targets.length; i++) {
+    let ok = 0, fail = 0, skipped = blocked.length;
+    log(`── Sending ${go.length} item(s) to HeyReach ──`);
+    for (let i = 0; i < go.length; i++) {
         if (cancelled) { log('Stopped by user.', 'warn'); break; }
-        const r = targets[i];
-        progress(Math.round((i / targets.length) * 100), `Moving ${i + 1} / ${targets.length}…`);
-        const res = await moveSlot(r.movableSlot, camp);
+        const { r, kind, camp } = go[i];
+        progress(Math.round((i / go.length) * 100), `Sending ${i + 1} / ${go.length}…`);
+        let res;
+        try {
+            res = kind === 'slot' ? await moveSlot(r.movableSlot, camp)
+                : kind === 'queued' ? await moveQueued(r.movableQueue, r, camp)
+                : kind === 'qm_add' ? await addQueueDocToQM(r.sub, r, camp, 'never reached HeyReach')
+                : await sendConnection(r.sub, r, camp);
+        } catch (e) { res = { ok: false, msg: e.message }; }
         if (res.ok) ok++; else if (res.skipped) skipped++; else fail++;
-        log(`${res.ok ? '✔' : res.skipped ? '↷' : '✘'} ${r.name || r.url}: ${res.msg}`, res.ok ? 'ok' : res.skipped ? 'warn' : 'bad');
+        log(`${res.ok ? '✔' : res.skipped ? '↷' : '✘'} ${r.name || r.url} [${SEND_KINDS[kind]}]: ${res.msg}`, res.ok ? 'ok' : res.skipped ? 'warn' : 'bad');
         await sleep(350);
     }
-    progress(100, `Done — moved ${ok}, failed ${fail}, skipped ${skipped}`);
-    log(`── Finished: ${ok} moved, ${fail} failed, ${skipped} skipped ──`, ok ? 'ok' : 'warn');
+    progress(100, `Done — sent ${ok}, failed ${fail}, skipped ${skipped}`);
+    log(`── Finished: ${ok} sent, ${fail} failed, ${skipped} skipped ──`, ok ? 'ok' : 'warn');
     setBusy(false);
     await runAudit();
+}
+
+const nameParts = (d, row) => {
+    let firstName = d.prospect_first_name || d.contactFirstName || d.contact_first_name || d.firstName || '';
+    let lastName = d.prospect_last_name || d.contactLastName || d.contact_last_name || d.lastName || '';
+    if (!firstName && !lastName) { const p = String(row.name || '').trim().split(/\s+/); firstName = p.shift() || ''; lastName = p.join(' '); }
+    return { firstName, lastName };
+};
+const companyOf = d => d.contactCompany || d.prospect_company || d.company_name || d.contact_company || '';
+const positionOf = d => d.contactTitle || d.prospect_title || d.prospect_position || d.contact_title || '';
+const urlOf = (d, row) => d.prospect_li_url || d.contact_linkedin_url || d.linkedin_url || d.linkedInUrl || row.url;
+
+async function writeQmActivity(d, row, camp, hrResult, extra = {}) {
+    const bdrEmail = ctx.bdr.primaryEmail.toLowerCase();
+    const { firstName, lastName } = nameParts(d, row);
+    const message = d.message_to_contact || row.message;
+    try {
+        await addDoc(collection(emailDB, 'connect_activity'), {
+            actionType: 'push_to_heyreach', status: 'added', via: 'quick_message_campaign',
+            contactName: `${firstName} ${lastName}`.trim(), contactFirstName: firstName, contactLastName: lastName,
+            contactLinkedInUrl: urlOf(d, row), prospect_li_url: urlOf(d, row), messageContent: message, message_to_contact: message,
+            contactCompany: companyOf(d), contactTitle: positionOf(d), bdrEmail, account_email: bdrEmail,
+            campaignId: String(camp.id), hrResult, source: d.source || row.source || 'Harvest Questions',
+            connect_queue_id: d.id, timestamp: new Date(), createdAt: new Date().toISOString(), pushedBy: currentUser.email, ...extra
+        });
+    } catch (e) { console.warn('activity write failed', e); }
+}
+
+async function qmAddLead(d, row, camp) {
+    const { firstName, lastName } = nameParts(d, row);
+    const resp = await fetch(`${BACKEND}/api/mass-messages/add-lead`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            customerId: ctx.customerId, campaignId: String(camp.id), linkedinUrl: urlOf(d, row),
+            firstName, lastName, company: companyOf(d), position: positionOf(d), customMessage: d.message_to_contact || row.message,
+            ...(camp.accountId ? { accountId: String(camp.accountId) } : {}),
+            ...(camp.listId ? { listId: String(camp.listId) } : {})
+        })
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+    const data = await resp.json();
+    if (data?.success === false) {
+        throw new Error(data.alreadyInCampaign ? 'Already in this campaign\'s history — HeyReach will not send a new message' : (data.error || 'HeyReach rejected the lead'));
+    }
+    return { added: data?.added ?? null, updated: data?.updated ?? null, failed: data?.failed ?? null, usedListFallback: !!data?.meta?.fallbackResults };
+}
+const hrResultText = h => `added ${h.added ?? '?'}, updated ${h.updated ?? '?'}${h.usedListFallback ? ', added to the campaign\'s lead LIST only — confirm later with “Check in HeyReach”' : ''}`;
+
+// A connect_queue doc whose message must go to Quick Message: either a slot message the scheduler rerouted into the
+// message-campaign queue (follow_up_scan_auto) or a submission that never reached HeyReach.
+async function addQueueDocToQM(d, row, camp, how) {
+    const ref = doc(emailDB, 'connect_queue', d.id);
+    if (!urlOf(d, row)) return { ok: false, msg: 'No LinkedIn URL on the queued message' };
+    if (!(d.message_to_contact || row.message)) return { ok: false, msg: 'No message text on the queued message' };
+
+    // Claim (only if the doc is still live in the push pipeline): take it out of circulation so Connect Push
+    // cannot also push it into the wrong campaign while we add it to Quick Message.
+    const needsClaim = !d.deleted && !d.pushed_to_heyreach;
+    if (needsClaim) {
+        let claimed = false;
+        try {
+            claimed = await runTransaction(emailDB, async tx => {
+                const snap = await tx.get(ref);
+                if (!existsOf(snap)) return false;
+                const x = dataOf(snap);
+                if (x.deleted || x.pushed_to_heyreach) return false;
+                tx.update(ref, { deleted: true, routed_via: 'moving_to_quick_message', moving_at: new Date().toISOString(), moving_by: currentUser.email });
+                return true;
+            });
+        } catch (e) { return { ok: false, msg: `Could not lock queued message: ${e.message}` }; }
+        if (!claimed) return { skipped: true, msg: 'Already pushed or removed since the audit loaded — left alone' };
+    }
+    const restore = async reason => {
+        if (!needsClaim) return;
+        try { await updateDoc(ref, { deleted: false, routed_via: d.routed_via || null, last_move_error: reason, last_move_attempt_at: new Date().toISOString() }); } catch (e) { console.error('restore failed', e); }
+    };
+    try {
+        const hrResult = await qmAddLead(d, row, camp);
+        await updateDoc(ref, {
+            deleted: true, deleted_date: new Date().toISOString(), deleted_reason: `Sent to Quick Message campaign from BDR Send Audit (${how})`,
+            routed_via: 'quick_message_campaign', routed_campaign_id: String(camp.id), routed_hr_result: hrResult,
+            routed_from_slot_id: row.slot?.id || null, routed_at: new Date().toISOString(), routed_by: currentUser.email,
+            push_failed: false, push_failure_reason: null
+        });
+        await writeQmActivity(d, row, camp, hrResult, { movedFromSlotId: row.slot?.id || null });
+        return { ok: true, msg: `Added to Quick Message campaign #${camp.id} (${hrResultText(hrResult)})` };
+    } catch (err) {
+        await restore(err.message);
+        return { ok: false, msg: `${err.message}${needsClaim ? ' — queued message restored' : ''}` };
+    }
+}
+const moveQueued = (fu, row, camp) => addQueueDocToQM(fu, row, camp, 'rerouted slot message');
+
+// Connection request that is not in HeyReach → the BDR's connect campaign (same call the Sync Audit re-push uses;
+// it does not touch the Quick Message nightly-cleanup tracking).
+async function sendConnection(sub, row, camp) {
+    const ref = doc(emailDB, 'connect_queue', sub.id);
+    const url = urlOf(sub, row);
+    if (!url) return { ok: false, msg: 'No LinkedIn URL on the connection request' };
+    const note = sub.message_to_contact || row.message || '';
+
+    const needsClaim = !sub.pushed_to_heyreach && !sub.deleted;
+    if (needsClaim) {
+        let claimed = false;
+        try {
+            claimed = await runTransaction(emailDB, async tx => {
+                const snap = await tx.get(ref);
+                if (!existsOf(snap)) return false;
+                const x = dataOf(snap);
+                if (x.deleted || x.pushed_to_heyreach || x.reviewStatus === 'duplicate' || x.reviewStatus === 'already_connected') return false;
+                tx.update(ref, { pushed_to_heyreach: true, heyreach_push_date: new Date().toISOString(), push_claimed_by: 'bdr_send_audit', push_claimed_at: new Date().toISOString() });
+                return true;
+            });
+        } catch (e) { return { ok: false, msg: `Could not lock the queue item: ${e.message}` }; }
+        if (!claimed) return { skipped: true, msg: 'Already pushed, removed or blocked since the audit loaded — left alone' };
+    }
+    const restore = async reason => {
+        if (!needsClaim) return;
+        try { await updateDoc(ref, { pushed_to_heyreach: false, heyreach_push_date: sub.heyreach_push_date || null, push_failed: true, push_failure_reason: `BDR Send Audit: ${reason}`, push_failure_at: new Date().toISOString() }); } catch (e) { console.error('restore failed', e); }
+    };
+    try {
+        const { firstName, lastName } = nameParts(sub, row);
+        const resp = await fetch(`${BACKEND}/proxy/heyreach/campaigns/addleadsv2`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ctx.apiKey },
+            body: JSON.stringify({
+                campaignId: String(camp.id),
+                ...(camp.accountId ? { accountId: String(camp.accountId) } : {}),
+                ...(camp.listId ? { listId: String(camp.listId) } : {}),
+                leads: [{ linkedinUrl: url, firstName: firstName || 'Contact', lastName: lastName || 'Prospect', company: companyOf(sub), position: positionOf(sub), customVariables: { content: note } }]
+            })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${data.message || data.Message || data.error || data.title || JSON.stringify(data).slice(0, 160)}`);
+        const added = data.addedLeadsCount ?? data.added ?? 0, updated = data.updatedLeadsCount ?? data.updated ?? 0, failed = data.failedLeadsCount ?? data.failed ?? 0;
+        const perLeadOk = data.meta?.leadCreateResults?.perLeadOk;
+        const accepted = Array.isArray(perLeadOk) && perLeadOk.length === 1 ? !!perLeadOk[0] : (added > 0 || updated > 0 || failed === 0);
+        if (!accepted) throw new Error(`HeyReach reported ${added} added / ${updated} updated / ${failed} failed${data.meta?.leadCreateResults?.firstFailureMessage ? ' — ' + data.meta.leadCreateResults.firstFailureMessage : ''}`);
+        const status = added > 0 ? 'added' : updated > 0 ? 'updated' : 'already_exists';
+        const listOnly = !!data.meta?.fallbackResults && added === 0 && updated === 0;
+        await updateDoc(ref, {
+            pushed_to_heyreach: true, heyreach_push_date: new Date().toISOString(), heyreach_push_status: status,
+            heyreach_campaign_id: camp.id, heyreach_campaign_name: camp.name || null, heyreach_bdr_id: ctx.bdr.id, heyreach_bdr_name: ctx.bdr.name || null,
+            push_failed: false, push_failure_reason: null, pushed_from_audit_by: currentUser.email, pushed_from_audit_at: new Date().toISOString()
+        });
+        return { ok: true, msg: `Sent to connect campaign #${camp.id} (${status}: added ${added}, updated ${updated}${listOnly ? ', on the campaign\'s lead LIST only — confirm later with “Check in HeyReach”' : ''})` };
+    } catch (err) {
+        await restore(err.message);
+        return { ok: false, msg: `${err.message}${needsClaim ? ' — queue item restored' : ''}` };
+    }
 }
 
 async function moveSlot(slot, camp) {
@@ -983,3 +1268,4 @@ async function moveSlot(slot, camp) {
 </script>
 </body>
 </html>
+
