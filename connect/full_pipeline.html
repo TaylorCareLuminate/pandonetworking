@@ -548,33 +548,10 @@
             <div class="grid-2">
                 <div class="form-group">
                     <label style="display: flex; align-items: center; gap: 8px;">
-                        <input type="checkbox" id="fpCrossBdrEnabled" style="width: auto;" onchange="document.getElementById('fpCrossBdrOptions').style.display = this.checked ? 'block' : 'none';">
+                        <input type="checkbox" id="fpCrossBdrEnabled" style="width: auto;">
                         <span><i class="fas fa-people-arrows"></i> Also use existing contacts from other BDRs / workspaces at each organization</span>
                     </label>
-                    <div class="form-help">Before the Apify scan results are used, contacts at the same organization already stored under other BDRs are found, <strong>refreshed with a live LinkedIn check</strong> (so we never work off stale data), and handed to the current BDR (moved or copied — see below).</div>
-                    <div id="fpCrossBdrOptions" style="display:none; margin-top:0.6rem; padding:0.7rem 0.9rem; background:#f8fafc; border:1.5px solid var(--border, #e2e8f0); border-radius:8px;">
-                        <div style="display:flex; flex-wrap:wrap; gap:0.9rem; align-items:flex-end;">
-                            <div>
-                                <label for="fpCrossBdrScope" style="display:block; font-size:0.8rem; font-weight:600; margin-bottom:3px;">Pull from</label>
-                                <select id="fpCrossBdrScope" class="form-select" style="min-width:300px;">
-                                    <option value="pool" selected>Other BDRs' pool — any contact at this organization</option>
-                                    <option value="group">Other BDRs' contacts that are in the selected hypothesis group</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label for="fpCrossBdrMode" style="display:block; font-size:0.8rem; font-weight:600; margin-bottom:3px;">Hand-off</label>
-                                <select id="fpCrossBdrMode" class="form-select" style="min-width:230px;">
-                                    <option value="move" selected>Move (reassign to this BDR)</option>
-                                    <option value="copy">Copy (other BDR keeps theirs)</option>
-                                </select>
-                            </div>
-                        </div>
-                        <label style="display:flex; align-items:center; gap:8px; margin-top:0.6rem;">
-                            <input type="checkbox" id="fpCrossBdrUntouchedOnly" checked style="width:auto;">
-                            <span>Only <strong>untouched</strong> contacts — no live outreach from any BDR (no sent, approved, or pending-review message)</span>
-                        </label>
-                        <div class="form-help">With this unchecked, contacts that already have outreach are included too, but they are always <strong>copied</strong>, never moved — a contact with outreach stays with the BDR who contacted them. Deleted / rejected / duplicate messages don't count as outreach. Contacts already connected to this BDR on LinkedIn are always skipped.</div>
-                    </div>
+                    <div class="form-help">Before the Apify scan results are used, contacts at the same organization already stored under other BDRs are found, <strong>refreshed with a live LinkedIn check</strong> (so we never work off stale data), and copied to the current BDR.</div>
                 </div>
                 <div class="form-group">
                     <label style="display: flex; align-items: center; gap: 8px;">
@@ -5966,75 +5943,11 @@
             throw new Error('Scan job timed out after 30 minutes');
         }
 
-        // ── Cross-BDR helpers ─────────────────────────────────────────────────────
-        // Which of these contacts already have LIVE outreach from ANY BDR? "Live" uses the same
-        // definition as the 30-day org limit (fpQueueDocDeadReason): a connect_queue message that
-        // was sent, approved, or is still pending review. Deleted / rejected / duplicate /
-        // already-connected messages are not outreach. Matches connect_queue docs by the contact's
-        // LinkedIn URL on every field the different code paths write it to.
-        async function fpLoadTouchedUrlSet(contacts) {
-            const touched = new Set(); // fpNormalizeUrl'd
-            const variants = new Set();
-            for (const c of contacts) {
-                const raw = String(c.linkedInUrl || c.li_url || c.linkedin_url || '').trim();
-                if (!raw) continue;
-                const noSlash = raw.replace(/\/+$/, '');
-                [raw, noSlash, noSlash + '/', noSlash.toLowerCase(), noSlash.toLowerCase() + '/'].forEach(v => variants.add(v));
-            }
-            const values = [...variants];
-            const fields = ['prospect_li_url', 'contact_linkedin_url', 'linkedin_url', 'linkedInUrl'];
-            const CHUNK = 10, PARALLEL = 4; // 'in' is capped at 10-30 values depending on backend; stay conservative
-            const jobs = [];
-            for (const field of fields) {
-                for (let i = 0; i < values.length; i += CHUNK) jobs.push({ field, chunk: values.slice(i, i + CHUNK) });
-            }
-            let failures = 0;
-            for (let i = 0; i < jobs.length; i += PARALLEL) {
-                await Promise.all(jobs.slice(i, i + PARALLEL).map(async ({ field, chunk }) => {
-                    try {
-                        const snap = await getDocs(query(collection(db, 'connect_queue'), where(field, 'in', chunk)));
-                        snap.forEach(d => {
-                            const data = d.data();
-                            if (fpQueueDocDeadReason(data)) return;
-                            const u = fpNormalizeUrl(data[field] || '');
-                            if (u) touched.add(u);
-                        });
-                    } catch (e) { failures++; }
-                }));
-            }
-            if (failures > 0) throw new Error(`${failures} outreach lookup(s) failed`);
-            return touched;
-        }
-
-        // Normalized LinkedIn URLs of every contact in a hypothesis group (cached per group per run).
-        let _fpCrossGroupUrlCache = null; // { groupId, urls: Set }
-        async function fpLoadGroupUrlSet(groupId) {
-            if (_fpCrossGroupUrlCache && _fpCrossGroupUrlCache.groupId === groupId) return _fpCrossGroupUrlCache.urls;
-            const ref = doc(db, 'hypothesis_groups', groupId);
-            const snap = await getDoc(ref);
-            const data = (snap.exists || snap.exists?.()) ? (snap.data() || {}) : {};
-            const { urls } = await fpReadGroupContacts(ref, data);
-            const set = new Set((urls || []).map(fpNormalizeUrl).filter(Boolean));
-            _fpCrossGroupUrlCache = { groupId, urls: set };
-            return set;
-        }
-
         // Optional cross-BDR step: find contacts at this org already stored under other
-        // BDRs / workspaces, refresh each one with a live LinkedIn check, and hand it to the
-        // current BDR (move or copy), tagged with this scan job so it flows through the same
-        // generation path.
-        //   opts.scope         'pool'  = any contact at this org in another BDR's pool
-        //                      'group' = only those that are part of the selected hypothesis group
-        //   opts.untouchedOnly only contacts with no live outreach from any BDR
-        //   opts.mode          'move' (reassign) or 'copy'. Contacts WITH outreach are always
-        //                      copied, never moved, so they stay with the BDR who contacted them.
-        async function fpImportCrossBdrContacts({ org, bdrEmail, scanJobId, connectedUrlSet, connectedUsernameSet, groupId, opts }) {
-            opts = opts || {};
-            const scope = opts.scope === 'group' ? 'group' : 'pool';
-            const untouchedOnly = opts.untouchedOnly !== false;
-            const mode = opts.mode === 'copy' ? 'copy' : 'move';
+        // BDRs / workspaces, refresh each one with a live LinkedIn check, and copy it to the
+        // current BDR tagged with this scan job so it flows through the same generation path.
+        async function fpImportCrossBdrContacts({ org, bdrEmail, scanJobId, connectedUrlSet, connectedUsernameSet }) {
             const found = new Map(); // normalized url -> contact doc
-            const ownUrls = new Set(); // contacts this BDR already has at this org (incl. this run's fresh scan)
             const CROSS_BDR_CAP = 100;
 
             const queries = [];
@@ -6045,14 +5958,7 @@
                 queries.push(query(collection(db, 'prospect_contacts'), where('company', '==', org.company_name)));
             }
 
-            let groupUrls = null;
-            if (scope === 'group') {
-                if (!groupId) { addLog('   ⚠️ Cross-BDR: no hypothesis group selected — cannot restrict to group members.', 'warning'); return 0; }
-                try { groupUrls = await fpLoadGroupUrlSet(groupId); }
-                catch (e) { addLog(`   ⚠️ Cross-BDR: could not read the hypothesis group's contact list (${e.message}) — skipping cross-BDR for this org.`, 'warning'); return 0; }
-            }
-
-            let skippedConnected = 0, skippedNotInGroup = 0, skippedAlreadyOwn = 0;
+            let skippedConnected = 0;
             for (const q of queries) {
                 try {
                     const snap = await getDocs(q);
@@ -6061,8 +5967,7 @@
                         const rawUrl = c.linkedInUrl || c.li_url || '';
                         const u = fpNormalizeUrl(rawUrl);
                         if (!u) return;
-                        if ((c.userEmail || c.bdrEmail) === bdrEmail) { ownUrls.add(u); return; } // already this BDR's contact
-                        if (scope === 'group' && !(c.hypothesisGroupId === groupId || groupUrls.has(u))) { skippedNotInGroup++; return; }
+                        if ((c.userEmail || c.bdrEmail) === bdrEmail) return; // already this BDR's contact
                         // Net-new connections only — skip before wasting a refresh scrape on them
                         if (connectedUrlSet && fpIsUrlConnected(connectedUrlSet, connectedUsernameSet || new Set(), rawUrl)) { skippedConnected++; return; }
                         if (!found.has(u)) found.set(u, c);
@@ -6071,44 +5976,16 @@
                     addLog(`   ⚠️ Cross-BDR lookup failed: ${e.message}`, 'warning');
                 }
             }
-            // This BDR already holds the person (e.g. the scan just saved them) — importing would duplicate them.
-            for (const u of [...found.keys()]) if (ownUrls.has(u)) { found.delete(u); skippedAlreadyOwn++; }
             if (skippedConnected > 0) addLog(`   🤝 Cross-BDR: skipped ${skippedConnected} contact(s) already connected to this BDR.`, 'dim');
-            if (skippedNotInGroup > 0) addLog(`   🔬 Cross-BDR: skipped ${skippedNotInGroup} contact(s) not in the selected hypothesis group.`, 'dim');
-            if (skippedAlreadyOwn > 0) addLog(`   ♻️ Cross-BDR: skipped ${skippedAlreadyOwn} contact(s) this BDR already has.`, 'dim');
 
-            let candidates = [...found.values()];
-
-            // Outreach check — always run, so we know which contacts may be MOVED. With "untouched only"
-            // on, touched contacts are dropped; with it off they are kept but forced to copy.
-            let touchedSet = new Set();
-            if (candidates.length > 0) {
-                try {
-                    touchedSet = await fpLoadTouchedUrlSet(candidates);
-                } catch (e) {
-                    if (untouchedOnly) {
-                        addLog(`   ⚠️ Cross-BDR: couldn't verify outreach status (${e.message}) — skipping cross-BDR for this org rather than risk pulling touched contacts.`, 'warning');
-                        return 0;
-                    }
-                    addLog(`   ⚠️ Cross-BDR: couldn't verify outreach status (${e.message}) — treating every contact as touched (copy only, nothing moved).`, 'warning');
-                    touchedSet = null; // null = unknown → treat all as touched
-                }
-            }
-            const isTouched = c => touchedSet === null || touchedSet.has(fpNormalizeUrl(c.linkedInUrl || c.li_url || ''));
-            if (untouchedOnly) {
-                const before = candidates.length;
-                candidates = candidates.filter(c => !isTouched(c));
-                if (before - candidates.length > 0) addLog(`   🔒 Cross-BDR: skipped ${before - candidates.length} contact(s) that already have outreach.`, 'dim');
-            }
-
-            candidates = candidates.slice(0, CROSS_BDR_CAP);
+            const candidates = [...found.values()].slice(0, CROSS_BDR_CAP);
             if (candidates.length === 0) {
-                addLog(`   🔎 Cross-BDR: no ${untouchedOnly ? 'untouched ' : ''}contacts ${scope === 'group' ? 'in this hypothesis group ' : ''}found at this organization under other BDRs.`, 'dim');
+                addLog('   🔎 Cross-BDR: no existing contacts found at this organization under other BDRs.', 'dim');
                 return 0;
             }
-            addLog(`   🔎 Cross-BDR: found ${candidates.length} ${untouchedOnly ? 'untouched ' : ''}contact(s) under other BDRs — refreshing and ${mode === 'move' ? 'moving' : 'copying'}…`);
+            addLog(`   🔎 Cross-BDR: found ${candidates.length} existing contact(s) under other BDRs — refreshing and importing…`);
 
-            let imported = 0, moved = 0, copied = 0;
+            let imported = 0;
             for (const c of candidates) {
                 if (window.fpStopRequested) break;
                 try {
@@ -6122,58 +5999,35 @@
                         addLog(`   ↩️ Skipping ${c.fullName || c.firstName || c.linkedInUrl} — now at "${freshEmployer}"`, 'dim');
                         continue;
                     }
-                    const nowIso = new Date().toISOString();
-                    const sourceOwner = c.userEmail || c.bdrEmail || '';
-                    const freshFields = fresh ? {
-                        linkedInConnectionCount: extractConnectionCount(fresh) ?? c.linkedInConnectionCount ?? null,
-                        enrichedAt: nowIso,
-                        enrichedBy: 'full_pipeline'
-                    } : {};
-                    // Contacts with outreach are never moved away from the BDR who contacted them.
-                    const doMove = mode === 'move' && !isTouched(c);
-                    if (doMove) {
-                        await updateDoc(doc(db, 'prospect_contacts', c.id), {
-                            userEmail: bdrEmail,
-                            bdrEmail: bdrEmail,
-                            linkedInAccountEmail: bdrEmail,
-                            movedAt: nowIso,
-                            movedFrom: sourceOwner,
-                            movedBy: currentUser.email,
-                            source: 'full_pipeline_cross_bdr',
-                            sourceJobId: scanJobId,
-                            scanJobId: scanJobId,
-                            previousSourceJobId: c.sourceJobId || c.scanJobId || null,
-                            crossBdrSourceOwner: sourceOwner,
-                            ...freshFields
-                        });
-                        moved++;
-                    } else {
-                        const copy = {
-                            ...c,
-                            userEmail: bdrEmail,
-                            bdrEmail: bdrEmail,
-                            linkedInAccountEmail: bdrEmail,
-                            uploadedAt: nowIso,
-                            uploadedBy: currentUser.email,
-                            source: 'full_pipeline_cross_bdr',
-                            sourceJobId: scanJobId,
-                            scanJobId: scanJobId,
-                            crossBdrSourceId: c.id,
-                            crossBdrSourceOwner: sourceOwner,
-                            ...freshFields
-                        };
-                        delete copy.id;
-                        await addDoc(collection(db, 'prospect_contacts'), copy);
-                        copied++;
-                    }
+                    const copy = {
+                        ...c,
+                        userEmail: bdrEmail,
+                        bdrEmail: bdrEmail,
+                        linkedInAccountEmail: bdrEmail,
+                        uploadedAt: new Date().toISOString(),
+                        uploadedBy: currentUser.email,
+                        source: 'full_pipeline_cross_bdr',
+                        sourceJobId: scanJobId,
+                        scanJobId: scanJobId,
+                        crossBdrSourceId: c.id,
+                        crossBdrSourceOwner: c.userEmail || c.bdrEmail || '',
+                        ...(fresh ? {
+                            linkedInConnectionCount: extractConnectionCount(fresh) ?? c.linkedInConnectionCount ?? null,
+                            enrichedAt: new Date().toISOString(),
+                            enrichedBy: 'full_pipeline'
+                        } : {})
+                    };
+                    delete copy.id;
+                    await addDoc(collection(db, 'prospect_contacts'), copy);
                     imported++;
                 } catch (e) {
                     addLog(`   ⚠️ Cross-BDR import failed for ${c.linkedInUrl}: ${e.message}`, 'warning');
                 }
             }
-            addLog(`   ✅ Cross-BDR: brought ${imported} refreshed contact(s) into ${bdrEmail} (${moved} moved, ${copied} copied).`, imported ? 'success' : 'dim');
+            addLog(`   ✅ Cross-BDR: imported ${imported} refreshed contact(s) into ${bdrEmail}.`, imported ? 'success' : 'dim');
             return imported;
         }
+
 
         // Target Contact / Exclude Rules filter — same bulk-classify endpoint
         // hypothesis_target_rules.html uses, chunked at 50.
@@ -6920,15 +6774,6 @@
             const connFilterMin = parseInt(document.getElementById('fpConnFilterMin').value) || 250;
             const opusExcludeMode = document.getElementById('fpOpusExcludeMode').value;
             const crossBdrEnabled = document.getElementById('fpCrossBdrEnabled').checked;
-            const crossBdrOpts = {
-                scope: document.getElementById('fpCrossBdrScope')?.value === 'group' ? 'group' : 'pool',
-                mode: document.getElementById('fpCrossBdrMode')?.value === 'copy' ? 'copy' : 'move',
-                untouchedOnly: document.getElementById('fpCrossBdrUntouchedOnly')?.checked !== false
-            };
-            _fpCrossGroupUrlCache = null; // re-read the group's contact list fresh each run
-            if (crossBdrEnabled) {
-                addLog(`🧑‍🤝‍🧑 Cross-BDR is ON — pulling from ${crossBdrOpts.scope === 'group' ? "other BDRs' contacts in this hypothesis group" : "other BDRs' pool at each organization"}; ${crossBdrOpts.untouchedOnly ? 'untouched contacts only' : 'contacts with outreach included (copy only)'}; hand-off: ${crossBdrOpts.mode}.`, 'info');
-            }
             const finalReviewEnabled = document.getElementById('fpFinalReviewEnabled').checked;
             const topContactsEnabled = document.getElementById('fpTopContactsEnabled').checked;
             const topContactsLimit = Math.max(1, parseInt(document.getElementById('fpTopContactsLimit').value) || 5);
@@ -7718,7 +7563,7 @@
 
                             // ── 3. Optional: cross-BDR contacts (refresh + import) ──
                             if (crossBdrEnabled) {
-                                orgReport.crossBdrImported = await fpImportCrossBdrContacts({ org, bdrEmail, scanJobId: jobId, connectedUrlSet, connectedUsernameSet, groupId, opts: crossBdrOpts });
+                                orgReport.crossBdrImported = await fpImportCrossBdrContacts({ org, bdrEmail, scanJobId: jobId, connectedUrlSet, connectedUsernameSet });
                             }
 
                             // ── 4. Load this job's contacts + Target Contact / Exclude Rules filter ──
