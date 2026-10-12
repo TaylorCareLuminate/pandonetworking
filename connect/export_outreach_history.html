@@ -528,6 +528,8 @@
         .badge-story_search   { background: #e0f2fe; color: #0c4a6e; }
         .badge-recovered_post { background: #f0fdf4; color: #14532d; }
         .badge-about_me_connect { background: #fdf4ff; color: #6b21a8; }
+        .badge-follow_up      { background: #ccfbf1; color: #115e59; }
+        .badge-quick_message  { background: #ffedd5; color: #9a3412; }
         .badge-other          { background: var(--gray-100); color: var(--gray-600); }
 
         .msg-count {
@@ -775,7 +777,8 @@
                 <div class="legend-row"><span class="legend-col">contact_company</span><span class="legend-desc">Company / organization of the contact</span></div>
                 <div class="legend-row"><span class="legend-col">bdr_name / bdr_email</span><span class="legend-desc">Which BDR sent the outreach</span></div>
                 <div class="legend-row"><span class="legend-col">client_company</span><span class="legend-desc">The client company this outreach was performed on behalf of</span></div>
-                <div class="legend-row"><span class="legend-col">message_type</span><span class="legend-desc">post / org_news / contact_news / story_search / profile / complement / fast_prospect / about_me_connect / other</span></div>
+                <div class="legend-row"><span class="legend-col">message_type</span><span class="legend-desc">post / org_news / contact_news / story_search / profile / complement / fast_prospect / about_me_connect / other / follow_up / quick_message</span></div>
+                <div class="legend-row"><span class="legend-col">outreach_sources</span><span class="legend-desc">Every route we reached this contact by: connection request, campaign message, follow-up / reply (review pages), Quick Message campaign, fast outreach, scheduled DM, or a HeyReach conversation</span></div>
                 <div class="legend-row"><span class="legend-col">first_outreach_date</span><span class="legend-desc">Date of first outbound message</span></div>
                 <div class="legend-row"><span class="legend-col">last_message_date</span><span class="legend-desc">Date of most recent message in the conversation</span></div>
                 <div class="legend-row"><span class="legend-col">connected</span><span class="legend-desc">1 if the connection request was accepted, 0 otherwise</span></div>
@@ -853,6 +856,7 @@
     let sortKey         = null;
     let sortDir          = 'asc';
     let summaryStats    = null;
+    let buildStats      = {};     // diagnostics from the last buildRows() run
     let loggedInEmail   = '';
 
     // Admin-only state
@@ -1281,9 +1285,30 @@
             const currentConnectionUrls = await loadCurrentConnections(allEmailsArr);
             doneStep(s5, `${currentConnectionUrls.size} current connections found`);
 
+            // Everything sent OUTSIDE the connection-request queue: follow-ups/replies sent from
+            // the review pages, Quick Message campaign adds, fast outreach, and scheduled DM slots.
+            const s5b = addStep('Loading follow-ups & replies (activity_tracking)…');
+            const activityEvents = await loadActivityMessages(allEmailsArr);
+            doneStep(s5b, `${activityEvents.length} follow-up / reply records found`);
+
+            const s5c = addStep('Loading Quick Message campaign sends…');
+            const quickMessageEvents = await loadQuickMessageLeads(targetBdrs, emailToCanonical);
+            doneStep(s5c, `${quickMessageEvents.length} Quick Message campaign sends found`);
+
+            const s5d = addStep('Loading scheduled direct-message sends…');
+            const slotEvents = await loadScheduledSends(allEmailsArr);
+            doneStep(s5d, `${slotEvents.length} scheduled sends found`);
+
             const s6 = addStep('Assembling your outreach history…');
-            dataset = buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet, bdrEmailToName, bdrEmailToCompany, currentConnectionUrls, emailToCanonical);
-            doneStep(s6, `${dataset.length} rows ready`);
+            buildStats = {};
+            // Respect the date-range selector for the non-queue sources too.
+            const sinceMs = daysBack > 0 ? Date.now() - daysBack * 86400000 : 0;
+            buildStats.sinceMs = sinceMs;
+            const inRange = ev => !sinceMs || !ev.date || ev.date.getTime() >= sinceMs;
+            dataset = buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet, bdrEmailToName, bdrEmailToCompany, currentConnectionUrls, emailToCanonical,
+                                [...activityEvents, ...quickMessageEvents, ...slotEvents].filter(inRange));
+            doneStep(s6, `${dataset.length} rows ready` +
+                (buildStats.eventsWithoutContact ? ` (${buildStats.eventsWithoutContact} send records had no LinkedIn URL and couldn't be matched to a contact)` : ''));
 
             document.getElementById('loadingTitle').textContent = `Outreach history for ${viewLabel} is ready!`;
             renderResults();
@@ -1548,6 +1573,127 @@
         return urls;
     }
 
+    // ── Message-send event sources ────────────────────────────────────────────
+    // connect_queue only holds connection requests / campaign pushes. Follow-ups and replies
+    // sent to existing connections never touch it, so these loaders gather every other place
+    // a send is recorded. Each returns "events": { kind, liUrl, rawBdrs[]/bdrEmail, name, text, date, ... }
+    const MESSAGE_ACTIVITY_TYPES = new Set([
+        'follow_up_message',              // company_review_replies / review_replies / conversation_lookup / delayed_replies_send (+ connected-no-reply sends)
+        'fast_message_via_conversation',  // fast_message_speedup
+        'fast_outreach_message',          // current_connections_fast_outreach
+        'fast_outreach_bulk_message',
+        'personal_message_reply'          // personal_messages
+    ]);
+
+    function chunk30(arr) {
+        const chunks = [];
+        for (let i = 0; i < arr.length; i += 30) chunks.push(arr.slice(i, i + 30));
+        return chunks;
+    }
+
+    async function loadActivityMessages(emailArr) {
+        const events = [];
+        const seenIds = new Set();
+        const promises = [];
+        for (const field of ['bdr_email', 'bdr_auth_email']) {
+            for (const chunk of chunk30(emailArr)) {
+                if (!chunk.length) continue;
+                promises.push(
+                    getDocs(query(collection(emailDB, 'activity_tracking'), where(field, 'in', chunk), limit(50000)))
+                        .catch(e => { console.warn(`activity_tracking ${field} failed:`, e); return null; })
+                );
+            }
+        }
+        const results = await Promise.all(promises);
+        results.forEach(snap => {
+            if (!snap) return;
+            snap.forEach(d => {
+                if (seenIds.has(d.id)) return;
+                seenIds.add(d.id);
+                const data = d.data();
+                if (!MESSAGE_ACTIVITY_TYPES.has(data.activity_type)) return;
+                events.push({
+                    kind:           data.activity_type,
+                    liUrl:          normalizeUrl(data.contact_linkedin_url || ''),
+                    conversationId: String(data.conversation_id || ''),
+                    rawBdrs:        [data.bdr_email, data.bdr_auth_email, data.account_email].map(e => (e || '').toLowerCase()).filter(Boolean),
+                    name:           data.contact_name || '',
+                    company:        data.contact_company || '',
+                    title:          '',
+                    text:           (data.reply_message || data.message || '').trim(),
+                    date:           safeToDate(data.sent_at || data.replied_at || data.timestamp || data.created_at)
+                });
+            });
+        });
+        return events;
+    }
+
+    // Quick Message campaign adds (connected-no-reply sends, fast batch review, HeyReach-side
+    // reconcile backfills). Records only carry the campaign ID, so map campaign -> owning BDR.
+    async function loadQuickMessageLeads(targetBdrs, emailToCanonical) {
+        const events = [];
+        const campToBdr = new Map();
+        targetBdrs.forEach(b => {
+            const primary = (b.primaryEmail || b.id || '').toLowerCase();
+            const canon = emailToCanonical.get(primary) || primary;
+            (b.heyreachCampaigns || []).forEach(c => {
+                if (String(c.type || '').toLowerCase() !== 'quick_message') return;
+                const id = String(c.id || c.campaignId || '');
+                if (id && canon && !campToBdr.has(id)) campToBdr.set(id, canon);
+            });
+        });
+        const ids = Array.from(campToBdr.keys());
+        const results = await Promise.all(chunk30(ids).map(chunk =>
+            getDocs(query(collection(emailDB, 'quick_message_campaign_leads'), where('campaignId', 'in', chunk), limit(50000)))
+                .catch(e => { console.warn('quick_message_campaign_leads failed:', e); return null; })
+        ));
+        results.forEach(snap => {
+            if (!snap) return;
+            snap.forEach(d => {
+                const data = d.data();
+                events.push({
+                    kind:     'quick_message_campaign',
+                    liUrl:    normalizeUrl(data.linkedinUrl || ''),
+                    bdrEmail: campToBdr.get(String(data.campaignId)) || '',
+                    name:     `${data.firstName || ''} ${data.lastName || ''}`.trim(),
+                    company:  data.company || '',
+                    title:    data.position || '',
+                    text:     '', // the campaign record doesn't store the message text
+                    date:     safeToDate(data.addedAt)
+                });
+            });
+        });
+        return events;
+    }
+
+    // Messages scheduled into 10-minute DM slots (linkedin_message_queue) that were actually sent.
+    async function loadScheduledSends(emailArr) {
+        const events = [];
+        const results = await Promise.all(chunk30(emailArr).map(chunk =>
+            getDocs(query(collection(emailDB, 'linkedin_message_queue'), where('bdrEmail', 'in', chunk), limit(50000)))
+                .catch(e => { console.warn('linkedin_message_queue failed:', e); return null; })
+        ));
+        results.forEach(snap => {
+            if (!snap) return;
+            snap.forEach(d => {
+                const data = d.data();
+                if (data.status !== 'sent' && data.status !== 'queued_as_campaign') return;
+                events.push({
+                    kind:           'scheduled_message',
+                    liUrl:          normalizeUrl(data.recipientLinkedInUrl || ''),
+                    conversationId: String(data.conversationId || ''),
+                    rawBdrs:        [(data.bdrEmail || '').toLowerCase()].filter(Boolean),
+                    name:           data.recipientName || '',
+                    company:        '',
+                    title:          '',
+                    text:           (data.message || '').trim(),
+                    date:           safeToDate(data.sentAt || data.scheduledTime || data.createdAt)
+                });
+            });
+        });
+        return events;
+    }
+
     // ── Load scheduled meetings ───────────────────────────────────────────────
     async function loadScheduledMeetings(emailArr, inboxByUrl, inboxByBdr) {
         const scheduledSet = new Set();
@@ -1601,9 +1747,94 @@
     }
 
     // ── Build rows ────────────────────────────────────────────────────────────
-    function buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet, bdrEmailToName, bdrEmailToCompany = new Map(), currentConnectionUrls = new Set(), emailToCanonical = new Map()) {
+    function buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet, bdrEmailToName, bdrEmailToCompany = new Map(), currentConnectionUrls = new Set(), emailToCanonical = new Map(), extraEvents = []) {
         const rows = [];
         const seen = new Set();
+
+        // ── Group every non-connect_queue send event by "liUrl||bdrEmail" ─────────────
+        const convIdToUrl = new Map();
+        inboxByBdr.forEach(e => {
+            if (e.conversationId && e.liUrl) convIdToUrl.set(String(e.conversationId).replace(/^webhook_/, ''), e.liUrl);
+        });
+        const eventsByKey = new Map();
+        let eventsWithoutContact = 0;
+        extraEvents.forEach(ev => {
+            const liUrl = ev.liUrl || convIdToUrl.get((ev.conversationId || '').replace(/^webhook_/, '')) || '';
+            let bdrEmail = ev.bdrEmail || '';
+            if (!bdrEmail) {
+                const known = (ev.rawBdrs || []).find(e => emailToCanonical.has(e));
+                bdrEmail = known ? emailToCanonical.get(known) : '';
+            }
+            if (!liUrl || !bdrEmail) { eventsWithoutContact++; return; }
+            const key = `${liUrl}||${bdrEmail}`;
+            if (!eventsByKey.has(key)) eventsByKey.set(key, []);
+            eventsByKey.get(key).push({ ...ev, liUrl });
+        });
+        buildStats.eventsWithoutContact = eventsWithoutContact;
+
+        // Best HeyReach thread per contact+BDR (the one with the most messages)
+        const bestInboxByKey = new Map();
+        inboxByBdr.forEach(e => {
+            if (!e.liUrl || !e.bdrEmail) return;
+            const k = `${e.liUrl}||${e.bdrEmail}`;
+            const prev = bestInboxByKey.get(k);
+            if (!prev || (e.rawMessages || []).length > (prev.rawMessages || []).length) bestInboxByKey.set(k, e);
+        });
+
+        const SOURCE_LABELS = {
+            connect_request:         'Connection request',
+            campaign_message:        'Campaign message',
+            follow_up_message:       'Follow-up / reply',
+            fast_message_via_conversation: 'Fast message',
+            fast_outreach_message:   'Fast outreach',
+            fast_outreach_bulk_message: 'Fast outreach',
+            personal_message_reply:  'Personal message reply',
+            quick_message_campaign:  'Quick Message campaign',
+            scheduled_message:       'Scheduled DM',
+            heyreach_thread:         'HeyReach conversation'
+        };
+        const sourceLabel = kinds => Array.from(new Set(Array.from(kinds).map(k => SOURCE_LABELS[k] || k))).join('; ');
+
+        const normText = t => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const isBdrMsg = m => m.sender === 'BDR';
+
+        // Folds events into a conversation history without double counting messages the
+        // HeyReach thread already contains. Returns the (possibly extended) history + kinds seen.
+        function mergeEvents(history, events) {
+            const kinds = new Set();
+            if (!events || !events.length) return { history, kinds };
+            const out = history.slice();
+            let added = false;
+            events.slice().sort((a, b) => ((a.date && a.date.getTime()) || 0) - ((b.date && b.date.getTime()) || 0)).forEach(ev => {
+                kinds.add(ev.kind);
+                const evMs = ev.date ? ev.date.getTime() : null;
+                if (ev.text) {
+                    const prefix = normText(ev.text).slice(0, 60);
+                    if (out.some(m => isBdrMsg(m) && normText(m.text).slice(0, 60) === prefix)) return;
+                    out.push({ sender: 'BDR', date: ev.date ? ev.date.toISOString().slice(0, 10) : '', datetime: ev.date ? ev.date.toISOString() : '', text: ev.text });
+                } else {
+                    // No text recorded (e.g. Quick Message campaign add): only count it if no BDR
+                    // message already covers that send.
+                    const covered = out.some(m => isBdrMsg(m) && (evMs === null || !m.datetime || new Date(m.datetime).getTime() >= evMs - 36 * 3600 * 1000));
+                    if (covered) return;
+                    out.push({
+                        sender: 'BDR',
+                        date: ev.date ? ev.date.toISOString().slice(0, 10) : '',
+                        datetime: ev.date ? ev.date.toISOString() : '',
+                        text: `(${SOURCE_LABELS[ev.kind] || 'Message'} sent — message text not recorded)`
+                    });
+                }
+                added = true;
+            });
+            if (added) out.sort((a, b) => (a.datetime || '').localeCompare(b.datetime || ''));
+            return { history: out, kinds };
+        }
+
+        function historyDateRange(history) {
+            const bdrDates = history.filter(isBdrMsg).map(m => m.date).filter(Boolean).sort();
+            const allDates = history.map(m => m.date).filter(Boolean).sort();
+            return { first: bdrDates[0] || '', last: allDates[allDates.length - 1] || '' };
+        }
 
         const sentRequestUrlSet = new Set();
         sentItems.forEach(item => {
@@ -1688,11 +1919,15 @@
             // which would risk attaching a different BDR's/client's real conversation to this
             // row. If there's no exact match, rawMessages stays empty and this row falls back
             // to whatever synthetic/queue-only message handling already exists below.
-            const inbox = (liUrl && bdrEmail) ? inboxByUrl.get(`${liUrl}||${bdrEmail}`) : null;
+            const inbox = (liUrl && bdrEmail) ? (bestInboxByKey.get(key) || inboxByUrl.get(key)) : null;
+            const keyEvents = eventsByKey.get(key) || [];
+            const evName    = keyEvents.find(e => e.name)?.name       || '';
+            const evTitle   = keyEvents.find(e => e.title)?.title     || '';
+            const evCompany = keyEvents.find(e => e.company)?.company || '';
 
-            const contactName    = inbox?.leadName    || cqName    || '';
-            const contactTitle   = inbox?.leadTitle   || cqTitle   || '';
-            const contactCompany = inbox?.leadCompany || cqCompany || '';
+            const contactName    = inbox?.leadName    || cqName    || evName    || '';
+            const contactTitle   = inbox?.leadTitle   || cqTitle   || evTitle   || '';
+            const contactCompany = inbox?.leadCompany || cqCompany || evCompany || '';
             const bdrName        = bdrEmailToName.get(bdrEmail) || bdrEmail;
             const connDate       = liUrl ? connectionDateMap.get(liUrl) : null;
             const msgType        = classifyMessageType(item);
@@ -1707,14 +1942,24 @@
                 item.pushed_at || item.created_at || item.uploaded_date || item.generated_at
             );
 
-            const convHistory = rawMessages.length
+            const baseHistory = rawMessages.length
                 ? makeConversationHistory(rawMessages)
                 : syntheticHistoryFromQueueItem(item);
+
+            // Fold in follow-ups / replies / Quick Message sends for the same contact that the
+            // connect_queue record doesn't know about.
+            const merged      = mergeEvents(baseHistory, keyEvents);
+            const convHistory = merged.history;
+            const sources     = new Set(merged.kinds);
+            sources.add((item.message_type || 'connect') === 'connect' ? 'connect_request' : 'campaign_message');
+            if (rawMessages.length) sources.add('heyreach_thread');
+            const histRange   = historyDateRange(convHistory);
 
             const bdrMsgCount     = convHistory.filter(m => m.sender === 'BDR').length;
             const contactMsgCount = convHistory.filter(m => m.sender === 'Contact').length;
 
             rows.push({
+                outreach_sources:      sourceLabel(sources),
                 contact_name:          contactName,
                 contact_linkedin_url:  liUrl,
                 contact_title:         contactTitle,
@@ -1726,8 +1971,8 @@
                 connected_by_healthluminate:     connectedByHL,
                 currently_connected_on_linkedin: currentlyConnected,
                 connection_date:       connDate ? connDate.toISOString().slice(0, 10) : '',
-                first_outreach_date:   firstOutreachDate(rawMessages) || (sentDate ? sentDate.toISOString().slice(0, 10) : ''),
-                last_message_date:     lastMessageDate(rawMessages) || (sentDate ? sentDate.toISOString().slice(0, 10) : ''),
+                first_outreach_date:   [firstOutreachDate(rawMessages) || (sentDate ? sentDate.toISOString().slice(0, 10) : ''), histRange.first].filter(Boolean).sort()[0] || '',
+                last_message_date:     [lastMessageDate(rawMessages) || (sentDate ? sentDate.toISOString().slice(0, 10) : ''), histRange.last].filter(Boolean).sort().pop() || '',
                 message_type:          msgType,
                 replied,
                 scheduled,
@@ -1738,30 +1983,63 @@
             });
         });
 
-        // Inbox-only rows: scheduled contacts not in connect_queue
-        inboxByBdr.forEach(inbox => {
-            const liUrl    = inbox.liUrl;
-            const bdrEmail = inbox.bdrEmail;
-            if (!liUrl || !scheduledUrlSet.has(liUrl)) return;
-            const key = `${liUrl}||${bdrEmail}`;
+        // ── Contacts NOT in connect_queue ────────────────────────────────────────────
+        // Anyone we messaged by any other route: follow-ups/replies sent from the review pages,
+        // Quick Message campaign adds, fast outreach, scheduled DM slots, or messages sent
+        // directly in HeyReach (any HeyReach thread where the BDR sent at least one message).
+        // Scheduled contacts are still included even when no BDR message is on record.
+        const extraKeys = new Set();
+        eventsByKey.forEach((_, k) => extraKeys.add(k));
+        bestInboxByKey.forEach((entry, k) => {
+            const hasBdrMessage = (entry.rawMessages || []).some(m =>
+                m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound');
+            if (!(hasBdrMessage || scheduledUrlSet.has(entry.liUrl))) return;
+            if (buildStats.sinceMs && !scheduledUrlSet.has(entry.liUrl)) {
+                // Date-range filter: skip threads with no activity inside the window
+                const lastTs = Math.max(0, ...(entry.rawMessages || []).map(m => (safeToDate(m.createdAt || m.timestamp) || 0) && safeToDate(m.createdAt || m.timestamp).getTime()));
+                if (lastTs && lastTs < buildStats.sinceMs) return;
+            }
+            extraKeys.add(k);
+        });
+
+        extraKeys.forEach(key => {
             if (seen.has(key)) return;
             seen.add(key);
+            const sep      = key.indexOf('||');
+            const liUrl    = key.slice(0, sep);
+            const bdrEmail = key.slice(sep + 2);
 
-            const convHistory     = makeConversationHistory(inbox.rawMessages || []);
-            const bdrMsgCount     = convHistory.filter(m => m.sender === 'BDR').length;
+            const inbox     = bestInboxByKey.get(key) || null;
+            const keyEvents = eventsByKey.get(key) || [];
+            const baseHistory = inbox ? makeConversationHistory(inbox.rawMessages || []) : [];
+            const merged      = mergeEvents(baseHistory, keyEvents);
+            const convHistory = merged.history;
+            const sources     = new Set(merged.kinds);
+            if (baseHistory.some(isBdrMsg)) sources.add('heyreach_thread');
+            const histRange   = historyDateRange(convHistory);
+
+            const bdrMsgCount     = convHistory.filter(isBdrMsg).length;
             const contactMsgCount = convHistory.filter(m => m.sender === 'Contact').length;
-            const connDate        = liUrl ? connectionDateMap.get(liUrl) : null;
+            const connDate        = connectionDateMap.get(liUrl) || null;
             const bdrName         = bdrEmailToName.get(bdrEmail) || bdrEmail;
             const connectedFlag   = connDate ? 1 : 0;
-            const currentlyConnected = (connectedFlag === 1 || (liUrl && currentConnectionUrls.has(liUrl))) ? 1 : 0;
-            const weSentARequest  = liUrl && sentRequestUrlSet.has(liUrl);
+            const currentlyConnected = (connectedFlag === 1 || currentConnectionUrls.has(liUrl)) ? 1 : 0;
+            const weSentARequest  = sentRequestUrlSet.has(liUrl);
             const connectedByHL   = (connectedFlag === 1 || (weSentARequest && currentlyConnected === 1)) ? 1 : 0;
 
+            // Type: keep HeyReach's own classification when it has one, otherwise label by route.
+            let msgType = inbox ? classifyMessageType(inbox) : 'other';
+            if (msgType === 'other' || msgType === 'post') {
+                msgType = keyEvents.some(e => e.kind === 'quick_message_campaign') && !keyEvents.some(e => e.text)
+                    ? 'quick_message' : 'follow_up';
+            }
+
             rows.push({
-                contact_name:          inbox.leadName    || '',
+                outreach_sources:      sourceLabel(sources),
+                contact_name:          inbox?.leadName    || keyEvents.find(e => e.name)?.name       || '',
                 contact_linkedin_url:  liUrl,
-                contact_title:         inbox.leadTitle   || '',
-                contact_company:       inbox.leadCompany || '',
+                contact_title:         inbox?.leadTitle   || keyEvents.find(e => e.title)?.title     || '',
+                contact_company:       inbox?.leadCompany || keyEvents.find(e => e.company)?.company || '',
                 bdr_name:              bdrName,
                 bdr_email:             bdrEmail,
                 client_company:        bdrEmailToCompany.get(bdrEmail) || '',
@@ -1769,11 +2047,11 @@
                 connected_by_healthluminate:     connectedByHL,
                 currently_connected_on_linkedin: currentlyConnected,
                 connection_date:       connDate ? connDate.toISOString().slice(0, 10) : '',
-                first_outreach_date:   firstOutreachDate(inbox.rawMessages || []),
-                last_message_date:     lastMessageDate(inbox.rawMessages || []),
-                message_type:          classifyMessageType(inbox),
-                replied:               inbox.hasLeadReply ? 1 : 0,
-                scheduled:             1,
+                first_outreach_date:   histRange.first,
+                last_message_date:     histRange.last,
+                message_type:          msgType,
+                replied:               inbox?.hasLeadReply ? 1 : 0,
+                scheduled:             scheduledUrlSet.has(liUrl) ? 1 : 0,
                 total_messages:        convHistory.length,
                 bdr_messages:          bdrMsgCount,
                 contact_messages:      contactMsgCount,
@@ -1781,10 +2059,12 @@
             });
         });
 
-        // Filter out rows with no job title UNLESS the contact scheduled a call
-        const outreachRows = rows.filter(r =>
-            r.scheduled === 1 || (r.contact_title || '').trim() !== ''
-        );
+        // Every row represents a contact we actually messaged, so nothing is filtered out
+        // (the old "drop rows with no job title" filter hid follow-up-only contacts).
+        const outreachRows = rows;
+
+        buildStats.rowsFromQueue = sentItems.length;
+        buildStats.totalRows     = rows.length;
 
         outreachRows.sort((a, b) => {
             if (!a.first_outreach_date && !b.first_outreach_date) return 0;
@@ -1841,6 +2121,8 @@
         complement:       'Complement',
         fast_prospect:    'Fast Prospect',
         about_me_connect: 'Common Ground',
+        follow_up:        'Follow-Up / Reply',
+        quick_message:    'Quick Message',
         other:            'Other',
     };
 
@@ -1964,7 +2246,7 @@
     const COLS = [
         'contact_name','contact_linkedin_url','contact_title','contact_company',
         'bdr_name','bdr_email','client_company',
-        'message_type','first_outreach_date','last_message_date',
+        'message_type','outreach_sources','first_outreach_date','last_message_date',
         'connected','connected_by_healthluminate','currently_connected_on_linkedin','connection_date',
         'replied','scheduled','total_messages','bdr_messages','contact_messages',
         'conversation_history'
@@ -1978,6 +2260,7 @@
         bdr_email:             'BDR Email',
         client_company:        'Client',
         message_type:          'Message Type',
+        outreach_sources:      'How We Reached Them',
         first_outreach_date:   'First Outreach Date',
         last_message_date:     'Last Message Date',
         connected:             'Connected',
@@ -2030,7 +2313,7 @@
             aoa.push(COLS.map(col => xlCell(row[col])));
         });
         const ws = XLSX.utils.aoa_to_sheet(aoa);
-        const colWidths = [22,38,28,28,20,28,24,16,18,18,10,16,26,16,9,16,14,14,16,60];
+        const colWidths = [22,38,28,28,20,28,24,16,34,18,18,10,16,26,16,9,16,14,14,16,60];
         ws['!cols'] = colWidths.map(w => ({ wch: w }));
         ws['!freeze'] = { xSplit: 0, ySplit: 1 };
 
