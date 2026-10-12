@@ -121,6 +121,16 @@
         }
         .detail h2 { margin: 0 0 12px; font-size: 18px; color: var(--primary); }
         .muted { color: var(--gray-600); font-size: 13px; }
+        .calc { margin-top: 28px; background: white; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+        .calc-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+        .calc-head h2 { margin: 0 0 4px; font-size: 20px; color: var(--primary); }
+        .calc-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+        .calc-stats .stat-card { background: var(--gray-50); box-shadow: none; }
+        .calc-method { background: #f8fafc; border-left: 4px solid var(--accent); border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--gray-600); margin-bottom: 16px; }
+        .calc-method ul { margin: 6px 0 0 18px; padding: 0; }
+        .calc table td.num, .calc table th.num { text-align: right; }
+        .calc tbody tr.total td { font-weight: 700; background: #f8fafc; border-top: 2px solid var(--gray-200); }
+        .hours-bar { display: inline-block; height: 8px; background: var(--grove); border-radius: 4px; vertical-align: middle; margin-right: 8px; }
         .denied {
             max-width: 640px;
             margin: 80px auto;
@@ -192,6 +202,46 @@
                     </tr>
                 </thead>
                 <tbody id="detailBody"></tbody>
+            </table>
+        </div>
+
+        <div class="calc" id="logInUsageCalc">
+            <div class="calc-head">
+                <div>
+                    <h2><i class="fas fa-hourglass-half"></i> Log In Usage Calculator</h2>
+                    <div class="muted" id="calcScope">Rough estimate of hours spent in Connect, per person.</div>
+                </div>
+                <button class="btn secondary" id="calcExportBtn"><i class="fas fa-download"></i> CSV</button>
+            </div>
+            <div class="calc-method">
+                <strong>How this is estimated</strong>
+                <ul>
+                    <li>Each person's page visits are put in time order. Time on a page runs from when it was opened until they opened the next page.</li>
+                    <li>If the next page was opened within <span id="calcCapLabel">20</span> minutes, the whole gap is counted. If it was longer, only <span id="calcCapLabel2">20</span> minutes are counted, since they probably walked away.</li>
+                    <li>The last page of the range has no "next page", so it adds no time. Someone with a single visit shows 0.</li>
+                    <li>Uses the time range and person selected above. The page search box is ignored, so time isn't lost when you filter pages.</li>
+                </ul>
+            </div>
+            <div class="calc-stats">
+                <div class="stat-card"><div class="label">Total est. hours</div><div class="value" id="calcTotalHours">—</div></div>
+                <div class="stat-card"><div class="label">People</div><div class="value" id="calcPeople">—</div></div>
+                <div class="stat-card"><div class="label">Avg hours / person</div><div class="value" id="calcAvgHours">—</div></div>
+                <div class="stat-card"><div class="label">Avg hours / active day</div><div class="value" id="calcAvgDay">—</div></div>
+            </div>
+            <div class="status" id="calcStatus" style="display:none;"></div>
+            <table id="calcTable">
+                <thead>
+                    <tr>
+                        <th>Person</th>
+                        <th class="num">Est. hours</th>
+                        <th class="num">Page visits</th>
+                        <th class="num">Days active</th>
+                        <th class="num">Hours / active day</th>
+                        <th>First visit</th>
+                        <th>Last visit</th>
+                    </tr>
+                </thead>
+                <tbody id="calcBody"></tbody>
             </table>
         </div>
     </div>
@@ -340,7 +390,134 @@
             return [...pages.values()].sort((a, b) => b.visits - a.visits);
         }
 
+        // ---------- Log In Usage Calculator ----------
+        // Time on a page = time until the person's next page visit, capped at CALC_CAP_MINUTES.
+        // The final visit has no "next page", so it contributes nothing.
+        const CALC_CAP_MINUTES = 20;
+        let calcRows = [];
+
+        function calcDayKey(date) {
+            return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+        }
+
+        function computeUsage() {
+            const person = document.getElementById('userSelect').value;
+            const capMs = CALC_CAP_MINUTES * 60 * 1000;
+            const byUser = new Map();
+            events.forEach((event) => {
+                if (!event.timestamp) return;
+                if (person !== 'all' && event.userEmail !== person) return;
+                if (!byUser.has(event.userEmail)) byUser.set(event.userEmail, []);
+                byUser.get(event.userEmail).push(event);
+            });
+
+            const rows = [];
+            byUser.forEach((list, email) => {
+                list.sort((a, b) => a.timestamp - b.timestamp);
+                let ms = 0;
+                const days = new Set();
+                list.forEach((event, i) => {
+                    days.add(calcDayKey(event.timestamp));
+                    const next = list[i + 1];
+                    if (next) ms += Math.min(next.timestamp - event.timestamp, capMs);
+                });
+                const hours = ms / 3600000;
+                rows.push({
+                    email,
+                    visits: list.length,
+                    daysActive: days.size,
+                    hours,
+                    perDay: days.size ? hours / days.size : 0,
+                    first: list[0].timestamp,
+                    last: list[list.length - 1].timestamp
+                });
+            });
+            rows.sort((a, b) => b.hours - a.hours);
+            return rows;
+        }
+
+        function fmtHours(h) {
+            return h >= 10 ? h.toFixed(1) : h.toFixed(2);
+        }
+
+        function renderUsageCalculator() {
+            calcRows = computeUsage();
+            document.getElementById('calcCapLabel').textContent = CALC_CAP_MINUTES;
+            document.getElementById('calcCapLabel2').textContent = CALC_CAP_MINUTES;
+
+            const days = Number(document.getElementById('rangeSelect').value);
+            const person = document.getElementById('userSelect').value;
+            document.getElementById('calcScope').textContent =
+                `Rough estimate of hours spent in Connect, per person. Last ${days} days, ${person === 'all' ? 'everyone' : person}.`;
+
+            const statusEl = document.getElementById('calcStatus');
+            const table = document.getElementById('calcTable');
+            const body = document.getElementById('calcBody');
+
+            const totalHours = calcRows.reduce((s, r) => s + r.hours, 0);
+            const totalActiveDays = calcRows.reduce((s, r) => s + r.daysActive, 0);
+            document.getElementById('calcTotalHours').textContent = calcRows.length ? fmtHours(totalHours) : '—';
+            document.getElementById('calcPeople').textContent = calcRows.length || '—';
+            document.getElementById('calcAvgHours').textContent = calcRows.length ? fmtHours(totalHours / calcRows.length) : '—';
+            document.getElementById('calcAvgDay').textContent = totalActiveDays ? fmtHours(totalHours / totalActiveDays) : '—';
+
+            if (!calcRows.length) {
+                statusEl.style.display = 'block';
+                statusEl.textContent = 'No visits in this range to estimate from.';
+                table.style.display = 'none';
+                return;
+            }
+            statusEl.style.display = 'none';
+            table.style.display = 'table';
+
+            const maxHours = Math.max(...calcRows.map((r) => r.hours), 0.0001);
+            const totalVisits = calcRows.reduce((s, r) => s + r.visits, 0);
+            body.innerHTML = calcRows.map((r) => `
+                <tr>
+                    <td>${r.email}</td>
+                    <td class="num"><span class="hours-bar" style="width:${Math.round((r.hours / maxHours) * 80)}px"></span><strong>${fmtHours(r.hours)}</strong></td>
+                    <td class="num">${r.visits}</td>
+                    <td class="num">${r.daysActive}</td>
+                    <td class="num">${fmtHours(r.perDay)}</td>
+                    <td>${formatWhen(r.first)}</td>
+                    <td>${formatWhen(r.last)}</td>
+                </tr>
+            `).join('') + (calcRows.length > 1 ? `
+                <tr class="total">
+                    <td>Total (${calcRows.length} people)</td>
+                    <td class="num">${fmtHours(totalHours)}</td>
+                    <td class="num">${totalVisits}</td>
+                    <td class="num">${totalActiveDays}</td>
+                    <td class="num">${totalActiveDays ? fmtHours(totalHours / totalActiveDays) : '—'}</td>
+                    <td></td><td></td>
+                </tr>` : '');
+        }
+
+        function exportUsageCsv() {
+            const lines = [['Person', 'Est. hours', 'Page visits', 'Days active', 'Hours per active day', 'First visit', 'Last visit']];
+            calcRows.forEach((r) => {
+                lines.push([
+                    r.email,
+                    r.hours.toFixed(2),
+                    r.visits,
+                    r.daysActive,
+                    r.perDay.toFixed(2),
+                    r.first.toISOString(),
+                    r.last.toISOString()
+                ]);
+            });
+            const csv = lines.map((line) => line.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `connect-login-usage-${new Date().toISOString().slice(0, 10)}.csv`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
         function render() {
+            renderUsageCalculator();
             const list = filteredEvents();
             const rows = summarize(list);
             const status = document.getElementById('status');
@@ -440,6 +617,7 @@
         document.getElementById('userSelect').addEventListener('change', render);
         document.getElementById('searchInput').addEventListener('input', render);
         document.getElementById('exportBtn').addEventListener('click', exportCsv);
+        document.getElementById('calcExportBtn').addEventListener('click', exportUsageCsv);
 
         function showError(error) {
             const status = document.getElementById('status');
