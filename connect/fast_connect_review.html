@@ -7925,7 +7925,8 @@
                                 education:               pd.education  || '',
                                 linkedInConnectionCount: pd.linkedInConnectionCount ?? null,
                                 followerCount:           pd.followerCount ?? null,
-                                headline:                pd.headline || pd.title || ''
+                                headline:                pd.headline || pd.title || '',
+                                location:                pd.location || location || ''
                             });
                         } else if (!rawPosition) {
                             console.log(`🔎 [TitleEnrichment] ${message.id}: no prospect_contacts doc matched linkedInUrlNormalized="${linkedInUrlForLookup}" — title will stay blank.`);
@@ -10403,7 +10404,6 @@
                 const bdrSel  = document.getElementById('bdrSelect');
                 const bdrName = bdrSel?.options[bdrSel?.selectedIndex]?.text || bdrSel?.value || 'Unknown BDR';
                 const exportDate = new Date().toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' });
-                const NUM_COLS = 12;
 
                 // ── Palette ────────────────────────────────────────────────────
                 const C = {
@@ -10471,7 +10471,107 @@
                     { label: 'Connected',     wch: 12, h:'center' },
                     { label: 'Chars',         wch:  8, h:'center' },
                     { label: 'Message Text',  wch: 65, h:'left', wrap:true },
+                    // ── Hypothesis group details (ties the message to its hypothesis / variation)
+                    { label: 'Hypothesis Group',        wch: 28, h:'left', wrap:true },
+                    { label: 'Hypothesis Statement',    wch: 55, h:'left', wrap:true },
+                    { label: 'Message Variation',       wch: 26, h:'left', wrap:true },
+                    { label: 'Variation Selected By',   wch: 22, h:'left', wrap:true },
+                    // ── Contact enrichment data (from prospect_contacts)
+                    { label: 'Headline',                wch: 40, h:'left', wrap:true },
+                    { label: 'Location',                wch: 24, h:'left', wrap:true },
+                    { label: 'Followers',               wch: 11, h:'center' },
+                    { label: 'About',                   wch: 60, h:'left', wrap:true },
+                    { label: 'Experience',              wch: 60, h:'left', wrap:true },
+                    { label: 'Education',               wch: 40, h:'left', wrap:true },
                 ];
+                const NUM_COLS = COLS.length;
+
+                // ── Enrichment / hypothesis helpers ────────────────────────────
+                // Excel cells max out at 32,767 characters — clamp so a huge About/Experience
+                // blob can never corrupt the workbook.
+                const clampXl = (s) => {
+                    const str = s == null ? '' : String(s);
+                    return str.length > 32000 ? str.slice(0, 32000) + '…' : str;
+                };
+                const parseJsonField = (raw) => {
+                    if (!raw) return null;
+                    if (typeof raw !== 'string') return raw;
+                    try { return JSON.parse(raw); } catch (_) { return raw; }
+                };
+                const stripEmploymentType = (s) => String(s || '')
+                    .replace(/\s*·\s*(Full-time|Part-time|Contract|Internship|Freelance|Self-employed|Seasonal|Apprenticeship).*$/i, '').trim();
+                // One line per role: "Title at Company (dates)". Handles LinkedIn's grouped entries
+                // (2+ roles at one company → e.title is the company, roles are in e.child[]).
+                const formatExperienceXl = (raw) => {
+                    const parsed = parseJsonField(raw);
+                    if (!parsed) return '';
+                    if (!Array.isArray(parsed)) return typeof parsed === 'string' ? parsed : '';
+                    const lines = [];
+                    parsed.forEach(e => {
+                        if (!e || typeof e !== 'object') return;
+                        const isGrouped = Array.isArray(e.child) && e.child.length > 0 && e.child[0].title;
+                        const dateOf = (x) => x.dateRange || x.caption ||
+                            [x.startDate || x.start, x.endDate || x.end].filter(Boolean).join(' – ') || '';
+                        if (isGrouped) {
+                            const co = e.companyName || e.company || e.title || '';
+                            e.child.forEach(c => {
+                                const t = c.title || '';
+                                const line = [t && co ? `${t} at ${co}` : (t || co), dateOf(c) ? `(${dateOf(c)})` : ''].filter(Boolean).join(' ');
+                                if (line) lines.push('• ' + line);
+                            });
+                        } else {
+                            const t  = e.title || e.jobTitle || e.position || '';
+                            const co = e.companyName || e.company || e.organization || stripEmploymentType(e.subtitle);
+                            const line = [t && co ? `${t} at ${co}` : (t || co), dateOf(e) ? `(${dateOf(e)})` : ''].filter(Boolean).join(' ');
+                            if (line) lines.push('• ' + line);
+                        }
+                    });
+                    return lines.join('\n');
+                };
+                const formatEducationXl = (raw) => {
+                    const parsed = parseJsonField(raw);
+                    if (!parsed) return '';
+                    if (!Array.isArray(parsed)) return typeof parsed === 'string' ? parsed : '';
+                    return parsed.map(e => {
+                        if (!e || typeof e !== 'object') return '';
+                        const school = e.schoolName || e.institution || e.school || e.title || '';
+                        const deg    = e.degreeName || e.degree || e.fieldOfStudy || e.subtitle || '';
+                        const dates  = e.dateRange || e.caption || '';
+                        const line = [school, deg].filter(Boolean).join(' · ') + (dates ? ` (${dates})` : '');
+                        return line.trim() ? '• ' + line : '';
+                    }).filter(Boolean).join('\n');
+                };
+
+                const VARIATION_SOURCE_LABELS = {
+                    stamped:  'From generation',
+                    ai:       'AI-selected by criteria',
+                    weighted: 'Random by Share %',
+                    auto:     'Auto-assigned (round-robin)',
+                    manual:   'Manually set',
+                    bulk:     'Bulk-assigned',
+                };
+                // Resolve group + variation for a message. Prefer the live assignment computed on
+                // this page (_fcrMsgGroupMap / _fcrMsgVariationMap — includes reviewer overrides);
+                // fall back to whatever was stamped on the queue doc at generation time.
+                const resolveHypothesis = (m) => {
+                    const groupId = _fcrMsgGroupMap.get(m.id) || m.hypothesisGroupId || '';
+                    const group   = groupId ? (_hypothesisGroups.find(g => g.id === groupId) || null) : null;
+                    const variationId = _fcrMsgVariationMap.get(m.id) || m.hypothesisVariationId || '';
+                    const variation = variationId
+                        ? ((group?.messageVariations || []).find(v => v.id === variationId) || null)
+                        : null;
+                    const srcKey = _fcrMsgVariationSourceMap.get(m.id) || (m.hypothesisVariationId && !_fcrMsgVariationMap.has(m.id) ? 'stamped' : '');
+                    return {
+                        groupId,
+                        group,
+                        groupName:     group?.name || m.hypothesisGroupName || (groupId ? groupId : ''),
+                        variationId,
+                        variation,
+                        variationName: variation ? (variation.label || variation.id) : (m.hypothesisVariationLabel || ''),
+                        variationSrc:  VARIATION_SOURCE_LABELS[srcKey] || '',
+                    };
+                };
+                const hypByMsg = new Map(loadedMessages.map(m => [m.id, resolveHypothesis(m)]));
 
                 // ── Stats ──────────────────────────────────────────────────────
                 // messageSelections intentionally survives same-session reloads (e.g. switching
@@ -10532,6 +10632,17 @@
                     const msgText  = editedMessages.get(m.id) ?? (m.message_to_contact || '');
                     const charCount = msgText.length;
 
+                    // Enrichment data (from the prospect_contacts record cached at card render)
+                    const enr = {
+                        headline:   pd?.headline || m.headline || m.contactHeadline || '',
+                        location:   pd?.location || m.location || m.contactLocation || m.prospect_location || '',
+                        followers:  pd?.followerCount != null && !isNaN(Number(pd.followerCount)) ? Number(pd.followerCount) : '',
+                        about:      pd?.about || '',
+                        experience: formatExperienceXl(pd?.experience),
+                        education:  formatEducationXl(pd?.education),
+                    };
+                    const hyp = hypByMsg.get(m.id) || resolveHypothesis(m);
+
                     // Base row background
                     let base;
                     if      (connected === 'Yes')   base = STYLE.connected;
@@ -10566,6 +10677,20 @@
                         mkCell(connected, connected === 'Yes' ? STYLE.connBadge : rs(base, 'center')),
                         mkCell(charCount, charS, 'n'),
                         mkCell(msgText,   rs(base, 'left', true)),
+                        // Hypothesis group details
+                        mkCell(clampXl(hyp.groupName),     { ...rs(base, 'left', true), font: { ...base.font, bold: !!hyp.groupName } }),
+                        mkCell(clampXl(hyp.group?.description || ''), rs(base, 'left', true)),
+                        mkCell(clampXl(hyp.variationName), rs(base, 'left', true)),
+                        mkCell(hyp.variationName ? hyp.variationSrc : '', rs(base, 'left', true)),
+                        // Enrichment data
+                        mkCell(clampXl(enr.headline),   rs(base, 'left', true)),
+                        mkCell(clampXl(enr.location),   rs(base, 'left', true)),
+                        enr.followers !== ''
+                            ? mkCell(enr.followers, rs(base, 'center'), 'n')
+                            : mkCell('', rs(base, 'center')),
+                        mkCell(clampXl(enr.about),      rs(base, 'left', true)),
+                        mkCell(clampXl(enr.experience), rs(base, 'left', true)),
+                        mkCell(clampXl(enr.education),  rs(base, 'left', true)),
                     ]);
                 });
 
@@ -10591,7 +10716,7 @@
                     { hpt: 20 }, // subtitle
                     { hpt: 20 }, // stats
                     { hpt: 22 }, // headers
-                    ...loadedMessages.map(() => ({ hpt: 58 })),
+                    ...loadedMessages.map(() => ({ hpt: 80 })),
                 ];
                 ws['!freeze']      = { xSplit: 0, ySplit: 4 };
                 ws['!autofilter']  = { ref: `A4:${XLSX.utils.encode_col(NUM_COLS - 1)}4` };
@@ -10640,6 +10765,25 @@
                     sumRows.push(kv(src, cnt));
                 });
 
+                // Hypothesis group breakdown (group → variation counts)
+                const grpCounts = new Map(); // groupKey -> { name, count, vars: Map(label -> count) }
+                loadedMessages.forEach(m => {
+                    const h = hypByMsg.get(m.id);
+                    const key = h?.groupId || '';
+                    if (!grpCounts.has(key)) grpCounts.set(key, { name: h?.groupName || '(No hypothesis group)', count: 0, vars: new Map() });
+                    const entry = grpCounts.get(key);
+                    entry.count++;
+                    if (h?.variationName) entry.vars.set(h.variationName, (entry.vars.get(h.variationName) || 0) + 1);
+                });
+                sumRows.push([mkCell('', sumVal), mkCell('', sumVal)]);
+                sumRows.push(sec('🔬  Hypothesis Groups'));
+                [...grpCounts.values()].sort((a, b) => b.count - a.count).forEach(g => {
+                    sumRows.push(kv(g.name, g.count));
+                    [...g.vars.entries()].sort((a, b) => b[1] - a[1]).forEach(([vLabel, cnt]) => {
+                        sumRows.push(kv(`    ↳ ${vLabel}`, cnt));
+                    });
+                });
+
                 const ws2 = {};
                 sumRows.forEach((row, r) => {
                     row.forEach((cellObj, c) => {
@@ -10654,22 +10798,213 @@
                 // Merge section-header rows
                 let sIdx = 2;
                 sumRows.forEach((row, r) => {
-                    if (r >= 2 && row[0]?.v && typeof row[0].v === 'string' && row[0].v.startsWith && (row[0].v.startsWith('📊') || row[0].v.startsWith('✅') || row[0].v.startsWith('📂'))) {
+                    if (r >= 2 && row[0]?.v && typeof row[0].v === 'string' && row[0].v.startsWith && (row[0].v.startsWith('📊') || row[0].v.startsWith('✅') || row[0].v.startsWith('📂') || row[0].v.startsWith('🔬'))) {
                         ws2['!merges'].push({ s: { r, c:0 }, e: { r, c:1 } });
                     }
                 });
-                ws2['!cols']  = [{ wch: 30 }, { wch: 22 }];
+                ws2['!cols']  = [{ wch: 44 }, { wch: 22 }];
                 ws2['!rows']  = [{ hpt: 36 }, { hpt: 20 }, ...sumRows.slice(2).map(() => ({ hpt: 20 }))];
+
+                // ── Hypothesis Groups sheet ────────────────────────────────────
+                // One row per (group × message variation) for every hypothesis group that
+                // appears in this export, carrying the full group definition so the
+                // Connection Queue rows can be tied back to the hypothesis being tested.
+                const HCOLS = [
+                    { label: 'Hypothesis Group',            wch: 28, h:'left',   wrap:true },
+                    { label: 'Hypothesis Statement',        wch: 55, h:'left',   wrap:true },
+                    { label: 'Assigned BDRs',               wch: 28, h:'left',   wrap:true },
+                    { label: 'Workspace',                   wch: 22, h:'left',   wrap:true },
+                    { label: 'Contact Source',              wch: 45, h:'left',   wrap:true },
+                    { label: 'Target Contact Instructions', wch: 55, h:'left',   wrap:true },
+                    { label: 'Message Review Instructions', wch: 65, h:'left',   wrap:true },
+                    { label: 'Messages in Export (Group)',  wch: 16, h:'center' },
+                    { label: 'Message Variation',           wch: 28, h:'left',   wrap:true },
+                    { label: 'Variation Status',            wch: 12, h:'center' },
+                    { label: 'Variation Prompt / Writing Instructions', wch: 65, h:'left', wrap:true },
+                    { label: 'Example Message',             wch: 55, h:'left',   wrap:true },
+                    { label: 'Random Selection Share %',    wch: 14, h:'center' },
+                    { label: 'AI Selection Criteria',       wch: 45, h:'left',   wrap:true },
+                    { label: 'Messages in Export (Variation)', wch: 16, h:'center' },
+                ];
+                const hypGroupsInExport = new Map(); // groupId -> { group, name, count, varCounts: Map(variationId -> n) }
+                loadedMessages.forEach(m => {
+                    const h = hypByMsg.get(m.id);
+                    if (!h || !h.groupId) return;
+                    if (!hypGroupsInExport.has(h.groupId)) {
+                        hypGroupsInExport.set(h.groupId, { group: h.group, name: h.groupName, count: 0, varCounts: new Map() });
+                    }
+                    const e = hypGroupsInExport.get(h.groupId);
+                    e.count++;
+                    const vk = h.variationId || '';
+                    e.varCounts.set(vk, (e.varCounts.get(vk) || 0) + 1);
+                });
+
+                const bdrNameFor = (email) => bdrLeaders?.find(b => b.primaryEmail === email)?.name || email;
+                const hypHdrRows = [HCOLS.map(c => mkCell(c.label, c.h === 'left' ? STYLE.hdrL : STYLE.hdr))];
+                const hypRows = [];
+                [...hypGroupsInExport.entries()]
+                    .sort((a, b) => b[1].count - a[1].count)
+                    .forEach(([gid, e], gi) => {
+                        const g = e.group || {};
+                        const base = gi % 2 === 0 ? STYLE.even : STYLE.odd;
+                        const emails = g.bdrEmails?.length ? g.bdrEmails : (g.bdrEmail ? [g.bdrEmail] : []);
+                        const wsName = g.workspaceName || '';
+                        const variations = g.messageVariations || [];
+                        // Include variations stamped on messages but no longer defined on the group
+                        const orphanVarIds = [...e.varCounts.keys()].filter(vk => vk && !variations.some(v => v.id === vk));
+                        const varRows = variations.map(v => ({ v, n: e.varCounts.get(v.id) || 0 }));
+                        orphanVarIds.forEach(vk => varRows.push({ v: { id: vk, label: vk + ' (no longer on group)' }, n: e.varCounts.get(vk) || 0 }));
+                        if (!varRows.length) varRows.push({ v: null, n: 0 });
+
+                        varRows.forEach(({ v, n }) => {
+                            const t = (val, h = 'left', wrap = true) => mkCell(clampXl(val), rs(base, h, wrap));
+                            hypRows.push([
+                                mkCell(clampXl(e.name), { ...rs(base, 'left', true), font: { ...base.font, bold: true } }),
+                                t(g.description || ''),
+                                t(emails.map(bdrNameFor).join(', ')),
+                                t(wsName),
+                                t(g.contactSource || ''),
+                                t(g.targetContactInstructions || ''),
+                                t(g.messageReviewInstructions || ''),
+                                mkCell(e.count, rs(base, 'center'), 'n'),
+                                t(v ? (v.label || v.id) : ''),
+                                t(v ? (v.inactive ? 'Stopped' : 'Active') : '', 'center', false),
+                                t(v?.prompt || ''),
+                                t(v?.exampleMessage || ''),
+                                v && v.sharePercent != null && v.sharePercent !== ''
+                                    ? mkCell(Number(v.sharePercent) || 0, rs(base, 'center'), 'n')
+                                    : mkCell('', rs(base, 'center')),
+                                t(v?.aiCriteria || ''),
+                                v ? mkCell(n, rs(base, 'center'), 'n') : mkCell('', rs(base, 'center')),
+                            ]);
+                        });
+                    });
+
+                let ws3 = null;
+                if (hypRows.length) {
+                    const hypAll = [...hypHdrRows, ...hypRows];
+                    ws3 = {};
+                    hypAll.forEach((row, r) => row.forEach((cellObj, c) => {
+                        ws3[XLSX.utils.encode_cell({ r, c })] = cellObj;
+                    }));
+                    ws3['!ref']  = XLSX.utils.encode_range({ s: { r:0, c:0 }, e: { r: hypAll.length - 1, c: HCOLS.length - 1 } });
+                    ws3['!cols'] = HCOLS.map(c => ({ wch: c.wch }));
+                    ws3['!rows'] = [{ hpt: 24 }, ...hypRows.map(() => ({ hpt: 90 }))];
+                    ws3['!freeze']     = { xSplit: 1, ySplit: 1 };
+                    ws3['!autofilter'] = { ref: `A1:${XLSX.utils.encode_col(HCOLS.length - 1)}1` };
+                }
+
+                // ── BDR About Me sheet ─────────────────────────────────────────
+                // Pulled from contact_profiles/{selected BDR email} — the same "About Me" profile
+                // the AI generation / review paths use (sales config, AI writing instructions,
+                // "I" statements by topic, and company "We" statements).
+                let ws4 = null;
+                try {
+                    const bp = await loadBdrProfile();
+                    if (bp && Object.keys(bp).length) {
+                        const prettify = (k) => String(k)
+                            .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+                            .replace(/[_-]+/g, ' ')
+                            .replace(/^./, ch => ch.toUpperCase());
+                        const valToText = (v) => {
+                            if (v == null) return '';
+                            if (typeof v === 'string') return v;
+                            if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+                            if (Array.isArray(v)) {
+                                return v.map(x => typeof x === 'string' ? x : (x?.text || (typeof x === 'object' ? JSON.stringify(x) : String(x)))).filter(Boolean).join('\n');
+                            }
+                            try { return JSON.stringify(v); } catch (_) { return String(v); }
+                        };
+                        const SC_LABELS = {
+                            companyName:                 'Company Name',
+                            companyValueProposition:     'Company Value Proposition',
+                            companySalesApproach:        'Sales Approach',
+                            targetProspectContacts:      'Target Prospect Roles',
+                            targetProspectOrganizations: 'Target Organizations',
+                            newsStoryTypes:              'News Story Types Used',
+                            otherOutreachNotes:          'Outreach Notes',
+                        };
+                        const AI_LABELS = {
+                            tone:                'Message Tone',
+                            commonalityPriority: 'Commonality Priority',
+                            length:              'Message Length Guidance',
+                            avoid:               'Things to Avoid',
+                            openClose:           'Opening / Closing Style',
+                            additional:          'Additional Instructions',
+                        };
+
+                        const bdrEmailSel = bdrSel?.value || '';
+                        const aboutRows = []; // { section, field, value }
+                        aboutRows.push({ section: 'BDR', field: 'Name',  value: bp.name || bdrName });
+                        aboutRows.push({ section: 'BDR', field: 'Email', value: bdrEmailSel });
+
+                        Object.entries(bp.bdrSalesConfig || {}).forEach(([k, v]) => {
+                            const t = valToText(v); if (t) aboutRows.push({ section: 'Sales Config', field: SC_LABELS[k] || prettify(k), value: t });
+                        });
+                        Object.entries(bp.aboutMeAiInstructions || {}).forEach(([k, v]) => {
+                            const t = valToText(v); if (t) aboutRows.push({ section: 'AI Writing Instructions', field: AI_LABELS[k] || prettify(k), value: t });
+                        });
+                        Object.entries(bp.statements || {}).forEach(([topic, arr]) => {
+                            const t = (Array.isArray(arr) ? arr : [])
+                                .map(s => typeof s === 'string' ? s : (s?.text || '')).filter(Boolean)
+                                .map(s => '• ' + s).join('\n');
+                            if (t) aboutRows.push({ section: '"I" Statements', field: topic, value: t });
+                        });
+                        const weTxt = (bp.weStatements || [])
+                            .map(s => typeof s === 'string' ? s : (s?.text || '')).filter(Boolean)
+                            .map(s => '• ' + s).join('\n');
+                        if (weTxt) aboutRows.push({ section: 'Company "We" Statements', field: 'We Statements', value: weTxt });
+
+                        if (aboutRows.length > 2) {
+                            const ACOLS = [
+                                { label: 'Section', wch: 26, h:'left' },
+                                { label: 'Field / Topic', wch: 30, h:'left' },
+                                { label: 'Details', wch: 110, h:'left' },
+                            ];
+                            const aTitle = ACOLS.map((_, i) => mkCell(i === 0 ? `BDR About Me  ·  ${bdrName}` : '', STYLE.title));
+                            const aHdr   = ACOLS.map(c => mkCell(c.label, STYLE.hdrL));
+                            const aBody  = aboutRows.map((r, i) => {
+                                const base = i % 2 === 0 ? STYLE.even : STYLE.odd;
+                                return [
+                                    mkCell(clampXl(r.section), { ...rs(base, 'left', true), font: { ...base.font, bold: true } }),
+                                    mkCell(clampXl(r.field),   rs(base, 'left', true)),
+                                    mkCell(clampXl(r.value),   rs(base, 'left', true)),
+                                ];
+                            });
+                            const aAll = [aTitle, aHdr, ...aBody];
+                            ws4 = {};
+                            aAll.forEach((row, r) => row.forEach((cellObj, c) => {
+                                ws4[XLSX.utils.encode_cell({ r, c })] = cellObj;
+                            }));
+                            ws4['!ref']    = XLSX.utils.encode_range({ s: { r:0, c:0 }, e: { r: aAll.length - 1, c: ACOLS.length - 1 } });
+                            ws4['!cols']   = ACOLS.map(c => ({ wch: c.wch }));
+                            ws4['!merges'] = [{ s: { r:0, c:0 }, e: { r:0, c: ACOLS.length - 1 } }];
+                            ws4['!rows']   = [
+                                { hpt: 32 }, { hpt: 22 },
+                                ...aboutRows.map(r => {
+                                    const text = String(r.value || '');
+                                    const lines = text.split('\n').reduce((n, ln) => n + Math.max(1, Math.ceil(ln.length / 110)), 0);
+                                    return { hpt: Math.min(409, Math.max(18, lines * 14 + 4)) };
+                                }),
+                            ];
+                            ws4['!freeze'] = { xSplit: 0, ySplit: 2 };
+                        }
+                    }
+                } catch (aboutErr) {
+                    console.warn('⚠️ Could not add BDR About Me sheet to export:', aboutErr);
+                }
 
                 // ── Write workbook ─────────────────────────────────────────────
                 const wb = XLSX.utils.book_new();
                 XLSX.utils.book_append_sheet(wb, ws,  'Connection Queue');
+                if (ws3) XLSX.utils.book_append_sheet(wb, ws3, 'Hypothesis Groups');
+                if (ws4) XLSX.utils.book_append_sheet(wb, ws4, 'BDR About Me');
                 XLSX.utils.book_append_sheet(wb, ws2, 'Summary');
 
                 const bdrSlug = (bdrSel?.value || 'unknown').replace(/[^a-z0-9]/gi, '_');
                 const fileDate = new Date().toISOString().slice(0, 10);
                 XLSX.writeFile(wb, `fast_connect_${bdrSlug}_${fileDate}.xlsx`);
-                showAlert(`✅ Exported ${loadedMessages.length} messages to Excel (Connection Queue + Summary tabs).`, 'success');
+                showAlert(`✅ Exported ${loadedMessages.length} messages to Excel (Connection Queue${ws3 ? ' + Hypothesis Groups' : ''}${ws4 ? ' + BDR About Me' : ''} + Summary tabs).`, 'success');
 
             } catch (err) {
                 console.error('❌ Excel export failed:', err);

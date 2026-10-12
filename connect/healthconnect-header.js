@@ -74,6 +74,7 @@ const HEALTHCONNECT_CONFIG = {
                 // Admin Dashboard & Guide
                 { label: 'Admin Dashboard', href: 'index_admin.html', icon: 'fa-tachometer-alt' },
                 { label: 'Page Usage', href: 'page_usage.html', icon: 'fa-chart-simple' },
+                { label: 'User Activity', href: 'user_activity.html', icon: 'fa-user-clock' },
                 { label: 'Lead Pause Manager', href: 'lead_pause_manager.html', icon: 'fa-circle-pause' },
                 { label: 'Demo: Scheduled Meetings', href: 'demo_review_replies.html', icon: 'fa-calendar-check' },
                 { label: 'Catch Missed Meetings (AI)', href: 'catch_meetings.html', icon: 'fa-magnifying-glass-chart' },
