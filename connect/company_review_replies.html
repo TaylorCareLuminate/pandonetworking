@@ -12391,7 +12391,7 @@ ${catSections}
                         tracking_source: 'company_review_replies.html',
                         scheduled_without_reply: true,
                         customer_id: contact.customerId || '',
-                        previous_response_category: 'Connected No Reply',
+                        previous_response_category: contact.isExtra ? 'Existing Connection' : 'Connected No Reply',
                         previous_followup_category: ''
                     });
                     trackingDocId = trackingRef?.id || '';
@@ -12496,43 +12496,95 @@ ${catSections}
             input.value = '';
         };
 
-        window.previewBulkScheduled = function() {
+        window.previewBulkScheduled = async function() {
+            const prevEl = document.getElementById('bulkScheduledPreview');
             const text = document.getElementById('bulkScheduledUrls').value || '';
             const matches = text.match(/(?:https?:\/\/)?(?:[\w-]+\.)?linkedin\.com\/(?:in|pub)\/[^\s,;"'<>]+/gi) || [];
             const keys = [...new Set(matches.map(linkedInSlugKey).filter(Boolean))];
             if (!keys.length) {
-                document.getElementById('bulkScheduledPreview').innerHTML = '<div style="color:#dc2626;">No LinkedIn profile URLs (linkedin.com/in/...) found.</div>';
+                prevEl.innerHTML = '<div style="color:#dc2626;">No LinkedIn profile URLs (linkedin.com/in/...) found.</div>';
                 return;
             }
+            prevEl.innerHTML = '<div style="color:#6b7280;">⏳ Checking matches…</div>';
             const byKey = new Map();
             connectedNoReplyContacts.forEach(c => { const k = linkedInSlugKey(c.linkedInUrl); if (k) byKey.set(k, c); });
 
-            const toMark = [], already = [], wrong = [], notFound = [];
+            // Contacts who replied (have a conversation) should be set to "Scheduled" via their card's
+            // Response Category instead, otherwise the meeting would be counted twice.
+            const convByKey = new Map();
+            (allConversations || []).forEach(cv => {
+                const k = linkedInSlugKey(cv.leadProfileUrl || cv.leadLinkedInUrl || cv.linkedin_url || cv.linkedInUrl || '');
+                if (k) convByKey.set(k, cv);
+            });
+
+            // URLs already marked Scheduled earlier (including previous bulk uploads of existing connections)
+            const existingSched = new Set();
+            try {
+                const snap = await getDocs(query(collection(emailDB, 'connected_no_reply_scheduled')));
+                snap.forEach(d => { const k = linkedInSlugKey(d.data().linkedInUrl); if (k) existingSched.add(k); });
+            } catch (e) { console.error('⚠️ Could not read existing scheduled records:', e); }
+
+            // Resolve the BDR for an existing connection from connect_queue (account_email may be the LinkedIn email)
+            const bdrForSlug = (slug) => {
+                const rec = connectQueueDebugRecords.find(r => r.normalizedUrl && r.normalizedUrl.includes('/in/' + slug));
+                let email = rec && rec.email ? String(rec.email).toLowerCase() : '';
+                if (email) {
+                    for (const [bdr, liEmail] of linkedInEmailAssociations.entries()) {
+                        if (String(liEmail).toLowerCase() === email) { email = bdr; break; }
+                    }
+                }
+                return email || viewingBdrEmail || accountEmail || currentUserEmail;
+            };
+            const prettyName = (slug) => slug.replace(/-[0-9a-f]{6,}$/i, '').replace(/-\d+$/, '').split('-').filter(Boolean)
+                .map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+
+            const toMark = [], extras = [], already = [], wrong = [], replied = [];
             keys.forEach(k => {
                 const c = byKey.get(k);
-                if (!c) notFound.push(k);
-                else if (c.isScheduled) already.push(c);
-                else if (c.isValidatedWrongContact) wrong.push(c);
-                else toMark.push(c);
+                if (c) {
+                    if (c.isScheduled) already.push(c);
+                    else if (c.isValidatedWrongContact) wrong.push(c);
+                    else toMark.push(c);
+                } else if (existingSched.has(k)) {
+                    already.push({ name: prettyName(k), company: 'linkedin.com/in/' + k });
+                } else if (convByKey.has(k)) {
+                    const cv = convByKey.get(k);
+                    replied.push({ name: cv.lead_name || cv.leadName || prettyName(k), company: 'linkedin.com/in/' + k });
+                } else {
+                    extras.push({
+                        id: 'url_' + k,
+                        isExtra: true,
+                        name: prettyName(k),
+                        firstName: prettyName(k).split(' ')[0] || '',
+                        lastName: prettyName(k).split(' ').slice(1).join(' '),
+                        company: '',
+                        linkedInUrl: 'https://www.linkedin.com/in/' + k + '/',
+                        bdrEmail: bdrForSlug(k),
+                        conversationId: '',
+                        customerId: ''
+                    });
+                }
             });
-            bulkScheduledMatches = toMark;
+            bulkScheduledMatches = [...toMark, ...extras];
 
             const list = (arr, fmt) => arr.length ? `<div style="max-height:110px;overflow-y:auto;font-size:0.8rem;color:#4b5563;margin:0.25rem 0 0.5rem 1rem;">${arr.map(fmt).join('<br>')}</div>` : '';
             const nm = c => escapeHtml(`${c.name || 'Unknown'}${c.company ? ' — ' + c.company : ''}`);
-            document.getElementById('bulkScheduledPreview').innerHTML = `
+            const nmExtra = c => escapeHtml(`${c.name} (linkedin.com/in/${linkedInSlugKey(c.linkedInUrl)}) · BDR: ${bdrEmailToNameMapping.get((c.bdrEmail || '').toLowerCase()) || c.bdrEmail || 'unknown'}`);
+            prevEl.innerHTML = `
                 <div style="padding:0.75rem 1rem;background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;">
                     <div><strong>${keys.length}</strong> unique URLs found</div>
-                    <div style="color:#047857;">✅ <strong>${toMark.length}</strong> will be marked Scheduled</div>${list(toMark, nm)}
+                    <div style="color:#047857;">✅ <strong>${toMark.length}</strong> Connected-No-Reply contacts will be marked Scheduled</div>${list(toMark, nm)}
+                    <div style="color:#047857;">🔗 <strong>${extras.length}</strong> existing connections (not in the list) will also be marked Scheduled</div>${list(extras, nmExtra)}
                     <div style="color:#6b7280;">⏭️ <strong>${already.length}</strong> already Scheduled (skipped)</div>${list(already, nm)}
                     <div style="color:#b45309;">⚠️ <strong>${wrong.length}</strong> flagged Wrong Contact (skipped)</div>${list(wrong, nm)}
-                    <div style="color:#b91c1c;">❓ <strong>${notFound.length}</strong> not in the Connected-No-Reply list (may have replied, or other BDR/filter)</div>${list(notFound, k => escapeHtml('linkedin.com/in/' + k))}
+                    <div style="color:#b45309;">💬 <strong>${replied.length}</strong> have a reply conversation (skipped, set their Response Category to Scheduled on the card instead)</div>${list(replied, nm)}
                 </div>`;
+            const total = toMark.length + extras.length;
             const btn = document.getElementById('bulkScheduledConfirmBtn');
-            btn.disabled = toMark.length === 0;
-            btn.style.opacity = toMark.length ? '1' : '0.5';
-            btn.innerHTML = `<i class="fas fa-check"></i> Mark ${toMark.length} as Scheduled`;
+            btn.disabled = total === 0;
+            btn.style.opacity = total ? '1' : '0.5';
+            btn.innerHTML = `<i class="fas fa-check"></i> Mark ${total} as Scheduled`;
         };
-
         window.confirmBulkScheduled = async function() {
             const targets = bulkScheduledMatches.filter(c => !c.isScheduled);
             if (!targets.length) return;
@@ -12566,7 +12618,7 @@ ${catSections}
                         bdr_auth_email: bdrEmailForContact,
                         account_email: '',
                         conversation_id: contact.conversationId || '',
-                        original_conversation_source: 'connected_no_reply',
+                        original_conversation_source: contact.isExtra ? 'existing_connection' : 'connected_no_reply',
                         scheduled_by: currentUserEmail,
                         scheduled_at: now,
                         meeting_scheduled_date: now,
@@ -12578,7 +12630,7 @@ ${catSections}
                         scheduled_without_reply: true,
                         bulk_url_upload: true,
                         customer_id: contact.customerId || '',
-                        previous_response_category: 'Connected No Reply',
+                        previous_response_category: contact.isExtra ? 'Existing Connection' : 'Connected No Reply',
                         previous_followup_category: ''
                     });
                     trackingDocId = trackingRef?.id || '';
