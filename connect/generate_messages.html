@@ -3378,7 +3378,7 @@
                         <div id="fullAiUrlListCount" style="font-size:12px; color:#065f46; margin-top:6px; font-weight:600;">0 valid LinkedIn URLs detected.</div>
                         <div class="form-help" style="margin-top:6px; color:#065f46;">
                             One URL per line (commas, spaces, or a pasted spreadsheet column also work). For each URL, the system:
-                            (1) skips anyone already connected to this BDR, already messaged/queued, or on an exclusion list,
+                            (1) skips anyone already connected to this BDR or already messaged/queued (contacts excluded in past runs are <strong>included anyway</strong> — pasting a URL overrides a past exclusion),
                             (2) looks up the LinkedIn profile (cache first) to fill in name, title, company, and location,
                             (3) adds them to this BDR's prospect list (contacts already on the list are reused),
                             then runs them through Full AI Generate. <strong>Every URL pasted is processed</strong> — the "Number of Prospects" setting below is ignored for this source.
@@ -17752,7 +17752,7 @@
             const pulledBy = window.auth?.currentUser?.email || 'unknown';
             const pulled = [];
             let skippedConnected = 0, skippedQueued = 0, skippedExcluded = 0, skippedNotInGroup = 0;
-            let lookupFailed = 0, reused = 0, created = 0;
+            let lookupFailed = 0, reused = 0, created = 0, overrodeExcluded = 0;
 
             for (let i = 0; i < entries.length; i++) {
                 if (!fullAiRunning) { addLog('⛔ Stopped by user during URL lookup.', 'warning'); break; }
@@ -17761,7 +17761,10 @@
                 document.getElementById('fullAiProgressLabel').textContent = `Looking up ${i + 1} of ${entries.length}: ${entry.slug}`;
 
                 if (groupUrlSet && !groupUrlSet.has(entry.normUrl)) { skippedNotInGroup++; addLog(`${tag} — not in the selected hypothesis group, skipped`, 'warning'); continue; }
-                if (excludedUrls.has(entry.normUrl))      { skippedExcluded++;  addLog(`${tag} — on an exclusion list, skipped`, 'warning'); continue; }
+                // Explicitly pasted URLs override past exclusions (soft-excluded prospect docs and
+                // prospect_exclusions / connect_exclusions entries) — the user chose these contacts.
+                const wasExcluded = excludedUrls.has(entry.normUrl);
+                if (wasExcluded) { overrodeExcluded++; addLog(`${tag} — was excluded in a past run; including anyway (pasted URL override)`, 'info'); }
                 if (connectedUrls.has(entry.normUrl))     { skippedConnected++; addLog(`${tag} — already connected to ${bdrEmail}, skipped`, 'warning'); continue; }
                 if (existingQueueUrls.has(entry.normUrl)) { skippedQueued++;    addLog(`${tag} — already messaged / queued for ${bdrEmail}, skipped`, 'warning'); continue; }
 
@@ -17804,6 +17807,12 @@
                 if (existing) {
                     // Reuse the existing doc: only fill gaps, then (re)tag so this run's init picks it up.
                     const updates = { moveBatchId, moveBatchLabel };
+                    // Pasted URL overrides a past soft-exclusion so the run doesn't filter it out again.
+                    if (existing.excludedFromCampaign) {
+                        updates.excludedFromCampaign = false;
+                        updates.reincludedAt = nowIso;
+                        updates.reincludedReason = 'Pasted LinkedIn URL override (Full AI)';
+                    }
                     if (!existing.firstName && firstName) updates.firstName = firstName;
                     if (!existing.lastName && lastName) updates.lastName = lastName;
                     if (!existing.title && title) updates.title = title;
@@ -17860,7 +17869,7 @@
 
             addLog(`✅ URL list processed: ${created} added, ${reused} already on list (reused), ` +
                 `${skippedConnected} already connected, ${skippedQueued} already messaged/queued, ` +
-                `${skippedExcluded} excluded, ` +
+                (overrodeExcluded ? `${overrodeExcluded} previously-excluded included anyway, ` : '') +
                 (groupUrlSet ? `${skippedNotInGroup} not in hypothesis group, ` : '') +
                 `${lookupFailed} lookup failed → ${pulled.length} ready for message generation (batch ${moveBatchId})`,
                 pulled.length ? 'success' : 'warning');
@@ -17869,7 +17878,8 @@
                 moveBatchId,
                 pulled,
                 stats: { eligible: pulled.length, pulled: pulled.length, created, reused,
-                         skippedConnected, skippedQueued, skippedExcluded, skippedNotInGroup, lookupFailed }
+                         skippedConnected, skippedQueued, skippedExcluded, overrodeExcluded, skippedNotInGroup, lookupFailed },
+                includedUrlSet: new Set(pulled.map(p => p._normUrl).filter(Boolean))
             };
         }
 
@@ -19148,6 +19158,8 @@
                             ...(scanJobId    ? { scanJobId, importBatchStartTime, importBatchEndTime } : {}),
                             ...(moveBatchId  ? { moveBatchId }  : {}),
                             ...(groupBatchId ? { groupBatchId } : {}),
+                            // Pasted-URL runs: server must not drop contacts excluded in past runs.
+                            ...(urlListPullResult?.pulled?.length ? { includeExcluded: true } : {}),
                             ...(fullAiHypGroupId ? { hypothesisGroupId: fullAiHypGroupId, hypothesisGroupName: fullAiHypGroupName } : {}),
                             ...(fullAiHypUrlSet && fullAiHypUrlSet.size ? { hypothesisGroupUrls: [...fullAiHypUrlSet] } : {})
                         })
@@ -19195,12 +19207,15 @@
                     const clientExcludedUrls = await loadBdrExclusionUrls(bdrEmail, { addLog });
                     const beforeClientFilter = prospectList.length;
                     let droppedExcluded = 0, droppedSoft = 0, droppedOutsideHyp = 0, droppedNoUrl = 0;
+                    // Pasted-URL runs: the user explicitly chose these contacts, so past exclusions don't apply.
+                    const pastedUrlSet = urlListPullResult?.includedUrlSet || null;
                     prospectList = prospectList.filter(p => {
-                        if (p.excludedFromCampaign) { droppedSoft++; return false; }
                         const rawUrl = p.linkedInUrl || p.li_url || p.linkedin_url || p.profile_url || '';
                         const url = normalizeLinkedInUrl(rawUrl);
+                        const isPasted = !!(pastedUrlSet && url && pastedUrlSet.has(url));
+                        if (p.excludedFromCampaign && !isPasted) { droppedSoft++; return false; }
                         if (!url) { droppedNoUrl++; return false; }
-                        if (clientExcludedUrls.has(url)) { droppedExcluded++; return false; }
+                        if (clientExcludedUrls.has(url) && !isPasted) { droppedExcluded++; return false; }
                         if (fullAiHypUrlSet && fullAiHypUrlSet.size > 0) {
                             const hypForm = _normalizeHypUrl(rawUrl);
                             const stamped = fullAiHypGroupId && (p.hypothesisGroupId === fullAiHypGroupId);
