@@ -308,7 +308,7 @@
                 <div id="fpDupeStatus" style="font-size: 12.5px; font-weight: 600;"></div>
                 <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                     <span id="fpOrgActivityStatus" style="font-size: 12px; color: var(--gray-500);"></span>
-                    <button class="btn" id="fpExportOrgReportBtn" onclick="fpExportOrgActivityReport()" disabled title="Download a customer-ready Excel report: summary, every organization in this preview, and every contact scanned (included / excluded / message created / sent)">
+                    <button class="btn" id="fpExportOrgReportBtn" onclick="fpExportOrgActivityReport()" disabled title="Download a customer-ready Excel report: summary, every organization in this preview, and every contact scanned (included / excluded / message created / sent) with each contact's full enrichment data (education, experience, about, skills, etc.)">
                         <i class="fas fa-file-excel"></i> Export Organization Report
                     </button>
                 </div>
@@ -4126,12 +4126,22 @@
                 ['orgId', 'name', 'title', 'company', 'url', 'connections', 'scanName', 'ruleReason', 'jobId'].forEach(f => {
                     if ((cur[f] === '' || cur[f] == null) && rec[f] !== '' && rec[f] != null) cur[f] = rec[f];
                 });
+                // Enrichment fields stored on the contact doc (fallback when no cached profile exists)
+                cur.prof = cur.prof || {};
+                Object.keys(rec.prof || {}).forEach(f => {
+                    if ((cur.prof[f] === '' || cur.prof[f] == null) && rec.prof[f] !== '' && rec.prof[f] != null) cur.prof[f] = rec.prof[f];
+                });
                 cur.kept = cur.kept || rec.kept;
                 cur.dropped = cur.dropped || rec.dropped;
                 cur.removed = cur.removed || rec.removed;
                 if (rec.scanDate && (!cur.scanDate || rec.scanDate > cur.scanDate)) { cur.scanDate = rec.scanDate; if (rec.scanName) cur.scanName = rec.scanName; }
             };
             const nameOf = c => `${c.firstName || ''} ${c.lastName || ''}`.trim() || c.name || c.fullName || '';
+            // Enrichment data the pipeline wrote back onto the contact doc (writeBackEnrichedProfile).
+            const profOf = c => ({
+                headline: c.headline || '', about: c.about || '', experience: c.experience || '', education: c.education || '',
+                location: c.location || '', followers: c.followerCount ?? null, enrichedAt: c.enrichedAt || ''
+            });
 
             liveDocs.forEach(c => {
                 const url = c.linkedInUrl || c.li_url || c.linkedin_url || c.profile_url || '';
@@ -4141,7 +4151,7 @@
                 upsert(key, {
                     key, orgId: orgForContact(c), name: nameOf(c), title: c.title || '', company: c.company || c.companyName || c.searchedOrganization || '',
                     url, connections: connCountOf(c), jobId: c.sourceJobId || '',
-                    scanName: j.scanName || '', scanDate: j.date || '',
+                    scanName: j.scanName || '', scanDate: j.date || '', prof: profOf(c),
                     kept: c.hypothesisGroupId === groupId && !c.excludedFromCampaign,
                     dropped: false, removed: false, ruleReason: ''
                 });
@@ -4155,7 +4165,7 @@
                 upsert(key, {
                     key, orgId: orgForContact(c), name: nameOf(c), title: c.title || '', company: c.company || c.companyName || c.orgName || '',
                     url, connections: connCountOf(c), jobId: c.scanJobId || c.sourceJobId || '',
-                    scanName: c.scanName || '', scanDate: String(c.deletedAt || '').slice(0, 10),
+                    scanName: c.scanName || '', scanDate: String(c.deletedAt || '').slice(0, 10), prof: profOf(c),
                     kept: false, dropped: isRules, removed: !isRules,
                     ruleReason: isRules ? (c.ruleReason || '') : ''
                 });
@@ -4168,7 +4178,7 @@
                 people.set(key, {
                     key, orgId, name: m.prospect_name || `${m.contactFirstName || ''} ${m.contactLastName || ''}`.trim(),
                     title: m.prospect_title || m.contactTitle || '', company: m.prospect_company || m.contactCompany || '',
-                    url: m.prospect_li_url || m.linkedin_url || '', connections: null, jobId: '', scanName: '', scanDate: '',
+                    url: m.prospect_li_url || m.linkedin_url || '', connections: null, jobId: '', scanName: '', scanDate: '', prof: {},
                     kept: true, dropped: false, removed: false, ruleReason: ''
                 });
             });
@@ -4297,6 +4307,28 @@
                 }
                 contacts.push(rec);
             });
+
+            // ── Full enrichment data (education, experience, skills, …) from the LinkedIn profile cache ──
+            const cacheKeys = [...new Set(contacts.map(c => profileCacheKey(c.url)).filter(Boolean))];
+            const profileByKey = new Map();
+            let cacheDone = 0, cacheFailures = 0;
+            const cacheQueue = cacheKeys.slice();
+            const cacheWorker = async () => {
+                while (cacheQueue.length) {
+                    const k = cacheQueue.shift();
+                    try {
+                        const snap = await getDoc(doc(db, PROFILE_CACHE_COLLECTION, k));
+                        if (typeof snap.exists === 'function' ? snap.exists() : snap.exists) profileByKey.set(k, snap.data());
+                    } catch (e) { cacheFailures++; }
+                    cacheDone++;
+                    if (cacheDone % 25 === 0 || cacheDone === cacheKeys.length) {
+                        setStatus(`<i class="fas fa-spinner fa-spin"></i> Loading enrichment data (education, experience…) ${cacheDone.toLocaleString()} / ${cacheKeys.length.toLocaleString()} contacts`);
+                    }
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(20, cacheKeys.length) }, cacheWorker));
+            if (cacheFailures) warnings.push(`${cacheFailures} contact profile(s) could not be loaded — their enrichment data may be missing`);
+            contacts.forEach(c => { c.profile = profileByKey.get(profileCacheKey(c.url)) || null; });
 
             const orgOrder = new Map(rows.map((o, i) => [o.id, i]));
             contacts.sort((a, b) =>
@@ -4524,6 +4556,105 @@
             });
             const wsScan = sc.finish();
             return { wsHyp, wsScan };
+        }
+
+        // ── Enrichment formatting for the report's Contacts tab ──
+        // Turns a contact's enrichment data into readable text. Uses the cached LinkedIn profile
+        // (linkedin_profile_cache) when there is one — handles both the flat dev_fusion shape
+        // (experiences[] / educations[]) and the older nested Bebity shape (EXPERIENCE / EDUCATION) —
+        // and falls back to what the pipeline wrote back onto the contact doc (about / experience /
+        // education as JSON strings).
+        const FP_XLSX_CELL_MAX = 32000; // Excel hard limit is 32,767 characters per cell
+        function fpEnrichmentForReport(c) {
+            const p = c.profile || null;
+            const d = c.prof || {};
+            const str = v => (typeof v === 'string' ? v.trim() : (typeof v === 'number' ? String(v) : ''));
+            const textOf = v => {
+                if (!v) return '';
+                if (typeof v === 'string') return v.trim();
+                if (Array.isArray(v)) return v.map(textOf).filter(Boolean).join('\n');
+                if (typeof v === 'object') return str(v.text) || textOf(v.description) || textOf(v.subComponents) || '';
+                return '';
+            };
+            const dateOf = v => {
+                if (!v) return '';
+                if (typeof v === 'string' || typeof v === 'number') return String(v);
+                if (typeof v === 'object' && v.year) return (v.month ? `${v.month}/` : '') + v.year;
+                return '';
+            };
+            const parseArr = v => {
+                if (Array.isArray(v)) return v;
+                if (typeof v === 'string' && v.trim()) { try { const a = JSON.parse(v); return Array.isArray(a) ? a : []; } catch (e) { return []; } }
+                return [];
+            };
+            const indent = t => t.split('\n').map(l => `     ${l}`).join('\n');
+            const cap = s => (s.length > FP_XLSX_CELL_MAX ? s.slice(0, FP_XLSX_CELL_MAX) + '… (truncated)' : s);
+
+            // Generic "flat" entries (dev_fusion): title/companyName/dates/location/description
+            const expFlat = e => {
+                const company = str(e.companyName) || str(e.subtitle).replace(/\s*·.*$/, '');
+                const type = str(e.employmentType) || (str(e.subtitle).includes('·') ? str(e.subtitle).split('·').slice(1).join('·').trim() : '');
+                const start = dateOf(e.jobStartedOn), end = dateOf(e.jobEndedOn) || (e.jobStillWorking ? 'Present' : '');
+                const dates = start ? `${start}${end ? ' – ' + end : ''}` : str(e.caption);
+                const head = [str(e.title), company].filter(Boolean).join(' at ');
+                const meta = [dates, str(e.jobLocation) || str(e.location) || str(e.metadata), type].filter(Boolean).join(' · ');
+                const desc = textOf(e.jobDescription) || textOf(e.description) || textOf(e.subComponents);
+                return `• ${head || '(role)'}${meta ? `  (${meta})` : ''}${desc ? '\n' + indent(desc) : ''}`;
+            };
+            // Nested entries (Bebity): title/subtitle/caption/meta with optional children
+            const nested = e => {
+                const own = [e.title, e.subtitle, e.caption, e.meta, e.text].map(str).filter(Boolean).join(' | ');
+                const kids = Array.isArray(e.child) ? e.child.map(k => '     ' + [k.title, k.subtitle, k.caption, k.meta, k.text].map(str).filter(Boolean).join(' | ')).filter(l => l.trim()) : [];
+                return `• ${own}${kids.length ? '\n' + kids.join('\n') : ''}`;
+            };
+            const eduFlat = e => {
+                const s = e.period?.startedOn?.year || dateOf(e.startedOn), en = e.period?.endedOn?.year || dateOf(e.endedOn);
+                const dates = s ? `${s}${en ? ' – ' + en : ''}` : str(e.caption);
+                const head = [str(e.title) || str(e.schoolName) || str(e.school), str(e.subtitle) || [str(e.degree), str(e.fieldOfStudy)].filter(Boolean).join(', ')].filter(Boolean).join(' — ');
+                const desc = textOf(e.description) || textOf(e.subComponents);
+                return `• ${head || '(education)'}${dates ? `  (${dates})` : ''}${desc ? '\n' + indent(desc) : ''}`;
+            };
+            const item = x => {
+                if (typeof x === 'string') return x.trim();
+                if (!x || typeof x !== 'object') return '';
+                const main = str(x.title) || str(x.name) || str(x.skill) || str(x.language);
+                const sub = str(x.subtitle) || str(x.proficiency) || str(x.authority) || str(x.issuer);
+                const extra = str(x.caption) || dateOf(x.issuedOn);
+                return [main, sub, extra].filter(Boolean).join(' – ');
+            };
+
+            let experience = '', education = '';
+            if (p) {
+                if (Array.isArray(p.experiences) && p.experiences.length) experience = p.experiences.map(expFlat).join('\n');
+                else if (Array.isArray(p.EXPERIENCE) && p.EXPERIENCE.length) experience = p.EXPERIENCE.map(nested).join('\n');
+                if (Array.isArray(p.educations) && p.educations.length) education = p.educations.map(eduFlat).join('\n');
+                else if (Array.isArray(p.EDUCATION) && p.EDUCATION.length) education = p.EDUCATION.map(nested).join('\n');
+            }
+            if (!experience) { const a = parseArr(d.experience); if (a.length) experience = a.map(expFlat).join('\n'); }
+            if (!education)  { const a = parseArr(d.education);  if (a.length) education  = a.map(eduFlat).join('\n'); }
+
+            let about = '';
+            if (p) about = str(p.about) || textOf(p.ABOUT);
+            if (!about) about = str(d.about);
+
+            const followers = p && p.followers != null ? p.followers : d.followers;
+            const fetched = p && p.fetchedAt ? String(p.fetchedAt).slice(0, 10) : (d.enrichedAt ? String(d.enrichedAt).slice(0, 10) : '');
+            const yrs = p && p.totalExperienceYears != null ? p.totalExperienceYears : '';
+            return {
+                headline: (p && str(p.headline)) || str(d.headline),
+                company: p ? [str(p.companyName), str(p.companyIndustry)].filter(Boolean).join(' · ') : '',
+                location: (p && str(p.location)) || str(d.location),
+                followers: followers == null ? '' : followers,
+                yearsExperience: yrs,
+                about: cap(about),
+                experience: cap(experience),
+                education: cap(education),
+                skills: cap(p && Array.isArray(p.skills) ? p.skills.map(item).filter(Boolean).join(', ') : ''),
+                certifications: cap(p && Array.isArray(p.licenseAndCertificates) ? p.licenseAndCertificates.map(item).filter(Boolean).map(t => `• ${t}`).join('\n') : ''),
+                languages: cap(p && Array.isArray(p.languages) ? p.languages.map(item).filter(Boolean).join(', ') : ''),
+                enrichedOn: fetched,
+                hasData: !!(experience || education || about)
+            };
         }
 
         function fpBuildOrgReportWorkbook({ rows, contacts, meta, detail }) {
@@ -4762,7 +4893,20 @@
                 { label: 'Visible in Fast Connect Review?', wch: 20, h: 'center' },
                 { label: 'Queue Detail',      wch: 52, h: 'left' },
                 { label: 'Message Account Email', wch: 30, h: 'left' },
-                { label: 'Message',           wch: 70, h: 'left' }
+                { label: 'Message',           wch: 70, h: 'left' },
+                // ── Full enrichment data ──
+                { label: 'Education',         wch: 55, h: 'left' },
+                { label: 'Experience',        wch: 75, h: 'left' },
+                { label: 'LinkedIn Headline', wch: 45, h: 'left' },
+                { label: 'About',             wch: 70, h: 'left' },
+                { label: 'Location',          wch: 24, h: 'left' },
+                { label: 'Current Company / Industry', wch: 30, h: 'left' },
+                { label: 'Skills',            wch: 50, h: 'left' },
+                { label: 'Licenses & Certifications', wch: 45, h: 'left' },
+                { label: 'Languages',         wch: 22, h: 'left' },
+                { label: 'Followers',         wch: 11, h: 'center' },
+                { label: 'Years of Experience', wch: 11, h: 'center' },
+                { label: 'Profile Enriched On', wch: 13, h: 'center' }
             ];
             const orgName = new Map(rows.map(o => [o.id, o.company_name || '']));
             const cg = titleBlock(CCOLS.length, `Contact Detail  ·  ${heading}`, subtitle,
@@ -4773,6 +4917,7 @@
             contacts.forEach((c, i) => {
                 const oc = FP_REPORT_OUTCOMES[c.outcome];
                 const mc = matchColors[c.targetMatch];
+                const en = fpEnrichmentForReport(c);
                 const msgText = c.msg ? (c.msg.message_to_contact || '') : '';
                 const li = c.url ? (/^https?:\/\//i.test(c.url) ? c.url : `https://${c.url}`) : '';
                 const msgDate = c.msg ? String(c.msg.uploaded_date || '').slice(0, 10) : '';
@@ -4796,10 +4941,25 @@
                     cell(c.queue ? c.queue.visible : '', rowStyle(i, { h: 'center', wrap: true, bold: !!(c.queue && c.queue.visible !== 'Yes' && !/^n\/a/.test(c.queue.visible)) })),
                     cell(c.queue ? c.queue.detail : '', rowStyle(i, { wrap: true })),
                     cell(c.queue ? c.queue.account : '', rowStyle(i, { wrap: true })),
-                    cell(msgText, rowStyle(i, { wrap: true }))
+                    cell(msgText, rowStyle(i, { wrap: true })),
+                    cell(en.education, rowStyle(i, { wrap: true })),
+                    cell(en.experience, rowStyle(i, { wrap: true })),
+                    cell(en.headline, rowStyle(i, { wrap: true })),
+                    cell(en.about, rowStyle(i, { wrap: true })),
+                    cell(en.location, rowStyle(i, { wrap: true })),
+                    cell(en.company, rowStyle(i, { wrap: true })),
+                    cell(en.skills, rowStyle(i, { wrap: true })),
+                    cell(en.certifications, rowStyle(i, { wrap: true })),
+                    cell(en.languages, rowStyle(i, { wrap: true })),
+                    cell(en.followers, rowStyle(i, { h: 'center' })),
+                    cell(en.yearsExperience, rowStyle(i, { h: 'center' })),
+                    cell(en.enrichedOn, rowStyle(i, { h: 'center' }))
                 ]);
-                const lines = Math.max(Math.ceil(msgText.length / 78), Math.ceil((c.notes || '').length / 56), Math.ceil(((c.queue && c.queue.detail) || '').length / 56), 1);
-                heights.push(Math.min(Math.max(lines * 13.5 + 6, 20), 230));
+                const wrapLines = (t, cpl) => String(t || '').split('\n').reduce((n, l) => n + Math.max(1, Math.ceil(l.length / cpl)), 0);
+                const lines = Math.max(
+                    Math.ceil(msgText.length / 78), Math.ceil((c.notes || '').length / 56), Math.ceil(((c.queue && c.queue.detail) || '').length / 56),
+                    wrapLines(en.education, 60), wrapLines(en.experience, 82), wrapLines(en.about, 76), 1);
+                heights.push(Math.min(Math.max(lines * 13.5 + 6, 20), 409)); // Excel's max row height is 409pt
             });
             const cMerges = [0, 1, 2].map(r => ({ s: { r, c: 0 }, e: { r, c: CCOLS.length - 1 } }));
             const wsCon = toSheet(cg, {
