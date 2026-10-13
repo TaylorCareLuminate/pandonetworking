@@ -10184,13 +10184,17 @@
             btn.style.display = count > 0 ? '' : 'none';
         }
 
-        window.saveAllEdits = async function saveAllEdits() {
+        // opts.silent = true is used by the Submit buttons: skips the confirm dialog and the
+        // "nothing to save" alert so the save runs automatically right before processing.
+        // Returns { total, saved, failed } (total 0 when there was nothing to save).
+        window.saveAllEdits = async function saveAllEdits(opts) {
+            const silent = !!(opts && opts.silent === true);
             const dirtySelectionIds = computeDirtySelectionIds();
             const allIds = new Set([...editedMessages.keys(), ...dirtySelectionIds]);
             const count = allIds.size;
             if (count === 0) {
-                showAlert('No pending edits or selections to save.', 'info');
-                return;
+                if (!silent) showAlert('No pending edits or selections to save.', 'info');
+                return { total: 0, saved: 0, failed: 0 };
             }
 
             const editCount = editedMessages.size;
@@ -10198,11 +10202,11 @@
             const parts = [];
             if (editCount > 0) parts.push(`${editCount} edited message text${editCount !== 1 ? 's' : ''}`);
             if (selectionCount > 0) parts.push(`${selectionCount} approve/exclude/delete/group-only selection${selectionCount !== 1 ? 's' : ''}`);
-            if (!confirm(
+            if (!silent && !confirm(
                 `Save ${parts.join(' and ')} to Firestore?\n\n` +
                 `This saves your progress so it survives a reload — it does NOT process approved ` +
                 `messages (no campaigns/sends happen). Use "Submit Batch" for that.`
-            )) return;
+            )) return { total: count, saved: 0, failed: 0, cancelled: true };
 
             const btn = document.getElementById('saveAllEditsBtn');
             if (btn) {
@@ -10300,6 +10304,32 @@
             } else {
                 showAlert(`Saved ${saved} message${saved !== 1 ? 's' : ''}, but ${failedIds.size} failed. Check the console for details.`, 'warning');
             }
+            return { total: count, saved, failed: failedIds.size };
+        };
+
+        // Runs Save All Edits automatically right before a Submit action so nothing is
+        // lost if the submit pipeline fails part-way. Returns true if it is OK to proceed
+        // (everything saved, nothing to save, or the user chose to continue despite failures).
+        window.autoSaveBeforeSubmit = async function autoSaveBeforeSubmit() {
+            // Instant local safety net first (survives a crash even if Firestore is unreachable).
+            try { if (messageSelections.size > 0) saveBatchState('pre-submit'); } catch (e) { /* non-fatal */ }
+            let result;
+            try {
+                result = await window.saveAllEdits({ silent: true });
+            } catch (err) {
+                console.error('[AutoSaveBeforeSubmit] Unexpected error:', err);
+                return confirm(
+                    'Saving your work to Firestore failed before submitting.\n\n' +
+                    'Your work is still backed up in this browser. Continue with the submit anyway?'
+                );
+            }
+            if (result && result.failed > 0) {
+                return confirm(
+                    `${result.failed} message${result.failed !== 1 ? 's' : ''} could not be saved to Firestore before submitting ` +
+                    `(see console for details).\n\nYour work is still backed up in this browser. Continue with the submit anyway?`
+                );
+            }
+            return true;
         };
 
         // Export all loaded messages to CSV (exposed globally so the onclick attribute can reach it)
@@ -17304,6 +17334,21 @@ Rules:
     // replaces submitBatchBtn's click handler.
 
     async function patchedSubmitBatch() {
+        // Save All Edits fires first (text edits + approve/exclude/delete/group-only
+        // selections -> Firestore) so nothing is lost if the submit pipeline fails.
+        // Submit First N already did this for the full selection set before narrowing it
+        // (re-saving the narrowed set would wrongly clear the saved remaining selections).
+        if (!_submitOnlyIds) {
+            _submitBtn.disabled = true;
+            let okToContinue = false;
+            try {
+                okToContinue = await window.autoSaveBeforeSubmit();
+            } finally {
+                _submitBtn.disabled = false;
+            }
+            if (!okToContinue) return 'cancelled';
+        }
+
         // Check toggle
         const toggleEl = document.getElementById('finalAiReviewToggle');
         const enabled   = toggleEl ? toggleEl.checked : true;
@@ -17495,6 +17540,13 @@ Rules:
             )) {
                 return;
             }
+
+            // Save ALL edits + selections (including the ones not being submitted now)
+            // before narrowing anything, so nothing is lost if the submit fails.
+            _firstNBtn.disabled = true;
+            const _okToContinue = await window.autoSaveBeforeSubmit();
+            _firstNBtn.disabled = false;
+            if (!_okToContinue) return;
 
             const remainingIds = orderedSelected.slice(n);
             const firstNIds    = orderedSelected.slice(0, n);
