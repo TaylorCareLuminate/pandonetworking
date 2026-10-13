@@ -32,7 +32,13 @@
  *     useTargets:     [{ id: 'post', label: 'Post Reply' }, ...],      // optional "use as ..." menu
  *     onUse:          ({ message, targetId, result }) => { ... },      // called by "Use in report"
  *     onResults:      (results) => { ... }
- *   });
+ *   });                                  // returns { getState, setState, getLeader, getResults, destroy }
+ *   // Save with a host page's own data:  saved.liveExample = widget.getState();
+ *   // Restore later:                     widget.setState(saved.liveExample);
+ *
+ * ---- Proposal page ------------------------------------------------------------------------
+ *   var page = OneOffFullAi.renderShowcase(widget.getResults(), { companyName, leader: widget.getLeader() });
+ *   // page.title = "Three Examples of Outreach to <Company> Prospects"; page.body = print-ready HTML
  */
 (function (global) {
     'use strict';
@@ -243,13 +249,18 @@
 
             out.ok = true;
             out.source = gen.source;
-            out.prospect = gen.prospect;
+            // prep.prospect carries the photo / network size; gen.prospect has the refreshed title.
+            out.prospect = Object.assign({}, prep.prospect || {}, gen.prospect || {});
+            if (!out.prospect.name) out.prospect.name = [out.prospect.firstName, out.prospect.lastName].filter(Boolean).join(' ');
             out.hypothesis = gen.hypothesis;
             out.maxChars = gen.maxChars;
             out.composed = gen.composed || [];
             out.best = gen.best || out.composed[0] || null;
             out.candidates = gen.candidates || [];
             out.recentPosts = gen.recentPosts || [];
+            out.findings = gen.findings || null;
+            out.explain = gen.explain || null;
+            out.generatedAt = new Date().toISOString();
             return out;
         } catch (err) {
             out.error = err && err.message ? err.message : String(err);
@@ -326,7 +337,21 @@
 .oofa-count.over{color:var(--danger,#A23B3B);font-weight:700}\
 .oofa-alt{margin-top:.5rem;padding:.55rem .7rem;background:var(--cream,#F6F4EF);border-radius:7px;font-size:.84rem}\
 .oofa-kv{font-size:.82rem;margin-top:.4rem}.oofa-kv b{color:var(--navy,#12314C)}\
-.oofa select{padding:.35rem .5rem;border:1px solid var(--line-strong,#CFC9BA);border-radius:7px;font:inherit;font-size:.82rem;background:#fff}';
+.oofa select{padding:.35rem .5rem;border:1px solid var(--line-strong,#CFC9BA);border-radius:7px;font:inherit;font-size:.82rem;background:#fff}\
+.oofa-who-row{display:flex;align-items:center;gap:.7rem}\
+.oofa-avatar{width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid var(--gold,#B9A77E);flex:none;background:var(--cream,#F6F4EF)}\
+.oofa-avatar-txt{display:inline-flex;align-items:center;justify-content:center;background:var(--navy,#12314C);color:#fff;font-weight:700;font-size:.9rem}\
+.oofa-found{margin:.3rem 0 .7rem;padding:.6rem .8rem;background:var(--cream,#F6F4EF);border-radius:8px;font-size:.82rem}\
+.oofa-found-k{font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted,#7C8594);font-weight:600}.oofa-found-k b{color:var(--navy,#12314C)}\
+.oofa-found-t{font-weight:600;color:var(--ink,#1B2430);margin-top:.2rem}\
+.oofa-found-q{margin-top:.25rem;padding-left:.6rem;border-left:2px solid var(--gold,#B9A77E);font-style:italic;color:var(--ink,#1B2430)}\
+.oofa-found-b{margin-top:.2rem;color:var(--ink-soft,#4B5563)}';
+
+    function initialsOf(name) {
+        var parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+        var s = parts.map(function (w) { return w.charAt(0); }).join('').slice(0, 2).toUpperCase();
+        return s || '?';
+    }
 
     function injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
@@ -484,14 +509,27 @@
                 ? '<div class="oofa-row"><select id="' + uid + '_use' + idx + '">' + useTargets.map(function (t) { return '<option value="' + esc(t.id) + '">' + esc(t.label) + '</option>'; }).join('') + '</select>'
                 + '<button type="button" class="oofa-btn sm" data-act="use"><i class="fas fa-arrow-right-to-bracket"></i> Use in report</button></div>'
                 : '';
+            var photo = p.photoDataUrl || p.photoUrl || '';
+            var avatar = photo
+                ? '<img class="oofa-avatar" src="' + esc(photo) + '" alt="">'
+                : '<span class="oofa-avatar oofa-avatar-txt">' + esc(initialsOf(p.name)) + '</span>';
+            var f = res.findings || {}; var hook = f.hook || {}; var ex = res.explain || {};
+            var foundHtml = (hook.label || hook.detail)
+                ? '<div class="oofa-found"><div class="oofa-found-k">What we found: <b>' + esc(hook.label || '') + (hook.date ? ' (' + esc(hook.date) + ')' : '') + '</b></div>'
+                + (hook.title && hook.kind !== 'post' ? '<div class="oofa-found-t">' + esc(hook.title) + '</div>' : '')
+                + (hook.detail ? '<div class="oofa-found-q">' + esc(hook.detail) + '</div>' : '')
+                + (ex.noticed || ex.built ? '<div class="oofa-found-k" style="margin-top:.45rem">How we built it</div><div class="oofa-found-b">' + esc([ex.noticed, ex.built].filter(Boolean).join(' ')) + '</div>' : '')
+                + '</div>'
+                : '';
             card.className = 'oofa-card';
-            card.innerHTML = '<div class="oofa-card-hd"><div><span class="oofa-who">' + esc(p.name || 'Prospect ' + (idx + 1)) + '</span> <span class="oofa-sub">' + esc([p.title, p.company].filter(Boolean).join(' at ')) + '</span></div>'
+            card.innerHTML = '<div class="oofa-card-hd"><div class="oofa-who-row">' + avatar + '<div><span class="oofa-who">' + esc(p.name || 'Prospect ' + (idx + 1)) + '</span><div class="oofa-sub">' + esc([p.title, p.company].filter(Boolean).join(' at ')) + (p.location ? ' · ' + esc(p.location) : '') + '</div></div></div>'
                 + '<span class="oofa-badge">' + esc(res.source || 'Full AI') + '</span></div>'
+                + foundHtml
                 + '<textarea data-role="msg" rows="4">' + esc(best.message || '') + '</textarea>'
                 + '<div data-role="count">' + counterHtml((best.message || '').length, limit) + '</div>'
                 + '<div class="oofa-row" style="margin-top:.4rem"><button type="button" class="oofa-btn ghost sm" data-act="copy"><i class="fas fa-copy"></i> Copy</button></div>'
                 + useMenu
-                + '<details><summary>How this was built</summary>'
+                + '<details><summary>Pipeline details</summary>'
                 + (best.original ? '<div class="oofa-kv"><b>Personalization from Full AI:</b> ' + esc(best.original) + '</div>' : '<div class="oofa-kv"><b>Personalization:</b> written from the LinkedIn profile (no post, shared ground, or news hook was found).</div>')
                 + '<div class="oofa-kv"><b>Temporary hypothesis group:</b> ' + esc(h.name || '') + '</div>'
                 + (h.hypothesis ? '<div class="oofa-kv"><b>Hypothesis:</b> ' + esc(h.hypothesis) + '</div>' : '')
@@ -556,11 +594,215 @@
             }
         });
 
+        // ── Save / restore (so a host page can store this section inside its own saved data) ──
+        // The snapshot is plain JSON: typed inputs, the built leader profile, prospect URLs and the
+        // generated messages. Long diagnostic logs are left out to keep the saved record small.
+        function slimResult(r) {
+            if (!r) return null;
+            var out = {
+                ok: !!r.ok, linkedInUrl: r.linkedInUrl || '', error: r.error || '', skipped: !!r.skipped,
+                source: r.source || '', maxChars: r.maxChars || maxChars,
+                prospect: r.prospect || null, hypothesis: r.hypothesis || null,
+                composed: r.composed || [], best: r.best || null,
+                findings: r.findings || null, explain: r.explain || null, generatedAt: r.generatedAt || ''
+            };
+            out.candidates = (r.candidates || []).slice(0, 3);
+            return out;
+        }
+        function getState() {
+            var prospects = [];
+            for (var i = 0; i < prospectCount; i++) prospects.push($('_p' + i).value.trim());
+            var leader = state.leader ? JSON.parse(JSON.stringify(collectLeader())) : null;
+            var hasInputs = elLi.value.trim() || prospects.some(Boolean);
+            if (!leader && !hasInputs && !state.results.length) return null;
+            return {
+                version: 1,
+                inputs: { linkedInUrl: elLi.value.trim(), name: elNm.value.trim(), companyName: elCo.value.trim(), companyWebsite: elWeb.value.trim(), companyBlurb: elBlurb.value.trim() },
+                leader: leader,
+                prospectUrls: prospects,
+                results: state.results.map(slimResult)
+            };
+        }
+        function setState(snap) {
+            if (!snap || typeof snap !== 'object') return false;
+            var inp = snap.inputs || {};
+            elLi.value = inp.linkedInUrl || '';
+            elNm.value = inp.name || '';
+            elCo.value = inp.companyName || '';
+            elWeb.value = inp.companyWebsite || '';
+            elBlurb.value = inp.companyBlurb || '';
+            for (var i = 0; i < prospectCount; i++) $('_p' + i).value = (snap.prospectUrls && snap.prospectUrls[i]) || '';
+
+            state.leader = snap.leader ? JSON.parse(JSON.stringify(snap.leader)) : null;
+            if (state.leader) {
+                state.leader.statements = state.leader.statements || {};
+                state.leader.weStatements = state.leader.weStatements || [];
+                renderStatements();
+                $('_s2').classList.remove('is-locked');
+                setStatus('_s1st', 'Leader profile restored from the saved proposal.', 'ok');
+            } else {
+                $('_stmtbody').innerHTML = '';
+                $('_stmts').style.display = 'none';
+                $('_s2').classList.add('is-locked');
+                setStatus('_s1st', '', '');
+            }
+            elLog.textContent = ''; elLog.style.display = 'none';
+            elRes.innerHTML = '';
+            state.results = (snap.results || []).filter(Boolean).map(function (r) { return r; });
+            state.results.forEach(function (r, idx) { renderResult(idx, r); });
+            var okCount = state.results.filter(function (r) { return r && r.ok; }).length;
+            setStatus('_s2st', state.results.length ? okCount + ' of ' + state.results.length + ' saved messages restored.' : '', okCount ? 'ok' : '');
+            btnGen.disabled = state.busy || !state.leader;
+            return true;
+        }
+
         return {
             getLeader: function () { return state.leader ? collectLeader() : null; },
             getResults: function () { return state.results.slice(); },
+            getState: getState,
+            setState: setState,
             destroy: function () { root.innerHTML = ''; }
         };
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // Proposal page renderer ("Three Examples of Outreach to <Company> Prospects")
+    //
+    //   var page = OneOffFullAi.renderShowcase(results, { companyName, leader, theme?, maxItems? });
+    //   page = { count, title, lede, eyebrow, body, header, html }
+    //     body   : the prospect bands + closing note (inline styles only, print safe)
+    //     header : a default title block for hosts without their own PDF helpers
+    //     html   : header + body
+    //   Hosts with their own page chrome (outcomes_calculator.html) wrap `body` themselves.
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    var SHOWCASE_THEME = {
+        navy: '#12314C', navyDeep: '#0C2236', cream: '#F6F4EF', gold: '#B9A77E', goldSoft: '#EFE9DA',
+        sage: '#4E6E4A', sageTint: '#EEF2EC', ink: '#1B2430', inkSoft: '#4B5563', muted: '#7C8594', line: '#E4E0D6', lineStrong: '#CFC9BA',
+        serif: "font-family:'Playfair Display',Georgia,'Times New Roman',serif;font-weight:500;letter-spacing:-0.01em;",
+        sans: 'font-family:Inter,Arial,Helvetica,sans-serif;'
+    };
+    var COUNT_WORDS = ['No', 'One', 'Two', 'Three', 'Four', 'Five', 'Six'];
+
+    function trimTo(text, n) {
+        var t = String(text || '').replace(/\s+/g, ' ').trim();
+        if (t.length <= n) return t;
+        var cut = t.slice(0, n);
+        var sp = cut.lastIndexOf(' ');
+        return (sp > n * 0.6 ? cut.slice(0, sp) : cut).replace(/[,;:\s]+$/, '') + '...';
+    }
+    function fmtCount(n) {
+        var v = Number(n);
+        if (!isFinite(v) || v <= 0) return '';
+        return v >= 1000 ? (Math.round(v / 100) / 10).toFixed(v >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'K' : String(v);
+    }
+    function showcaseTitle(count, companyName) {
+        var word = COUNT_WORDS[count] || String(count);
+        return word + ' Example' + (count === 1 ? '' : 's') + ' of Outreach to ' + (String(companyName || '').trim() || 'Your') + ' Prospects';
+    }
+
+    function renderShowcase(results, opts) {
+        opts = opts || {};
+        var T = Object.assign({}, SHOWCASE_THEME, opts.theme || {});
+        var items = (results || []).filter(function (r) { return r && r.ok && r.best && r.best.message; }).slice(0, opts.maxItems || 3);
+        var count = items.length;
+        var company = String(opts.companyName || '').trim();
+        var leader = opts.leader || {};
+        var leaderName = leader.name || 'Your sales leader';
+        var title = showcaseTitle(count, company);
+        var eyebrow = 'Live examples · written for real people';
+        var lede = 'We researched ' + (count === 1 ? 'one real person' : COUNT_WORDS[count].toLowerCase() + ' real people')
+            + (company ? ' ' + company + ' would want to reach' : ' you would want to reach')
+            + ', read what they have posted and published, and wrote to each one as we would on your team\'s behalf. Nothing here is a template.';
+        if (!count) return { count: 0, title: title, lede: lede, eyebrow: eyebrow, body: '', header: '', html: '' };
+
+        var compact = count >= 3;
+        var quoteMax = compact ? 170 : 280;
+        var builtMax = compact ? 330 : 400;
+        var eb = function (n, label) {
+            return '<div style="' + T.sans + 'font-size:8px;letter-spacing:.18em;text-transform:uppercase;color:' + T.gold + ';font-weight:600;">'
+                + '<span style="color:' + T.navy + ';margin-right:6px;">' + n + '</span>' + label + '</div>';
+        };
+        var chip = function (text) {
+            return '<span style="display:inline-block;padding:2px 7px;border-radius:999px;background:rgba(255,255,255,0.1);color:rgba(255,255,255,0.86);' + T.sans + 'font-size:7.5px;letter-spacing:.06em;text-transform:uppercase;margin:0 4px 4px 0;white-space:nowrap;">' + text + '</span>';
+        };
+
+        var bands = items.map(function (r, i) {
+            var p = r.prospect || {}; var f = r.findings || {}; var hook = f.hook || {}; var ex = r.explain || {}; var fp = f.profile || {};
+            var msg = String(r.best.message || '');
+            var photo = p.photoDataUrl || p.photoUrl || '';
+            var size = compact ? 56 : 68;
+            var avatar = photo
+                ? '<img src="' + esc(photo) + '" alt="" style="width:' + size + 'px;height:' + size + 'px;border-radius:50%;object-fit:cover;display:block;border:2px solid ' + T.gold + ';background:#fff;">'
+                : '<div style="width:' + size + 'px;height:' + size + 'px;border-radius:50%;background:rgba(255,255,255,0.12);border:2px solid ' + T.gold + ';display:flex;align-items:center;justify-content:center;' + T.serif + 'font-size:' + Math.round(size * 0.36) + 'px;color:#fff;">' + esc(initialsOf(p.name)) + '</div>';
+            var chips = [];
+            if (f.postsFound) chips.push(chip(f.postsFound + ' recent post' + (f.postsFound === 1 ? '' : 's')));
+            else if (f.source) chips.push(chip('Profile scanned'));
+            if (fmtCount(fp.connections || p.connections)) chips.push(chip(fmtCount(fp.connections || p.connections) + ' connections'));
+            else if (fmtCount(fp.followers || p.followers)) chips.push(chip(fmtCount(fp.followers || p.followers) + ' followers'));
+            if (hook.kind === 'news') chips.push(chip('In the news'));
+            if (hook.kind === 'common') chips.push(chip('Common ground'));
+
+            var foundTitle = hook.label || 'Their LinkedIn profile';
+            var foundMeta = hook.date ? ' <span style="font-weight:400;color:' + T.muted + ';">· ' + esc(hook.date) + '</span>' : '';
+            var foundHead = hook.title && hook.kind !== 'post' ? '<div style="' + T.sans + 'font-size:10px;font-weight:600;color:' + T.ink + ';margin-top:4px;line-height:1.4;">' + esc(trimTo(hook.title, 110)) + '</div>' : '';
+            var quote = hook.detail
+                ? '<div style="margin-top:5px;padding:6px 10px;border-left:2px solid ' + T.gold + ';background:#fff;border-radius:0 6px 6px 0;' + T.serif + 'font-weight:400;font-style:italic;font-size:' + (compact ? 10 : 10.5) + 'px;line-height:1.5;color:' + T.ink + ';">' + esc(trimTo(hook.detail, quoteMax)) + '</div>'
+                : '<div style="margin-top:5px;' + T.sans + 'font-size:10px;color:' + T.inkSoft + ';line-height:1.5;">' + esc(trimTo(fp.headline || [p.title, p.company].filter(Boolean).join(' at '), 140)) + '</div>';
+            var builtText = [ex.noticed, ex.built].filter(Boolean).join(' ') || ('The note opens with that detail in plain words, then adds one short line on what ' + (leader.companyName || 'we') + ' does. No ask, no pitch.');
+
+            var identity = '<td style="width:27%;vertical-align:top;background:' + T.navy + ';border-radius:8px 0 0 8px;padding:0;">'
+                + '<div style="height:3px;background:' + T.gold + ';border-radius:8px 0 0 0;"></div>'
+                + '<div style="padding:' + (compact ? '14px 14px 12px' : '18px 16px 16px') + ';">'
+                + '<div style="display:flex;align-items:center;gap:10px;">' + avatar + '<div style="min-width:0;">'
+                + '<div style="' + T.serif + 'font-size:' + (compact ? 14 : 16) + 'px;line-height:1.15;color:#fff;">' + esc(p.name || 'Prospect ' + (i + 1)) + '</div>'
+                + '</div></div>'
+                + '<div style="' + T.sans + 'font-size:9.5px;line-height:1.4;color:rgba(255,255,255,0.9);margin-top:9px;">' + esc(trimTo(p.title || fp.headline || '', 70)) + '</div>'
+                + (p.company ? '<div style="' + T.sans + 'font-size:9.5px;color:' + T.gold + ';margin-top:2px;">' + esc(trimTo(p.company, 50)) + '</div>' : '')
+                + (p.location || fp.location ? '<div style="' + T.sans + 'font-size:8.5px;color:rgba(255,255,255,0.6);margin-top:3px;">' + esc(trimTo(p.location || fp.location, 50)) + '</div>' : '')
+                + (chips.length ? '<div style="margin-top:9px;">' + chips.join('') + '</div>' : '')
+                + '</div></td>';
+
+            var builtHtml = ex.noticed && ex.built
+                ? '<div style="' + T.sans + 'font-size:' + (compact ? 9.5 : 10.5) + 'px;color:' + T.ink + ';line-height:1.5;margin-top:5px;">' + esc(trimTo(ex.noticed, 200)) + '</div>'
+                + '<div style="' + T.sans + 'font-size:' + (compact ? 9.5 : 10.5) + 'px;color:' + T.inkSoft + ';line-height:1.5;margin-top:3px;">' + esc(trimTo(ex.built, 240)) + '</div>'
+                : '<div style="' + T.sans + 'font-size:' + (compact ? 9.5 : 10.5) + 'px;color:' + T.inkSoft + ';line-height:1.5;margin-top:5px;">' + esc(trimTo(builtText, builtMax)) + '</div>';
+
+            var found = '<td style="width:43%;vertical-align:top;background:' + T.cream + ';padding:' + (compact ? '13px 14px' : '16px 18px') + ';border-top:1px solid ' + T.line + ';border-bottom:1px solid ' + T.line + ';">'
+                + eb('01', 'What we found')
+                + '<div style="' + T.sans + 'font-size:10.5px;font-weight:600;color:' + T.navy + ';margin-top:6px;">' + esc(foundTitle) + foundMeta + '</div>'
+                + foundHead + quote
+                + '<div style="margin-top:9px;">' + eb('02', 'How we built it') + '</div>'
+                + builtHtml
+                + '</td>';
+
+            var bubble = '<td style="width:30%;vertical-align:top;background:' + T.cream + ';border-radius:0 8px 8px 0;padding:' + (compact ? '13px 14px 13px 2px' : '16px 18px 16px 2px') + ';border-top:1px solid ' + T.line + ';border-bottom:1px solid ' + T.line + ';border-right:1px solid ' + T.line + ';">'
+                + eb('03', 'The message')
+                + '<div style="margin-top:6px;background:#fff;border:1px solid ' + T.line + ';border-radius:12px 12px 12px 3px;padding:9px 11px;">'
+                + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"><span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:' + T.navy + ';color:#fff;' + T.sans + 'font-size:7px;font-weight:600;">' + esc(initialsOf(leaderName)) + '</span>'
+                + '<span style="' + T.sans + 'font-size:8px;color:' + T.muted + ';">' + esc(trimTo(leaderName, 28)) + ' · connection request</span></div>'
+                + '<div style="' + T.sans + 'font-size:' + (compact ? 10 : 10.5) + 'px;line-height:1.55;color:' + T.ink + ';">' + esc(msg) + '</div>'
+                + '</div>'
+                + '<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:2px 10px;' + T.sans + 'font-size:7.5px;color:' + T.muted + ';margin-top:5px;"><span style="white-space:nowrap;">' + msg.length + ' characters</span><span style="white-space:nowrap;">Reviewed by a person before sending</span></div>'
+                + '</td>';
+
+            return '<table style="width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed;margin-bottom:' + (compact ? 10 : 14) + 'px;break-inside:avoid;page-break-inside:avoid;"><tr>' + identity + found + bubble + '</tr></table>';
+        }).join('');
+
+        var note = '<table style="width:100%;border-collapse:separate;border-spacing:0;margin-top:' + (compact ? 4 : 8) + 'px;"><tr><td style="padding:0;">'
+            + '<div style="border:1px solid ' + T.line + ';border-radius:6px;padding:9px 14px;background:#fff;display:flex;justify-content:space-between;gap:14px;align-items:center;break-inside:avoid;page-break-inside:avoid;">'
+            + '<div style="' + T.sans + 'font-size:9.5px;color:' + T.inkSoft + ';line-height:1.5;">' + (compact
+                ? 'Same process every time: read the person, write to the one thing worth saying, and a person reviews it before it goes out.'
+                : 'Every message above came from the same process ' + (company ? esc(company) : 'you') + ' would get: we read the person\'s LinkedIn, their recent posts and news about their organization, write to the one specific thing worth saying, and a person reviews it before it goes out.') + '</div>'
+            + '<div style="' + T.sans + 'font-size:8px;letter-spacing:.14em;text-transform:uppercase;color:' + T.gold + ';font-weight:600;white-space:nowrap;">Scan · Write · Review</div>'
+            + '</div></td></tr></table>';
+
+        var header = '<div style="margin-bottom:' + (compact ? 18 : 24) + 'px;">'
+            + '<div style="' + T.sans + 'font-size:9.5px;letter-spacing:0.2em;text-transform:uppercase;color:' + T.gold + ';font-weight:600;display:flex;align-items:center;gap:8px;"><span style="display:inline-block;width:22px;height:1px;background:' + T.gold + ';"></span>' + esc(eyebrow) + '</div>'
+            + '<div style="margin:10px 0 10px;' + T.serif + 'font-size:26px;line-height:1.18;color:' + T.navy + ';">' + esc(title) + '</div>'
+            + '<div style="' + T.sans + 'font-size:12.5px;line-height:1.65;color:' + T.inkSoft + ';max-width:640px;">' + esc(lede) + '</div></div>';
+
+        var body = bands + note;
+        return { count: count, title: title, lede: lede, eyebrow: eyebrow, body: body, header: header, html: header + body };
     }
 
     global.OneOffFullAi = {
@@ -568,6 +810,8 @@
         generateForProspect: generateForProspect,
         run: run,
         mount: mount,
+        renderShowcase: renderShowcase,
+        showcaseTitle: showcaseTitle,
         normalizeLinkedInUrl: normalizeLinkedInUrl,
         nameFromLinkedInUrl: nameFromLinkedInUrl
     };
