@@ -12549,7 +12549,12 @@ ${catSections}
                     already.push({ name: prettyName(k), company: 'linkedin.com/in/' + k });
                 } else if (convByKey.has(k)) {
                     const cv = convByKey.get(k);
-                    replied.push({ name: cv.lead_name || cv.leadName || prettyName(k), company: 'linkedin.com/in/' + k });
+                    const cvName = (cv.leadFirstName && cv.leadLastName) ? `${cv.leadFirstName} ${cv.leadLastName}` : (cv.lead_name || cv.leadName || cv.name || prettyName(k));
+                    if (cv.responseCategory === 'Scheduled') {
+                        already.push({ name: cvName, company: 'linkedin.com/in/' + k + ' (response category already Scheduled)' });
+                    } else {
+                        replied.push({ id: cv.id, isConversation: true, conversation: cv, name: cvName, company: 'linkedin.com/in/' + k + (cv.responseCategory ? ` (currently: ${cv.responseCategory})` : '') });
+                    }
                 } else {
                     extras.push({
                         id: 'url_' + k,
@@ -12565,7 +12570,7 @@ ${catSections}
                     });
                 }
             });
-            bulkScheduledMatches = [...toMark, ...extras];
+            bulkScheduledMatches = [...toMark, ...replied, ...extras];
 
             const list = (arr, fmt) => arr.length ? `<div style="max-height:110px;overflow-y:auto;font-size:0.8rem;color:#4b5563;margin:0.25rem 0 0.5rem 1rem;">${arr.map(fmt).join('<br>')}</div>` : '';
             const nm = c => escapeHtml(`${c.name || 'Unknown'}${c.company ? ' — ' + c.company : ''}`);
@@ -12577,14 +12582,78 @@ ${catSections}
                     <div style="color:#047857;">🔗 <strong>${extras.length}</strong> existing connections (not in the list) will also be marked Scheduled</div>${list(extras, nmExtra)}
                     <div style="color:#6b7280;">⏭️ <strong>${already.length}</strong> already Scheduled (skipped)</div>${list(already, nm)}
                     <div style="color:#b45309;">⚠️ <strong>${wrong.length}</strong> flagged Wrong Contact (skipped)</div>${list(wrong, nm)}
-                    <div style="color:#b45309;">💬 <strong>${replied.length}</strong> have a reply conversation (skipped, set their Response Category to Scheduled on the card instead)</div>${list(replied, nm)}
+                    <div style="color:#047857;">💬 <strong>${replied.length}</strong> replied conversations will have their Response Category set to Scheduled</div>${list(replied, nm)}
                 </div>`;
-            const total = toMark.length + extras.length;
+            const total = toMark.length + replied.length + extras.length;
             const btn = document.getElementById('bulkScheduledConfirmBtn');
             btn.disabled = total === 0;
             btn.style.opacity = total ? '1' : '0.5';
             btn.innerHTML = `<i class="fas fa-check"></i> Mark ${total} as Scheduled`;
         };
+        // Same effect as choosing "Scheduled" in a reply card's Response Category dropdown
+        // (see saveCategoryAuto), but without needing the card to be rendered.
+        async function bulkSetConversationScheduled(conversation, meetingDate) {
+            const conversationId = conversation.id;
+            const previousCategory = conversation.responseCategory || '';
+            const previousFollowUp = conversation.followUpCategory || '';
+            const updateData = { manualCategoryOverride: true, responseCategory: 'Scheduled' };
+
+            if (String(conversationId).startsWith('webhook_')) {
+                const { doc, setDoc } = window.clemailFirestore;
+                await setDoc(doc(emailDB, 'conversation_category_overrides', conversationId), {
+                    conversationId,
+                    bdrEmail: conversation.bdrEmail || accountEmail,
+                    ...updateData,
+                    updatedAt: new Date(),
+                    updatedBy: currentUserEmail
+                });
+            }
+
+            const { collection: rawCollection, docId: rawDocId } = resolveConversationDocRef(conversation);
+            const response = await fetch(`${RAILWAY_URL}/heyreach/inbox/update-conversation-category`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ conversationId: rawDocId, collection: rawCollection, ...updateData })
+            });
+            const result = await response.json();
+            if (!result.success) throw new Error(result.error || 'update-conversation-category failed');
+
+            conversation.responseCategory = 'Scheduled';
+            conversation.manualCategoryOverride = true;
+            if (conversation.followUpSequence) conversation.followUpSequence = null;
+
+            // Cost/revenue tracking (same shape as the reply flow)
+            const { addDoc, collection } = window.clemailFirestore;
+            const now = new Date();
+            await addDoc(collection(emailDB, 'activity_tracking'), {
+                activity_type: 'meeting_scheduled',
+                status_change: 'scheduled',
+                contact_name: conversation.leadFirstName && conversation.leadLastName ?
+                    `${conversation.leadFirstName} ${conversation.leadLastName}` : (conversation.name || 'Unknown'),
+                contact_first_name: conversation.leadFirstName || '',
+                contact_last_name: conversation.leadLastName || '',
+                contact_company: conversation.leadCompany || conversation.company || '',
+                contact_linkedin_url: conversation.leadProfileUrl || conversation.linkedInUrl || '',
+                bdr_email: conversation.bdrEmail || accountEmail || currentUserEmail,
+                bdr_auth_email: conversation.bdrEmail || accountEmail || currentUserEmail,
+                account_email: conversation.linkedInAccountEmail || conversation.accountEmail || '',
+                conversation_id: conversationId,
+                original_conversation_source: conversation.source || '',
+                scheduled_by: currentUserEmail,
+                scheduled_at: now,
+                meeting_scheduled_date: now,
+                ...(meetingDate ? { meeting_date_time: meetingDate } : {}),
+                created_at: now,
+                timestamp: now,
+                source: 'company_review_replies_meeting_scheduled',
+                tracking_source: 'company_review_replies.html',
+                bulk_url_upload: true,
+                customer_id: conversation.customerId || '',
+                previous_response_category: previousCategory,
+                previous_followup_category: previousFollowUp
+            });
+        }
+
         window.confirmBulkScheduled = async function() {
             const targets = bulkScheduledMatches.filter(c => !c.isScheduled);
             if (!targets.length) return;
@@ -12603,6 +12672,11 @@ ${catSections}
             for (const contact of targets) {
                 prev.innerHTML = `<div style="color:#047857;font-weight:600;">Marking ${done + 1} of ${targets.length}…</div>`;
                 try {
+                    if (contact.isConversation) {
+                        await bulkSetConversationScheduled(contact.conversation, meetingDate);
+                        done++;
+                        continue;
+                    }
                     const bdrEmailForContact = contact.bdrEmail || viewingBdrEmail || accountEmail || currentUserEmail;
                     const now = new Date();
                     let trackingDocId = '';
@@ -12658,10 +12732,12 @@ ${catSections}
                 }
             }
 
+            const convsChanged = targets.some(t => t.isConversation);
             bulkScheduledMatches = [];
             updateSelectedCount();
             updateScheduledNoReplyCount();
             renderConnectedNoReplyContacts();
+            if (convsChanged) { try { updateCategoryGrid(); applyAllFilters(); } catch (e) { console.error('⚠️ Could not refresh replies list:', e); } }
             prev.innerHTML = `<div style="padding:0.75rem 1rem;background:${failed.length ? '#fef3c7' : '#d1fae5'};border-radius:8px;">
                 <strong>✅ ${done} contact(s) marked Scheduled.</strong>
                 ${failed.length ? `<div style="color:#b91c1c;margin-top:0.5rem;">❌ ${failed.length} failed:<br>${failed.map(escapeHtml).join('<br>')}</div>` : ''}
