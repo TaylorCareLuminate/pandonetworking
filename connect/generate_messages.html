@@ -12273,8 +12273,10 @@
                 if (filled.length > 0) {
                     console.log(`💾 Wrote enriched profile to prospect_contacts [${contact.id}]: ${filled.join(', ')}`);
                 }
+                return now; // enrichedAt stamp actually persisted
             } catch (err) {
                 console.warn(`⚠️ Could not write enriched profile for ${contact.id}:`, err.message);
+                return null;
             }
         }
 
@@ -13039,7 +13041,7 @@
          * @returns {object|null}          - Raw dev_fusion profile, or null on error
          */
         async function getOrFetchProfile(linkedInUrl, logFn = () => {}, opts = {}) {
-            const { forceRefresh = false } = opts;
+            const { forceRefresh = false, maxCacheAgeDays = null } = opts;
             const key = profileCacheKey(linkedInUrl);
 
             // ── 1. Try cache lookup ─────────────────────────────────────────
@@ -13073,7 +13075,9 @@
                     logFn(`   🔄 Re-fetching — cached profile pre-dates connection-count fix`, 'dim');
                     cached = null;
 
-                } else if (forceRefresh) {
+                } else if (forceRefresh && !(maxCacheAgeDays != null && age <= maxCacheAgeDays)) {
+                    // (If the caller passed maxCacheAgeDays and the cache is younger than that,
+                    // it counts as a live-enough check — fall through to the "fresh" branch.)
                     // ── Caller requires a live re-verification (e.g. enrichment freshness
                     // check already decided this contact is stale) — ignore cache age.
                     logFn(`   🔄 Forcing live LinkedIn check (caller requested re-verification)`, 'dim');
@@ -17823,7 +17827,11 @@
                     try {
                         await ud(docFn(db, 'prospect_contacts', existing.id), updates);
                         const merged = { ...existing, ...updates };
-                        if (profile) await writeBackEnrichedProfile(merged, profile);
+                        if (profile) {
+                            const stamp = await writeBackEnrichedProfile(merged, profile);
+                            if (stamp) merged.enrichedAt = stamp;
+                            else addLog(`   ⚠️ Could not stamp enrichment on ${entry.slug} — it may be re-enriched later`, 'warning');
+                        }
                         pulled.push({ ...merged, _normUrl: entry.normUrl });
                         reused++;
                     } catch (e) {
@@ -17856,7 +17864,9 @@
                     const saved = { id: ref.id, ...newDoc, _normUrl: entry.normUrl };
                     // Fill about / experience / education / followers + stamp enrichedAt so the
                     // Full AI enrichment pre-step doesn't scrape this profile a second time.
-                    await writeBackEnrichedProfile(saved, profile);
+                    const enrichStamp = await writeBackEnrichedProfile(saved, profile);
+                    if (enrichStamp) saved.enrichedAt = enrichStamp;
+                    else addLog(`   ⚠️ Could not stamp enrichment on ${entry.slug} — it may be re-enriched later`, 'warning');
                     pulled.push(saved);
                     created++;
                     addLog(`   ✅ Added ${[firstName, lastName].filter(Boolean).join(' ') || entry.slug}` +
@@ -19324,6 +19334,19 @@
                             i
                         ])
                     );
+                    // The server re-reads prospect_contacts for the list; if the enrichedAt stamp
+                    // written during the pull isn't in what it returned, restore it from the pull
+                    // result so the enrichment pre-step doesn't re-scrape just-enriched contacts.
+                    const pulledEnrichedAt = new Map(
+                        orderedPullResult.pulled
+                            .filter(p => p.enrichedAt)
+                            .map(p => [normalizeLinkedInUrl(p._normUrl || p.linkedInUrl || p.li_url || ''), p.enrichedAt])
+                    );
+                    prospectList.forEach(p => {
+                        if (p.enrichedAt) return;
+                        const stamp = pulledEnrichedAt.get(normalizeLinkedInUrl(p.linkedInUrl || p.li_url || ''));
+                        if (stamp) p.enrichedAt = stamp;
+                    });
                     prospectList.sort((a, b) => {
                         const ia = pullOrder.get(normalizeLinkedInUrl(a.linkedInUrl || a.li_url || ''));
                         const ib = pullOrder.get(normalizeLinkedInUrl(b.linkedInUrl || b.li_url || ''));
@@ -19443,7 +19466,10 @@
                                 // own 90-day cache short-circuit so we always get a live
                                 // LinkedIn check, not a shared cache doc written by some
                                 // other page/flow that happens to be under 90 days old.
-                                enrichmentProfileData = await getOrFetchProfile(prospect.linkedInUrl, (msg) => addLog(msg), { forceRefresh: true });
+                                // maxCacheAgeDays: a profile fetched in the last 7 days (e.g. by the
+                                // pasted-URL lookup step moments ago, or another page) is already a
+                                // live LinkedIn check — don't scrape it again.
+                                enrichmentProfileData = await getOrFetchProfile(prospect.linkedInUrl, (msg) => addLog(msg), { forceRefresh: true, maxCacheAgeDays: 7 });
                                 if (enrichmentProfileData) {
                                     // Extract the freshest employer from the profile
                                     const freshEmployer = extractFreshEmployer(enrichmentProfileData);
