@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en" class="protection-hide">
 <head>
-    <!-- CACHE BUSTER v4.12.1 - SHARED POOL FIX: fetch full pending/scheduled pool (no limit) so due-today calls aren't truncated away in large campaigns like neurocast -->
+    <!-- CACHE BUSTER v4.14.0 - PHONE HYDRATION: scheduled activities missing a phone are filled from outreach_sets before the queue filter -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
@@ -2472,7 +2472,7 @@
 
     <script type="module">
         // 🔐 PAGE VERSION FOR CACHE BUSTING
-            const PAGE_VERSION = 'v2.11.0-admin-preview-dry-run';
+            const PAGE_VERSION = 'v2.12.0-outreach-phone-hydrate';
         console.log(`📄 Phone Calls Page Version: ${PAGE_VERSION}`);
         console.log('🛡️ Duplicate Call Checking: ENABLED (72-hour / 3-day cooldown)');
         console.log('🔒 Assignment System: FIXED (respects assignment expiry - prevents queue overlaps)');
@@ -3164,7 +3164,6 @@
                 startHour = 8;    // 8:00 AM Mountain Time = 10:00 AM Eastern Time
                 endHour = 15;     // 3:00 PM Mountain Time = 5:00 PM Eastern Time
                 source = 'default (Mountain Time - Conservative)';
-                console.log('📍 No timezone data for contact, using default Mountain Time (8 AM - 3 PM MT = 10 AM - 5 PM ET)');
             }
             
             // Get current time in that timezone
@@ -5118,6 +5117,112 @@
             }
         }
 
+        function outreachPhoneRaw(os) {
+            if (!os) return '';
+            const cf = os.customFields || {};
+            return os.phone || os.phoneNumber || os.workphone || os.workPhone ||
+                cf.phone || cf.phoneNumber || cf.workphone || cf.workPhone || '';
+        }
+
+        function mergeOutreachPhone(activity, os) {
+            if (!activity || !os || window.CallFiltering?.hasUsablePhone(activity)) return false;
+            const raw = outreachPhoneRaw(os);
+            if (!window.CallFiltering?.normalizePhone10(raw)) return false;
+            activity.phoneNumber = raw;
+            activity.phone = raw;
+            const cf = os.customFields || {};
+            if (!activity.phone2) activity.phone2 = os.phone2 || cf.phone2 || '';
+            if (!activity.phone3) activity.phone3 = os.phone3 || cf.phone3 || '';
+            if (!activity.contactState) {
+                activity.contactState = os.contactState || os.contact_state || os.state || cf.contact_state || cf.state || '';
+            }
+            return true;
+        }
+
+        async function loadOutreachPhonesForActivities(snapshots) {
+            const byId = new Map();
+            const needIds = new Set();
+            (snapshots || []).forEach((snap) => {
+                snap?.docs?.forEach((docSnap) => {
+                    const data = docSnap.data();
+                    if (window.CallFiltering?.hasUsablePhone({ id: docSnap.id, ...data })) return;
+                    if (data.outreachSetId) needIds.add(data.outreachSetId);
+                });
+            });
+            if (!needIds.size || !selectedCampaign) {
+                console.log(`📞 Outreach phone lookup skipped (${needIds.size} blank-phone activities)`);
+                return byId;
+            }
+
+            const keep = (docSnap) => {
+                if (!needIds.has(docSnap.id) || byId.has(docSnap.id)) return;
+                byId.set(docSnap.id, docSnap.data());
+            };
+
+            try {
+                const campaignSnap = await getDocs(query(
+                    collection(db, 'outreach_sets'),
+                    where('campaignId', '==', selectedCampaign)
+                ));
+                campaignSnap.forEach(keep);
+                console.log(`📞 Outreach phone lookup by campaignId: ${campaignSnap.size} sets, ${byId.size} match blank-phone activities`);
+            } catch (err) {
+                console.warn('Outreach phone lookup by campaignId failed:', err);
+            }
+
+            if (byId.size === 0) {
+                const campaign = availableCampaigns.find(c => c.id === selectedCampaign);
+                if (campaign?.customerId) {
+                    try {
+                        const customerSnap = await getDocs(query(
+                            collection(db, 'outreach_sets'),
+                            where('customerId', '==', campaign.customerId)
+                        ));
+                        customerSnap.forEach((docSnap) => {
+                            const data = docSnap.data();
+                            if (data.campaignId && data.campaignId !== selectedCampaign) return;
+                            keep(docSnap);
+                        });
+                        console.log(`📞 Outreach phone lookup by customerId: ${customerSnap.size} sets, ${byId.size} match`);
+                    } catch (err) {
+                        console.warn('Outreach phone lookup by customerId failed:', err);
+                    }
+                }
+            }
+
+            const stillMissing = [...needIds].filter((id) => !byId.has(id));
+            const chunkCap = 200;
+            const toChunk = stillMissing.slice(0, chunkCap);
+            for (let i = 0; i < toChunk.length; i += 10) {
+                const batch = toChunk.slice(i, i + 10);
+                try {
+                    const snap = await getDocs(query(
+                        collection(db, 'outreach_sets'),
+                        where('__name__', 'in', batch)
+                    ));
+                    snap.forEach(keep);
+                } catch (err) {
+                    console.warn('Outreach phone id batch failed:', err);
+                    break;
+                }
+            }
+            if (stillMissing.length > chunkCap) {
+                console.warn(`📞 Outreach phone id lookup capped at ${chunkCap} of ${stillMissing.length} missing ids`);
+            }
+
+            let withPhone = 0;
+            const sampleKeys = [];
+            byId.forEach((data) => {
+                if (window.CallFiltering?.normalizePhone10(outreachPhoneRaw(data))) withPhone++;
+                else if (sampleKeys.length < 3) sampleKeys.push(Object.keys(data).slice(0, 20));
+            });
+            console.log(`📞 Outreach phones ready: ${withPhone} of ${byId.size} matched sets have a dialable number (${needIds.size} activities needed one)`);
+            if (byId.size && !withPhone) {
+                console.log('📞 Sample outreach set fields (no dialable phone on the usual fields):', sampleKeys);
+            }
+            return byId;
+        }
+
         async function loadCalls() {
             console.log('🎯 loadCalls function called, selectedCampaign:', selectedCampaign);
             
@@ -5167,8 +5272,9 @@
                     // (requires a Firestore composite index), so results come back unordered. A
                     // limit() would grab an ARBITRARY slice that can miss the "due today" calls in
                     // large campaigns (e.g. neurocast) - causing an empty queue after the
-                    // future-scheduled filter. We fetch the full pool and filter client-side,
-                    // exactly like the diagnosticQuery below already does for this same campaign.
+                    // future-scheduled filter. Fetch the pending/scheduled pool only — not the
+                    // campaign's full history. A history scan on large campaigns (OutcomeMD)
+                    // runs in parallel with these reads and resets the API connection.
                     phoneActivitiesQuery = query(
                         collection(db, 'phone_activities'),
                         where('campaignId', '==', selectedCampaign),
@@ -5303,13 +5409,7 @@
                     console.log(`✅ Found ${additionalCalls.length} overdue/unassigned calls available to all agents`);
                 }
                 
-                console.log('⚡ Executing all queries in parallel...');
-                
-                // Build all query references first
-                const diagnosticQuery = query(
-                    collection(db, 'phone_activities'),
-                    where('campaignId', '==', selectedCampaign)
-                );
+                console.log('⚡ Executing queue queries in parallel...');
                 
                 const callbackQuery = query(
                     collection(db, 'phone_activities'),
@@ -5347,29 +5447,57 @@
                 // REMOVED: outreachSetsQuery - no longer pulling from outreach_sets
                 // All timezone/state/alternate phone data is now in phone_activities (written by rescheduler)
                 
-                // Execute all independent queries in parallel (6 queries - reduced from 9!)
-                const [
-                    diagnosticSnapshot,
-                    initialQuerySnapshot, 
-                    callbackSnapshot, 
-                    completedRecentSnapshot, 
-                    historicalSnapshot,
+                // Pending pool, callbacks, 72h cooldown, and flags. The old sixth read
+                // downloaded every phone_activity for the campaign (no status filter)
+                // and the cooldown query was issued twice. On large campaigns that
+                // burst reset the Railway connection (ERR_INTERNET_DISCONNECTED) and
+                // loadCalls died before a queue was built.
+                async function fetchQueueSnapshots() {
+                    const [
+                        initialQuerySnapshot,
+                        callbackSnapshot,
+                        completedRecentSnapshot,
+                        flaggedSnapshot
+                    ] = await Promise.all([
+                        getDocs(phoneActivitiesQuery),
+                        getDocs(callbackQuery),
+                        getDocs(completedRecentQuery),
+                        getDocs(flaggedQuery)
+                    ]);
+                    return { initialQuerySnapshot, callbackSnapshot, completedRecentSnapshot, flaggedSnapshot };
+                }
+
+                let queueSnapshots = null;
+                let queueLoadError = null;
+                for (let attempt = 1; attempt <= 2; attempt++) {
+                    try {
+                        queueSnapshots = await fetchQueueSnapshots();
+                        queueLoadError = null;
+                        break;
+                    } catch (err) {
+                        queueLoadError = err;
+                        const retryable = err instanceof TypeError || /failed to fetch|network|internet/i.test(String(err && err.message || ''));
+                        if (!retryable || attempt === 2) break;
+                        console.warn(`⚠️ Queue load failed (attempt ${attempt}/2), retrying…`, err.message);
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                }
+                if (queueLoadError) throw queueLoadError;
+
+                const {
+                    initialQuerySnapshot,
+                    callbackSnapshot,
+                    completedRecentSnapshot,
                     flaggedSnapshot
-                ] = await Promise.all([
-                    getDocs(diagnosticQuery),
-                    getDocs(phoneActivitiesQuery),
-                    getDocs(callbackQuery),
-                    getDocs(completedRecentQuery),
-                    getDocs(completedRecentQuery), // historicalSnapshot is same query
-                    getDocs(flaggedQuery)
-                ]);
+                } = queueSnapshots;
+                // Bad-number window below used to re-fetch this same 72h query.
+                const historicalSnapshot = completedRecentSnapshot;
                 
                 // Use let so we can reassign if we need to reload after auto-marking bad numbers
                 let querySnapshot = initialQuerySnapshot;
                 
                 const queryEndTime = performance.now();
-                console.log(`⚡ All queries completed in ${(queryEndTime - queryStartTime).toFixed(0)}ms`);
-                console.log(`✅ Diagnostic: ${diagnosticSnapshot.docs.length} total activities`);
+                console.log(`⚡ Queue queries completed in ${(queryEndTime - queryStartTime).toFixed(0)}ms`);
                 console.log(`✅ Main query: ${querySnapshot.docs.length} assigned/pending activities`);
                 console.log(`✅ Callbacks: ${callbackSnapshot.docs.length} callback activities`);
                 console.log(`✅ Completed activities: ${completedRecentSnapshot.docs.length} completed activities`);
@@ -5384,77 +5512,8 @@
                 }
                 
                 console.log(`✅ Flagged contacts: ${flaggedSnapshot.docs.length} active flags`);
-                console.log(`📍 SINGLE SOURCE OF TRUTH: Using phone_activities directly (no outreach_sets enrichment)`);
-                
-                // 🔍 DIAGNOSTIC: Process activity status breakdown
-                console.log('🔍 DIAGNOSTIC: Processing activity status breakdown...');
-                try {
-                    const statusCounts = {};
-                    const sampleActivities = [];
-                    
-                    // Track completion times to detect mass updates
-                    const completionTimes = {};
-                    const completionsByUser = {};
-                    
-                    diagnosticSnapshot.docs.forEach((doc) => {
-                        const data = doc.data();
-                        const status = data.status || 'no-status';
-                        statusCounts[status] = (statusCounts[status] || 0) + 1;
-                        
-                        // Track completion times and users for completed activities
-                        if (status === 'completed' && data.completedAt) {
-                            const timestamp = data.completedAt;
-                            completionTimes[timestamp] = (completionTimes[timestamp] || 0) + 1;
-                            
-                            const user = data.completedBy || 'unknown';
-                            if (!completionsByUser[user]) completionsByUser[user] = {};
-                            completionsByUser[user][timestamp] = (completionsByUser[user][timestamp] || 0) + 1;
-                        }
-                        
-                        // Collect first 3 activities of each status as samples
-                        if (!sampleActivities[status]) sampleActivities[status] = [];
-                        if (sampleActivities[status].length < 10) {  // Increased from 3 to 10
-                            sampleActivities[status].push({
-                                id: doc.id,
-                                contactName: data.contactName,
-                                status: data.status,
-                                outcome: data.outcome,
-                                completedAt: data.completedAt,
-                                completedBy: data.completedBy,
-                                autoCompletedReason: data.autoCompletedReason,
-                                notes: data.notes?.substring(0, 100)
-                            });
-                        }
-                    });
-                    
-                    console.log(`📊 DIAGNOSTIC: Total activities for campaign: ${diagnosticSnapshot.docs.length}`);
-                    console.log(`📊 DIAGNOSTIC: Status breakdown:`, statusCounts);
-                    console.log(`📊 DIAGNOSTIC: Sample activities by status:`, sampleActivities);
-                    
-                    // Show completion time analysis
-                    console.log(`⏰ DIAGNOSTIC: Completion timestamps (showing mass updates):`, completionTimes);
-                    console.log(`👤 DIAGNOSTIC: Completions by user:`, completionsByUser);
-                    
-                    // Special check for mass completion
-                    if (statusCounts['completed'] > 50 && statusCounts['pending'] === 0) {
-                        console.warn('⚠️ DIAGNOSTIC: ALL ACTIVITIES ARE COMPLETED! This may indicate a mass update occurred.');
-                        console.warn('⚠️ Check samples above for autoCompletedReason and completedBy to identify what happened.');
-                        
-                        // Find the timestamps with the most completions
-                        const sortedTimes = Object.entries(completionTimes)
-                            .sort((a, b) => b[1] - a[1])
-                            .slice(0, 5);
-                        
-                        console.warn('🔥 DIAGNOSTIC: Top 5 mass completion events:');
-                        sortedTimes.forEach(([timestamp, count]) => {
-                            const date = new Date(timestamp);
-                            const mountainTime = date.toLocaleString('en-US', { timeZone: 'America/Denver' });
-                            console.warn(`   ${count} activities at ${mountainTime} Mountain Time (${timestamp})`);
-                        });
-                    }
-                } catch (diagError) {
-                    console.error('❌ Diagnostic processing failed:', diagError);
-                }
+                console.log(`📍 Activities loaded; filling missing phones from outreach sets before filtering`);
+                const outreachPhones = await loadOutreachPhonesForActivities([callbackSnapshot, querySnapshot]);
                 
                 callQueue = [];
                 let dueCallbacks = [];
@@ -5472,6 +5531,7 @@
                 callbackSnapshot.docs.forEach((doc) => {
                     const data = doc.data();
                     const activity = { id: doc.id, ...data };
+                    mergeOutreachPhone(activity, outreachPhones.get(data.outreachSetId));
                     
                     // NO-PHONE PREVENTION: a callback to a contact with no usable phone is not
                     // callable, so it must never be queued/prioritized.
@@ -6057,7 +6117,10 @@
                 // Combine assigned calls with overdue/unassigned calls
                 const allCallsToProcess = [];
                 querySnapshot.docs.forEach((doc) => {
-                    allCallsToProcess.push({ id: doc.id, ...doc.data() });
+                    const data = doc.data();
+                    const activity = { id: doc.id, ...data };
+                    mergeOutreachPhone(activity, outreachPhones.get(data.outreachSetId));
+                    allCallsToProcess.push(activity);
                 });
                 // Add overdue/unassigned calls (if any)
                 if (additionalCalls.length > 0) {
@@ -9443,7 +9506,6 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 }
             }
             
-            console.log(`📞 Original: "${phoneNumber}" -> Cleaned: "${cleanNumber}"`);
             return cleanNumber;
         }
 
@@ -12176,8 +12238,12 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
                 const startOfTodayISO = startOfToday.toISOString();
                 
-                // Load completed calls from today
-                const trackingSnapshot = await getDocs(collection(db, 'campaign_call_tracking'));
+                // Today's rows only. A full collection read is ~17k docs and was
+                // resetting the API connection while a campaign queue was loading.
+                const trackingSnapshot = await getDocs(query(
+                    collection(db, 'campaign_call_tracking'),
+                    where('timestamp', '>=', startOfTodayISO)
+                ));
                 
                 // Group by agent
                 const agentStats = {};
@@ -12285,8 +12351,10 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 endOfWeek.setDate(startOfWeek.getDate() + 6); // Saturday
                 endOfWeek.setHours(23, 59, 59, 999);
                 
-                // Query campaign_call_tracking for scheduled meetings this week
-                const trackingSnapshot = await getDocs(collection(db, 'campaign_call_tracking'));
+                const trackingSnapshot = await getDocs(query(
+                    collection(db, 'campaign_call_tracking'),
+                    where('timestamp', '>=', startOfWeek.toISOString())
+                ));
                 
                 let scheduledCount = 0;
                 trackingSnapshot.docs.forEach((doc) => {
