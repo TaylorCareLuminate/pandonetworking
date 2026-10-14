@@ -1627,6 +1627,15 @@
                         <button type="button" id="btnBulkModeAi" class="btn btn-secondary" style="font-size:0.8rem;padding:0.35rem 0.8rem;"><i class="fas fa-wand-magic-sparkles"></i> AI edit</button>
                         <button type="button" id="btnBulkModeHyp" class="btn btn-secondary" style="font-size:0.8rem;padding:0.35rem 0.8rem;" title="Re-run the Opus review under a different hypothesis group / variation, optimize the variation mix, and save the tags to Firebase"><i class="fas fa-flask"></i> Hypothesis review &amp; optimize</button>
                     </div>
+                    <div style="display:flex;align-items:center;gap:0.5rem;margin:0 0 0.6rem;">
+                        <label for="bulkCampaignType" style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:#6b7280;">Campaign to edit</label>
+                        <select id="bulkCampaignType" style="padding:0.35rem 0.6rem;border:1.5px solid #e2e8f0;border-radius:8px;font-size:0.86rem;font-family:inherit;" title="Limits every bulk tool below (find &amp; replace, AI edit, hypothesis review) to messages in one kind of HeyReach campaign">
+                            <option value="">All campaigns</option>
+                            <option value="connect">Connect</option>
+                            <option value="message">Messages</option>
+                            <option value="quick_message">Quick Messages</option>
+                        </select>
+                    </div>
                     <div id="bulkTruthNote" style="font-size:0.82rem;margin:-0.25rem 0 0.75rem;max-width:62rem;"></div>
                     <div id="bulkFrSection">
                     <p style="font-size:0.82rem;color:#64748b;margin:0 0 0.65rem;max-width:60rem;">
@@ -4956,7 +4965,33 @@
                     if (!resp.ok || !j.success) throw new Error((j && j.error) || `HTTP ${resp.status}`);
                     const urls = new Set();
                     (j.leads || []).forEach(l => { if (!l._excluded && l.url) urls.add(canonicalLinkedInUrl(l.url)); });
-                    _inProcessTruth = { email, urls, pending: j.pending != null ? j.pending : urls.size, listed: urls.size, diagnostics: j.diagnostics || {}, at: Date.now() };
+
+                    // The in-process list is built from connect_queue (not from this page's activity history), so fetch the
+                    // queue records for those leads directly — same query the backend runs (account_email, up to 5000 per
+                    // address, pushed_to_heyreach) — instead of relying on the Time Range / "sent" classification above.
+                    const docs = new Map(); // canonical url -> { id, data, ms }
+                    const msOf = v => {
+                        if (!v) return 0;
+                        if (typeof v.toMillis === 'function') return v.toMillis();
+                        if (typeof v.seconds === 'number') return v.seconds * 1000;
+                        const t = Date.parse(String(v)); return isNaN(t) ? 0 : t;
+                    };
+                    try {
+                        const variants = emailCaseVariants(email, linkedInEmailAssociations.get(email) || '');
+                        const snaps = await Promise.all(variants.map(e => getDocs(query(collection(emailDB, 'connect_queue'), where('account_email', '==', e), limit(5000)))
+                            .catch(err => { console.warn('[InProcessTruth] connect_queue query failed for', e, err.message || err); return EMPTY_SNAP; })));
+                        snaps.forEach(snap => snap.forEach(d => {
+                            const data = d.data();
+                            if (!data.pushed_to_heyreach) return;
+                            const k = canonicalLinkedInUrl(data.prospect_li_url || data.contact_linkedin_url || data.linkedin_url || '');
+                            if (!k || !urls.has(k)) return;
+                            const ms = msOf(data.heyreach_push_date || data.pushed_date || data.uploaded_date || data.created_at);
+                            const prev = docs.get(k);
+                            if (!prev || ms > prev.ms) docs.set(k, { id: d.id, data, ms });
+                        }));
+                    } catch (err) { console.warn('[InProcessTruth] could not load queue records:', err.message || err); }
+
+                    _inProcessTruth = { email, urls, docs, synth: new Map(), pending: j.pending != null ? j.pending : urls.size, listed: urls.size, diagnostics: j.diagnostics || {}, at: Date.now() };
                     _inProcessTruthError = '';
                     return _inProcessTruth;
                 } catch (e) {
@@ -4978,42 +5013,163 @@
         function bulkQueuedBase(inclUnresolved) {
             return allSentItems.filter(i => (i.isHeyReachQueued || (inclUnresolved && i.isUnresolved)) && i.queueDocId && (i.sentItem.message || '').trim());
         }
+        // Which kind of HeyReach campaign a queued message belongs to: 'connect' | 'message' | 'quick_message'.
+        // Uses the campaign type registered on the BDR record (same source the sync code uses), falling back to
+        // the queue record's own routing fields when the campaign id isn't registered.
+        function bulkCampaignTypeOf(item) {
+            const bdrInfo = bdrLeaders.find(b => (b.primaryEmail || '').toLowerCase() === currentViewedBdrEmail());
+            const campaigns = (bdrInfo && Array.isArray(bdrInfo.heyreachCampaigns)) ? bdrInfo.heyreachCampaigns : [];
+            const camp = item.queueCampaignId ? campaigns.find(c => String(c.id || c.campaignId || '') === String(item.queueCampaignId)) : null;
+            if (camp) {
+                const t = String(camp.type || '').toLowerCase();
+                const n = String(camp.name || '').toLowerCase();
+                if (t === 'quick_message' || (n.includes('quick') && n.includes('message')) || n.includes('quick_message')) return 'quick_message';
+                if (t === 'message') return 'message';
+                return 'connect';
+            }
+            if (item.queueRoutedVia === 'quick_message_campaign') return 'quick_message';
+            if (item.queueMessageType === 'message' || item.type === 'message') return 'message';
+            return 'connect';
+        }
+        const BULK_CAMPAIGN_LABELS = { connect: 'Connect', message: 'Messages', quick_message: 'Quick Messages' };
+        function bulkCampaignFilter() { return document.getElementById('bulkCampaignType')?.value || ''; }
+
+        // Editable messages narrowed to the campaign type picked at the top of the bulk panel (all tools use this).
         function bulkEditableQueued(inclUnresolvedOverride) {
+            const all = bulkEditableQueuedAll(inclUnresolvedOverride);
+            const f = bulkCampaignFilter();
+            return f ? all.filter(i => bulkCampaignTypeOf(i) === f) : all;
+        }
+        function bulkEditableQueuedAll(inclUnresolvedOverride) {
             const inclUnresolved = inclUnresolvedOverride !== undefined
                 ? !!inclUnresolvedOverride
                 : !!document.getElementById('bulkIncludeUnresolved')?.checked;
             const truth = inProcessTruthForViewer();
+            if (truth) return bulkTruthItems(truth);
             const seen = new Set();
             return bulkQueuedBase(inclUnresolved).filter(i => {
                 if (seen.has(i.queueDocId)) return false;
-                if (truth) {
-                    const k = canonicalLinkedInUrl(i.queueLiUrl || i.contact.profileUrl || '');
-                    if (!k || !truth.urls.has(k)) return false;
-                }
                 seen.add(i.queueDocId);
                 return true;
             });
         }
 
+        // Editable set when the live HeyReach check is available: one item per lead HeyReach really has in queue,
+        // resolved from its connect_queue record. Uses the page's own item when it has one (so saved edits show up in
+        // the tables); otherwise builds a stand-in item from the queue record, so leads that this page's Time Range /
+        // webhook "sent" history would have hidden are still editable.
+        function bulkTruthItems(truth) {
+            const pageItems = new Map();
+            allSentItems.forEach(i => {
+                if (!i.queueDocId || !(i.sentItem.message || '').trim()) return;
+                const k = canonicalLinkedInUrl(i.queueLiUrl || i.contact.profileUrl || '');
+                if (!k) return;
+                const cur = pageItems.get(k);
+                // Prefer an item the page itself still shows as queued/unresolved
+                if (!cur || ((i.isHeyReachQueued || i.isUnresolved) && !(cur.isHeyReachQueued || cur.isUnresolved))) pageItems.set(k, i);
+            });
+            const out = [], seen = new Set();
+            truth.docs.forEach((rec, k) => {
+                let item = pageItems.get(k);
+                if (item && !(item.isHeyReachQueued || item.isUnresolved) ) item = null; // page thinks it was sent — use the queue record
+                if (!item) {
+                    item = truth.synth.get(rec.id);
+                    if (!item) {
+                        const d = rec.data;
+                        const message = extractHeyReachContent(d);
+                        if (!message || !message.trim()) return;
+                        const first = (d.contact_first_name || d.contactFirstName || d.prospect_first_name || '').trim();
+                        const last = (d.contact_last_name || d.contactLastName || d.prospect_last_name || '').trim();
+                        const mt = String(d.message_type || '').toLowerCase();
+                        item = {
+                            synthetic: true,
+                            type: mt === 'message' ? 'message' : 'connection',
+                            isHeyReachQueued: true, isUnresolved: false, isHeyReachSent: false, isHeyReachFailed: false,
+                            contact: {
+                                contactName: [first, last].filter(Boolean).join(' ') || d.prospect_name || d.contact_name || d.full_name || '',
+                                profileUrl: k,
+                                contactCompany: (d.prospect_company || d.contactCompany || d.company || d.company_name || '').trim(),
+                                contactTitle: (d.prospect_title || d.contactTitle || d.title || d.position || '').trim()
+                            },
+                            sentItem: { id: 'queue_' + rec.id, message },
+                            queueDocId: rec.id,
+                            queueCampaignId: d.heyreach_campaign_id || d.campaign_id || d.campaignId || d.routed_campaign_id || null,
+                            queueAccountId: d.heyreach_account_id || d.accountId || null,
+                            queueMessageType: mt,
+                            queueRoutedVia: d.routed_via || '',
+                            queueLiUrl: d.prospect_li_url || d.contact_linkedin_url || d.linkedin_url || '',
+                            queueFirstName: first,
+                            queueLastName: last,
+                            queueHypGroupId: d.hypothesisGroupId || '',
+                            queueHypGroupName: d.hypothesisGroupName || '',
+                            queueHypVariationId: d.hypothesisVariationId || '',
+                            queueHypVariationLabel: d.hypothesisVariationLabel || ''
+                        };
+                        truth.synth.set(rec.id, item);
+                    }
+                }
+                if (seen.has(item.queueDocId)) return;
+                seen.add(item.queueDocId);
+                out.push(item);
+            });
+            return out;
+        }
+        // Items still tracked by the page, or stand-ins built from the live queue check.
+        function bulkItemIsCurrent(item) { return !!item && (item.synthetic === true || allSentItems.includes(item)); }
+
         // Status line at the top of the bulk panel explaining what the bulk tools will (and won't) touch.
+        // Shows how many editable messages each campaign type has, right in the selector.
+        function bulkCampaignRefreshOptions() {
+            const sel = document.getElementById('bulkCampaignType');
+            if (!sel) return;
+            const all = bulkEditableQueuedAll();
+            const counts = { connect: 0, message: 0, quick_message: 0 };
+            all.forEach(i => { counts[bulkCampaignTypeOf(i)]++; });
+            [...sel.options].forEach(o => {
+                o.textContent = o.value ? `${BULK_CAMPAIGN_LABELS[o.value]} (${counts[o.value].toLocaleString()})` : `All campaigns (${all.length.toLocaleString()})`;
+            });
+        }
+        (function () {
+            const sel = document.getElementById('bulkCampaignType');
+            if (sel) sel.addEventListener('change', () => {
+                if ((_bulkAiProposals.length || _bulkHypProposals.length) && !_bulkBusy) {
+                    showDeleteToast('Campaign filter changed — proposed edits already on screen are unchanged; re-run to cover the new selection.', false);
+                }
+                bulkSchedulePreview();
+            });
+        })();
         function bulkTruthRender() {
+            bulkCampaignRefreshOptions();
             const el = document.getElementById('bulkTruthNote');
             if (!el) return;
             const email = currentViewedBdrEmail();
             const truth = inProcessTruthForViewer();
             const recheck = ' <a href="#" id="bulkTruthRecheck">Re-check</a>';
+            ['bulkIncludeUnresolved', 'bulkAiIncludeUnresolved', 'bulkHypIncludeUnresolved'].forEach(id => {
+                const cb = document.getElementById(id); const lab = cb && (cb.closest('label') || cb.parentElement);
+                if (lab) lab.style.display = '';
+            });
             if (_inProcessTruthPromise && _inProcessTruthPromise.email === email) {
                 el.style.color = '#92400e';
                 el.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Checking which messages are really still in HeyReach\'s queue (already-sent leads are being left out)…';
             } else if (truth) {
-                const base = bulkQueuedBase(!!document.getElementById('bulkIncludeUnresolved')?.checked);
-                const uniq = new Set(base.map(i => i.queueDocId)).size;
-                const editable = bulkEditableQueued().length;
-                const left = uniq - editable;
-                el.style.color = '#065f46';
-                el.innerHTML = `<i class="fas fa-circle-check"></i> Live check: HeyReach has <strong>${Number(truth.pending).toLocaleString()}</strong> leads in queue; <strong>${editable.toLocaleString()}</strong> of them match a message here and can be edited.` +
-                    (left > 0 ? ` ${left.toLocaleString()} other message${left !== 1 ? 's' : ''} listed as queued/unresolved on this page are <strong>not</strong> in HeyReach's queue (already sent, failed, or dropped) and are excluded from every bulk tool.` : '') +
-                    (truth.pending > truth.listed ? ` (${(truth.pending - truth.listed).toLocaleString()} HeyReach leads can't be matched to a message here.)` : '') + recheck;
+                const editable = bulkEditableQueuedAll().length;
+                const base = bulkQueuedBase(true);
+                const stale = new Set(base.filter(i => !truth.urls.has(canonicalLinkedInUrl(i.queueLiUrl || i.contact.profileUrl || ''))).map(i => i.queueDocId)).size;
+                const noRecord = Math.max(0, truth.listed - editable);
+                const hidden = Math.max(0, truth.pending - truth.listed);
+                const notEditable = Math.max(0, truth.pending - editable);
+                el.style.color = notEditable > 0 ? '#92400e' : '#065f46';
+                el.innerHTML = `<i class="fas fa-circle-check"></i> Live check: HeyReach has <strong>${Number(truth.pending).toLocaleString()}</strong> leads in queue; <strong>${editable.toLocaleString()}</strong> can be edited here.` +
+                    (notEditable > 0 ? ` The other ${notEditable.toLocaleString()} can't be edited: ` +
+                        [hidden > 0 ? `${hidden.toLocaleString()} sit in HeyReach's "not started" pool, which HeyReach doesn't let us list by name` : '',
+                         noRecord > 0 ? `${noRecord.toLocaleString()} have no usable message record in the queue` : ''].filter(Boolean).join(' and ') + '.' : '') +
+                    (stale > 0 ? ` ${stale.toLocaleString()} message${stale !== 1 ? 's' : ''} this page lists as queued/unresolved are <strong>not</strong> in HeyReach's queue any more and are excluded.` : '') + recheck;
+                // With the live check on, it alone decides what is editable, so the "include Unresolved" switches no longer apply
+                ['bulkIncludeUnresolved', 'bulkAiIncludeUnresolved', 'bulkHypIncludeUnresolved'].forEach(id => {
+                    const cb = document.getElementById(id); const lab = cb && (cb.closest('label') || cb.parentElement);
+                    if (lab) lab.style.display = 'none';
+                });
             } else if (_inProcessTruthError) {
                 el.style.color = '#b91c1c';
                 el.innerHTML = `<i class="fas fa-triangle-exclamation"></i> Couldn't verify against HeyReach (${escapeHtml(_inProcessTruthError)}). The counts below include messages that may already have been sent.` + recheck;
@@ -5990,6 +6146,7 @@
             let cleaned = String(raw).trim();
             const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
             if (fence) cleaned = fence[1].trim();
+            const fullText = cleaned;
             const start = cleaned.indexOf('[');
             if (start !== -1) {
                 let depth = 0, end = -1, inStr = false, esc = false;
@@ -6003,7 +6160,18 @@
                 if (end !== -1) cleaned = cleaned.slice(start, end + 1);
             }
             try { const parsed = JSON.parse(cleaned); return Array.isArray(parsed) ? parsed : []; }
-            catch (e) { console.warn('[BulkAI] Could not parse model JSON:', cleaned.slice(0, 300)); return []; }
+            catch (e) {
+                // Truncated output (model hit its token limit) or a stray unescaped character: keep every
+                // complete {"id":…,"editedMessage":…} object we can find instead of throwing the whole batch away.
+                const salvaged = [];
+                const re = /\{\s*"id"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"(?:editedMessage|improvedMessage|message|text)"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+                let m;
+                while ((m = re.exec(fullText))) {
+                    try { salvaged.push({ id: JSON.parse('"' + m[1] + '"'), editedMessage: JSON.parse('"' + m[2] + '"') }); } catch (e2) { /* skip this one */ }
+                }
+                console.warn(`[BulkAI] Model JSON was not valid; salvaged ${salvaged.length} complete edit(s). Start of output:`, cleaned.slice(0, 200));
+                return salvaged;
+            }
         }
 
         // One batch → one /api/ai-profile-eval (OpenRouter proxy) call, with retries on timeouts / 429 / 502.
@@ -6035,13 +6203,13 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                 if (_bulkAiAbort) throw new Error('Stopped');
                 if (attempt > 0) await hrSleep(4000);
                 const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), 150000);
+                const timer = setTimeout(() => controller.abort(), 120000);
                 try {
                     const headers = { 'Content-Type': 'application/json' };
                     if (token) headers['Authorization'] = `Bearer ${token}`;
                     const resp = await fetch(`${BACKEND_API_URL}/api/ai-profile-eval`, {
                         method: 'POST', headers, signal: controller.signal,
-                        body: JSON.stringify({ provider: 'openrouter', model, prompt, temperature: 0.2, max_tokens: 6000, lowReasoning: true })
+                        body: JSON.stringify({ provider: 'openrouter', model, prompt, temperature: 0.2, max_tokens: 8000, lowReasoning: true })
                     });
                     clearTimeout(timer);
                     if (!resp.ok) throw new Error(`API error ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
@@ -6053,7 +6221,9 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                 } catch (err) {
                     clearTimeout(timer);
                     lastErr = err.name === 'AbortError' ? new Error(`Timed out waiting for ${model} — try a faster model or a smaller "Only first N" run.`) : err;
-                    const retryable = err.name === 'AbortError' || err.message === 'Failed to fetch' || /\b(429|502|503|504)\b/.test(err.message);
+                    // A timeout is NOT retried here (that would just wait another 2 minutes on the same oversized batch):
+                    // the caller splits the batch into smaller ones instead.
+                    const retryable = err.message === 'Failed to fetch' || /\b(429|502|503|504)\b/.test(err.message);
                     if (attempt < MAX_RETRIES && retryable) continue;
                     throw lastErr;
                 }
@@ -6084,7 +6254,7 @@ Return ONLY a JSON array with exactly one object per input message, in this form
             document.getElementById('btnBulkAiStop').style.display = 'inline-flex';
             try { localStorage.setItem(BULK_AI_MODEL_LS_KEY, model); } catch (e) { /* ignore */ }
 
-            const batchSize = bulkAiIsHiddenReasoningModel(model) ? 4 : 8;
+            const batchSize = (bulkAiIsHiddenReasoningModel(model) || /opus/i.test(model)) ? 4 : 8; // slow models get smaller batches
             const batches = [];
             for (let i = 0; i < items.length; i += batchSize) {
                 batches.push(items.slice(i, i + batchSize).map((item, j) => ({ id: 'm' + (i + j), idx: i + j, item })));
@@ -6093,7 +6263,10 @@ Return ONLY a JSON array with exactly one object per input message, in this form
             let processed = 0, failedBatches = 0, unchanged = 0, missing = 0, lastErr = '';
             bulkAiSetSummary(`Asking ${model}… 0 / ${items.length}`);
 
-            await bulkPool(batches, 3, async batch => {
+            // Runs one batch. If the model times out or returns unusable output, the batch is split in half and each half
+            // is retried (down to single messages), and messages the model skipped are re-asked once — so a slow or
+            // truncated response costs a few extra calls instead of losing the whole batch.
+            const runBatch = async (batch, depth = 0) => {
                 if (_bulkAiAbort) return;
                 try {
                     const payload = batch.map(b => ({
@@ -6104,7 +6277,20 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                         maxChars: getEditCharLimit(b.item),
                         message: b.item.sentItem.message
                     }));
-                    const results = await bulkAiCallModel(payload, instructions, model);
+                    let results;
+                    try {
+                        results = await bulkAiCallModel(payload, instructions, model);
+                    } catch (err) {
+                        if (err.message === 'Stopped') throw err;
+                        if (batch.length > 1) {
+                            console.warn(`[BulkAI] batch of ${batch.length} failed (${err.message}) — splitting and retrying`);
+                            const mid = Math.ceil(batch.length / 2);
+                            await runBatch(batch.slice(0, mid), depth);
+                            await runBatch(batch.slice(mid), depth);
+                            return;
+                        }
+                        throw err;
+                    }
                     const seen = new Set();
                     results.forEach((r, ri) => {
                         let target = r && r.id != null ? batch.find(b => b.id === String(r.id)) : null;
@@ -6119,13 +6305,20 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                         const limit = getEditCharLimit(target.item);
                         found.set(target.idx, { id: target.id, item: target.item, oldMessage: old, newMessage: nw, limit, include: nw.length <= limit });
                     });
-                    missing += batch.filter(b => !seen.has(b.id)).length;
+                    const absent = batch.filter(b => !seen.has(b.id));
+                    if (absent.length && depth < 1 && absent.length < batch.length) {
+                        processed += batch.length - absent.length;
+                        await runBatch(absent, depth + 1); // the model dropped some — ask again for just those
+                        return;
+                    }
+                    missing += absent.length;
                 } catch (err) {
                     if (err.message !== 'Stopped') { failedBatches++; lastErr = err.message || String(err); console.warn('[BulkAI] batch failed:', lastErr); }
                 }
                 processed += batch.length;
                 bulkAiSetSummary(`Asking ${model}… ${Math.min(processed, items.length)} / ${items.length} — ${found.size} edit${found.size !== 1 ? 's' : ''} so far`);
-            });
+            };
+            await bulkPool(batches, 3, batch => runBatch(batch));
 
             _bulkAiProposals = [...found.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
             const stopped = _bulkAiAbort;
@@ -6151,7 +6344,7 @@ Return ONLY a JSON array with exactly one object per input message, in this form
             let stale = 0, invalid = 0;
             for (const p of _bulkAiProposals) {
                 if (!p.include) continue;
-                if (!allSentItems.includes(p.item) || p.item.sentItem.message !== p.oldMessage) { stale++; continue; }
+                if (!bulkItemIsCurrent(p.item) || p.item.sentItem.message !== p.oldMessage) { stale++; continue; }
                 if (!bulkAiValid(p)) { invalid++; continue; }
                 valid.push(p);
             }
@@ -6595,7 +6788,7 @@ Return ONLY a JSON array with exactly one object per input message, in this form
             let stale = 0, invalid = 0;
             for (const p of _bulkHypProposals) {
                 if (!p.include) continue;
-                if (!allSentItems.includes(p.item) || p.item.sentItem.message !== p.oldMessage) { stale++; continue; }
+                if (!bulkItemIsCurrent(p.item) || p.item.sentItem.message !== p.oldMessage) { stale++; continue; }
                 if (!bulkHypValid(p)) { invalid++; continue; }
                 valid.push(p);
             }
