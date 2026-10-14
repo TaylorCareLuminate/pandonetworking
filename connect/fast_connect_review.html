@@ -3792,6 +3792,10 @@
                 <i class="fas fa-file-excel"></i>
                 Export Excel
             </button>
+            <button id="importAiChangesBtn" class="btn" style="background:#7c3aed;color:white;" title="Import a JSON file from ChatGPT (or any reviewer) to apply text edits, approvals, exclusions and deletions in one click" onclick="openFcrAiImportModal()">
+                <i class="fas fa-file-import"></i>
+                Import AI Changes (JSON)
+            </button>
         </div>
 
         <!-- Bulk Delete Panel (sticky, shown with batch actions) -->
@@ -10346,6 +10350,7 @@
             }
 
             const headers = [
+                'Message ID',
                 'Name',
                 'Title',
                 'Organization',
@@ -10382,6 +10387,7 @@
                 const msgText = editedMessages.get(m.id) ?? (m.message_to_contact || '');
 
                 return [
+                    csvEscape(m.id),
                     csvEscape(name),
                     csvEscape(title),
                     csvEscape(org),
@@ -10490,6 +10496,7 @@
                 // ── Column definitions ─────────────────────────────────────────
                 const COLS = [
                     { label: '#',             wch:  5, h:'center' },
+                    { label: 'Message ID',    wch: 24, h:'left'   },
                     { label: 'Name',          wch: 22, h:'left'   },
                     { label: 'Title',         wch: 28, h:'left'   },
                     { label: 'Organization',  wch: 24, h:'left'   },
@@ -10695,6 +10702,7 @@
 
                     ROWS.push([
                         mkCell(idx + 1, { ...rs(base, 'center'), font: { ...base.font, bold: true } }, 'n'),
+                        mkCell(m.id,    rs(base, 'left')),
                         mkCell(name,    { ...rs(base, 'left'),   font: { ...base.font, bold: true } }),
                         mkCell(title,   rs(base, 'left')),
                         mkCell(org,     rs(base, 'left')),
@@ -11197,6 +11205,390 @@
             );
         }
         window.approveAllMessages = approveAllMessages;
+
+        // ══════════════════════════════════════════════════════════════════════
+        // IMPORT AI REVIEW CHANGES (JSON)
+        // Lets a reviewer (e.g. ChatGPT) return one JSON file describing text edits,
+        // approvals, contact exclusions and deletions, keyed by the "Message ID" column
+        // in the CSV/Excel export. Applying it drives the real card checkboxes/textareas
+        // (exactly like typing/clicking) so stats, duplicate-handling, auto-save and
+        // "Save All Edits" all behave normally. Nothing is submitted.
+        // ══════════════════════════════════════════════════════════════════════
+        const FCR_AI_IMPORT_PROMPT = [
+            'You are reviewing LinkedIn outreach messages exported from Fast Connect Review (attached file). Every row has a "Message ID" column. Review each message and reply with ONLY one JSON object (a single code block, no commentary) in exactly this format:',
+            '',
+            '{',
+            '  "version": 1,',
+            '  "edits":   [ { "id": "<Message ID>", "message": "<full replacement message text>", "reason": "<short reason>" } ],',
+            '  "approve": [ { "id": "<Message ID>", "reason": "<short reason>" } ],',
+            '  "exclude": [ { "id": "<Message ID>", "reason": "<short reason>" } ],',
+            '  "delete":  [ { "id": "<Message ID>", "reason": "<short reason>", "type": "market" } ]',
+            '}',
+            '',
+            'Rules:',
+            '- Use the exact Message ID from the file. Never invent, shorten or alter IDs.',
+            '- "edits": messages whose text should change. "message" must be the COMPLETE final text (not a diff). An edited message is automatically approved unless you also list it under exclude or delete.',
+            '- "approve": messages that are good to send exactly as written.',
+            '- "exclude": the CONTACT should not be contacted at all (wrong person, poor fit, competitor, etc.). This applies to every message for that contact.',
+            '- "delete": this specific message should be discarded (low quality, off-target, duplicate) but the contact itself is still fine. Set "type" to "duplicate" if it is a duplicate, otherwise "market".',
+            '- A Message ID should appear in only one of approve / exclude / delete (it may additionally appear in edits).',
+            '- Connect Request messages must be 275 characters or fewer.',
+            '- Omit messages you have no opinion on. Use [] for any unused category.',
+            '- Output valid JSON only: double quotes, no trailing commas, and write line breaks inside message text as \\n.'
+        ].join('\n');
+
+        const _FCR_AI_KEYS = {
+            edits:   ['edits', 'edit', 'messages_to_change', 'changes', 'message_edits'],
+            approve: ['approve', 'approved', 'include', 'messages_to_include'],
+            exclude: ['exclude', 'excluded', 'contacts_to_exclude'],
+            delete:  ['delete', 'deleted', 'messages_to_delete']
+        };
+        const _FCR_AI_PRIORITY = { approve: 1, delete: 2, exclude: 3 }; // higher wins on conflict
+
+        let _fcrAiPlan = null;          // result of the last successful preview
+        let _fcrAiUndoSnapshot = null;  // state captured just before the last Apply
+        let _fcrAiPreviewTimer = null;
+
+        function _fcrAiContactName(m) {
+            const f = m.contactFirstName || m.prospect_first_name || m.firstName || '';
+            const l = m.contactLastName  || m.prospect_last_name  || m.lastName  || '';
+            return `${f} ${l}`.trim() || 'Unknown';
+        }
+
+        function _fcrAiParseJson(raw) {
+            let s = String(raw || '').trim();
+            if (!s) throw new Error('Nothing to import. Paste the JSON or choose a file.');
+            const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+            if (fence) s = fence[1].trim();
+            const a = s.indexOf('{'), b = s.lastIndexOf('}');
+            if (a !== -1 && b > a) s = s.slice(a, b + 1);
+            let data;
+            try { data = JSON.parse(s); }
+            catch (e) { throw new Error('Invalid JSON: ' + e.message); }
+            if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                throw new Error('JSON must be an object with edits / approve / exclude / delete lists.');
+            }
+            return data;
+        }
+
+        function _fcrAiEntries(data, kind) {
+            const key = _FCR_AI_KEYS[kind].find(k => data[k] !== undefined && data[k] !== null);
+            if (!key) return [];
+            const list = data[key];
+            if (!Array.isArray(list)) throw new Error(`"${key}" must be an array.`);
+            return list.map(e => {
+                if (typeof e === 'string') return { id: e.trim() };
+                if (!e || typeof e !== 'object') return { id: '' };
+                const text = e.message ?? e.new_message ?? e.newMessage ?? e.text ?? e.message_text ?? e.new_text;
+                return {
+                    id:      String(e.id ?? e.message_id ?? e.messageId ?? '').trim(),
+                    url:     String(e.linkedin_url ?? e.linkedinUrl ?? e.prospect_li_url ?? e.url ?? '').trim(),
+                    message: typeof text === 'string' ? text : undefined,
+                    reason:  String(e.reason ?? e.note ?? e.notes ?? '').trim(),
+                    type:    String(e.type ?? e.kind ?? '').trim().toLowerCase()
+                };
+            });
+        }
+
+        // Find the loaded message(s) an entry refers to: by Message ID, else by LinkedIn URL.
+        function _fcrAiResolve(entry, kind) {
+            if (entry.id) {
+                const m = loadedMessages.find(x => x.id === entry.id);
+                if (m) return { ids: [m.id] };
+            }
+            if (entry.url) {
+                const canon = canonicalizeLinkedInUrl(entry.url);
+                if (canon) {
+                    const matches = loadedMessages.filter(x => canonicalizeLinkedInUrl(x.prospect_li_url || x.linkedInUrl || '') === canon);
+                    if (matches.length === 1 || (matches.length > 1 && kind === 'exclude')) {
+                        return { ids: matches.map(x => x.id) };
+                    }
+                    if (matches.length > 1) return { error: `LinkedIn URL matches ${matches.length} messages. Use a Message ID.` };
+                }
+            }
+            return { error: entry.id ? `Message ID "${entry.id}" is not in the currently loaded messages.` : 'Entry has no usable id.' };
+        }
+
+        function _fcrAiBuildPlan(data) {
+            const plan = { items: new Map(), problems: [], counts: { edits: 0, approve: 0, exclude: 0, delete: 0 } };
+            const getItem = id => {
+                if (!plan.items.has(id)) plan.items.set(id, { id, newText: null, action: null, reason: '', type: '' });
+                return plan.items.get(id);
+            };
+            const problem = (level, msg) => plan.problems.push({ level, msg });
+
+            _fcrAiEntries(data, 'edits').forEach(e => {
+                if (typeof e.message !== 'string' || !e.message.trim()) { problem('warn', `Edit for "${e.id || e.url || '?'}" has no message text; skipped.`); return; }
+                const r = _fcrAiResolve(e, 'edits');
+                if (r.error) { problem('warn', r.error); return; }
+                r.ids.forEach(id => {
+                    const it = getItem(id);
+                    it.newText = e.message;
+                    if (e.reason) it.reason = e.reason;
+                    plan.counts.edits++;
+                });
+            });
+
+            ['approve', 'delete', 'exclude'].forEach(kind => {
+                _fcrAiEntries(data, kind).forEach(e => {
+                    const r = _fcrAiResolve(e, kind);
+                    if (r.error) { problem('warn', r.error); return; }
+                    r.ids.forEach(id => {
+                        const it = getItem(id);
+                        if (it.action && it.action !== kind) {
+                            const m = loadedMessages.find(x => x.id === id);
+                            problem('info', `${_fcrAiContactName(m)} is listed as both "${it.action}" and "${kind}". Using "${_FCR_AI_PRIORITY[kind] > _FCR_AI_PRIORITY[it.action] ? kind : it.action}".`);
+                        }
+                        if (!it.action || _FCR_AI_PRIORITY[kind] > _FCR_AI_PRIORITY[it.action]) {
+                            it.action = kind;
+                            if (kind === 'delete') it.type = e.type === 'duplicate' ? 'duplicate' : 'market';
+                        }
+                        if (e.reason) it.reason = e.reason;
+                    });
+                });
+            });
+
+            plan.items.forEach(it => { if (it.action) plan.counts[it.action]++; });
+
+            // Informational checks against what's currently on screen
+            plan.items.forEach(it => {
+                const m = loadedMessages.find(x => x.id === it.id);
+                const card = document.querySelector(`.message-card[data-message-id="${it.id}"]`);
+                const ta = card?.querySelector('.message-textarea');
+                if (!card) { problem('warn', `${_fcrAiContactName(m)}: card not on screen; skipped.`); it.skip = true; return; }
+                if (ta?.disabled) { problem('warn', `${_fcrAiContactName(m)}: locked (another message to this contact is already approved); skipped.`); it.skip = true; return; }
+                if (it.newText !== null && (m.message_type || 'connect') === 'connect' && it.newText.length > 275) {
+                    problem('warn', `${_fcrAiContactName(m)}: edited connect message is ${it.newText.length} characters (limit 275).`);
+                }
+            });
+            return plan;
+        }
+
+        function _fcrAiRenderPreview(plan) {
+            const summaryEl = document.getElementById('fcrAiImportSummary');
+            const previewEl = document.getElementById('fcrAiImportPreview');
+            const applyBtn  = document.getElementById('fcrAiImportApplyBtn');
+            const c = plan.counts;
+            const active = [...plan.items.values()].filter(i => !i.skip);
+            summaryEl.textContent = `${c.edits} text edit${c.edits !== 1 ? 's' : ''} · ${c.approve} approve · ${c.exclude} exclude · ${c.delete} delete  →  ${active.length} message${active.length !== 1 ? 's' : ''} will change`;
+            applyBtn.disabled = active.length === 0;
+
+            const colors = { approve: ['#d1fae5', '#065f46', 'Approve'], exclude: ['#fef3c7', '#92400e', 'Exclude'], delete: ['#fee2e2', '#991b1b', 'Delete'] };
+            let html = '';
+            if (plan.problems.length) {
+                html += '<div style="border:1px solid #fcd34d;background:#fffbeb;border-radius:8px;padding:0.6rem 0.9rem;margin-bottom:0.8rem;font-size:0.8rem;color:#92400e;max-height:160px;overflow:auto;">'
+                    + `<strong>${plan.problems.length} note${plan.problems.length !== 1 ? 's' : ''}:</strong><ul style="margin:0.3rem 0 0 1.1rem;padding:0;">`
+                    + plan.problems.map(p => `<li>${escapeHtml(p.msg)}</li>`).join('')
+                    + '</ul></div>';
+            }
+            active.forEach(it => {
+                const m = loadedMessages.find(x => x.id === it.id);
+                const ta = document.getElementById(`messageTextarea_${it.id}`);
+                const oldText = ta ? ta.value : (m.message_to_contact || '');
+                const badge = it.action
+                    ? `<span style="background:${colors[it.action][0]};color:${colors[it.action][1]};font-weight:700;font-size:0.72rem;padding:2px 8px;border-radius:10px;">${colors[it.action][2]}${it.action === 'delete' && it.type === 'duplicate' ? ' (dup)' : ''}</span>`
+                    : '<span style="background:#e0e7ff;color:#3730a3;font-weight:700;font-size:0.72rem;padding:2px 8px;border-radius:10px;">Edit + auto-approve</span>';
+                const editBadge = (it.newText !== null && it.action)
+                    ? ' <span style="background:#e0e7ff;color:#3730a3;font-weight:700;font-size:0.72rem;padding:2px 8px;border-radius:10px;">+ Edit</span>' : '';
+                html += `<div style="border:1px solid #e5e7eb;border-radius:8px;padding:0.55rem 0.8rem;margin-bottom:0.5rem;font-size:0.8rem;">
+                    <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
+                        <strong>${escapeHtml(_fcrAiContactName(m))}</strong>${badge}${editBadge}
+                        ${it.reason ? `<span style="color:#6b7280;">${escapeHtml(it.reason)}</span>` : ''}
+                    </div>
+                    ${it.newText !== null ? `<div style="margin-top:0.4rem;display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;">
+                        <div><div style="font-size:0.7rem;color:#6b7280;font-weight:600;">CURRENT</div><div style="background:#fef2f2;border-radius:6px;padding:0.4rem;white-space:pre-wrap;">${escapeHtml(oldText)}</div></div>
+                        <div><div style="font-size:0.7rem;color:#6b7280;font-weight:600;">NEW (${it.newText.length} chars)</div><div style="background:#f0fdf4;border-radius:6px;padding:0.4rem;white-space:pre-wrap;">${escapeHtml(it.newText)}</div></div>
+                    </div>` : ''}
+                </div>`;
+            });
+            previewEl.innerHTML = html;
+        }
+
+        function _fcrAiPreview() {
+            const raw = document.getElementById('fcrAiImportText').value;
+            const summaryEl = document.getElementById('fcrAiImportSummary');
+            const previewEl = document.getElementById('fcrAiImportPreview');
+            const applyBtn  = document.getElementById('fcrAiImportApplyBtn');
+            _fcrAiPlan = null;
+            applyBtn.disabled = true;
+            if (!raw.trim()) { summaryEl.textContent = ''; previewEl.innerHTML = ''; return; }
+            try {
+                const plan = _fcrAiBuildPlan(_fcrAiParseJson(raw));
+                _fcrAiPlan = plan;
+                _fcrAiRenderPreview(plan);
+            } catch (err) {
+                summaryEl.innerHTML = `<span style="color:#b91c1c;">${escapeHtml(err.message)}</span>`;
+                previewEl.innerHTML = '';
+            }
+        }
+
+        window.openFcrAiImportModal = function openFcrAiImportModal() {
+            if (!loadedMessages || loadedMessages.length === 0) {
+                showAlert('No messages loaded. Load messages first, then import AI changes.', 'warning');
+                return;
+            }
+            document.getElementById('fcrAiImportPromptPre').textContent = FCR_AI_IMPORT_PROMPT;
+            document.getElementById('fcrAiImportOverlay').classList.add('open');
+            _fcrAiPreview();
+        };
+        window.closeFcrAiImportModal = function closeFcrAiImportModal() {
+            document.getElementById('fcrAiImportOverlay').classList.remove('open');
+        };
+        window.copyFcrAiImportPrompt = async function copyFcrAiImportPrompt() {
+            try { await navigator.clipboard.writeText(FCR_AI_IMPORT_PROMPT); showAlert('Instructions copied to clipboard.', 'success'); }
+            catch (e) { showAlert('Could not copy automatically. Select the text and copy it manually.', 'warning'); }
+        };
+
+        (function wireFcrAiImportInputs() {
+            const ta = document.getElementById('fcrAiImportText');
+            const fi = document.getElementById('fcrAiImportFile');
+            ta?.addEventListener('input', () => {
+                clearTimeout(_fcrAiPreviewTimer);
+                _fcrAiPreviewTimer = setTimeout(_fcrAiPreview, 300);
+            });
+            fi?.addEventListener('change', async () => {
+                const f = fi.files && fi.files[0];
+                if (!f) return;
+                ta.value = await f.text();
+                fi.value = '';
+                _fcrAiPreview();
+            });
+        })();
+
+        // Capture everything Apply can change so it can be undone in one click.
+        function _fcrAiSnapshot(editIds) {
+            const texts = new Map();
+            editIds.forEach(id => {
+                const ta = document.getElementById(`messageTextarea_${id}`);
+                if (ta) texts.set(id, ta.value);
+            });
+            return { texts, sels: new Map(messageSelections), dups: new Set(deletedAsDuplicate) };
+        }
+
+        function _fcrAiSetSelection(id, action) {
+            // Check/uncheck the real checkbox so all existing side effects run.
+            ['approve', 'exclude', 'delete'].forEach(type => {
+                const cb = document.getElementById(`${type}_${id}`);
+                if (!cb) return;
+                const want = type === action;
+                if (cb.checked !== want) { cb.checked = want; cb.dispatchEvent(new Event('change')); }
+            });
+        }
+
+        function _fcrAiSetText(id, text) {
+            const ta = document.getElementById(`messageTextarea_${id}`);
+            if (!ta) return;
+            _aiIsWritingToTextarea = true;
+            try {
+                ta.value = text;
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+            } finally { _aiIsWritingToTextarea = false; }
+        }
+
+        function _fcrAiFinish() {
+            updateGrayedOutMessages(); // also refreshes stats
+            if (activeActionFilter) applyActionFilter();
+            scheduleAutoSave();
+            if (typeof syncSaveEditsBtn === 'function') syncSaveEditsBtn();
+        }
+
+        window.applyFcrAiImport = async function applyFcrAiImport() {
+            // Re-validate against the current screen in case state changed since preview.
+            _fcrAiPreview();
+            const plan = _fcrAiPlan;
+            if (!plan) return;
+            const items = [...plan.items.values()].filter(i => !i.skip);
+            if (items.length === 0) { showAlert('Nothing to apply.', 'info'); return; }
+
+            _fcrAiUndoSnapshot = _fcrAiSnapshot(items.filter(i => i.newText !== null).map(i => i.id));
+            const counts = { edited: 0, approved: 0, excluded: 0, deleted: 0, skipped: 0 };
+            const verb = { approve: 'approved', exclude: 'excluded', delete: 'deleted' };
+
+            _suppressCheckboxSideEffects = true;
+            try {
+                // Pass 1: text edits (auto-approves via the normal edit handler)
+                items.forEach(it => {
+                    if (it.newText === null) return;
+                    const ta = document.getElementById(`messageTextarea_${it.id}`);
+                    if (!ta || ta.disabled) { counts.skipped++; return; }
+                    if (ta.value !== it.newText) { _fcrAiSetText(it.id, it.newText); counts.edited++; }
+                });
+                // Pass 2: explicit decisions override the auto-approve from edits.
+                // Exclude last because it cascades to every message for the same contact.
+                ['approve', 'delete', 'exclude'].forEach(kind => {
+                    items.filter(i => i.action === kind).forEach(it => {
+                        const cb = document.getElementById(`${kind}_${it.id}`);
+                        if (!cb || cb.disabled) { counts.skipped++; return; }
+                        _fcrAiSetSelection(it.id, kind);
+                        if (kind === 'delete') {
+                            if (it.type === 'duplicate') deletedAsDuplicate.add(it.id);
+                            else deletedAsDuplicate.delete(it.id);
+                        }
+                        counts[verb[kind]]++;
+                    });
+                });
+            } finally {
+                _suppressCheckboxSideEffects = false;
+            }
+
+            // Banners on affected cards
+            items.forEach(it => {
+                const card = document.querySelector(`.message-card[data-message-id="${it.id}"]`);
+                if (!card) return;
+                card.querySelectorAll('.fcr-ai-banner').forEach(el => el.remove());
+                const parts = [];
+                if (it.newText !== null) parts.push('text edited');
+                parts.push(it.action ? (verb[it.action]) : 'approved (edited)');
+                const b = document.createElement('div');
+                b.className = 'fcr-ai-banner';
+                b.style.cssText = 'background:#f5f3ff;border:1px solid #ddd6fe;color:#5b21b6;border-radius:6px;padding:0.35rem 0.7rem;margin-bottom:0.5rem;font-size:0.8rem;';
+                b.innerHTML = `<strong>🤖 AI review import:</strong> ${escapeHtml(parts.join(', '))}${it.reason ? ' — ' + escapeHtml(it.reason) : ''}`;
+                card.insertBefore(b, card.querySelector('.message-header') || card.firstChild);
+            });
+
+            _fcrAiFinish();
+
+            document.getElementById('fcrAiImportUndoBtn').style.display = '';
+            const msg = `Imported AI changes: ${counts.edited} edited, ${counts.approved} approved, ${counts.excluded} excluded, ${counts.deleted} deleted`
+                + (counts.skipped ? `, ${counts.skipped} skipped (locked)` : '') + '.';
+
+            if (document.getElementById('fcrAiImportSaveAfter')?.checked && typeof window.saveAllEdits === 'function') {
+                showAlert(msg + ' Saving to Firestore…', 'info');
+                await window.saveAllEdits();
+            } else {
+                showAlert(msg + ' Review them, then use Save All Edits or Submit Batch.', 'success');
+            }
+            document.getElementById('fcrAiImportSummary').textContent = '✅ ' + msg;
+            document.getElementById('fcrAiImportApplyBtn').disabled = true;
+            closeFcrAiImportModal();
+        };
+
+        window.undoFcrAiImport = function undoFcrAiImport() {
+            const snap = _fcrAiUndoSnapshot;
+            if (!snap) { showAlert('Nothing to undo.', 'info'); return; }
+            _suppressCheckboxSideEffects = true;
+            try {
+                snap.texts.forEach((text, id) => _fcrAiSetText(id, text));
+                // Clear first (un-exclude cascades), then restore each prior decision.
+                loadedMessages.forEach(m => {
+                    if ((messageSelections.get(m.id) || null) !== (snap.sels.get(m.id) || null)) _fcrAiSetSelection(m.id, null);
+                });
+                loadedMessages.forEach(m => {
+                    const want = snap.sels.get(m.id) || null;
+                    if (want && messageSelections.get(m.id) !== want) _fcrAiSetSelection(m.id, want);
+                });
+                deletedAsDuplicate.clear();
+                snap.dups.forEach(id => deletedAsDuplicate.add(id));
+            } finally {
+                _suppressCheckboxSideEffects = false;
+            }
+            document.querySelectorAll('.fcr-ai-banner').forEach(el => el.remove());
+            _fcrAiFinish();
+            _fcrAiUndoSnapshot = null;
+            document.getElementById('fcrAiImportUndoBtn').style.display = 'none';
+            showAlert('Undid the last AI import (text and decisions restored).', 'info');
+        };
+        // ══ End Import AI Review Changes ═════════════════════════════════════
 
         // Check if contact has approved message in past 75 days
         // Uses the shared filter logic for consistency
@@ -17987,6 +18379,48 @@ Rules:
                 <button class="btn btn-secondary" onclick="closeOpusBeforeAfterModal()">
                     <i class="fas fa-times"></i> Close
                 </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Import AI Review Changes (JSON) — paste/upload ChatGPT's JSON and apply its
+         text edits / approvals / exclusions / deletions to the loaded messages ── -->
+    <div id="fcrAiImportOverlay" class="opus-ba-overlay" onclick="if(event.target===this)closeFcrAiImportModal()">
+        <div class="opus-ba-modal" style="max-width:980px;">
+            <div class="opus-ba-header" style="background:linear-gradient(135deg,#5b21b6 0%,#7c3aed 100%);">
+                <h2><i class="fas fa-file-import"></i> &nbsp;Import AI Review Changes (JSON)</h2>
+                <button class="opus-ba-close" onclick="closeFcrAiImportModal()" title="Close">&times;</button>
+            </div>
+            <div class="opus-ba-body">
+                <details style="margin-bottom:0.9rem;border:1px solid #e5e7eb;border-radius:8px;padding:0.6rem 0.9rem;background:#faf5ff;">
+                    <summary style="cursor:pointer;font-weight:600;font-size:0.85rem;color:#5b21b6;">
+                        Instructions to give ChatGPT (click to view)
+                    </summary>
+                    <pre id="fcrAiImportPromptPre" style="white-space:pre-wrap;font-size:0.76rem;margin:0.6rem 0;background:white;border:1px solid #e5e7eb;border-radius:6px;padding:0.7rem;max-height:260px;overflow:auto;"></pre>
+                    <button type="button" class="btn btn-secondary" style="font-size:0.78rem;padding:0.35rem 0.8rem;" onclick="copyFcrAiImportPrompt()">
+                        <i class="fas fa-copy"></i> Copy Instructions
+                    </button>
+                </details>
+
+                <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;margin-bottom:0.5rem;">
+                    <label for="fcrAiImportFile" style="font-weight:600;font-size:0.85rem;">Upload JSON file:</label>
+                    <input type="file" id="fcrAiImportFile" accept=".json,.txt,application/json" style="font-size:0.82rem;">
+                    <span style="font-size:0.8rem;color:#6b7280;">or paste it below</span>
+                </div>
+                <textarea id="fcrAiImportText" rows="8" spellcheck="false" placeholder='Paste the JSON from ChatGPT here...' style="width:100%;font-family:Consolas,monospace;font-size:0.78rem;padding:0.6rem;border:2px solid #ddd6fe;border-radius:8px;resize:vertical;"></textarea>
+
+                <div id="fcrAiImportSummary" class="opus-ba-summary" style="margin:0.8rem 0 0.4rem;"></div>
+                <div id="fcrAiImportPreview"></div>
+            </div>
+            <div class="opus-ba-footer" style="display:flex;gap:0.6rem;align-items:center;justify-content:space-between;flex-wrap:wrap;">
+                <label style="font-size:0.8rem;display:flex;align-items:center;gap:0.35rem;color:#374151;">
+                    <input type="checkbox" id="fcrAiImportSaveAfter"> Also save to Firestore after applying (Save All Edits)
+                </label>
+                <div style="display:flex;gap:0.5rem;">
+                    <button class="btn btn-secondary" onclick="closeFcrAiImportModal()"><i class="fas fa-times"></i> Close</button>
+                    <button id="fcrAiImportUndoBtn" class="btn btn-secondary" style="display:none;" onclick="undoFcrAiImport()"><i class="fas fa-undo"></i> Undo Last Import</button>
+                    <button id="fcrAiImportApplyBtn" class="btn" style="background:#7c3aed;color:white;" disabled onclick="applyFcrAiImport()"><i class="fas fa-bolt"></i> Apply Changes</button>
+                </div>
             </div>
         </div>
     </div>

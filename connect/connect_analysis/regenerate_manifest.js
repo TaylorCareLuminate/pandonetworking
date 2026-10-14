@@ -36,6 +36,14 @@ const DATE_RE = /^Connect_Analysis_(\d{4}-\d{2}-\d{2})\.json$/;
 const DEIDENTIFIED_DATE_RE = /^Connect_Analysis_(\d{4}-\d{2}-\d{2})_deidentified\.json$/;
 const RUNS_DATE_RE = /^(\d{4}-\d{2}-\d{2})\.json$/;
 
+// Full history lives in Firebase Realtime Database (ConnectAnalysis/runs/<date> and
+// ConnectAnalysisDeidentified/runs/<date> — see upload_to_firebase.R), which has no
+// per-file size limit. These local dated exports are only kept for local development
+// and as a same-origin fallback, so there's no need to retain more than the last couple
+// on disk — and every one kept here is a 50-100+ MB blob that GitHub hard-rejects outright
+// past 100MB. Anything older than this is deleted from disk on every regenerate.
+const MAX_RETAINED_RUNS = 2;
+
 // A usable funnel must keep the sent → accepted → replied → scheduled order.
 // The 2026-08-22 export inverted that (321 replies vs 412 meetings), which
 // collapses "reply of accepted" to ~3% and inflates "schedule of replied" past 100%.
@@ -53,12 +61,25 @@ function funnelIsUsable(filePath) {
 }
 
 function buildManifest(dir, { manifestFile, latestFile, comment }, byDate) {
-    const runs = [...byDate.values()].sort((a, b) => b.run_date.localeCompare(a.run_date));
+    const allRuns = [...byDate.values()].sort((a, b) => b.run_date.localeCompare(a.run_date));
 
-    if (!runs.length) {
+    if (!allRuns.length) {
         console.warn(`[regenerate_manifest] No files found for ${manifestFile} — leaving ${manifestFile}/${latestFile} untouched.`);
         return null;
     }
+
+    // Keep only the newest MAX_RETAINED_RUNS dated exports on disk; delete the rest.
+    // Older runs are still reachable via Firebase (see the comment on MAX_RETAINED_RUNS).
+    const runs = allRuns.slice(0, MAX_RETAINED_RUNS);
+    const stale = allRuns.slice(MAX_RETAINED_RUNS);
+    stale.forEach(r => {
+        try {
+            fs.unlinkSync(path.join(dir, r.file));
+            console.log(`  🗑  Removed ${r.file} — beyond the ${MAX_RETAINED_RUNS}-run local retention limit (still in Firebase).`);
+        } catch (e) {
+            console.warn(`  [WARN] Could not remove stale export ${r.file}: ${e.message}`);
+        }
+    });
 
     const manifest = { _comment: comment, runs };
     fs.writeFileSync(path.join(dir, manifestFile), JSON.stringify(manifest, null, 2) + '\n');

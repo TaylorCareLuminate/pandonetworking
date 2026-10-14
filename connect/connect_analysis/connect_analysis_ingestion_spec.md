@@ -15,7 +15,13 @@ Companion files (hand these to the web builder alongside this spec):
 - `ConnectAnalysis/runs/<YYYY-MM-DD>` → historical snapshots (for a "view past week" picker)
 - `ConnectAnalysis/index/<YYYY-MM-DD>` → `{ last_run, updated_at }` lightweight pointers for building a run picker
 
+The de-identified counterpart (used by `demos/analysis_results.html`) lives at the parallel
+`ConnectAnalysisDeidentified/latest` / `ConnectAnalysisDeidentified/runs/<date>` /
+`ConnectAnalysisDeidentified/index/<date>` paths, same database.
+
 Fetch `latest`, render, and optionally offer the run picker from the `index` node. A static file (e.g. `Connect_Analysis_<date>.json`) can be used for local development, but production should read live from Firebase so it auto-updates weekly.
+
+**Uploading a new run:** `connect/connect_analysis/upload_to_firebase.R` pushes both of the above directly from the R pipeline — no git commit needed, and no 100MB-per-file limit the way a committed JSON export has. `connect/connect_analysis/regenerate_manifest.js` only keeps the 2 newest dated exports on disk locally (for dev / same-origin fallback); older runs are only in Firebase.
 
 ## 3. Top-level structure
 

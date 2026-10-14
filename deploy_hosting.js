@@ -52,6 +52,15 @@ const IGNORE_PATTERNS = [
   /firebase\.json$/,
   /deploy_hosting\.js$/,
   /regenerate_manifest\.js$/,
+  // Connect Analysis weekly exports (50-100+ MB each) — Firebase Realtime Database
+  // (ConnectAnalysis/*, ConnectAnalysisDeidentified/*) is the verified live source
+  // (see upload_to_firebase.R, connect_analysis_ingestion_spec.md §2). No need to
+  // ship these as static Hosting files too; analysis_results.html and
+  // demos/analysis_results.html both fall back to Firebase automatically when
+  // they're absent.
+  /[/\\]connect_analysis[/\\]Connect_Analysis_.*\.json$/i,
+  /[/\\]connect_analysis[/\\]latest(_deidentified)?\.json$/i,
+  /[/\\]connect_analysis[/\\]runs[/\\].*\.json$/i,
   /[/\\]\.[^/\\]+/,
 ];
 

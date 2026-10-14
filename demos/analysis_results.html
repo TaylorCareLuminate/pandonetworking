@@ -899,9 +899,10 @@ body {
 </div>
 
 <script type="module">
+import { ref, get } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js';
 import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
 
-console.log('📊 analysis_results.html v1.0 — Connect Success Analysis');
+console.log('📊 analysis_results.html v1.1 — Connect Success Analysis (Firebase fallback)');
 
 const RAILWAY_BASE = 'https://railwayclemail-production.up.railway.app';
 
@@ -1109,8 +1110,39 @@ async function fetchPayloadFromLocal(entry) {
     return await resp.json();
 }
 
+// De-identified data lives at ConnectAnalysisDeidentified in the same Realtime
+// Database connect/analysis_results.html reads ConnectAnalysis from (see
+// upload_to_firebase.R) — this is the fallback for whenever a run is too large
+// to keep as a committed local file (regenerate_manifest.js only retains the 2
+// newest dated exports on disk).
+async function fetchFirebaseIndex() {
+    try {
+        if (!window.database) return [];
+        const snap = await get(ref(window.database, 'ConnectAnalysisDeidentified/index'));
+        if (!snap.exists()) return [];
+        const val = snap.val();
+        return Object.keys(val).map(d => ({ run_date: d, source: 'firebase' })).sort((a, b) => b.run_date.localeCompare(a.run_date));
+    } catch (e) {
+        console.warn('Firebase ConnectAnalysisDeidentified/index not available:', e.message);
+        return [];
+    }
+}
+
+async function fetchPayloadFromFirebase(runDate) {
+    if (!window.database) return null;
+    const path = runDate ? `ConnectAnalysisDeidentified/runs/${runDate}` : 'ConnectAnalysisDeidentified/latest';
+    const snap = await get(ref(window.database, path));
+    return snap.exists() ? snap.val() : null;
+}
+
 async function loadRunCandidates() {
-    return await fetchLocalManifest();
+    await window.firebaseReady.catch(() => {});
+    const [fbIndex, localList] = await Promise.all([fetchFirebaseIndex(), fetchLocalManifest()]);
+    const byDate = new Map();
+    // Local entries first so we always know a file to fetch; firebase entries can override/add dates.
+    localList.forEach(r => byDate.set(r.run_date, r));
+    fbIndex.forEach(r => { if (!byDate.has(r.run_date)) byDate.set(r.run_date, r); });
+    return [...byDate.values()].sort((a, b) => b.run_date.localeCompare(a.run_date));
 }
 
 function isAnalysisFunnelUsable(funnel) {
@@ -1122,7 +1154,8 @@ function isAnalysisFunnelUsable(funnel) {
 
 async function loadPayloadForRun(entry) {
     // No specific historical run requested — latest_deidentified.json always
-    // mirrors the newest dated export (regenerate_manifest.js keeps it current).
+    // mirrors the newest dated export (regenerate_manifest.js keeps it current),
+    // when a local copy exists at all.
     if (!entry) {
         try {
             const resp = await fetch('../connect/connect_analysis/latest_deidentified.json', { cache: 'no-store' });
@@ -1137,7 +1170,7 @@ async function loadPayloadForRun(entry) {
             console.warn('connect_analysis/latest_deidentified.json not available:', e.message);
         }
         for (const candidate of RUN_CANDIDATES) {
-            if (!candidate.file) continue;
+            if (candidate.source === 'firebase' || !candidate.file) continue;
             try {
                 const payload = await fetchPayloadFromLocal(candidate);
                 if (isAnalysisFunnelUsable(payload.overall && payload.overall.funnel)) {
@@ -1145,11 +1178,37 @@ async function loadPayloadForRun(entry) {
                 }
             } catch (e) { /* try next dated run */ }
         }
+        // Nothing usable on disk — fall back to live Firebase data.
+        try {
+            const fb = await fetchPayloadFromFirebase(null);
+            if (fb && isAnalysisFunnelUsable(fb.overall && fb.overall.funnel)) {
+                return { payload: fb, source: 'firebase' };
+            }
+        } catch (e) {
+            console.warn('Firebase RTDB fetch failed:', e.message);
+        }
+        throw new Error('No de-identified analysis data is available yet. Check back after the next export.');
     }
-    if (entry && entry.file) {
-        const payload = await fetchPayloadFromLocal(entry);
-        return { payload, source: 'local' };
+    if (entry.source === 'firebase') {
+        const payload = await fetchPayloadFromFirebase(entry.run_date);
+        if (!payload) throw new Error(`No Firebase data found for run ${entry.run_date}.`);
+        return { payload, source: 'firebase' };
     }
+    if (entry.file) {
+        // Local manifest says this date exists, but the static file itself may not be
+        // deployed (regenerate_manifest.js only retains the 2 newest runs on disk, and
+        // deploy_hosting.js excludes these large exports from Hosting entirely — see
+        // connect_analysis_ingestion_spec.md §2). Fall back to Firebase for this date
+        // before giving up.
+        try {
+            const payload = await fetchPayloadFromLocal(entry);
+            return { payload, source: 'local' };
+        } catch (e) {
+            console.warn(`Local ${entry.file} failed, falling back to Firebase:`, e.message);
+        }
+    }
+    const fb = await fetchPayloadFromFirebase(entry.run_date);
+    if (fb) return { payload: fb, source: 'firebase' };
     throw new Error('No de-identified analysis data is available yet. Check back after the next export.');
 }
 

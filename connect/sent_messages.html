@@ -5298,6 +5298,85 @@
             return out;
         }
 
+        // Submits entries to HeyReach in up to BULK_MAX_ROUNDS rounds. Each round pushes every entry that is
+        // not yet confirmed, then reads the campaigns back from HeyReach; anything that failed to push or that
+        // HeyReach still shows with the OLD text goes into the next round. Stops early once all are confirmed.
+        // entries: [{ item, queueId, oldMessage, newMessage }]
+        // Returns { results: Map(queueId → { status, error, live, rounds }), roundsUsed }
+        //   status: 'verified' | 'unconfirmed' (pushed, can't be read back) | 'stale' (HeyReach kept old text) | 'push_failed'
+        const BULK_MAX_ROUNDS = 5;
+        async function bulkPushInRounds(entries, label = 'updating HeyReach') {
+            const results = new Map();
+            entries.forEach(e => results.set(e.queueId, { status: 'push_failed', error: 'not attempted', live: '', rounds: 0 }));
+            let pending = entries.slice();
+            let round = 0;
+            while (pending.length && round < BULK_MAX_ROUNDS) {
+                round++;
+                const tag = `Round ${round}/${BULK_MAX_ROUNDS}`;
+                if (round > 1) {
+                    const waitMs = Math.min(5000 * (round - 1), 15000); // back off a little more each round
+                    bulkSetProgress(`${tag} — ${pending.length} not confirmed yet; waiting ${Math.round(waitMs / 1000)}s before resubmitting…`);
+                    await hrSleep(waitMs);
+                }
+                const pushed = [];
+                let done = 0;
+                bulkSetProgress(`${tag} — ${label}: 0 / ${pending.length}…`);
+                await bulkPool(pending, 3, async e => {
+                    let r;
+                    try { r = await syncMessageToHeyReach(e.item, e.queueId, e.newMessage, { skipVerify: true }); }
+                    catch (err) { r = { ok: false, error: err.message || String(err) }; }
+                    const rec = results.get(e.queueId);
+                    rec.rounds = round;
+                    if (r.ok) pushed.push(e);
+                    else {
+                        rec.status = r.needsReadd ? 'stale' : 'push_failed';
+                        rec.error = r.error || '';
+                        rec.live = r.live || '';
+                        console.warn(`[BulkRounds] ${tag} push failed`, e.queueId, r.error);
+                    }
+                    done++;
+                    bulkSetProgress(`${tag} — ${label}: ${done} / ${pending.length}…`);
+                });
+
+                if (pushed.length) {
+                    bulkSetProgress(`${tag} — confirming ${pushed.length} push${pushed.length !== 1 ? 'es' : ''} in HeyReach…`);
+                    let vr;
+                    try { vr = await bulkVerifyPass(pushed); }
+                    catch (err) { console.warn('[BulkRounds] verify pass failed', err); vr = { verified: [], mismatch: [], unknown: pushed.slice() }; }
+                    vr.verified.forEach(e => Object.assign(results.get(e.queueId), { status: 'verified', error: '' }));
+                    vr.unknown.forEach(e => Object.assign(results.get(e.queueId), { status: 'unconfirmed', error: '' }));
+                    vr.mismatch.forEach(e => Object.assign(results.get(e.queueId), {
+                        status: 'stale', live: e.live || '', error: 'HeyReach still shows the old message.'
+                    }));
+                }
+
+                pending = pending.filter(e => {
+                    const s = results.get(e.queueId).status;
+                    return s === 'push_failed' || s === 'stale';
+                });
+                console.log(`[BulkRounds] ${tag} done — ${pending.length} still not confirmed`);
+            }
+            return { results, roundsUsed: round };
+        }
+
+        // Sorts the outcome of bulkPushInRounds into the Retry / Re-add queues and returns the counts.
+        function bulkCollectRoundOutcome(entries, rr) {
+            const c = { verified: 0, unconfirmed: 0, stale: 0, failed: 0 };
+            entries.forEach(e => {
+                const res = rr.results.get(e.queueId) || { status: 'push_failed' };
+                if (res.status === 'verified') c.verified++;
+                else if (res.status === 'unconfirmed') c.unconfirmed++;
+                else if (res.status === 'stale') {
+                    c.stale++;
+                    _bulkReadd.push({ item: e.item, queueId: e.queueId, oldMessage: res.live || e.oldMessage || '', newMessage: e.newMessage });
+                } else {
+                    c.failed++;
+                    _bulkRetry.push({ item: e.item, queueId: e.queueId });
+                }
+            });
+            return c;
+        }
+
         // Pushes every queued message whose saved text differs from what HeyReach holds (or can't be read),
         // even when no find/replace rule is involved — fixes leads whose Firestore text changed but HeyReach
         // never picked it up.
@@ -5356,37 +5435,20 @@
             if (!ok) { _bulkBusy = false; syncBtn.disabled = false; bulkUpdatePreview(); bulkSetProgress('Sync cancelled.'); return; }
 
             _bulkRetry = []; _bulkReadd = []; bulkRefreshRetryButton();
-            let done = 0, hrFail = 0, stillOld = 0;
-            const pushed = [];
-            bulkSetProgress(`Pushing 0 / ${targets.length}…`);
-            await bulkPool(targets, 3, async t => {
-                const r = await syncMessageToHeyReach(t.item, t.queueId, t.newMessage, { skipVerify: true });
-                if (r.ok) pushed.push(t);
-                else if (r.needsReadd) {
-                    // HeyReach accepted the update but kept the old text: retrying won't help, re-adding the lead will.
-                    stillOld++;
-                    _bulkReadd.push({ item: t.item, queueId: t.queueId, oldMessage: r.live || t.oldMessage || '', newMessage: t.newMessage });
-                    console.warn('[BulkSync] HeyReach still shows the old text', t.queueId);
-                }
-                else { hrFail++; _bulkRetry.push({ item: t.item, queueId: t.queueId }); console.warn('[BulkSync] push failed', t.queueId, r.error); }
-                done++;
-                bulkSetProgress(`Pushing ${done} / ${targets.length}…`);
-            });
-
-            const vr = await bulkVerifyPass(pushed);
-            vr.mismatch.forEach(e => _bulkReadd.push({ item: e.item, queueId: e.queueId, oldMessage: e.live || e.oldMessage || '', newMessage: e.newMessage }));
+            const rr = await bulkPushInRounds(targets, 'pushing');
+            const oc = bulkCollectRoundOutcome(targets, rr);
             _bulkBusy = false;
             syncBtn.disabled = false;
             renderTable();
             bulkRefreshRetryButton();
             bulkUpdatePreview();
-            const staleTotal = vr.mismatch.length + stillOld;
+            const hrFail = oc.failed, staleTotal = oc.stale;
             const problems = hrFail + staleTotal;
             bulkSetProgress(
-                `Done — ${vr.verified.length} confirmed in HeyReach` +
-                (vr.unknown.length ? `, ${vr.unknown.length} pushed but not confirmable (spot-check in HeyReach)` : '') +
-                (staleTotal ? `, ${staleTotal} STILL show the old text (use "Re-add unchanged leads")` : '') +
-                (hrFail ? `, ${hrFail} failed to push (use Retry)` : '') +
+                `Done after ${rr.roundsUsed} round${rr.roundsUsed !== 1 ? 's' : ''} — ${oc.verified} confirmed in HeyReach` +
+                (oc.unconfirmed ? `, ${oc.unconfirmed} pushed but not confirmable (spot-check in HeyReach)` : '') +
+                (staleTotal ? `, ${staleTotal} STILL show the old text after ${BULK_MAX_ROUNDS} rounds (use "Re-add unchanged leads")` : '') +
+                (hrFail ? `, ${hrFail} still failing to push after ${BULK_MAX_ROUNDS} rounds (use Retry)` : '') +
                 `. ${inSync} were already in sync.`,
                 problems > 0);
             showDeleteToast(problems ? `Sync finished with ${problems} problem${problems !== 1 ? 's' : ''}.` : `<i class="fas fa-check-circle"></i> HeyReach is now up to date.`, problems > 0);
@@ -5455,15 +5517,16 @@
                 ? { bulkAiEdit: true, aiModel: audit.model || '', aiInstructions: audit.instructions || '' }
                 : { bulkFindReplace: true, bulkRules: (audit && audit.rules) || [] };
             const defaultEditor = isAiEdit ? 'admin_bulk_ai_edit' : 'admin_bulk_find_replace';
-            let done = 0, okCount = 0, hrFail = 0, fsFail = 0, unverified = 0, stale = 0;
-            const pushedEntries = [];
+            let done = 0, fsFail = 0;
             const total = plan.targets.length;
-            bulkSetProgress(`Updating 0 / ${total}…`);
+            const states = []; // one per target: { t, queueId, firebaseOk, firebaseError }
+            bulkSetProgress(`Saving 0 / ${total}…`);
 
+            // Phase 1 — save every new message to Firestore.
             await bulkPool(plan.targets, 3, async t => {
-                const { item, oldMessage, newMessage } = t;
+                const { item, newMessage } = t;
                 const queueId = item.queueDocId;
-                let firebaseOk = false, firebaseError = null, heyreachOk = false, heyreachError = null, heyreachVerified = false, needsReadd = false;
+                let firebaseOk = false, firebaseError = null;
 
                 try {
                     await fsUpdateDoc(fsDoc(window.clemailDb, 'connect_queue', queueId), {
@@ -5478,13 +5541,28 @@
                     firebaseError = err.message || String(err);
                 }
 
-                if (firebaseOk) {
-                    // Verification happens once for the whole run afterwards (bulkVerifyPass), not per lead.
-                    const r = await syncMessageToHeyReach(item, queueId, newMessage, { skipVerify: true });
-                    heyreachOk = r.ok; heyreachError = r.error;
-                    heyreachVerified = !!r.verified; needsReadd = !!r.needsReadd;
-                    if (r.ok) pushedEntries.push({ item, queueId, oldMessage, newMessage });
-                }
+                if (!firebaseOk) { fsFail++; console.warn('[BulkReplace] Firestore save failed', queueId, firebaseError); }
+                states.push({ t, queueId, firebaseOk, firebaseError });
+                done++;
+                bulkSetProgress(`Saving ${done} / ${total}…`);
+            });
+
+            // Phase 2 — submit to HeyReach in up to 5 rounds, resubmitting whatever isn't confirmed yet.
+            const entries = states.filter(s => s.firebaseOk).map(s => ({
+                item: s.t.item, queueId: s.queueId, oldMessage: s.t.oldMessage, newMessage: s.t.newMessage
+            }));
+            const rr = await bulkPushInRounds(entries, 'updating HeyReach');
+            const oc = bulkCollectRoundOutcome(entries, rr);
+
+            // Phase 3 — one audit doc per message, recording the FINAL HeyReach outcome.
+            bulkSetProgress(`Writing audit trail for ${states.length} message${states.length !== 1 ? 's' : ''}…`);
+            await bulkPool(states, 3, async s => {
+                const { item, oldMessage, newMessage } = s.t;
+                const { queueId, firebaseOk, firebaseError } = s;
+                const res = firebaseOk ? (rr.results.get(queueId) || { status: 'push_failed', error: '', rounds: 0 }) : null;
+                const heyreachOk = !!res && (res.status === 'verified' || res.status === 'unconfirmed');
+                const heyreachVerified = !!res && res.status === 'verified';
+                const heyreachError = res && !heyreachOk ? (res.error || null) : null;
 
                 try {
                     await fsAddDoc(fsCollection(window.clemailDb, 'connect_message_edits'), {
@@ -5507,39 +5585,25 @@
                         heyreachSuccess: heyreachOk,
                         heyreachError: heyreachError,
                         heyreachVerified,
+                        heyreachRounds: res ? res.rounds : 0,
                         createdAt: new Date().toISOString()
                     });
                 } catch (auditErr) {
                     console.warn('[BulkReplace] audit write failed (non-fatal):', auditErr.message);
                 }
-
-                if (!firebaseOk) { fsFail++; console.warn('[BulkReplace] Firestore save failed', queueId, firebaseError); }
-                else if (needsReadd) { stale++; _bulkReadd.push({ item, queueId, oldMessage, newMessage }); console.warn('[BulkReplace] HeyReach still shows old text', queueId); }
-                else if (!heyreachOk) { hrFail++; _bulkRetry.push({ item, queueId }); console.warn('[BulkReplace] HeyReach push failed', queueId, heyreachError); }
-                else { okCount++; if (!heyreachVerified) unverified++; }
-                done++;
-                bulkSetProgress(`Updating ${done} / ${total}…`);
             });
 
-            // One read-back of the affected campaigns tells us what HeyReach REALLY holds now.
-            const vr = await bulkVerifyPass(pushedEntries);
-            unverified -= vr.verified.length;
-            vr.mismatch.forEach(e => {
-                okCount--; unverified--; stale++;
-                _bulkReadd.push({ item: e.item, queueId: e.queueId, oldMessage: e.live || e.oldMessage || '', newMessage: e.newMessage });
-                console.warn('[BulkReplace] HeyReach still shows old text', e.queueId);
-            });
-
+            const okCount = oc.verified + oc.unconfirmed, unverified = oc.unconfirmed, stale = oc.stale, hrFail = oc.failed;
             _bulkBusy = false;
             renderTable();
             bulkRefreshRetryButton();
             const problems = hrFail + fsFail + stale;
             const skipNote = plan.tooLong.length ? ` ${plan.tooLong.length} skipped (over the length limit).` : '';
             bulkSetProgress(
-                `Done — ${okCount - unverified} confirmed in HeyReach` +
+                `Done after ${rr.roundsUsed} round${rr.roundsUsed !== 1 ? 's' : ''} — ${oc.verified} confirmed in HeyReach` +
                 (unverified ? `, ${unverified} sent but not confirmable (spot-check in HeyReach)` : '') +
-                (stale ? `, ${stale} NOT changed in HeyReach (it kept the old text — use "Re-add unchanged leads")` : '') +
-                (hrFail ? `, ${hrFail} saved but the HeyReach push failed (use Retry)` : '') +
+                (stale ? `, ${stale} NOT changed in HeyReach after ${BULK_MAX_ROUNDS} rounds (it kept the old text — use "Re-add unchanged leads")` : '') +
+                (hrFail ? `, ${hrFail} saved but the HeyReach push still failed after ${BULK_MAX_ROUNDS} rounds (use Retry)` : '') +
                 (fsFail ? `, ${fsFail} could not be saved` : '') + `.${skipNote}`,
                 problems > 0);
             bulkUpdatePreview();
@@ -5553,28 +5617,17 @@
             document.getElementById('btnBulkRetry').disabled = true;
             const pending = _bulkRetry.slice();
             _bulkRetry = [];
-            let done = 0, okCount = 0;
-            const pushed = [];
-            bulkSetProgress(`Retrying 0 / ${pending.length}…`);
-            await bulkPool(pending, 3, async entry => {
-                const msg = entry.item.sentItem.message;
-                const r = await syncMessageToHeyReach(entry.item, entry.queueId, msg, { skipVerify: true });
-                if (r.ok) pushed.push({ item: entry.item, queueId: entry.queueId, oldMessage: '', newMessage: msg });
-                else { _bulkRetry.push(entry); console.warn('[BulkReplace] retry failed', entry.queueId, r.error); }
-                done++;
-                bulkSetProgress(`Retrying ${done} / ${pending.length}…`);
-            });
-            const vr = await bulkVerifyPass(pushed);
-            okCount = pushed.length - vr.mismatch.length;
-            vr.mismatch.forEach(e => _bulkReadd.push({ item: e.item, queueId: e.queueId, oldMessage: e.live || '', newMessage: e.newMessage }));
+            const entries = pending.map(p => ({ item: p.item, queueId: p.queueId, oldMessage: '', newMessage: p.item.sentItem.message }));
+            const rr = await bulkPushInRounds(entries, 'retrying');
+            const oc = bulkCollectRoundOutcome(entries, rr);
             _bulkBusy = false;
             document.getElementById('btnBulkRetry').disabled = false;
             bulkRefreshRetryButton();
-            bulkSetProgress(`Retry finished — ${vr.verified.length} confirmed in HeyReach` +
-                (vr.unknown.length ? `, ${vr.unknown.length} pushed but not confirmable` : '') +
-                (vr.mismatch.length ? `, ${vr.mismatch.length} still show the old text (use "Re-add unchanged leads")` : '') +
-                (_bulkRetry.length ? `, ${_bulkRetry.length} still failing` : '') + '.',
-                _bulkRetry.length > 0 || vr.mismatch.length > 0);
+            bulkSetProgress(`Retry finished after ${rr.roundsUsed} round${rr.roundsUsed !== 1 ? 's' : ''} — ${oc.verified} confirmed in HeyReach` +
+                (oc.unconfirmed ? `, ${oc.unconfirmed} pushed but not confirmable` : '') +
+                (oc.stale ? `, ${oc.stale} still show the old text (use "Re-add unchanged leads")` : '') +
+                (oc.failed ? `, ${oc.failed} still failing` : '') + '.',
+                oc.failed > 0 || oc.stale > 0);
         }
 
         async function bulkReaddUnchanged() {
