@@ -10336,6 +10336,49 @@
             return true;
         };
 
+        // Prior LinkedIn thread (oldest → newest) for follow-up/harvest messages
+        // (message_type !== 'connect'), as plain text for CSV/Excel exports so a reviewer
+        // can see what was already said. Connection requests have no thread → ''.
+        // Format: "[2026-10-01 14:05] Jane Doe (Prospect): text"
+        function getConversationHistoryTextForExport(m, maxMessages = 50) {
+            try {
+                if ((m.message_type || 'connect') === 'connect') return '';
+                const liUrl = m.prospect_li_url || m.linkedInUrl || '';
+                if (!liUrl || liUrl === '#') return '';
+                const acct = m.account_email || m.bdr_auth_email || m.bdr_email || m.accountEmail || '';
+                const conv = findConversationForProspect(liUrl, acct);
+                if (!conv) return '';
+                const msgs = extractMessages(conv);
+                if (!msgs.length) return '';
+
+                const raw = typeof conv.rawData === 'object' && conv.rawData ? conv.rawData : {};
+                const corr = raw.correspondentProfile || raw.lead || {};
+                const acctProf = raw.linkedInAccount || {};
+                const leadName = `${conv.leadFirstName || corr.firstName || m.prospect_first_name || ''} ${conv.leadLastName || corr.lastName || m.prospect_last_name || ''}`.trim() || 'Prospect';
+                const acctName = `${acctProf.firstName || ''} ${acctProf.lastName || ''}`.trim() || 'BDR';
+
+                const fmt = (ts) => {
+                    if (!ts) return '';
+                    const d = ts.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
+                    if (isNaN(d.getTime())) return '';
+                    const p = n => String(n).padStart(2, '0');
+                    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+                };
+
+                const slice = msgs.length > maxMessages ? msgs.slice(-maxMessages) : msgs;
+                const lines = slice.map(x => {
+                    const who = x.sender === 'lead' ? `${leadName} (Prospect)` : `${acctName} (BDR)`;
+                    const when = fmt(x.timestamp);
+                    return `${when ? `[${when}] ` : ''}${who}: ${String(x.text || '').trim()}`;
+                });
+                if (msgs.length > slice.length) lines.unshift(`(showing last ${slice.length} of ${msgs.length} messages)`);
+                return lines.join('\n');
+            } catch (err) {
+                console.warn('[Export] Could not build conversation history for', m.id, err);
+                return '';
+            }
+        }
+
         // Export all loaded messages to CSV (exposed globally so the onclick attribute can reach it)
         window.exportMessagesCSV = function exportMessagesCSV() {
             if (!loadedMessages || loadedMessages.length === 0) {
@@ -10360,7 +10403,8 @@
                 'Source',
                 'Review Status',
                 'Already Connected',
-                'Message Text'
+                'Message Text',
+                'Conversation History'
             ];
 
             const rows = loadedMessages.map(m => {
@@ -10397,7 +10441,8 @@
                     csvEscape(source),
                     csvEscape(selection),
                     csvEscape(connected),
-                    csvEscape(msgText)
+                    csvEscape(msgText),
+                    csvEscape(getConversationHistoryTextForExport(m))
                 ].join(',');
             });
 
@@ -10508,6 +10553,7 @@
                     { label: 'Connected',     wch: 12, h:'center' },
                     { label: 'Chars',         wch:  8, h:'center' },
                     { label: 'Message Text',  wch: 65, h:'left', wrap:true },
+                    { label: 'Conversation History', wch: 70, h:'left', wrap:true },
                     // ── Hypothesis group details (ties the message to its hypothesis / variation)
                     { label: 'Hypothesis Group',        wch: 28, h:'left', wrap:true },
                     { label: 'Hypothesis Statement',    wch: 55, h:'left', wrap:true },
@@ -10715,6 +10761,7 @@
                         mkCell(connected, connected === 'Yes' ? STYLE.connBadge : rs(base, 'center')),
                         mkCell(charCount, charS, 'n'),
                         mkCell(msgText,   rs(base, 'left', true)),
+                        mkCell(clampXl(getConversationHistoryTextForExport(m)), rs(base, 'left', true)),
                         // Hypothesis group details
                         mkCell(clampXl(hyp.groupName),     { ...rs(base, 'left', true), font: { ...base.font, bold: !!hyp.groupName } }),
                         mkCell(clampXl(hyp.group?.description || ''), rs(base, 'left', true)),
@@ -11233,6 +11280,7 @@
             '- "delete": this specific message should be discarded (low quality, off-target, duplicate) but the contact itself is still fine. Set "type" to "duplicate" if it is a duplicate, otherwise "market".',
             '- A Message ID should appear in only one of approve / exclude / delete (it may additionally appear in edits).',
             '- Connect Request messages must be 275 characters or fewer.',
+            '- For follow-up/harvest rows (Message Type = Message), the "Conversation History" column holds the prior LinkedIn thread. Use it so the message flows from where the conversation left off and does not repeat what was already said.',
             '- Omit messages you have no opinion on. Use [] for any unused category.',
             '- Output valid JSON only: double quotes, no trailing commas, and write line breaks inside message text as \\n.'
         ].join('\n');
