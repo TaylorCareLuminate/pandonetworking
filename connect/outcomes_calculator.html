@@ -1389,6 +1389,12 @@
     const ANALYSIS_DIR = 'connect_analysis';
     const ANALYSIS_JSON_PATH = `${ANALYSIS_DIR}/latest.json`;
     const ANALYSIS_MANIFEST_PATH = `${ANALYSIS_DIR}/manifest.json`;
+    // Local dated exports are a dev-only convenience (see connect_analysis_ingestion_spec.md
+    // §2 and upload_to_firebase.R) — they can be 50-100+ MB and aren't guaranteed to be
+    // present (not committed to the repo, not shipped to Hosting). Firebase Realtime
+    // Database is the verified live source; this is the same payload
+    // connect/analysis_results.html reads.
+    const FIREBASE_ANALYSIS_PATH = 'ConnectAnalysis/latest';
     const GEN_POST_FRACTION = 0.20;
     const GEN_RATE_FLOOR_FRACTION = 0.30;
     const GEN_MSG_TYPE_SOURCE = { post: ['post'], complement: ['complement'], news: ['news', 'org_news'] };
@@ -1749,23 +1755,39 @@
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp.json();
     }
+    // Reads straight from Firebase Realtime Database via window.firebaseRTDB (exposed by
+    // js/auth.js — this page is a classic script, not a module, so it can't `import` the
+    // Firebase SDK directly). Mirrors connect/analysis_results.html's fetchPayloadFromFirebase.
+    async function fetchAnalysisFromFirebase(rtdbPath) {
+        await (window.firebaseReady || Promise.resolve()).catch(() => {});
+        if (!window.firebaseRTDB) throw new Error('Firebase not initialized');
+        const snap = await window.firebaseRTDB.get(window.firebaseRTDB.ref(rtdbPath));
+        if (!snap || typeof snap.exists !== 'function' || !snap.exists()) throw new Error(`No data at ${rtdbPath}`);
+        return snap.val();
+    }
     async function loadAnalysisPayload() {
-        const consider = async (path, label) => {
-            const payload = await fetchAnalysisJson(path);
-            if (isAnalysisFunnelUsable(payload.overall?.funnel)) return payload;
+        const consider = async (payload, label) => {
+            if (isAnalysisFunnelUsable(payload?.overall?.funnel)) return payload;
             console.warn(`[Generate From Analysis] Skipping ${label}: funnel is incoherent.`);
             return null;
         };
-        try { const latest = await consider(ANALYSIS_JSON_PATH, 'latest.json'); if (latest) return latest; }
-        catch (e) { console.warn('[Generate From Analysis] latest.json failed:', e.message); }
+        try {
+            const usable = await consider(await fetchAnalysisJson(ANALYSIS_JSON_PATH), 'latest.json');
+            if (usable) return usable;
+        } catch (e) { console.warn('[Generate From Analysis] latest.json failed:', e.message); }
         try {
             const manifest = await fetchAnalysisJson(ANALYSIS_MANIFEST_PATH);
             for (const run of (manifest.runs || [])) {
                 if (!run.file) continue;
-                try { const payload = await consider(`${ANALYSIS_DIR}/${run.file}`, run.file); if (payload) return payload; }
+                try { const usable = await consider(await fetchAnalysisJson(`${ANALYSIS_DIR}/${run.file}`), run.file); if (usable) return usable; }
                 catch (e) { console.warn(`[Generate From Analysis] ${run.file} failed:`, e.message); }
             }
         } catch (e) { console.warn('[Generate From Analysis] manifest.json failed:', e.message); }
+        // Nothing usable on disk (not committed / not deployed) — fall back to live Firebase data.
+        try {
+            const usable = await consider(await fetchAnalysisFromFirebase(FIREBASE_ANALYSIS_PATH), `Firebase (${FIREBASE_ANALYSIS_PATH})`);
+            if (usable) return usable;
+        } catch (e) { console.warn('[Generate From Analysis] Firebase fallback failed:', e.message); }
         throw new Error('No usable analysis run found');
     }
     async function loadAnalysisData() {

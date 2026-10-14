@@ -376,19 +376,34 @@
         }
 
         // ── Cross-tab lock (never run this page's sender in two tabs at once) ──
-        function readLock() {
-            try { return JSON.parse(localStorage.getItem(LOCK_KEY) || 'null'); } catch (_) { return null; }
+        // The lock exists so two tabs never work the same lead (a double send). It is therefore kept
+        // per Quick Message campaign: tabs running DIFFERENT BDRs/campaigns run side by side, while a
+        // second tab on a campaign that is already being sent is blocked.
+        let _lockScopes = [];            // campaign scopes held by this tab's current run
+        const scopeOf = job => `${job.customerId}::${job.campaignId}`;
+        const lockKeyFor = scope => `${LOCK_KEY}.${scope}`;
+        function readLock(scope) {
+            try { return JSON.parse(localStorage.getItem(lockKeyFor(scope)) || 'null'); } catch (_) { return null; }
         }
-        function lockHeldByOtherTab() {
-            const l = readLock();
-            return !!(l && l.id !== _tabId && (Date.now() - l.ts) < LOCK_STALE_MS);
+        // Returns the scope (campaign) that another tab is currently running, or '' if none.
+        function scopeHeldByOtherTab(scopes) {
+            for (const s of scopes) {
+                const l = readLock(s);
+                if (l && l.id !== _tabId && (Date.now() - l.ts) < LOCK_STALE_MS) return s;
+            }
+            return '';
         }
         function touchLock() {
-            try { localStorage.setItem(LOCK_KEY, JSON.stringify({ id: _tabId, ts: Date.now() })); } catch (_) { /* ignore */ }
+            for (const s of _lockScopes) {
+                try { localStorage.setItem(lockKeyFor(s), JSON.stringify({ id: _tabId, ts: Date.now() })); } catch (_) { /* ignore */ }
+            }
         }
         function releaseLock() {
-            const l = readLock();
-            if (l && l.id === _tabId) { try { localStorage.removeItem(LOCK_KEY); } catch (_) { /* ignore */ } }
+            for (const s of _lockScopes) {
+                const l = readLock(s);
+                if (l && l.id === _tabId) { try { localStorage.removeItem(lockKeyFor(s)); } catch (_) { /* ignore */ } }
+            }
+            _lockScopes = [];
         }
 
         // ── "Already handled" memory (belt and braces against re-sending) ──
@@ -1031,6 +1046,7 @@
                         }
                     });
                     stats.queuedTotal += queued.length;
+                    console.log(`[fast-msg] ${job.bdr.name} / ${job.campaignName}: ${campRes.map.size} leads read from HeyReach, ${queued.length} queued`);
                     if (!queued.length) continue;
 
                     // Message-text fallback + presence in the campaign list
@@ -1038,6 +1054,7 @@
                     try {
                         const lr = await fetchListRows(job);
                         listMap = lr.map;
+                        console.log(`[fast-msg] ${job.bdr.name}: lead list ${job.listIdInt} read — ${lr.map.size} leads${lr.truncated ? ' (TRUNCATED)' : ''}`);
                         if (lr.truncated) warnings.push(`${job.bdr.name} / ${job.campaignName}: lead list is larger than this page reads; some leads may be treated as missing from the list.`);
                     } catch (e) {
                         warnings.push(`${job.bdr.name} / ${job.campaignName}: could not read the campaign's lead list (${e.message}) — its messages were skipped.`);
@@ -1113,6 +1130,21 @@
 
         function renderResults(stats) {
             const n = stats.eligible;
+            // One-line summary of the whole scan, so it can be copied straight from the console.
+            console.log('[fast-msg] SCAN SUMMARY ' + JSON.stringify({
+                campaigns: stats.campaigns,
+                queuedInHeyReach: stats.queuedTotal,
+                droppedNotInCampaignList: stats.noListMatch,
+                droppedBlankMessage: stats.blank,
+                droppedTooLong: stats.tooLong,
+                droppedAlreadyHandled: stats.handled,
+                checkedForConversation: stats.eligible + stats.noConversation + stats.otherAccount + stats.checkErrors,
+                noOpenConversation: stats.noConversation,
+                conversationOnOtherAccount: stats.otherAccount,
+                checkErrors: stats.checkErrors,
+                eligible: stats.eligible,
+                notQueuedInHeyReach: { sent: stats.sent, paused: stats.paused, finished: stats.finished, failed: stats.failed }
+            }));
             const banner = $('foundBanner');
             banner.className = 'found-banner' + (n ? '' : ' none');
             banner.innerHTML = n
@@ -1352,7 +1384,15 @@
             let target = parseInt($('sendCount').value, 10);
             if (isNaN(target) || target < 1) { alert('Enter how many messages to send (1 or more).'); return; }
             target = Math.min(target, pending.length);
-            if (lockHeldByOtherTab()) { alert('Another tab (or window) is already running this sender. Close it or wait for it to finish before starting here.'); return; }
+            // Claim every campaign this run can touch. Other tabs running different campaigns are unaffected.
+            const scopes = [...new Set(pending.map(i => scopeOf(i.job)))];
+            const heldScope = scopeHeldByOtherTab(scopes);
+            if (heldScope) {
+                const clash = pending.find(i => scopeOf(i.job) === heldScope);
+                const who = clash ? `${clash.job.bdr.name} / ${clash.job.campaignName}` : 'one of these campaigns';
+                alert(`Another tab (or window) is already sending for ${who}. Close it or wait for it to finish before starting here.\n\nTabs working on different BDRs can run at the same time.`);
+                return;
+            }
 
             const avgMs = target * ((MIN_DELAY_S + MAX_DELAY_S) / 2) * 1000;
             if (!confirm(
@@ -1363,6 +1403,7 @@
 
             $('haltBox').classList.add('hidden');
             _run = { target, sent: 0, stop: false, startedAt: Date.now() };
+            _lockScopes = scopes;
             touchLock();
             startTicker();
             $('startBtn').classList.add('hidden');
