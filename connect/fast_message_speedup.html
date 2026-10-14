@@ -569,13 +569,26 @@
         }
         function classifyLead(l) {
             const campaignStatus = normStatus(l.leadCampaignStatus || l.status);
+            const connectionStatus = normStatus(l.leadConnectionStatus);
             const messageStatus = normStatus(l.leadMessageStatus);
             const errCode = l.errorCode;
+            const hasErrCode = errCode != null && errCode !== 0 && String(errCode) !== '0' && String(errCode).toUpperCase() !== 'NONE';
+            // Same rule as classifyHrLead() in js/heyreach-live-status.js (what the dashboard counts use):
+            // a lead HeyReach never actually attempted anything for (connection AND message status both
+            // None/empty) is NOT dead just because HeyReach flagged it "Failed" or attached an errorCode.
+            // The common case is errorCode "FailedToCheckIfConversationExists" — HeyReach's own pre-send
+            // check failing, which is exactly what happens to many contacts who already have a conversation.
+            // Only the FAILED/ERROR statuses and error codes get this benefit of the doubt; STOPPED,
+            // FINISHED, EXCLUDED etc. stay terminal so a lead this page already stopped is never picked up again.
+            const neverAttempted = (connectionStatus === '' || connectionStatus === 'NONE')
+                && (messageStatus === '' || messageStatus === 'NONE');
+            const internalFail = neverAttempted && !l.failedTime
+                && (campaignStatus === 'FAILED' || campaignStatus === 'ERROR' || hasErrCode);
             const hasFailed = !!l.failedTime
-                || campaignStatus === 'FAILED'
-                || (errCode != null && errCode !== 0 && String(errCode) !== '0' && String(errCode).toUpperCase() !== 'NONE');
+                || (!internalFail && (campaignStatus === 'FAILED' || hasErrCode));
             const isPaused = campaignStatus === 'PAUSED';
-            const isTerminal = hasFailed || HR_TERMINAL_STATUSES.has(campaignStatus);
+            const isTerminal = hasFailed
+                || (HR_TERMINAL_STATUSES.has(campaignStatus) && !(internalFail && (campaignStatus === 'FAILED' || campaignStatus === 'ERROR')));
             const messageSent = /SENT|REPLIED|REPLY/.test(messageStatus) && !/NOT_?SENT/.test(messageStatus);
             let state, label;
             if (hasFailed) { state = 'failed'; label = 'Failed'; }
@@ -583,7 +596,14 @@
             else if (isTerminal) { state = 'finished'; label = 'Finished/stopped'; }
             else if (messageSent) { state = 'sent'; label = 'Message already sent'; }
             else { state = 'queued'; label = 'Queued'; }
-            return { state, label, messageSent };
+            const detail = [
+                `campaign: ${campaignStatus || 'none'}`,
+                `connection: ${connectionStatus || 'none'}`,
+                `message: ${messageStatus || 'none'}`,
+                hasErrCode ? `error: ${errCode}` : '',
+                l.failedTime ? 'failedTime set' : ''
+            ].filter(Boolean).join(' · ');
+            return { state, label, messageSent, internalFail, detail };
         }
         function parseCampaignLead(l) {
             const prof = l.linkedInUserProfile || l.leadProfile || l.lead || {};
@@ -598,6 +618,7 @@
                 company: prof.companyName || prof.company || l.companyName || l.company || '',
                 position: prof.position || prof.headline || l.position || '',
                 state: cls.state, label: cls.label, messageSent: cls.messageSent,
+                internalFail: cls.internalFail, detail: cls.detail,
                 content: extractContent(l)
             };
         }
@@ -716,16 +737,32 @@
                     { campaignId: job.campaignIdInt, leadUrl: item.rawUrl, leadMemberId: null });
                 return r;
             };
+            // HeyReach refuses to edit a list that a RUNNING campaign is using ("The list you selected cannot be
+            // currently modified because it is used by a running campaign" — HTTP 400). sent_messages.html gets
+            // around it by passing campaignId + pauseAndResume: the backend pauses the campaign, deletes the lead,
+            // then resumes the campaign (even if the delete fails).
+            const apiMsg = r => String((r && r.data && (r.data.errorMessage || r.data.error || r.data.message)) || (r && !r.ok ? r.text : '') || '').slice(0, 220);
+            let lastApiError = '';
             const deleteFromList = async () => {
-                const urls = [...new Set([listEntry.rawUrl, item.rawUrl, item.rawUrl.toLowerCase().replace(/\/+$/, '')].filter(Boolean))];
-                return hrFetch(job.apiKey, '/proxy/heyreach/lists/deleteleads', { listId: job.listIdInt, profileUrls: urls }, { method: 'DELETE' });
+                const urls = [...new Set([listEntry.rawUrl, item.rawUrl].filter(Boolean))];
+                const r = await hrFetch(job.apiKey, '/proxy/heyreach/lists/deleteleads',
+                    { listId: job.listIdInt, profileUrls: urls, campaignId: job.campaignIdInt, pauseAndResume: true },
+                    { method: 'DELETE', timeoutMs: 90000 });
+                if (!r.ok) {
+                    lastApiError = apiMsg(r);
+                } else {
+                    lastApiError = '';
+                    const nf = r.data && Array.isArray(r.data.notFoundInList) ? r.data.notFoundInList : [];
+                    if (nf.length) note(`HeyReach reports ${nf.length} URL(s) not found in list ${job.listIdInt}`);
+                }
+                return r;
             };
 
             let stopRes, delRes;
             try { stopRes = await stopLead(); } catch (e) { return { ok: false, error: `Stop request failed: ${e.message}` }; }
             note(`Stop lead in campaign → HTTP ${stopRes.status}`);
             try { delRes = await deleteFromList(); } catch (e) { return { ok: false, error: `Delete-from-list request failed: ${e.message}` }; }
-            note(`Delete lead from campaign list → HTTP ${delRes.status}`);
+            note(`Delete lead from campaign list → HTTP ${delRes.status}${lastApiError ? ' — ' + lastApiError : ''}`);
 
             const waits = [3000, 5000, 8000, 12000];
             let lastProblem = '';
@@ -739,7 +776,10 @@
                 const row = campRes.map.get(item.key);
                 const stillInList = listRes.map.has(item.key);
                 if (row && row.messageSent) return { ok: false, alreadySent: true };
-                const stillQueued = !!(row && row.state === 'queued');
+                // A lead HeyReach itself flagged Failed (never attempted) can keep showing that status after
+                // it has been removed from the list; it counts as "queued" for scanning but cannot send once
+                // it is out of the list, so list membership alone decides whether it is removed.
+                const stillQueued = !!(row && row.state === 'queued' && !row.internalFail);
                 if (!stillInList && !stillQueued) {
                     note(`Verified: lead is gone from the campaign list and no longer queued${row ? ` (HeyReach shows: ${row.label})` : ''}`);
                     return { ok: true };
@@ -748,10 +788,13 @@
                 note(`Not removed yet (${lastProblem}) — retrying`);
                 try {
                     if (stillQueued) await stopLead();
-                    if (stillInList) await deleteFromList();
+                    if (stillInList) {
+                        const rr = await deleteFromList();
+                        if (!rr.ok) note(`Delete lead from campaign list → HTTP ${rr.status}${lastApiError ? ' — ' + lastApiError : ''}`);
+                    }
                 } catch (e) { lastProblem += ` (retry failed: ${e.message})`; }
             }
-            return { ok: false, error: `HeyReach still shows the lead ${lastProblem || 'in the campaign'} after several attempts` };
+            return { ok: false, error: `HeyReach still shows the lead ${lastProblem || 'in the campaign'} after several attempts${lastApiError ? `. HeyReach said: ${lastApiError}` : ''}` };
         }
 
         // ── Sending through the conversation ───────────────────────────────
@@ -925,7 +968,8 @@
             const stats = {
                 campaigns: 0, queuedTotal: 0, eligible: 0, noConversation: 0, otherAccount: 0, checkErrors: 0,
                 blank: 0, tooLong: 0, handled: 0, noListMatch: 0,
-                sent: 0, paused: 0, finished: 0, failed: 0
+                sent: 0, paused: 0, finished: 0, failed: 0,
+                notQueued: new Map()     // "label — status detail" -> count, for the "why left out" list
             };
             const checkErrorSamples = [];
 
@@ -977,10 +1021,14 @@
                     const queued = [];
                     campRes.map.forEach(row => {
                         if (row.state === 'queued') queued.push(row);
-                        else if (row.state === 'sent') stats.sent++;
-                        else if (row.state === 'paused') stats.paused++;
-                        else if (row.state === 'failed') stats.failed++;
-                        else stats.finished++;
+                        else {
+                            if (row.state === 'sent') stats.sent++;
+                            else if (row.state === 'paused') stats.paused++;
+                            else if (row.state === 'failed') stats.failed++;
+                            else stats.finished++;
+                            const k = `${row.label} — ${row.detail}`;
+                            stats.notQueued.set(k, (stats.notQueued.get(k) || 0) + 1);
+                        }
                     });
                     stats.queuedTotal += queued.length;
                     if (!queued.length) continue;
@@ -1087,7 +1135,12 @@
             if (stats.noListMatch) reasons.push(`${stats.noListMatch} are not in the campaign's lead list, so removal could not be verified.`);
             if (stats.handled) reasons.push(`${stats.handled} were already handled by this page in the last 3 days.`);
             const other = stats.sent + stats.paused + stats.finished + stats.failed;
-            if (other) reasons.push(`Not counted as queued: ${stats.sent} already sent, ${stats.paused} paused, ${stats.finished} finished/stopped, ${stats.failed} failed.`);
+            if (other) {
+                reasons.push(`Not counted as queued: ${stats.sent} already sent, ${stats.paused} paused, ${stats.finished} finished/stopped, ${stats.failed} failed.`);
+                const top = Array.from(stats.notQueued.entries()).sort((a, b) => b[1] - a[1]).slice(0, 6);
+                top.forEach(([k, n]) => reasons.push(`   ${n} × ${k}`));
+                console.log('[fast-msg] Leads not counted as queued (by HeyReach status):', Object.fromEntries(stats.notQueued));
+            }
             $('reasonList').innerHTML = reasons.map(r => `<li>${escapeHtml(r)}</li>`).join('');
 
             $('resultsCard').classList.remove('hidden');
