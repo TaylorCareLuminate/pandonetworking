@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en" class="protection-hide">
 <head>
-    <!-- CACHE BUSTER v4.14.0 - PHONE HYDRATION: scheduled activities missing a phone are filled from outreach_sets before the queue filter -->
+    <!-- CACHE BUSTER v4.15.0 - CALL LOG: cooldown and previous outcomes read the call backlog, not a partial phone_activities scan -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
@@ -2472,7 +2472,7 @@
 
     <script type="module">
         // 🔐 PAGE VERSION FOR CACHE BUSTING
-            const PAGE_VERSION = 'v2.12.0-outreach-phone-hydrate';
+            const PAGE_VERSION = 'v2.13.0-call-log-cooldown';
         console.log(`📄 Phone Calls Page Version: ${PAGE_VERSION}`);
         console.log('🛡️ Duplicate Call Checking: ENABLED (72-hour / 3-day cooldown)');
         console.log('🔒 Assignment System: FIXED (respects assignment expiry - prevents queue overlaps)');
@@ -2609,7 +2609,7 @@
 
         function purgeCallQueueForContact(record) {
             const before = callQueue.length;
-            callQueue = callQueue.filter((c) => !recordsMatchSameContact(c, record));
+            callQueue = callQueue.filter((c) => !recordsMatchSameContact(c, record) && !matchCalledParty(c, record));
             const removed = before - callQueue.length;
             if (removed > 0) {
                 console.log(`🧹 Purged ${removed} queue entr${removed === 1 ? 'y' : 'ies'} for recently-called contact`);
@@ -2628,6 +2628,162 @@
                 return true;
             }
             return false;
+        }
+
+        // The call backlog (campaign_call_tracking) is the record that actually logged the dial.
+        // A phone_activities scan can miss it: completedAt may not match the 72-hour query, and an
+        // unordered limit() on a large campaign returns an arbitrary slice. This log is what the
+        // call manager shows, so cooldown and previous-outcome checks use it directly.
+        let recentCallLog = [];
+        let recentCallLogLoadedAt = 0;
+        let recentCallLogCampaignId = '';
+        const RECENT_CALL_LOG_TTL_MS = 60 * 1000;
+        // 72h cooldown plus a day of margin. Previous-outcome history only needs the recent window too.
+        const RECENT_CALL_LOG_LOOKBACK_DAYS = 4;
+
+        function parseCallLogDate(value) {
+            if (!value) return null;
+            if (value instanceof Date) return isNaN(value.getTime()) ? null : value;
+            if (typeof value.toDate === 'function') return value.toDate();
+            if (value.seconds) return new Date(value.seconds * 1000);
+            const parsed = new Date(value);
+            return isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function calledParty(record) {
+            const rawPhone = record?.contactPhone || record?.phoneNumber || record?.phone ||
+                record?.contactData?.workphone || record?.contactData?.phone || '';
+            const phone = window.CallFiltering?.normalizePhone10
+                ? window.CallFiltering.normalizePhone10(rawPhone)
+                : String(rawPhone).replace(/\D/g, '').slice(-10);
+            const email = String(record?.contactEmail || record?.email || '').trim().toLowerCase();
+            const orgRaw = record?.companyName || record?.contactCompany || record?.company ||
+                record?.orgName || record?.contactData?.company_name || '';
+            const org = window.CallFiltering?.normalizeOrganizationName
+                ? window.CallFiltering.normalizeOrganizationName(orgRaw)
+                : String(orgRaw).trim().toLowerCase();
+            const personRaw = String(record?.contactName || '').trim().toLowerCase();
+            const orgLabel = String(record?.orgName || '').trim().toLowerCase();
+            const personIsOrg = !personRaw || personRaw === org || (orgLabel && personRaw === orgLabel);
+            return {
+                phone: phone && phone.length >= 10 ? phone : '',
+                email: email.includes('@') ? email : '',
+                org,
+                person: personIsOrg ? '' : personRaw,
+                outreachSetId: String(record?.outreachSetId || '').trim()
+            };
+        }
+
+        // Same phone, email, or contact id always matches. The same organization matches when at
+        // least one side is the organization itself (no separate person), which is how clinic
+        // calls are logged. Two different named people at the same company do not match.
+        function matchCalledParty(activity, loggedCall) {
+            const a = calledParty(activity);
+            const b = calledParty(loggedCall);
+            if (a.outreachSetId && b.outreachSetId && a.outreachSetId === b.outreachSetId) return 'Same contact';
+            if (a.email && b.email && a.email === b.email) return 'Same email';
+            if (a.phone && b.phone && a.phone === b.phone) return 'Same phone number';
+            if (a.org && b.org && a.org === b.org) {
+                if (a.person && b.person) {
+                    return a.person === b.person ? 'Same contact at this company' : null;
+                }
+                return 'Same organization';
+            }
+            return null;
+        }
+
+        function rememberLoggedCall(entry) {
+            if (!entry?.calledAt) return;
+            recentCallLog = recentCallLog.filter((existing) => existing.id !== entry.id);
+            recentCallLog.unshift(entry);
+            recentCallLog.sort((a, b) => b.calledAt - a.calledAt);
+            recentCallLogCampaignId = entry.campaignId || recentCallLogCampaignId;
+            recentCallLogLoadedAt = Date.now();
+        }
+
+        // maxAgeMs lets a caller accept a recent copy instead of re-reading the log every call.
+        async function loadRecentCallLog(campaignId, forceRefresh = false, maxAgeMs = RECENT_CALL_LOG_TTL_MS) {
+            if (!campaignId) return [];
+            const fresh = recentCallLogCampaignId === campaignId &&
+                (Date.now() - recentCallLogLoadedAt) < maxAgeMs;
+            if (!forceRefresh && fresh) return recentCallLog;
+
+            const since = new Date(Date.now() - RECENT_CALL_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+            const snapshot = await getDocs(query(
+                collection(db, 'campaign_call_tracking'),
+                where('timestamp', '>=', since.toISOString())
+            ));
+
+            const entries = [];
+            snapshot.docs.forEach((docSnap) => {
+                const data = docSnap.data();
+                if (data.campaignId !== campaignId) return;
+                const calledAt = parseCallLogDate(data.timestamp || data.completedAt);
+                if (!calledAt) return;
+                entries.push({
+                    id: docSnap.id,
+                    callId: data.callId || '',
+                    campaignId: data.campaignId || '',
+                    outcome: data.outcome || '',
+                    notes: data.notes || '',
+                    userEmail: data.userEmail || '',
+                    callerName: data.callerName || '',
+                    contactName: data.contactName || '',
+                    contactEmail: data.contactEmail || '',
+                    contactPhone: data.contactPhone || data.phoneNumber || '',
+                    phoneNumber: data.phoneNumber || data.contactPhone || '',
+                    companyName: data.companyName || data.contactCompany || '',
+                    contactCompany: data.contactCompany || data.companyName || '',
+                    outreachSetId: data.outreachSetId || '',
+                    calledAt
+                });
+            });
+            entries.sort((a, b) => b.calledAt - a.calledAt);
+            recentCallLog = entries;
+            recentCallLogLoadedAt = Date.now();
+            recentCallLogCampaignId = campaignId;
+            console.log(`📒 Call log: ${entries.length} calls in the last ${RECENT_CALL_LOG_LOOKBACK_DAYS} days for this campaign (${snapshot.size} team-wide)`);
+            return recentCallLog;
+        }
+
+        function loggedCallsForActivity(activity, { withinHours = null, skipSameActivity = false } = {}) {
+            const cutoff = withinHours == null ? null : Date.now() - withinHours * 60 * 60 * 1000;
+            const matches = [];
+            for (const entry of recentCallLog) {
+                if (cutoff != null && entry.calledAt.getTime() < cutoff) continue;
+                if (skipSameActivity && activity?.id && entry.callId && entry.callId === activity.id) continue;
+                const reason = matchCalledParty(activity, entry);
+                if (!reason) continue;
+                matches.push({ ...entry, matchReason: reason });
+            }
+            return matches;
+        }
+
+        function historyMatchType(reason) {
+            if (reason === 'Same phone number') return 'phone';
+            if (reason === 'Same email') return 'email';
+            if (reason === 'Same contact') return 'contactId';
+            if (reason === 'Same contact at this company') return 'name+company';
+            return 'organization';
+        }
+
+        function historyRecordsFromLog(activity) {
+            return loggedCallsForActivity(activity, { skipSameActivity: true }).map((entry) => ({
+                id: entry.callId || entry.id,
+                outcome: entry.outcome,
+                notes: entry.notes,
+                status: 'completed',
+                completedAt: entry.calledAt.toISOString(),
+                completedBy: entry.callerName || entry.userEmail || 'Unknown',
+                contactName: entry.contactName,
+                contactEmail: entry.contactEmail,
+                phoneNumber: entry.phoneNumber,
+                companyName: entry.companyName,
+                campaignId: entry.campaignId,
+                timestamp: entry.calledAt,
+                matchType: historyMatchType(entry.matchReason),
+                fromCallLog: true
+            }));
         }
 
         // Companies that already have a meeting booked. Shared by queue loading, the
@@ -3249,7 +3405,26 @@
         }
 
         // Check for previous completed calls for this contact and calculate next follow-up date
+        function previousInfoFromLog(entries) {
+            if (!entries.length) return null;
+            const mostRecent = entries[0];
+            return {
+                lastCallDate: mostRecent.calledAt,
+                lastOutcome: mostRecent.outcome,
+                lastNotes: mostRecent.notes,
+                expectedNextCallDate: addBusinessDays(mostRecent.calledAt, 2),
+                attemptNumber: entries.length + 1
+            };
+        }
+
         async function getPreviousCallInfo(currentCall) {
+            let logMatches = [];
+            try {
+                await loadRecentCallLog(currentCall.campaignId || selectedCampaign);
+                logMatches = loggedCallsForActivity(currentCall, { skipSameActivity: true });
+            } catch (callLogError) {
+                console.warn('⚠️ Call log unavailable for previous-call check:', callLogError);
+            }
             try {
                 // Extract ALL possible identifiers for robust matching
                 const contactId = currentCall.contactId || currentCall.contact_id || null;
@@ -3322,6 +3497,10 @@
                 console.log(`📊 Found ${matchingDocs.length} completed calls for this contact (using multi-identifier matching)`);
                 
                 if (matchingDocs.length === 0) {
+                    if (logMatches.length > 0) {
+                        console.log(`📒 Previous call found in the call log (${logMatches[0].matchReason})`);
+                        return previousInfoFromLog(logMatches);
+                    }
                     console.log('✅ No previous calls found - this is the first attempt');
                     return null; // No previous calls - this is the first attempt
                 }
@@ -3365,6 +3544,10 @@
                 
             } catch (error) {
                 console.error('❌ Error checking previous calls:', error);
+                if (logMatches.length > 0) {
+                    console.log('📒 Using the call log after the phone_activities history query failed');
+                    return previousInfoFromLog(logMatches);
+                }
                 return null;
             }
         }
@@ -5709,6 +5892,16 @@
                 console.log(`   Contacts called TODAY: ${contactsCalledToday.size}`);
                 console.log(`   Contacts with bad numbers: ${contactsWithBadNumbers.size}`);
                 console.log(`   Follow-up cache built for: ${contactFollowUpMap.size} contacts`);
+
+                // Call backlog for this campaign. This is the list the call manager shows, and it
+                // still has a call when the phone_activities cooldown query does not.
+                try {
+                    await loadRecentCallLog(selectedCampaign, true);
+                    const loggedInCooldown = recentCallLog.filter((entry) => entry.calledAt >= cooldownStart).length;
+                    console.log(`📒 Call log cooldown: ${loggedInCooldown} logged calls within ${cooldownHours}h`);
+                } catch (callLogError) {
+                    console.error('⚠️ Call log could not be loaded; cooldown is using phone_activities only:', callLogError);
+                }
                 
                 // ============ AUTOMATIC BAD NUMBER DETECTION ============
                 // Query ALL historical bad numbers (not just today) and automatically mark pending activities with those numbers
@@ -6221,6 +6414,13 @@
                             cooldownMatchReason = hasOutreachSetId ? 'outreachSetId:' + data.outreachSetId :
                                                   hasEmail ? 'email:' + data.contactEmail :
                                                   'phone:' + mainPhone;
+                        }
+                    }
+                    if (!wasCalledRecently) {
+                        const loggedMatch = loggedCallsForActivity(data, { withinHours: cooldownHours })[0];
+                        if (loggedMatch) {
+                            wasCalledRecently = true;
+                            cooldownMatchReason = `call log (${loggedMatch.matchReason}, ${loggedMatch.calledAt.toLocaleString()} by ${loggedMatch.userEmail || 'unknown'})`;
                         }
                     }
                     
@@ -7168,6 +7368,28 @@
                 });
                 
                 console.log(`🔍 Post-claim: Checked ${recentCallsSnapshot.docs.length} completed calls, ${callsWithinCooldown} within ${cooldownHours}h cooldown`);
+
+                if (!foundRecentCall) {
+                    try {
+                        // Race guard: accept a copy up to 15s old so a call logged by another agent
+                        // moments ago is still caught without re-reading the log for every contact.
+                        await loadRecentCallLog(selectedCampaign, false, 15 * 1000);
+                        const loggedMatch = loggedCallsForActivity(callData, { withinHours: cooldownHours })[0];
+                        if (loggedMatch) {
+                            foundRecentCall = true;
+                            recentCallInfo = {
+                                completedBy: loggedMatch.userEmail || 'Unknown',
+                                completedAt: loggedMatch.calledAt,
+                                hoursAgo: Math.max(0, Math.floor((now - loggedMatch.calledAt) / (1000 * 60 * 60))),
+                                matchReason: `${loggedMatch.matchReason} (call log)`,
+                                outcome: loggedMatch.outcome || 'Unknown'
+                            };
+                            console.error(`🚨 Call log shows this contact was called ${recentCallInfo.hoursAgo}h ago by ${recentCallInfo.completedBy}`);
+                        }
+                    } catch (callLogError) {
+                        console.warn('⚠️ Post-claim call log check failed:', callLogError);
+                    }
+                }
                 
                 if (foundRecentCall && recentCallInfo) {
                     addRecordToCooldownIdentifiers(sessionCooldownIdentifiers, callData);
@@ -7272,10 +7494,30 @@
                     return; // Skip duplicate check if no campaign is selected
                 }
                 
-                // ⚡ PERFORMANCE FIX: Only check THIS campaign for duplicates (much faster!)
-                // This prevents duplicate calls within the same campaign while keeping queries fast
+                // The call backlog is the source the call manager uses. Check it before the
+                // phone_activities slice, which can miss a call that was logged yesterday.
+                let recentMatchingCalls = [];
+                try {
+                    await loadRecentCallLog(selectedCampaign, false, 15 * 1000);
+                    recentMatchingCalls = loggedCallsForActivity(currentCall, { withinHours: cooldownHours }).map((entry) => ({
+                        timestamp: entry.calledAt.toISOString(),
+                        userEmail: entry.callerName ? `${entry.callerName} (${entry.userEmail})` : (entry.userEmail || 'Unknown'),
+                        outcome: entry.outcome,
+                        matchReason: entry.matchReason
+                    }));
+                    if (recentMatchingCalls.length > 0) {
+                        console.log(`📒 Call log found ${recentMatchingCalls.length} recent call(s) for this contact`);
+                    }
+                } catch (callLogError) {
+                    console.error('⚠️ Call log check failed; falling back to phone activities:', callLogError);
+                }
+
+                // ⚡ Fallback: phone_activities slice. Only used when the call log has no match.
                 let recentCallsSnapshot;
                 let recentCalls = [];
+                if (recentMatchingCalls.length > 0) {
+                    recentCallsSnapshot = { docs: [] };
+                } else {
                 
                 // CRITICAL FIX: Don't use orderBy (requires Firestore index) - we'll sort client-side
                 // Get completed calls and filter by completedAt on the client
@@ -7324,6 +7566,7 @@
                         return; // Skip duplicate check if queries fail
                     }
                 }
+                }
                 
                 // Extract recent calls data
                 recentCallsSnapshot.docs.forEach((doc) => {
@@ -7363,11 +7606,9 @@
                 
                 console.log(`📊 Found ${recentCalls.length} recent calls in this campaign`);
                 
-                // Check if any match this contact
-                let recentMatchingCalls = [];
+                // Check phone_activities only when the call log did not already find this contact.
                 const mainPhoneNumber = extractMainPhoneNumber(phoneNumber);
-                
-                recentCalls.forEach((data) => {
+                if (recentMatchingCalls.length === 0) recentCalls.forEach((data) => {
                     // All calls are already filtered to last 24 hours
                     // Check ALL calls within 24 hours - including user's own calls
                     // This prevents duplicate calls by the same person or team members
@@ -8582,7 +8823,9 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     contactEmail: currentCall.contactEmail || currentCall.email || '',
                     contactCompany: currentCall.companyName || currentCall.company || currentCall.orgName || currentCall.contactData?.company_name || '',
                     companyName: currentCall.companyName || currentCall.company || currentCall.orgName || currentCall.contactData?.company_name || '',
-                    notes: notes
+                    notes: notes,
+                    outreachSetId: currentCall.outreachSetId || '',
+                    orgName: currentCall.orgName || ''
                 };
                 
                 if (additionalData) {
@@ -8607,6 +8850,23 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 console.log('📝 Step 1: Adding document to campaign_call_tracking...');
                 const trackingDocRef = await addDoc(collection(db, 'campaign_call_tracking'), callTrackingData);
                 console.log('✅ Step 1 COMPLETE: Call logged to campaign_call_tracking:', trackingDocRef.id);
+                rememberLoggedCall({
+                    id: trackingDocRef.id,
+                    callId: currentCall.id,
+                    campaignId: selectedCampaign,
+                    outcome: outcome,
+                    notes: notes,
+                    userEmail: userEmail,
+                    callerName: callTrackingData.callerName,
+                    contactName: callTrackingData.contactName,
+                    contactEmail: callTrackingData.contactEmail,
+                    contactPhone: phoneNumber,
+                    phoneNumber: phoneNumber,
+                    companyName: callTrackingData.companyName,
+                    contactCompany: callTrackingData.contactCompany || callTrackingData.companyName,
+                    outreachSetId: callTrackingData.outreachSetId,
+                    calledAt: now
+                });
                 
                 // Update phone activity status and clear claim
                 // PAYMENT FIELDS ADDED - phone_activities is now the Single Source of Truth for payments
@@ -9504,6 +9764,12 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 } else {
                     cleanNumber = cleanNumber.substring(0, 10);
                 }
+            }
+
+            // 1-801-555-1212 and (801) 555-1212 are the same number. Keeping the leading 1
+            // made yesterday's call look like a different phone, so the cooldown missed it.
+            if (cleanNumber.length === 11 && cleanNumber.startsWith('1')) {
+                cleanNumber = cleanNumber.slice(1);
             }
             
             return cleanNumber;
@@ -11450,7 +11716,7 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 
                 // Sort by timestamp (newest first) and limit to 10
                 callRecords.sort((a, b) => b.timestamp - a.timestamp);
-                const limitedRecords = callRecords.slice(0, 10);
+                const limitedRecords = (await mergeCallLogHistory(callRecords)).slice(0, 10);
                 
                 const endTime = performance.now();
                 console.log(`✅ Call history loaded in ${Math.round(endTime - startTime)}ms (${limitedRecords.length} total records after fallback matching)`);
@@ -11459,10 +11725,34 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 
             } catch (error) {
                 console.warn('⚠️ Error loading call history:', error.message);
+                try {
+                    const fromLog = await mergeCallLogHistory([]);
+                    if (fromLog.length > 0) {
+                        displayCallHistory(fromLog.slice(0, 10));
+                        return;
+                    }
+                } catch (callLogError) {
+                    console.warn('⚠️ Call log history also failed:', callLogError.message);
+                }
                 // Don't show error - just show no history
                 historyContent.innerHTML = '<div style="text-align: center; color: var(--gray); font-style: italic;">No previous calls found</div>';
                 historySection.style.display = 'block';
             }
+        }
+
+        async function mergeCallLogHistory(callRecords) {
+            const campaignId = currentCall?.campaignId || selectedCampaign;
+            if (!campaignId || !currentCall) return callRecords;
+            await loadRecentCallLog(campaignId);
+            const seenActivityIds = new Set(callRecords.map((record) => record.id));
+            const merged = callRecords.slice();
+            historyRecordsFromLog(currentCall).forEach((entry) => {
+                if (entry.id && seenActivityIds.has(entry.id)) return;
+                seenActivityIds.add(entry.id);
+                merged.push(entry);
+            });
+            merged.sort((a, b) => b.timestamp - a.timestamp);
+            return merged;
         }
 
         // Display call history
@@ -11501,7 +11791,8 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     'contactId': { label: 'Same Contact ID', color: '#10b981', icon: '✓' },
                     'email': { label: 'Same Email', color: '#3b82f6', icon: '✉' },
                     'name+company': { label: 'Same Name+Company', color: '#8b5cf6', icon: '👤' },
-                    'phone': { label: 'Same Phone #', color: '#f59e0b', icon: '📞' }
+                    'phone': { label: 'Same Phone #', color: '#f59e0b', icon: '📞' },
+                    'organization': { label: 'Same Organization', color: '#dc2626', icon: '🏢' }
                 };
                 
                 if (record.matchType && matchTypeLabels[record.matchType]) {
