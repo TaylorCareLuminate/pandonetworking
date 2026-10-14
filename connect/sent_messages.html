@@ -1627,6 +1627,7 @@
                         <button type="button" id="btnBulkModeAi" class="btn btn-secondary" style="font-size:0.8rem;padding:0.35rem 0.8rem;"><i class="fas fa-wand-magic-sparkles"></i> AI edit</button>
                         <button type="button" id="btnBulkModeHyp" class="btn btn-secondary" style="font-size:0.8rem;padding:0.35rem 0.8rem;" title="Re-run the Opus review under a different hypothesis group / variation, optimize the variation mix, and save the tags to Firebase"><i class="fas fa-flask"></i> Hypothesis review &amp; optimize</button>
                     </div>
+                    <div id="bulkTruthNote" style="font-size:0.82rem;margin:-0.25rem 0 0.75rem;max-width:62rem;"></div>
                     <div id="bulkFrSection">
                     <p style="font-size:0.82rem;color:#64748b;margin:0 0 0.65rem;max-width:60rem;">
                         Changes the wording in <strong>every message currently queued for this BDR</strong> (not just the ones on screen) &mdash; including the <strong>Unresolved</strong> section unless you untick it &mdash; saves it, and updates HeyReach.
@@ -4929,11 +4930,108 @@
         }
 
         // Every queued message for the BDR being viewed that we can actually edit
+        // "Queued" on this page is built from OUR webhook history, so it also lists leads HeyReach has already sent,
+        // failed or quietly dropped (and "Unresolved" is every push we couldn't verify). The bulk tools therefore also
+        // require each message to be in the SAME authoritative list the BDR Dashboard / In Process page use
+        // (/api/bdr/in-process-leads → computeInProcessLeads), and de-duplicate by queue record, since several
+        // activity rows for one contact all point at the same connect_queue doc.
+        let _inProcessTruth = null;        // { email, urls:Set<canonical url>, pending, listed, diagnostics, at }
+        let _inProcessTruthPromise = null; // { email, p }
+        let _inProcessTruthError = '';
+        let _inProcessTruthTriedFor = '';  // BDR email we already attempted (avoids retry loops after a failure)
+
+        async function loadInProcessTruth(force = false) {
+            const email = currentViewedBdrEmail();
+            if (!email) return null;
+            if (!force && _inProcessTruth && _inProcessTruth.email === email && Date.now() - _inProcessTruth.at < 10 * 60 * 1000) return _inProcessTruth;
+            if (!force && _inProcessTruthPromise && _inProcessTruthPromise.email === email) return _inProcessTruthPromise.p;
+            _inProcessTruthTriedFor = email;
+            const p = (async () => {
+                try {
+                    let token = '';
+                    try { token = auth.currentUser ? await auth.currentUser.getIdToken() : ''; } catch (e) { /* none */ }
+                    const resp = await fetch(`${BACKEND_API_URL}/api/bdr/in-process-leads?bdrEmail=${encodeURIComponent(email)}`,
+                        { headers: token ? { 'Authorization': `Bearer ${token}` } : {} });
+                    const j = await resp.json().catch(() => ({}));
+                    if (!resp.ok || !j.success) throw new Error((j && j.error) || `HTTP ${resp.status}`);
+                    const urls = new Set();
+                    (j.leads || []).forEach(l => { if (!l._excluded && l.url) urls.add(canonicalLinkedInUrl(l.url)); });
+                    _inProcessTruth = { email, urls, pending: j.pending != null ? j.pending : urls.size, listed: urls.size, diagnostics: j.diagnostics || {}, at: Date.now() };
+                    _inProcessTruthError = '';
+                    return _inProcessTruth;
+                } catch (e) {
+                    _inProcessTruth = null;
+                    _inProcessTruthError = e.message || String(e);
+                    console.warn('[InProcessTruth] could not verify queue against HeyReach:', _inProcessTruthError);
+                    return null;
+                } finally {
+                    _inProcessTruthPromise = null;
+                }
+            })();
+            _inProcessTruthPromise = { email, p };
+            return p;
+        }
+        function inProcessTruthForViewer() {
+            return (_inProcessTruth && _inProcessTruth.email === currentViewedBdrEmail()) ? _inProcessTruth : null;
+        }
+        // Items passing the page-level queued/unresolved test, before the live-HeyReach filter and de-duplication.
+        function bulkQueuedBase(inclUnresolved) {
+            return allSentItems.filter(i => (i.isHeyReachQueued || (inclUnresolved && i.isUnresolved)) && i.queueDocId && (i.sentItem.message || '').trim());
+        }
         function bulkEditableQueued(inclUnresolvedOverride) {
             const inclUnresolved = inclUnresolvedOverride !== undefined
                 ? !!inclUnresolvedOverride
                 : !!document.getElementById('bulkIncludeUnresolved')?.checked;
-            return allSentItems.filter(i => (i.isHeyReachQueued || (inclUnresolved && i.isUnresolved)) && i.queueDocId && (i.sentItem.message || '').trim());
+            const truth = inProcessTruthForViewer();
+            const seen = new Set();
+            return bulkQueuedBase(inclUnresolved).filter(i => {
+                if (seen.has(i.queueDocId)) return false;
+                if (truth) {
+                    const k = canonicalLinkedInUrl(i.queueLiUrl || i.contact.profileUrl || '');
+                    if (!k || !truth.urls.has(k)) return false;
+                }
+                seen.add(i.queueDocId);
+                return true;
+            });
+        }
+
+        // Status line at the top of the bulk panel explaining what the bulk tools will (and won't) touch.
+        function bulkTruthRender() {
+            const el = document.getElementById('bulkTruthNote');
+            if (!el) return;
+            const email = currentViewedBdrEmail();
+            const truth = inProcessTruthForViewer();
+            const recheck = ' <a href="#" id="bulkTruthRecheck">Re-check</a>';
+            if (_inProcessTruthPromise && _inProcessTruthPromise.email === email) {
+                el.style.color = '#92400e';
+                el.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Checking which messages are really still in HeyReach\'s queue (already-sent leads are being left out)…';
+            } else if (truth) {
+                const base = bulkQueuedBase(!!document.getElementById('bulkIncludeUnresolved')?.checked);
+                const uniq = new Set(base.map(i => i.queueDocId)).size;
+                const editable = bulkEditableQueued().length;
+                const left = uniq - editable;
+                el.style.color = '#065f46';
+                el.innerHTML = `<i class="fas fa-circle-check"></i> Live check: HeyReach has <strong>${Number(truth.pending).toLocaleString()}</strong> leads in queue; <strong>${editable.toLocaleString()}</strong> of them match a message here and can be edited.` +
+                    (left > 0 ? ` ${left.toLocaleString()} other message${left !== 1 ? 's' : ''} listed as queued/unresolved on this page are <strong>not</strong> in HeyReach's queue (already sent, failed, or dropped) and are excluded from every bulk tool.` : '') +
+                    (truth.pending > truth.listed ? ` (${(truth.pending - truth.listed).toLocaleString()} HeyReach leads can't be matched to a message here.)` : '') + recheck;
+            } else if (_inProcessTruthError) {
+                el.style.color = '#b91c1c';
+                el.innerHTML = `<i class="fas fa-triangle-exclamation"></i> Couldn't verify against HeyReach (${escapeHtml(_inProcessTruthError)}). The counts below include messages that may already have been sent.` + recheck;
+            } else {
+                el.style.color = '#64748b';
+                el.textContent = '';
+            }
+            const link = document.getElementById('bulkTruthRecheck');
+            if (link) link.addEventListener('click', e => { e.preventDefault(); bulkEnsureTruth(true); });
+        }
+        async function bulkEnsureTruth(force = false) {
+            const panel = document.getElementById('bulkReplacePanel');
+            if (!panel || panel.style.display === 'none' || !isAdmin) return;
+            const p = loadInProcessTruth(force);
+            bulkTruthRender();
+            await p;
+            bulkTruthRender();
+            bulkSchedulePreview();
         }
 
         // Computes what a run would do: which messages change, which are skipped for length.
@@ -4996,6 +5094,7 @@
         function bulkSchedulePreview() {
             clearTimeout(_bulkTimer);
             _bulkTimer = setTimeout(() => {
+                bulkTruthRender();
                 if (_bulkMode === 'ai') bulkAiUpdateSummary();
                 else if (_bulkMode === 'hyp') bulkHypRefresh();
                 else bulkUpdatePreview();
@@ -5008,6 +5107,11 @@
             if (!btn) return;
             btn.style.display = isAdmin ? '' : 'none';
             if (!isAdmin) document.getElementById('bulkReplacePanel').style.display = 'none';
+            // Open panel + no live HeyReach check yet for this BDR → run it (once; "Re-check" retries after a failure)
+            if (isAdmin && document.getElementById('bulkReplacePanel').style.display !== 'none'
+                && !inProcessTruthForViewer() && !_inProcessTruthPromise && _inProcessTruthTriedFor !== currentViewedBdrEmail()) {
+                bulkEnsureTruth();
+            }
             bulkSchedulePreview();
         }
 
@@ -6335,6 +6439,9 @@ Return ONLY a JSON array with exactly one object per input message, in this form
             const bdr = bdrLeaders.find(b => (b.primaryEmail || '').toLowerCase() === bdrEmail);
             const bdrInstr = ((bdr && bdr.opusReviewInstructions) || '').trim();
             const companyName = bdrCompanyMap.get(bdrEmail) || (bdr && (bdr.companyName || bdr.company)) || '';
+            if (_inProcessTruthPromise) { showDeleteToast('Still checking which messages are really in HeyReach\'s queue — try again in a moment.', true); return; }
+            if (!inProcessTruthForViewer()
+                && !confirm(`Couldn't verify the queue against HeyReach${_inProcessTruthError ? ` (${_inProcessTruthError})` : ''}.\n\nWithout that check this includes messages that may already have been sent, and re-tagging them would change your reporting.\n\nContinue anyway?`)) return;
             const items = bulkHypCandidates();
             if (!items.length) { showDeleteToast('No editable queued messages to review (check the filters).', true); return; }
             const hasInstr = (group.messageReviewInstructions || '').trim() || (group.targetContactInstructions || '').trim()
@@ -6671,6 +6778,7 @@ Return ONLY a JSON array with exactly one object per input message, in this form
             document.getElementById('btnToggleBulkReplace').addEventListener('click', () => {
                 const panel = document.getElementById('bulkReplacePanel');
                 panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+                if (panel.style.display !== 'none') bulkEnsureTruth();
                 if (_bulkMode === 'ai') bulkAiUpdateSummary(); else if (_bulkMode === 'hyp') bulkHypRefresh(); else bulkUpdatePreview();
             });
             document.getElementById('btnBulkAddRule').addEventListener('click', () => bulkAddRule());
