@@ -80,6 +80,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Catch Missed Meetings (AI)', href: 'catch_meetings.html', icon: 'fa-magnifying-glass-chart' },
                 { label: 'Scan Conversations (AI)', href: 'scan_conversations.html', icon: 'fa-search-plus' },
                 { label: 'Follow-Up Needed (AI)', href: 'followup_needed.html', icon: 'fa-reply-all' },
+                { label: 'Test Insert Times (All BDRs)', href: 'test_insert_times.html', icon: 'fa-calendar-check' },
                 { label: 'LinkedIn → Email & Phone Follow-ups', href: 'linkedin_followups.html', icon: 'fa-envelope-open-text' },
                 { label: 'Engagement Score', href: 'profile_enrichment.html', icon: 'fa-star-half-stroke' },
                 { label: 'divider' },
