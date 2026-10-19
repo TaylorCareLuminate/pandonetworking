@@ -123,6 +123,7 @@
         <div id="tab-campaigns">
             <div class="section" id="campaignListSection">
                 <h2><i class="fas fa-layer-group"></i> Follow-up campaigns <span style="flex:1"></span>
+                    <button class="btn small" id="testEmailBtn" title="Send a sample follow-up from each sending account to check its signature"><i class="fas fa-vial"></i> Send test emails</button>
                     <button class="btn small" id="runNowBtn" title="Process due follow-ups now instead of waiting for the 5-minute timer"><i class="fas fa-play"></i> Run now</button>
                     <button class="btn primary small" id="newCampaignBtn"><i class="fas fa-plus"></i> New campaign</button>
                 </h2>
@@ -200,6 +201,10 @@
                             <div><label class="f">Daily cap per sender</label><input type="number" id="c_cap" min="1" max="500"></div>
                         </div>
                         <div id="overridesWrap" style="margin-top:0.8rem"></div>
+                        <div style="margin-top:0.8rem">
+                            <button class="btn small" id="c_testEmailsBtn" type="button"><i class="fas fa-vial"></i> Send test emails from each account</button>
+                            <span class="muted" style="margin-left:0.4rem">Sends a sample of step 1 with each account's real signature to your inbox. Nothing is scheduled.</span>
+                        </div>
                         <div class="grid g4" style="margin-top:0.8rem">
                             <div><label class="f">Window start</label><input type="time" id="c_start"></div>
                             <div><label class="f">Window end</label><input type="time" id="c_end"></div>
@@ -505,7 +510,8 @@
 
         // ── Add prospects by LinkedIn URL ─────────────────────────────────────
         const LI_URL_RE = /(?:https?:\/\/)?(?:[a-z]{2,3}\.)?linkedin\.com\/(?:in|sales\/lead|sales\/people|pub)\/[^\s,;"'<>()\[\]]+/gi;
-        const MAX_URLS = 500;
+        const MAX_URLS = 5000;      // per paste; the list is sent to the server in batches
+        const ENROLL_BATCH = 100;   // URLs per request (the server accepts up to 500)
         const OUTCOME_LABELS = {
             enrolled: 'Queued', already_enrolled: 'Already in campaign', skipped: 'Skipped',
             duplicate_in_list: 'Duplicate in list', invalid: 'Not a profile URL', error: 'Error'
@@ -521,6 +527,37 @@
                 out.push(m);
             }
             return out;
+        }
+
+        /**
+         * Queues any number of URLs by sending them in batches and adding up the results.
+         * Re-sending is safe: anyone already queued comes back as "Already in campaign".
+         * Stops at the first failed batch and reports how many URLs were handled (`done`),
+         * so the caller can leave the rest in the box.
+         */
+        async function enrollInBatches(campaignId, urls, linkedInAccountId, onProgress) {
+            const total = { summary: {}, results: [], warnings: [], noSender: 0, done: 0, error: null };
+            for (let i = 0; i < urls.length; i += ENROLL_BATCH) {
+                if (onProgress) onProgress(i, urls.length);
+                const batch = urls.slice(i, i + ENROLL_BATCH);
+                try {
+                    const r = await api(`/campaigns/${encodeURIComponent(campaignId)}/enroll-urls`, {
+                        method: 'POST', body: { urls: batch, linkedInAccountId: linkedInAccountId || null }
+                    });
+                    for (const [k, v] of Object.entries(r.summary || {})) total.summary[k] = (total.summary[k] || 0) + v;
+                    total.results.push(...(r.results || []));
+                    (r.warnings || []).forEach(w => { if (!total.warnings.includes(w)) total.warnings.push(w); });
+                    total.noSender += r.noSender || 0;
+                    total.done = i + batch.length;
+                } catch (e) {
+                    total.error = e.message;
+                    break;
+                }
+            }
+            if (total.noSender) {
+                total.warnings.push(`${total.noSender} prospect(s) have no known LinkedIn sender and this campaign has no default sender email, so they will stop in "Needs attention". Pick a "Send as" sender or set a default sender on the campaign.`);
+            }
+            return total;
         }
 
         function openAddProspects(id) {
@@ -558,18 +595,14 @@
                 if (!urls.length) return;
                 $('ap_submit').disabled = true;
                 $('ap_busy').classList.remove('hidden');
-                try {
-                    const r = await api(`/campaigns/${encodeURIComponent(id)}/enroll-urls`, {
-                        method: 'POST', body: { urls, linkedInAccountId: $('ap_sender').value || null }
-                    });
-                    renderAddProspectsResult(r);
-                    $('ap_urls').value = '';
-                    update();
-                    loadCampaigns();
-                } catch (e) {
-                    $('ap_result').innerHTML = `<div class="err">${esc(e.message)}</div>`;
-                    update();
-                }
+                const r = await enrollInBatches(id, urls, $('ap_sender').value || null, (i, n) => {
+                    $('ap_busy').innerHTML = `<i class="fas fa-spinner fa-spin"></i> Queuing ${Math.min(i + ENROLL_BATCH, n)} of ${n}...`;
+                });
+                renderAddProspectsResult(r);
+                // Leave only the URLs that were not handled, so a failed run can simply be retried.
+                $('ap_urls').value = urls.slice(r.done).join('\n');
+                update();
+                loadCampaigns();
                 $('ap_busy').classList.add('hidden');
             });
         }
@@ -580,15 +613,106 @@
             const chips = Object.keys(OUTCOME_LABELS).filter(k => s[k]).map(k =>
                 `<span class="pill ${k === 'enrolled' ? 'active' : (k === 'error' || k === 'invalid' ? 'failed' : 'draft')}">${s[k]} ${esc(OUTCOME_LABELS[k])}</span>`).join(' ');
             const problems = (r.results || []).filter(x => x.outcome !== 'enrolled');
+            const SHOW = 200;
             $(targetId).innerHTML = `
                 <h4 style="margin:1rem 0 0.4rem">${queued ? `<i class="fas fa-check" style="color:var(--success)"></i> ${queued} queued` : 'Nothing new was queued'}</h4>
                 <div style="display:flex; gap:0.4rem; flex-wrap:wrap">${chips}</div>
+                ${r.error ? `<div class="err">Stopped after ${r.done} URL${r.done === 1 ? '' : 's'}: ${esc(r.error)}. The ones not yet handled are still in the box. Click again to continue; anyone already queued is skipped.</div>` : ''}
                 ${(r.warnings || []).map(w => `<div class="warn">${esc(w)}</div>`).join('')}
                 ${problems.length ? `<table style="margin-top:0.7rem"><thead><tr><th>LinkedIn URL</th><th>Result</th><th>Why</th></tr></thead><tbody>
-                    ${problems.map(x => `<tr><td style="word-break:break-all">${esc(x.name ? `${x.name} · ` : '')}${esc(x.url)}</td><td>${esc(OUTCOME_LABELS[x.outcome] || x.outcome)}</td><td class="muted">${esc(x.detail || '')}</td></tr>`).join('')}
-                    </tbody></table>` : ''}
+                    ${problems.slice(0, SHOW).map(x => `<tr><td style="word-break:break-all">${esc(x.name ? `${x.name} · ` : '')}${esc(x.url)}</td><td>${esc(OUTCOME_LABELS[x.outcome] || x.outcome)}</td><td class="muted">${esc(x.detail || '')}</td></tr>`).join('')}
+                    </tbody></table>${problems.length > SHOW ? `<div class="muted" style="margin-top:0.4rem">...and ${problems.length - SHOW} more not shown.</div>` : ''}` : ''}
                 ${queued ? '<p class="muted" style="margin-top:0.7rem">They show up under the <b>Prospects</b> tab as “Added manually”. Use <b>Run now</b> on the campaigns page to start the email lookup immediately instead of waiting for the 5-minute timer.</p>' : ''}`;
         }
+
+        // ── Test emails (check each account's signature) ──────────────────────
+        function openTestEmails(fromEditor) {
+            let subject = '';
+            let body = '';
+            let customerId = '';
+            if (fromEditor && editing) {
+                readEditor();
+                const step = (editing.steps || []).find(s => s.type === 'email');
+                if (step) { subject = step.subject || ''; body = step.body || ''; }
+                customerId = editing.customerId || '';
+            }
+            if (!subject.trim()) subject = 'Quick follow-up';
+            if (!body.trim()) body = 'Hi {{firstName}},\n\nThis is a sample follow-up so we can check how the signature looks.\n\nThanks';
+            const customerName = (options.customers.find(x => String(x.id) === String(customerId)) || {}).name || '';
+            const me = (auth.currentUser && auth.currentUser.email) || '';
+
+            openModal(`
+                <h3>Send test emails <button class="btn small" data-close><i class="fas fa-times"></i></button></h3>
+                <p class="muted">Sends a sample message from each account you tick, immediately, to the address below. Each one is formatted exactly like a real follow-up with that account's own signature. Nothing is scheduled and no prospect is emailed. Names are filled with a sample prospect (Alex Sample, Sample Health); AI blocks show a placeholder.</p>
+                <div class="grid g2">
+                    <div><label class="f">Send tests to</label><input type="text" id="te_to" value="${esc(me)}"></div>
+                    <div><label class="f">Subject</label><input type="text" id="te_subject" value="${esc(subject)}"></div>
+                </div>
+                <label class="f" style="margin-top:0.6rem">Message</label>
+                <textarea id="te_body" style="min-height:120px">${esc(body)}</textarea>
+                <div style="margin-top:0.8rem; display:flex; gap:0.8rem; align-items:center; flex-wrap:wrap">
+                    <label class="f" style="margin:0">Sending accounts</label>
+                    <button class="btn small" type="button" id="te_all">Select all</button>
+                    <button class="btn small" type="button" id="te_none">Clear</button>
+                    ${customerName ? `<label style="font-size:0.85rem; display:inline-flex; gap:0.35rem; align-items:center"><input type="checkbox" id="te_onlyCustomer" checked> Only ${esc(customerName)} accounts</label>` : ''}
+                    <span class="muted" id="te_count"></span>
+                </div>
+                <div class="checks" id="te_accounts" style="margin-top:0.5rem; max-height:220px; overflow-y:auto; border:1px solid var(--border); border-radius:8px; padding:0.6rem 0.8rem"></div>
+                <div style="margin-top:0.8rem; display:flex; gap:0.5rem; align-items:center">
+                    <button class="btn primary" id="te_send"><i class="fas fa-paper-plane"></i> Send tests</button>
+                    <span class="muted hidden" id="te_busy"><i class="fas fa-spinner fa-spin"></i> Sending...</span>
+                </div>
+                <div id="te_result"></div>`);
+
+            const checked = new Set();
+            const drawAccounts = () => {
+                const only = $('te_onlyCustomer') ? $('te_onlyCustomer').checked : false;
+                const list = options.emailAccounts.filter(a => !only || !a.customerId || String(a.customerId) === String(customerId));
+                $('te_accounts').innerHTML = list.length
+                    ? list.map(a => `<label style="min-width:260px"><input type="checkbox" value="${esc(a.id)}" ${checked.has(a.id) ? 'checked' : ''}> ${esc(a.name ? `${a.name} <${a.email}>` : a.email)}</label>`).join('')
+                    : '<span class="muted">No sending accounts found</span>';
+                $('te_accounts').querySelectorAll('input').forEach(i => i.addEventListener('change', () => {
+                    if (i.checked) checked.add(i.value); else checked.delete(i.value);
+                    count();
+                }));
+                count();
+            };
+            const count = () => { $('te_count').textContent = `${checked.size} selected`; };
+            $('te_all').addEventListener('click', () => { $('te_accounts').querySelectorAll('input').forEach(i => { i.checked = true; checked.add(i.value); }); count(); });
+            $('te_none').addEventListener('click', () => { checked.clear(); $('te_accounts').querySelectorAll('input').forEach(i => { i.checked = false; }); count(); });
+            if ($('te_onlyCustomer')) $('te_onlyCustomer').addEventListener('change', drawAccounts);
+            drawAccounts();
+
+            $('te_send').addEventListener('click', async () => {
+                const ids = [...checked];
+                if (!ids.length) return toast('Tick at least one sending account', true);
+                const to = $('te_to').value.trim();
+                if (!confirm(`Send ${ids.length} test email${ids.length === 1 ? '' : 's'} to ${to}?`)) return;
+                $('te_send').disabled = true;
+                $('te_busy').classList.remove('hidden');
+                $('te_result').innerHTML = '';
+                try {
+                    const r = await api('/test-email', { method: 'POST', body: {
+                        accountIds: ids, to, subject: $('te_subject').value, body: $('te_body').value
+                    } });
+                    const ok = r.results.filter(x => x.ok).length;
+                    $('te_result').innerHTML = `
+                        <h4 style="margin:1rem 0 0.4rem">${ok} of ${r.results.length} sent to ${esc(r.to)}</h4>
+                        <table><thead><tr><th>Account</th><th>Result</th></tr></thead><tbody>
+                        ${r.results.map(x => `<tr><td>${esc(x.email || x.accountId)}${x.name ? `<br><span class="muted">${esc(x.name)}</span>` : ''}</td>
+                            <td>${x.ok ? '<span class="pill active">Sent</span>' : `<span class="pill failed">Failed</span> <span class="muted">${esc(x.error || '')}</span>`}
+                            ${x.ok && x.hasSignature === false ? '<br><span class="muted" style="color:var(--warn)">This account has no signature configured.</span>' : ''}</td></tr>`).join('')}
+                        </tbody></table>
+                        <p class="muted" style="margin-top:0.6rem">Check each message's signature in your inbox. Subjects start with [TEST account@address] so you can tell them apart.</p>`;
+                } catch (e) {
+                    $('te_result').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+                }
+                $('te_send').disabled = false;
+                $('te_busy').classList.add('hidden');
+            });
+        }
+        $('testEmailBtn').addEventListener('click', () => openTestEmails(false));
+        $('c_testEmailsBtn').addEventListener('click', () => openTestEmails(true));
 
         $('runNowBtn').addEventListener('click', async () => {
             $('runNowBtn').disabled = true;
@@ -875,21 +999,18 @@
             const urls = extractLinkedInUrls($('c_pasteUrls').value);
             if (!urls.length) return;
             if (urls.length > MAX_URLS) {
-                $('c_pasteResult').innerHTML = `<div class="err">Campaign saved, but ${urls.length} URLs is over the ${MAX_URLS} limit. Remove some and save again.</div>`;
+                $('c_pasteResult').innerHTML = `<div class="err">Campaign saved, but ${urls.length} URLs is over the ${MAX_URLS} per-paste limit. Remove some and save again.</div>`;
                 return;
             }
             $('c_pasteResult').innerHTML = '<div class="muted"><i class="fas fa-spinner fa-spin"></i> Queuing pasted LinkedIn URLs...</div>';
-            try {
-                const r = await api(`/campaigns/${encodeURIComponent(campaignId)}/enroll-urls`, {
-                    method: 'POST', body: { urls, linkedInAccountId: $('c_pasteSender').value || null }
-                });
-                renderAddProspectsResult(r, 'c_pasteResult');
-                $('c_pasteUrls').value = '';
-                updatePasteCount();
-                toast(`${(r.summary && r.summary.enrolled) || 0} prospect(s) queued`);
-            } catch (e) {
-                $('c_pasteResult').innerHTML = `<div class="err">Campaign saved, but the pasted URLs were not queued: ${esc(e.message)}. They are still in the box; click Save to retry.</div>`;
-            }
+            const r = await enrollInBatches(campaignId, urls, $('c_pasteSender').value || null, (i, n) => {
+                $('c_pasteResult').innerHTML = `<div class="muted"><i class="fas fa-spinner fa-spin"></i> Queuing ${Math.min(i + ENROLL_BATCH, n)} of ${n}...</div>`;
+            });
+            renderAddProspectsResult(r, 'c_pasteResult');
+            // Leave only what was not handled, so a failed run can be retried with Save.
+            $('c_pasteUrls').value = urls.slice(r.done).join('\n');
+            updatePasteCount();
+            toast(r.error ? `Queued ${(r.summary && r.summary.enrolled) || 0}, then stopped: ${r.error}` : `${(r.summary && r.summary.enrolled) || 0} prospect(s) queued`, !!r.error);
         }
         $('saveCampaignBtn').addEventListener('click', () => saveCampaign(false));
         $('saveActivateBtn').addEventListener('click', () => saveCampaign(true));
@@ -1068,6 +1189,7 @@
             if (!isAdmin) {
                 $('newCampaignBtn').classList.add('hidden');
                 $('runNowBtn').classList.add('hidden');
+                $('testEmailBtn').classList.add('hidden');
             }
             try {
                 options = (await api('/options')).options;
