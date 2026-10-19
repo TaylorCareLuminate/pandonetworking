@@ -198,8 +198,9 @@
                                 </select>
                             </div>
                             <div><label class="f">Default / fallback account</label><select id="c_defaultAccount"></select></div>
-                            <div><label class="f">Daily cap per sender</label><input type="number" id="c_cap" min="1" max="500"></div>
+                            <div><label class="f">Daily cap per email account</label><input type="number" id="c_cap" min="1" max="500"></div>
                         </div>
+                        <label style="display:block;margin-top:0.6rem;font-weight:400"><input type="checkbox" id="c_requireSig"> Hold emails (Needs attention) when the sending account has no HTML signature</label>
                         <div id="overridesWrap" style="margin-top:0.8rem"></div>
                         <div style="margin-top:0.8rem">
                             <button class="btn small" id="c_testEmailsBtn" type="button"><i class="fas fa-vial"></i> Send test emails from each account</button>
@@ -729,7 +730,7 @@
             name: '', customerId: options.customers[0] ? options.customers[0].id : '', status: 'draft',
             triggers: ['CONNECTION_REQUEST_ACCEPTED'],
             filters: { heyreachCampaignIds: [], linkedInAccountIds: [] },
-            sender: { mode: 'bdr_auto', defaultAccountId: '', overrides: {} },
+            sender: { mode: 'bdr_auto', defaultAccountId: '', overrides: {}, requireSignature: true },
             sendWindow: { timezone: 'America/Denver', useRecipientTimezone: true, start: '08:30', end: '16:30', days: [1, 2, 3, 4, 5], dailyCapPerSender: 40, minGapMinutes: 6 },
             businessDaysOnly: true,
             lookup: { useSeamless: true, allowPersonalEmail: false, requireValidEmail: false, dailyLimit: 150 },
@@ -760,6 +761,7 @@
             $('c_senderMode').value = editing.sender.mode || 'bdr_auto';
             $('c_defaultAccount').innerHTML = '<option value="">— none —</option>' + options.emailAccounts.map(a => `<option value="${esc(a.id)}">${esc(a.name ? `${a.name} <${a.email}>` : a.email)}</option>`).join('');
             $('c_defaultAccount').value = editing.sender.defaultAccountId || '';
+            $('c_requireSig').checked = editing.sender.requireSignature !== false;
             const w = editing.sendWindow;
             $('c_cap').value = w.dailyCapPerSender; $('c_start').value = w.start; $('c_end').value = w.end;
             $('c_tz').value = w.timezone; $('c_gap').value = w.minGapMinutes;
@@ -795,9 +797,23 @@
                 + accounts.map(a => `<option value="${esc(a.heyreachAccountId)}">${esc(a.name)}${a.bdrEmail ? ` (${esc(a.bdrEmail)})` : ''}</option>`).join('');
             $('c_pasteSender').value = accounts.some(a => a.heyreachAccountId === keepSender) ? keepSender : '';
             const overrides = editing.sender.overrides || {};
-            const acctOpts = (sel) => '<option value="">Auto (match BDR email)</option>' + options.emailAccounts.map(e => `<option value="${esc(e.id)}" ${sel === e.id ? 'selected' : ''}>${esc(e.email)}</option>`).join('');
-            $('overridesWrap').innerHTML = accounts.length ? `<label class="f">Sender per LinkedIn account (optional overrides)</label>
-                <div class="grid g3">${accounts.map(a => `<div><span class="muted">${esc(a.name)}</span><select data-override="${esc(a.heyreachAccountId)}">${acctOpts(overrides[a.heyreachAccountId] || '')}</select></div>`).join('')}</div>` : '';
+            const emailById = Object.fromEntries(options.emailAccounts.map(e => [e.id, e]));
+            const label = (e) => `${esc(e.email)}${e.hasHtmlSignature ? '' : ' <span style="color:#b02a37" title="No HTML signature: emails from this account will be held until one is assigned on the OAuth Email Connections page">⚠ no signature</span>'}`;
+            const poolOf = (a) => {
+                const v = overrides[a.heyreachAccountId];
+                return (Array.isArray(v) ? v : v ? [v] : []).map(String);
+            };
+            $('overridesWrap').innerHTML = accounts.length ? `<label class="f">Email accounts per LinkedIn sender</label>
+                <div class="muted" style="margin-bottom:0.4rem">Leave all unticked for Automatic: every email account assigned to that BDR is used. Tick two or more to send from several mailboxes. Each mailbox has its own daily cap, so two mailboxes send twice as many, and each new prospect goes to the least-busy one.</div>
+                <div class="grid g3">${accounts.map(a => {
+                    const picked = poolOf(a);
+                    const auto = (a.autoEmailAccountIds || []).map(id => emailById[id]).filter(Boolean);
+                    return `<div style="border:1px solid #e3e6ee;border-radius:8px;padding:0.5rem 0.6rem" data-override-box="${esc(a.heyreachAccountId)}">
+                        <b>${esc(a.name)}</b>
+                        <div class="muted" style="margin:0.15rem 0 0.3rem">Automatic uses: ${auto.length ? auto.map(label).join(', ') : '<span style="color:#b02a37">no matching email account (assign the BDR in Email Controls, or tick one below)</span>'}</div>
+                        ${options.emailAccounts.map(e => `<label style="display:block;font-weight:400"><input type="checkbox" data-override="${esc(a.heyreachAccountId)}" value="${esc(e.id)}" ${picked.includes(String(e.id)) ? 'checked' : ''}> ${label(e)}</label>`).join('')}
+                    </div>`;
+                }).join('')}</div>` : '';
             document.querySelectorAll('.call-campaign').forEach(sel => fillCallCampaigns(sel, sel.dataset.value));
         }
         $('c_customer').addEventListener('change', () => { readEditor(); renderCustomerScoped(); });
@@ -914,8 +930,11 @@
                 linkedInAccountIds: [...document.querySelectorAll('#c_liAccounts input:checked')].map(i => i.value)
             };
             const overrides = {};
-            document.querySelectorAll('[data-override]').forEach(sel => { if (sel.value) overrides[sel.dataset.override] = sel.value; });
-            editing.sender = { mode: $('c_senderMode').value, defaultAccountId: $('c_defaultAccount').value || null, overrides };
+            document.querySelectorAll('[data-override]').forEach(cb => {
+                if (!cb.checked) return;
+                (overrides[cb.dataset.override] = overrides[cb.dataset.override] || []).push(cb.value);
+            });
+            editing.sender = { mode: $('c_senderMode').value, defaultAccountId: $('c_defaultAccount').value || null, overrides, requireSignature: $('c_requireSig').checked };
             editing.sendWindow = {
                 timezone: $('c_tz').value, useRecipientTimezone: $('c_recipientTz').checked,
                 start: $('c_start').value || '08:30', end: $('c_end').value || '16:30',
