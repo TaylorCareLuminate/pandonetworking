@@ -3143,8 +3143,13 @@
                                style="flex:1; accent-color:var(--danger); cursor:pointer;"
                                title="Contacts last messaged within this many days are auto-marked for deletion. Set to 0 to disable.">
                         <span id="recentContactDaysValue" style="min-width:2.8rem; text-align:right; font-weight:700; font-size:0.9rem; color:var(--danger);">30d</span>
+                        <button type="button" id="recentContactRefreshBtn"
+                                style="border:1px solid var(--danger); background:#fff; color:var(--danger); border-radius:6px; padding:4px 8px; cursor:pointer; font-size:0.85rem;"
+                                title="Apply this window to all loaded cards now. Anyone messaged within this many days is marked Delete — even if you already approved them.">
+                            <i class="fas fa-sync-alt"></i> Refresh
+                        </button>
                     </div>
-                    <div style="font-size:0.76rem; color:var(--gray); margin-top:2px;">Slide to 0 to disable. Changes apply instantly to loaded cards.</div>
+                    <div id="recentContactRefreshStatus" style="font-size:0.76rem; color:var(--gray); margin-top:2px;">Adjust the slider, then click Refresh to apply to loaded cards (overrides approved). 0 disables.</div>
                 </div>
                 <div class="control-group" id="daysSinceMessageGroup" style="display:none;">
                     <label for="daysSinceMessageMin"><i class="fas fa-calendar-alt" style="color:#0F2D4D;"></i> Min days since last LinkedIn message</label>
@@ -5992,11 +5997,16 @@
         // contact received a BDR message within the configured window, and injects
         // a visible badge explaining why. Users can manually un-delete.
         // Only active when Message Type = "Messages".
-        function autoDeleteRecentlyContacted() {
-            if (messageTypeSelect?.value !== 'message') return;
+        // options.force = true (used by the Refresh button): also override cards the
+        // user already marked Approve / Exclude / Group-only, and returns the number
+        // of cards newly flipped to Delete.
+        function autoDeleteRecentlyContacted(options = {}) {
+            const force = !!options.force;
+            let changedCount = 0;
+            if (messageTypeSelect?.value !== 'message') return changedCount;
             const daysInput = document.getElementById('recentContactDaysInput');
             const windowDays = daysInput ? parseInt(daysInput.value, 10) : 30;
-            if (!windowDays || windowDays <= 0) return; // disabled
+            if (!windowDays || windowDays <= 0) return changedCount; // disabled
 
             const WINDOW_MS = windowDays * 24 * 60 * 60 * 1000;
             const now = Date.now();
@@ -6008,7 +6018,7 @@
                 // Respect an explicit manual user decision (non-auto)
                 const existingAction = messageSelections.get(message.id);
                 const wasAutoSet = recentlyContactedDeleted.has(message.id) || autoDeletedMessages.has(message.id);
-                if (existingAction && !wasAutoSet) return;
+                if (existingAction && !wasAutoSet && !force) return;
 
                 const mostRecentMs = getMostRecentSentTimestamp(message);
                 if (!mostRecentMs) return; // no history — nothing to do
@@ -6022,7 +6032,19 @@
 
                 const deleteCheckbox = card.querySelector('#delete_' + message.id);
                 if (deleteCheckbox && !deleteCheckbox.checked) {
+                    if (force) {
+                        // Clear any other action (approve / exclude / group-only) on this card
+                        card.querySelectorAll('input[type="checkbox"][data-action]:not([data-action="delete"])').forEach(cb => { cb.checked = false; });
+                        if (approvalTimestamps.has(message.id)) {
+                            approvalTimestamps.delete(message.id);
+                            let maxTime = null;
+                            approvalTimestamps.forEach(d => { if (!maxTime || d.timestampMs > maxTime) maxTime = d.timestampMs; });
+                            lastApprovalTime = maxTime;
+                        }
+                        staleStoryUserKept.delete(message.id);
+                    }
                     deleteCheckbox.checked = true;
+                    changedCount++;
                     messageSelections.set(message.id, 'delete');
                     recentlyContactedDeleted.add(message.id);
                     card.classList.remove('checked-approve', 'checked-exclude', 'checked-group-only');
@@ -6044,7 +6066,9 @@
                 }
             });
 
+            if (changedCount > 0 && force && typeof scheduleAutoSave === 'function') scheduleAutoSave();
             updateStats();
+            return changedCount;
         }
 
         // ── Messages-only card filters (days since last message) ──
@@ -15427,11 +15451,18 @@ Rules:
 
             slider.addEventListener('input', () => syncLabel(parseInt(slider.value, 10)));
 
-            slider.addEventListener('change', () => {
+            // Slider only updates the label; the Refresh button applies the window.
+            const refreshBtn = document.getElementById('recentContactRefreshBtn');
+            const statusEl = document.getElementById('recentContactRefreshStatus');
+
+            function applyWindow() {
                 const days = parseInt(slider.value, 10);
                 syncLabel(days);
 
-                if (!loadedMessages || loadedMessages.length === 0) return;
+                if (!loadedMessages || loadedMessages.length === 0) {
+                    if (statusEl) statusEl.textContent = 'No messages loaded yet.';
+                    return;
+                }
 
                 // Un-delete all cards previously auto-deleted by this rule,
                 // then re-run so the new window is applied cleanly.
@@ -15449,9 +15480,18 @@ Rules:
                 });
                 recentlyContactedDeleted.clear();
 
-                if (days > 0) autoDeleteRecentlyContacted();
+                let changed = 0;
+                if (days > 0) changed = autoDeleteRecentlyContacted({ force: true });
+                if (typeof activeActionFilter !== 'undefined' && activeActionFilter) applyActionFilter();
                 updateStats();
-            });
+                if (statusEl) {
+                    statusEl.textContent = days > 0
+                        ? `Refreshed (${days}d): ${changed} card(s) newly marked Delete.`
+                        : 'Auto-delete disabled — cleared previous recent-contact deletes.';
+                }
+            }
+
+            if (refreshBtn) refreshBtn.addEventListener('click', applyWindow);
 
             syncLabel(parseInt(slider.value, 10));
         })();
