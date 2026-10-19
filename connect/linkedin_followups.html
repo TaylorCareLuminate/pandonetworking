@@ -149,6 +149,16 @@
                             <label><input type="checkbox" value="CONNECTION_REQUEST_ACCEPTED"> A connection request is accepted</label>
                             <label><input type="checkbox" value="MESSAGE_SENT"> A LinkedIn message is sent</label>
                             <label><input type="checkbox" value="INMAIL_SENT"> An InMail is sent</label>
+                            <label><input type="checkbox" value="MANUAL"> I add people myself (paste LinkedIn URLs)</label>
+                        </div>
+                        <div id="manualPanel" class="hidden" style="margin-top:0.8rem; background:#f8fafc; border:1px dashed #cbd5e1; border-radius:10px; padding:0.8rem 1rem">
+                            <label class="f">LinkedIn URLs to queue</label>
+                            <textarea id="c_pasteUrls" style="min-height:130px" placeholder="https://www.linkedin.com/in/jane-doe&#10;https://www.linkedin.com/in/john-smith"></textarea>
+                            <div class="muted" id="c_pasteCount" style="margin:0.3rem 0 0.7rem">0 LinkedIn URLs detected</div>
+                            <label class="f">Send follow-ups as</label>
+                            <select id="c_pasteSender"></select>
+                            <p class="muted" style="margin:0.5rem 0 0">One per line, or any messy paste (commas, spreadsheet columns). These people are queued when you click <b>Save</b> or <b>Save &amp; activate</b>, then go through the same lookup, duplicate and opt-out checks, send windows and approval settings as everyone else. You can paste more any time with <b>Add prospects</b> on the campaign card. People without a known email or phone use Seamless credits.</p>
+                            <div id="c_pasteResult"></div>
                         </div>
                         <div class="grid g2" style="margin-top:0.8rem">
                             <div>
@@ -311,7 +321,7 @@
         const API = 'https://railwayclemail-production.up.railway.app';
         const TRIGGER_LABELS = {
             CONNECTION_REQUEST_SENT: 'Request sent', CONNECTION_REQUEST_ACCEPTED: 'Accepted',
-            MESSAGE_SENT: 'Message sent', INMAIL_SENT: 'InMail sent'
+            MESSAGE_SENT: 'Message sent', INMAIL_SENT: 'InMail sent', MANUAL: 'Added manually'
         };
         const STATUS_LABELS = {
             finding_contact: 'Finding contact', active: 'Active', awaiting_approval: 'Awaiting approval',
@@ -457,6 +467,7 @@
                                <button class="btn small" data-backfill="${esc(c.id)}"><i class="fas fa-clock-rotate-left"></i> Backfill</button>`
                             : `<button class="btn small success" data-status="active" data-id="${esc(c.id)}"><i class="fas fa-play"></i> Activate</button>`}
                         <button class="btn small" data-view="${esc(c.id)}"><i class="fas fa-users"></i> Prospects</button>
+                        ${isAdmin ? `<button class="btn small" data-addurls="${esc(c.id)}" title="Paste LinkedIn URLs to queue those people into this campaign"><i class="fas fa-user-plus"></i> Add prospects</button>` : ''}
                         ${c.status !== 'active' ? `<button class="btn small danger" data-status="archived" data-id="${esc(c.id)}"><i class="fas fa-box-archive"></i></button>` : ''}
                     </div>
                 </div>`;
@@ -464,6 +475,7 @@
             $('campaignList').querySelectorAll('[data-edit]').forEach(b => b.addEventListener('click', () => openEditor(campaigns.find(c => c.id === b.dataset.edit))));
             $('campaignList').querySelectorAll('[data-status]').forEach(b => b.addEventListener('click', () => setStatus(b.dataset.id, b.dataset.status)));
             $('campaignList').querySelectorAll('[data-backfill]').forEach(b => b.addEventListener('click', () => backfill(b.dataset.backfill)));
+            $('campaignList').querySelectorAll('[data-addurls]').forEach(b => b.addEventListener('click', () => openAddProspects(b.dataset.addurls)));
             $('campaignList').querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => {
                 $('actCampaign').value = b.dataset.view;
                 document.querySelector('.tab[data-tab="activity"]').click();
@@ -489,6 +501,93 @@
                 toast(`Scanned ${result.scanned} LinkedIn events, enrolled ${result.enrolled} new prospects.`);
                 loadCampaigns();
             } catch (e) { toast(e.message, true); }
+        }
+
+        // ── Add prospects by LinkedIn URL ─────────────────────────────────────
+        const LI_URL_RE = /(?:https?:\/\/)?(?:[a-z]{2,3}\.)?linkedin\.com\/(?:in|sales\/lead|sales\/people|pub)\/[^\s,;"'<>()\[\]]+/gi;
+        const MAX_URLS = 500;
+        const OUTCOME_LABELS = {
+            enrolled: 'Queued', already_enrolled: 'Already in campaign', skipped: 'Skipped',
+            duplicate_in_list: 'Duplicate in list', invalid: 'Not a profile URL', error: 'Error'
+        };
+
+        function extractLinkedInUrls(text) {
+            const seen = new Set();
+            const out = [];
+            for (const m of String(text || '').match(LI_URL_RE) || []) {
+                const key = m.toLowerCase().replace(/^https?:\/\//, '').replace(/^[a-z]{2,3}\./, '').replace(/^www\./, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push(m);
+            }
+            return out;
+        }
+
+        function openAddProspects(id) {
+            const c = campaigns.find(x => x.id === id);
+            if (!c) return;
+            const accounts = options.linkedInAccounts.filter(a => !a.customerId || String(a.customerId) === String(c.customerId));
+            openModal(`
+                <h3>Add prospects to “${esc(c.name)}” <button class="btn small" data-close><i class="fas fa-times"></i></button></h3>
+                <p class="muted">Paste LinkedIn profile URLs, one per line (commas, spreadsheet columns, or a messy paste all work). Each person is queued as if the campaign's trigger had just fired: email/phone lookup, duplicate and opt-out checks, send windows, and your approval settings all still apply. Step 1 is due after its delay from now.</p>
+                <textarea id="ap_urls" placeholder="https://www.linkedin.com/in/jane-doe&#10;https://www.linkedin.com/in/john-smith" style="min-height:180px"></textarea>
+                <div class="muted" id="ap_count" style="margin:0.3rem 0 0.7rem">0 LinkedIn URLs detected</div>
+                <label class="f">Send follow-ups as</label>
+                <select id="ap_sender">
+                    <option value="">Automatic: the LinkedIn sender HeyReach recorded for that person, else this campaign's default sender</option>
+                    ${accounts.map(a => `<option value="${esc(a.heyreachAccountId)}">${esc(a.name)}${a.bdrEmail ? ` (${esc(a.bdrEmail)})` : ''}</option>`).join('')}
+                </select>
+                <div class="muted" style="margin-top:0.3rem">Pick a sender to force every person in this paste to be emailed from that BDR's mailbox.</div>
+                ${c.lookup && c.lookup.useSeamless !== false ? '<div class="warn"><i class="fas fa-coins"></i> People without a known email or phone are looked up in Seamless, which uses credits (capped by this campaign\'s daily lookup limit).</div>' : ''}
+                ${c.status !== 'active' ? `<div class="warn">This campaign is <b>${esc(c.status)}</b>. People are queued now but won't move until you activate it.</div>` : ''}
+                <div style="margin-top:0.8rem; display:flex; gap:0.5rem; align-items:center">
+                    <button class="btn primary" id="ap_submit" disabled><i class="fas fa-user-plus"></i> Queue these people</button>
+                    <span class="muted hidden" id="ap_busy"><i class="fas fa-spinner fa-spin"></i> Queuing... this can take a minute for long lists.</span>
+                </div>
+                <div id="ap_result"></div>`);
+
+            const update = () => {
+                const n = extractLinkedInUrls($('ap_urls').value).length;
+                $('ap_count').textContent = `${n} LinkedIn URL${n === 1 ? '' : 's'} detected${n > MAX_URLS ? ` (max ${MAX_URLS} per paste)` : ''}`;
+                $('ap_submit').disabled = n === 0 || n > MAX_URLS;
+            };
+            $('ap_urls').addEventListener('input', update);
+
+            $('ap_submit').addEventListener('click', async () => {
+                const urls = extractLinkedInUrls($('ap_urls').value);
+                if (!urls.length) return;
+                $('ap_submit').disabled = true;
+                $('ap_busy').classList.remove('hidden');
+                try {
+                    const r = await api(`/campaigns/${encodeURIComponent(id)}/enroll-urls`, {
+                        method: 'POST', body: { urls, linkedInAccountId: $('ap_sender').value || null }
+                    });
+                    renderAddProspectsResult(r);
+                    $('ap_urls').value = '';
+                    update();
+                    loadCampaigns();
+                } catch (e) {
+                    $('ap_result').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+                    update();
+                }
+                $('ap_busy').classList.add('hidden');
+            });
+        }
+
+        function renderAddProspectsResult(r, targetId = 'ap_result') {
+            const s = r.summary || {};
+            const queued = s.enrolled || 0;
+            const chips = Object.keys(OUTCOME_LABELS).filter(k => s[k]).map(k =>
+                `<span class="pill ${k === 'enrolled' ? 'active' : (k === 'error' || k === 'invalid' ? 'failed' : 'draft')}">${s[k]} ${esc(OUTCOME_LABELS[k])}</span>`).join(' ');
+            const problems = (r.results || []).filter(x => x.outcome !== 'enrolled');
+            $(targetId).innerHTML = `
+                <h4 style="margin:1rem 0 0.4rem">${queued ? `<i class="fas fa-check" style="color:var(--success)"></i> ${queued} queued` : 'Nothing new was queued'}</h4>
+                <div style="display:flex; gap:0.4rem; flex-wrap:wrap">${chips}</div>
+                ${(r.warnings || []).map(w => `<div class="warn">${esc(w)}</div>`).join('')}
+                ${problems.length ? `<table style="margin-top:0.7rem"><thead><tr><th>LinkedIn URL</th><th>Result</th><th>Why</th></tr></thead><tbody>
+                    ${problems.map(x => `<tr><td style="word-break:break-all">${esc(x.name ? `${x.name} · ` : '')}${esc(x.url)}</td><td>${esc(OUTCOME_LABELS[x.outcome] || x.outcome)}</td><td class="muted">${esc(x.detail || '')}</td></tr>`).join('')}
+                    </tbody></table>` : ''}
+                ${queued ? '<p class="muted" style="margin-top:0.7rem">They show up under the <b>Prospects</b> tab as “Added manually”. Use <b>Run now</b> on the campaigns page to start the email lookup immediately instead of waiting for the 5-minute timer.</p>' : ''}`;
         }
 
         $('runNowBtn').addEventListener('click', async () => {
@@ -529,6 +628,10 @@
             $('c_customer').innerHTML = options.customers.map(x => `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');
             $('c_customer').value = editing.customerId || '';
             document.querySelectorAll('#c_triggers input').forEach(i => { i.checked = (editing.triggers || []).includes(i.value); });
+            $('c_pasteUrls').value = '';
+            $('c_pasteResult').innerHTML = '';
+            updatePasteCount();
+            toggleManualPanel();
             $('c_hrCampaigns').value = (editing.filters.heyreachCampaignIds || []).join(', ');
             $('c_senderMode').value = editing.sender.mode || 'bdr_auto';
             $('c_defaultAccount').innerHTML = '<option value="">— none —</option>' + options.emailAccounts.map(a => `<option value="${esc(a.id)}">${esc(a.name ? `${a.name} <${a.email}>` : a.email)}</option>`).join('');
@@ -563,6 +666,10 @@
             $('c_liAccounts').innerHTML = accounts.length
                 ? accounts.map(a => `<label><input type="checkbox" value="${esc(a.heyreachAccountId)}" ${chosen.includes(a.heyreachAccountId) ? 'checked' : ''}> ${esc(a.name)}</label>`).join('')
                 : '<span class="muted">No LinkedIn accounts mapped for this customer</span>';
+            const keepSender = $('c_pasteSender').value;
+            $('c_pasteSender').innerHTML = '<option value="">Automatic: the LinkedIn sender HeyReach recorded for that person, else this campaign\'s default sender</option>'
+                + accounts.map(a => `<option value="${esc(a.heyreachAccountId)}">${esc(a.name)}${a.bdrEmail ? ` (${esc(a.bdrEmail)})` : ''}</option>`).join('');
+            $('c_pasteSender').value = accounts.some(a => a.heyreachAccountId === keepSender) ? keepSender : '';
             const overrides = editing.sender.overrides || {};
             const acctOpts = (sel) => '<option value="">Auto (match BDR email)</option>' + options.emailAccounts.map(e => `<option value="${esc(e.id)}" ${sel === e.id ? 'selected' : ''}>${esc(e.email)}</option>`).join('');
             $('overridesWrap').innerHTML = accounts.length ? `<label class="f">Sender per LinkedIn account (optional overrides)</label>
@@ -570,6 +677,18 @@
             document.querySelectorAll('.call-campaign').forEach(sel => fillCallCampaigns(sel, sel.dataset.value));
         }
         $('c_customer').addEventListener('change', () => { readEditor(); renderCustomerScoped(); });
+
+        // "I add people myself" trigger: shows the paste panel
+        function toggleManualPanel() {
+            const on = !!document.querySelector('#c_triggers input[value="MANUAL"]:checked');
+            $('manualPanel').classList.toggle('hidden', !on);
+        }
+        function updatePasteCount() {
+            const n = extractLinkedInUrls($('c_pasteUrls').value).length;
+            $('c_pasteCount').textContent = `${n} LinkedIn URL${n === 1 ? '' : 's'} detected${n > MAX_URLS ? ` (max ${MAX_URLS} per paste)` : ''}`;
+        }
+        document.querySelector('#c_triggers input[value="MANUAL"]').addEventListener('change', toggleManualPanel);
+        $('c_pasteUrls').addEventListener('input', updatePasteCount);
 
         function fillCallCampaigns(sel, value) {
             const cid = $('c_customer').value;
@@ -744,9 +863,32 @@
                 (r.warnings || []).forEach(w => notes.push(`<div class="warn">${esc(w)}</div>`));
                 $('editorErrors').innerHTML = notes.join('');
                 toast(activate ? 'Saved and activated' : 'Saved');
+                await queuePastedUrls(editing.id);
                 loadCampaigns();
             } catch (e) {
                 $('editorErrors').innerHTML = `<div class="err">${(e.validation || [e.message]).map(esc).join('<br>')}</div>`;
+            }
+        }
+        // Queues whatever is in the editor's paste box into the (just saved) campaign.
+        async function queuePastedUrls(campaignId) {
+            if (!document.querySelector('#c_triggers input[value="MANUAL"]:checked')) return;
+            const urls = extractLinkedInUrls($('c_pasteUrls').value);
+            if (!urls.length) return;
+            if (urls.length > MAX_URLS) {
+                $('c_pasteResult').innerHTML = `<div class="err">Campaign saved, but ${urls.length} URLs is over the ${MAX_URLS} limit. Remove some and save again.</div>`;
+                return;
+            }
+            $('c_pasteResult').innerHTML = '<div class="muted"><i class="fas fa-spinner fa-spin"></i> Queuing pasted LinkedIn URLs...</div>';
+            try {
+                const r = await api(`/campaigns/${encodeURIComponent(campaignId)}/enroll-urls`, {
+                    method: 'POST', body: { urls, linkedInAccountId: $('c_pasteSender').value || null }
+                });
+                renderAddProspectsResult(r, 'c_pasteResult');
+                $('c_pasteUrls').value = '';
+                updatePasteCount();
+                toast(`${(r.summary && r.summary.enrolled) || 0} prospect(s) queued`);
+            } catch (e) {
+                $('c_pasteResult').innerHTML = `<div class="err">Campaign saved, but the pasted URLs were not queued: ${esc(e.message)}. They are still in the box; click Save to retry.</div>`;
             }
         }
         $('saveCampaignBtn').addEventListener('click', () => saveCampaign(false));
