@@ -3151,6 +3151,26 @@
                     </div>
                     <div id="recentContactRefreshStatus" style="font-size:0.76rem; color:var(--gray); margin-top:2px;">Adjust the slider, then click Refresh to apply to loaded cards (overrides approved). 0 disables.</div>
                 </div>
+                <div class="control-group" id="reviewStatusAutoDeleteGroup" style="display:none;">
+                    <label><i class="fas fa-calendar-check" style="color:#059669;"></i> Auto-delete if contact has…</label>
+                    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+                        <label style="display:flex; align-items:center; gap:4px; font-weight:600; font-size:0.85rem; cursor:pointer; margin:0;">
+                            <input type="checkbox" id="reviewStatusDelScheduled" checked> Scheduled
+                        </label>
+                        <label style="display:flex; align-items:center; gap:4px; font-weight:600; font-size:0.85rem; cursor:pointer; margin:0;">
+                            <input type="checkbox" id="reviewStatusDelDeclined" checked> Declined
+                        </label>
+                        <label style="display:flex; align-items:center; gap:4px; font-weight:600; font-size:0.85rem; cursor:pointer; margin:0;">
+                            <input type="checkbox" id="reviewStatusDelWrongContact" checked> Wrong Contact
+                        </label>
+                        <button type="button" id="reviewStatusRefreshBtn"
+                                style="border:1px solid var(--danger); background:#fff; color:var(--danger); border-radius:6px; padding:4px 8px; cursor:pointer; font-size:0.85rem; margin-left:auto;"
+                                title="Apply the checked statuses to all loaded cards now. Matching contacts are marked Delete — even if you already approved them.">
+                            <i class="fas fa-sync-alt"></i> Refresh
+                        </button>
+                    </div>
+                    <div id="reviewStatusRefreshStatus" style="font-size:0.76rem; color:var(--gray); margin-top:2px;">Uncheck a status to turn it off. Click Refresh to apply to loaded cards (overrides approved).</div>
+                </div>
                 <div class="control-group" id="daysSinceMessageGroup" style="display:none;">
                     <label for="daysSinceMessageMin"><i class="fas fa-calendar-alt" style="color:#0F2D4D;"></i> Min days since last LinkedIn message</label>
                     <div style="display:flex; gap:8px; align-items:center;">
@@ -5092,7 +5112,7 @@
 
             function syncMessagesOnlyControls(type) {
                 const isMsg = type === 'message';
-                ['recentContactDaysGroup', 'daysSinceMessageGroup', 'maxStoryAgeGroup'].forEach(id => {
+                ['recentContactDaysGroup', 'reviewStatusAutoDeleteGroup', 'daysSinceMessageGroup', 'maxStoryAgeGroup'].forEach(id => {
                     const el = document.getElementById(id);
                     if (el) el.style.display = isMsg ? '' : 'none';
                 });
@@ -6262,8 +6282,18 @@
         // ── Auto-delete contacts already Scheduled, Declined, or Wrong Contact ──
         // Only active for Message Type = "Messages".
         // Mirrors autoDeleteRecentlyContacted — users can still un-delete manually.
-        function autoDeleteReviewStatusContacts() {
-            if (messageTypeSelect?.value !== 'message') return;
+        // options.force = true (Refresh button): also override Approve / Exclude / Group-only
+        // choices and return the number of cards newly flipped to Delete.
+        function autoDeleteReviewStatusContacts(options = {}) {
+            const force = !!options.force;
+            let changedCount = 0;
+            if (messageTypeSelect?.value !== 'message') return changedCount;
+
+            const enabledStatuses = {
+                scheduled:     document.getElementById('reviewStatusDelScheduled')?.checked !== false,
+                declined:      document.getElementById('reviewStatusDelDeclined')?.checked !== false,
+                wrong_contact: document.getElementById('reviewStatusDelWrongContact')?.checked !== false
+            };
 
             const LABELS = {
                 scheduled:     '📅 SCHEDULED — Meeting already booked',
@@ -6276,15 +6306,27 @@
                 if (!card) return;
                 const rs = card.dataset.reviewStatus;
                 if (!rs) return;
+                if (enabledStatuses[rs] === false) return; // this status is turned off
 
-                // Respect an explicit manual user decision
+                // Respect an explicit manual user decision (unless Refresh forced)
                 const existingAction = messageSelections.get(message.id);
                 const wasAutoSet = reviewStatusDeleted.has(message.id) || autoDeletedMessages.has(message.id);
-                if (existingAction && !wasAutoSet) return;
+                if (existingAction && !wasAutoSet && !force) return;
 
                 const deleteCheckbox = card.querySelector('#delete_' + message.id);
                 if (deleteCheckbox && !deleteCheckbox.checked) {
+                    if (force) {
+                        card.querySelectorAll('input[type="checkbox"][data-action]:not([data-action="delete"])').forEach(cb => { cb.checked = false; });
+                        if (approvalTimestamps.has(message.id)) {
+                            approvalTimestamps.delete(message.id);
+                            let maxTime = null;
+                            approvalTimestamps.forEach(d => { if (!maxTime || d.timestampMs > maxTime) maxTime = d.timestampMs; });
+                            lastApprovalTime = maxTime;
+                        }
+                        staleStoryUserKept.delete(message.id);
+                    }
                     deleteCheckbox.checked = true;
+                    changedCount++;
                     messageSelections.set(message.id, 'delete');
                     reviewStatusDeleted.add(message.id);
                     card.classList.remove('checked-approve', 'checked-exclude', 'checked-group-only');
@@ -6303,7 +6345,9 @@
                 else card.appendChild(badge);
             });
 
+            if (changedCount > 0 && force && typeof scheduleAutoSave === 'function') scheduleAutoSave();
             updateStats();
+            return changedCount;
         }
 
         // After runConnectionsScan re-renders cards, restore the selections stored in
@@ -15494,6 +15538,53 @@ Rules:
             if (refreshBtn) refreshBtn.addEventListener('click', applyWindow);
 
             syncLabel(parseInt(slider.value, 10));
+        })();
+
+        // ── Review-status (Scheduled / Declined / Wrong Contact) auto-delete: Refresh button ──
+        (function () {
+            const btn = document.getElementById('reviewStatusRefreshBtn');
+            const statusEl = document.getElementById('reviewStatusRefreshStatus');
+            if (!btn) return;
+
+            const checkboxFor = {
+                scheduled:     document.getElementById('reviewStatusDelScheduled'),
+                declined:      document.getElementById('reviewStatusDelDeclined'),
+                wrong_contact: document.getElementById('reviewStatusDelWrongContact')
+            };
+
+            btn.addEventListener('click', () => {
+                if (!loadedMessages || loadedMessages.length === 0) {
+                    if (statusEl) statusEl.textContent = 'No messages loaded yet.';
+                    return;
+                }
+
+                // Undo earlier auto-deletes for any status that is now turned off
+                Array.from(reviewStatusDeleted).forEach(msgId => {
+                    const card = document.querySelector(`.message-card[data-message-id="${msgId}"]`);
+                    if (!card) return;
+                    const cb = checkboxFor[card.dataset.reviewStatus];
+                    if (!cb || cb.checked) return; // still enabled
+                    if (messageSelections.get(msgId) === 'delete') {
+                        const delCb = card.querySelector('#delete_' + msgId);
+                        if (delCb) delCb.checked = false;
+                        messageSelections.delete(msgId);
+                        card.classList.remove('checked-delete');
+                    }
+                    const badge = card.querySelector('.review-status-badge');
+                    if (badge) badge.remove();
+                    reviewStatusDeleted.delete(msgId);
+                });
+
+                const changed = autoDeleteReviewStatusContacts({ force: true });
+                if (typeof activeActionFilter !== 'undefined' && activeActionFilter) applyActionFilter();
+                updateStats();
+                if (statusEl) {
+                    const on = Object.entries(checkboxFor).filter(([, c]) => c && c.checked).map(([k]) => k.replace('_', ' '));
+                    statusEl.textContent = on.length
+                        ? `Refreshed (${on.join(', ')}): ${changed} card(s) newly marked Delete.`
+                        : 'All statuses off — nothing is auto-deleted.';
+                }
+            });
         })();
 
         // ── Messages-only: days-since-last-message filter input ──
