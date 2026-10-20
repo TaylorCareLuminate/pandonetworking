@@ -282,6 +282,26 @@
                 </div>
             </div>
 
+            <!-- Exclude URLs Card -->
+            <div class="card" id="excludeUrlsCard">
+                <h2><i class="fas fa-user-slash"></i> Exclude contacts from Harvest Runs</h2>
+                <p class="muted" style="margin-bottom:12px;line-height:1.55;">
+                    Paste LinkedIn profile URLs you <strong>never</strong> want in the harvest pool for the selected BDR — one per line, or separated by commas / spaces. Each is saved as an <strong>excluded</strong> label, so it is removed from pool counts and will not be picked up by <strong>Harvest Run</strong> in Generate Messages. Anything that isn't a <code>linkedin.com/in/…</code> link is ignored, and duplicates are removed.
+                    To undo, remove the entry from the <a href="#manualHarvestCard" style="color:var(--primary);font-weight:600;">Manual harvest labels</a> table (excluded rows show an <strong>Excluded</strong> badge).
+                </p>
+                <label for="excludeBulkUrls">LinkedIn URLs to exclude</label>
+                <textarea id="excludeBulkUrls" rows="10" placeholder="https://www.linkedin.com/in/example-one&#10;https://www.linkedin.com/in/example-two&#10;…" style="width:100%;max-width:100%;padding:12px;border:1px solid var(--gray-200);border-radius:8px;font-size:13px;font-family:ui-monospace,monospace;resize:vertical;box-sizing:border-box;"></textarea>
+                <div style="margin-top:10px;">
+                    <label for="excludeNotes">Note (optional)</label>
+                    <input type="text" id="excludeNotes" placeholder="Why excluded, e.g. competitor / asked not to be contacted" style="width:100%;max-width:640px;">
+                </div>
+                <div class="row" style="margin-top:12px;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <button type="button" class="btn btn-primary" id="excludeBulkBtn"><i class="fas fa-user-slash"></i> Exclude these URLs</button>
+                    <span class="muted" id="excludeBulkCount" style="font-size:13px;">0 valid URLs</span>
+                    <span class="muted" id="excludeBulkStatus" style="font-size:13px;"></span>
+                </div>
+            </div>
+
             <!-- AI Scan Cleanup Card -->
             <div class="card" id="aiScanCard">
                 <h2><i class="fas fa-robot"></i> AI Scan Cleanup — Harvest Pool</h2>
@@ -790,7 +810,11 @@
             }
             if (empty) empty.style.display = 'none';
             tbody.innerHTML = j.entries.map((e) => {
-                const originLabel = e.originType === 'healthluminate' ? 'HL' : 'Pre-existing';
+                const originLabel = e.originType === 'healthluminate'
+                    ? 'HL'
+                    : e.originType === 'excluded'
+                        ? '<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:999px;font-weight:600;font-size:12px;">Excluded</span>'
+                        : 'Pre-existing';
                 const d = e.referenceDate ? String(e.referenceDate).slice(0, 10) : '—';
                 return `<tr style="border-bottom:1px solid var(--gray-200);">
                     <td style="padding:8px;word-break:break-all;"><a href="${escapeHtml(e.linkedInUrl)}" target="_blank" rel="noopener">${escapeHtml(e.linkedInUrl)}</a></td>
@@ -1079,6 +1103,86 @@
                 statusEl.textContent = '';
             } finally {
                 setBusy(false);
+            }
+        });
+
+        // ── Exclude pasted LinkedIn URLs from the harvest pool ─────────────────
+        // Pulls every linkedin.com/in/... link out of arbitrary pasted text.
+        function parseExcludeUrls(raw) {
+            const tokens = String(raw || '').split(/[\s,;]+/).filter(Boolean);
+            const seen = new Set();
+            const valid = [];
+            let ignored = 0;
+            for (let t of tokens) {
+                t = t.replace(/^["'<(\[]+|[>"')\]]+$/g, '');
+                if (!/linkedin\.com\/in\/[^/?#\s]+/i.test(t)) { ignored++; continue; }
+                if (!/^https?:\/\//i.test(t)) t = 'https://' + t.replace(/^\/+/, '');
+                const key = t.toLowerCase().split('?')[0].split('#')[0].replace(/\/+$/, '').replace('://www.', '://');
+                if (seen.has(key)) continue;
+                seen.add(key);
+                valid.push(t);
+            }
+            return { valid, ignored };
+        }
+
+        function updateExcludeCount() {
+            const { valid, ignored } = parseExcludeUrls(document.getElementById('excludeBulkUrls').value);
+            document.getElementById('excludeBulkCount').textContent =
+                `${valid.length} valid URL${valid.length === 1 ? '' : 's'}` + (ignored ? ` (${ignored} non-LinkedIn item${ignored === 1 ? '' : 's'} ignored)` : '');
+        }
+        document.getElementById('excludeBulkUrls').addEventListener('input', updateExcludeCount);
+
+        document.getElementById('excludeBulkBtn').addEventListener('click', async () => {
+            const bdr = document.getElementById('bdrSelect').value;
+            if (!bdr) return alert('Select a BDR');
+            const { valid: urls } = parseExcludeUrls(document.getElementById('excludeBulkUrls').value);
+            if (!urls.length) return alert('Paste at least one LinkedIn profile URL (linkedin.com/in/…).');
+            if (!confirm(`Exclude ${urls.length} contact(s) from the harvest pool for ${bdr}?\n\nThey will no longer be picked up by Harvest Run.`)) return;
+
+            const note = document.getElementById('excludeNotes').value.trim();
+            const notes = (note ? note + ' — ' : '') + `Excluded via pasted URL list on ${new Date().toLocaleDateString()}`;
+            const btn = document.getElementById('excludeBulkBtn');
+            const statusEl = document.getElementById('excludeBulkStatus');
+            const CONCURRENCY = 10;
+            let ok = 0;
+            const errors = [];
+
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Excluding…';
+            try {
+                for (let i = 0; i < urls.length; i += CONCURRENCY) {
+                    const chunk = urls.slice(i, i + CONCURRENCY);
+                    const settled = await Promise.allSettled(
+                        chunk.map((u) => postOneManualHarvestLabel(bdr, { linkedInUrl: u, originType: 'excluded', notes }))
+                    );
+                    settled.forEach((res, idx) => {
+                        if (res.status === 'fulfilled') ok++;
+                        else errors.push({ url: chunk[idx], err: res.reason && res.reason.message ? res.reason.message : String(res.reason) });
+                    });
+                    statusEl.textContent = `Progress: ${Math.min(i + chunk.length, urls.length)} / ${urls.length} (${ok} excluded)`;
+                }
+                if (ok > 0) {
+                    // Keep failed URLs in the box so they can be retried; clear the rest.
+                    document.getElementById('excludeBulkUrls').value = errors.map((e) => e.url).join('\n');
+                    updateExcludeCount();
+                    await recomputeOneBdr(bdr);
+                    await refresh();
+                }
+                let msg = `Done. Excluded ${ok} of ${urls.length}.`;
+                if (errors.length) {
+                    msg += `\n\nFailed: ${errors.length} (left in the box to retry).\n\n` +
+                        errors.slice(0, 8).map((e) => `${e.url} → ${e.err}`).join('\n') + (errors.length > 8 ? '\n…' : '');
+                    console.warn('Exclude URL errors', errors);
+                }
+                alert(msg);
+                statusEl.textContent = errors.length ? `Finished: ${ok} excluded, ${errors.length} failed.` : `Finished: ${ok} excluded.`;
+            } catch (e) {
+                console.error(e);
+                alert('Exclude failed: ' + e.message);
+                statusEl.textContent = '';
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-user-slash"></i> Exclude these URLs';
             }
         });
 
