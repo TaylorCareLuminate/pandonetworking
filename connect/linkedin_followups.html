@@ -283,7 +283,10 @@
         <!-- Review queue -->
         <div id="tab-review" class="hidden">
             <div class="section">
-                <h2><i class="fas fa-user-check"></i> Emails waiting for approval <span style="flex:1"></span><button class="btn small" id="refreshReviewBtn"><i class="fas fa-sync-alt"></i> Refresh</button></h2>
+                <h2><i class="fas fa-user-check"></i> Emails waiting for approval <span style="flex:1"></span>
+                    <select id="reviewCampaign" style="width:auto"><option value="">All campaigns</option></select>
+                    <button class="btn success small hidden" id="approveAllBtn" type="button" title="Approve and schedule every email shown below (held emails are skipped)"><i class="fas fa-check-double"></i> Approve all</button>
+                    <button class="btn small" id="refreshReviewBtn"><i class="fas fa-sync-alt"></i> Refresh</button></h2>
                 <div class="body" id="reviewList"><div class="empty">Loading...</div></div>
             </div>
         </div>
@@ -1042,10 +1045,15 @@
                 const { enrollments } = await api('/enrollments?status=awaiting_approval&limit=200');
                 $('reviewCount').textContent = enrollments.length;
                 $('reviewCount').classList.toggle('hidden', !enrollments.length);
-                if (!enrollments.length) { box.innerHTML = '<div class="empty"><i class="fas fa-check"></i> Nothing waiting for review.</div>'; return; }
+                const keepCampaign = $('reviewCampaign').value;
+                const byCampaign = new Map();
+                enrollments.forEach(e => { const k = e.campaignId || ''; byCampaign.set(k, { name: e.campaignName || k, n: ((byCampaign.get(k) || {}).n || 0) + 1 }); });
+                $('reviewCampaign').innerHTML = '<option value="">All campaigns</option>' + [...byCampaign].map(([k, v]) => `<option value="${esc(k)}">${esc(v.name)} (${v.n})</option>`).join('');
+                $('reviewCampaign').value = byCampaign.has(keepCampaign) ? keepCampaign : '';
+                if (!enrollments.length) { box.innerHTML = '<div class="empty"><i class="fas fa-check"></i> Nothing waiting for review.</div>'; updateApproveAll(); return; }
                 box.innerHTML = enrollments.map(e => {
                     const st = (e.stepStates || {})[`s${e.currentStep || 0}`] || {};
-                    return `<div class="review-card" data-id="${esc(e.id)}">
+                    return `<div class="review-card" data-id="${esc(e.id)}" data-campaign="${esc(e.campaignId || '')}" ${st.issues && st.issues.length ? 'data-held="1"' : ''}>
                         <div class="who">
                             <div><b>${esc(e.lead.fullName)}</b> <span class="muted">${esc(e.lead.title)}${e.lead.company ? ` at ${esc(e.lead.company)}` : ''}</span><br>
                                 <span class="muted"><i class="fas fa-envelope"></i> ${esc(e.lead.email)} (${esc(e.lead.emailSource || '')}${e.lead.emailValidation ? `, ${esc(e.lead.emailValidation)}` : ''})
@@ -1067,11 +1075,87 @@
                     </div>`;
                 }).join('');
                 box.querySelectorAll('.review-card').forEach(card => card.querySelectorAll('[data-act]').forEach(b => b.addEventListener('click', () => reviewAction(card, b.dataset.act, b))));
+                applyReviewFilter();
             } catch (e) {
                 box.innerHTML = `<div class="err">${esc(e.message)}</div>`;
             }
         }
         $('refreshReviewBtn').addEventListener('click', loadReview);
+
+        // ── Mass approve ──────────────────────────────────────────────────────
+        // Approves each visible email through the normal approve endpoint, sending the subject and
+        // body currently in the card (so edits are kept). Emails held for issues are never bulk-approved.
+        let massRunning = false, massStop = false;
+        const reviewVisibleCards = () => [...document.querySelectorAll('#reviewList .review-card')].filter(c => c.style.display !== 'none');
+        function applyReviewFilter() {
+            const cid = $('reviewCampaign').value;
+            document.querySelectorAll('#reviewList .review-card').forEach(c => { c.style.display = !cid || c.dataset.campaign === cid ? '' : 'none'; });
+            updateApproveAll();
+        }
+        function updateApproveAll() {
+            if (massRunning) return;
+            const cards = reviewVisibleCards();
+            const ready = cards.filter(c => !c.dataset.held);
+            const btn = $('approveAllBtn');
+            btn.classList.toggle('hidden', !cards.length);
+            btn.disabled = !ready.length;
+            btn.innerHTML = `<i class="fas fa-check-double"></i> Approve all (${ready.length})`;
+            const total = document.querySelectorAll('#reviewList .review-card').length;
+            $('reviewCount').textContent = total;
+            $('reviewCount').classList.toggle('hidden', !total);
+        }
+        $('reviewCampaign').addEventListener('change', applyReviewFilter);
+
+        async function approveAll() {
+            if (massRunning) { massStop = true; return; }
+            const cards = reviewVisibleCards();
+            const ready = cards.filter(c => !c.dataset.held);
+            const held = cards.length - ready.length;
+            if (!ready.length) return;
+            const sel = $('reviewCampaign');
+            const scope = sel.value ? `for "${sel.options[sel.selectedIndex].text.replace(/ \(\d+\)$/, '')}"` : 'across all campaigns';
+            if (!confirm(`Approve and schedule ${ready.length} email${ready.length === 1 ? '' : 's'} ${scope}, exactly as shown (including your edits)?` +
+                (held ? `\n\n${held} held email${held === 1 ? '' : 's'} with issues will be left for you to review.` : '') +
+                (document.querySelectorAll('#reviewList .review-card').length >= 200 ? '\n\nThe queue loads 200 at a time, so more may remain afterward.' : '') +
+                '\n\nEach email is scheduled for its normal send time. You can stop part-way by clicking the button again.')) return;
+
+            massRunning = true; massStop = false;
+            const btn = $('approveAllBtn');
+            let done = 0, scheduled = 0, notScheduled = 0, failed = 0;
+            const errors = new Map();
+            const queue = [...ready];
+            const worker = async () => {
+                while (queue.length && !massStop) {
+                    const card = queue.shift();
+                    try {
+                        const { result } = await api(`/enrollments/${encodeURIComponent(card.dataset.id)}/approve`, { method: 'POST', body: {
+                            subject: card.querySelector('.rv-subject').value, body: card.querySelector('.rv-body').value
+                        } });
+                        if (result.scheduled) scheduled++; else notScheduled++;
+                        card.remove();
+                    } catch (e) {
+                        failed++;
+                        errors.set(e.message, (errors.get(e.message) || 0) + 1);
+                        card.querySelector('.err.mass-err')?.remove();
+                        card.querySelector('.actions').insertAdjacentHTML('beforebegin', `<div class="err mass-err"><i class="fas fa-triangle-exclamation"></i> Not approved: ${esc(e.message)}</div>`);
+                    }
+                    done++;
+                    btn.innerHTML = `<i class="fas fa-stop"></i> Approving ${done}/${ready.length}... (click to stop)`;
+                }
+            };
+            await Promise.all([worker(), worker(), worker()]);
+            massRunning = false;
+            const stopped = massStop; massStop = false;
+            updateApproveAll();
+            const parts = [`${scheduled} scheduled`];
+            if (notScheduled) parts.push(`${notScheduled} skipped or stopped by safety checks`);
+            if (failed) parts.push(`${failed} not approved (see the red note on each)`);
+            if (stopped) parts.push('stopped early');
+            const top = [...errors].slice(0, 2).map(([m, n]) => `${m} (${n})`).join('; ');
+            toast(parts.join(', ') + (top ? `. ${top}` : ''), failed > 0);
+            if (!document.querySelector('#reviewList .review-card')) loadReview();
+        }
+        $('approveAllBtn').addEventListener('click', approveAll);
 
         async function reviewAction(card, act, btn) {
             const id = card.dataset.id;
@@ -1100,6 +1184,7 @@
                 }
             } catch (e) { toast(e.message, true); }
             btn.disabled = false;
+            updateApproveAll();
         }
 
         // ── Activity ──────────────────────────────────────────────────────────
