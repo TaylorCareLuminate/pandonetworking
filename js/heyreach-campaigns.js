@@ -205,33 +205,167 @@
    * (and optionally their email). Returns candidates sorted best-first,
    * each as { account, score }. Scores ≥ 70 are considered a confident match.
    */
-  function findAccountMatches(accounts, fullName, email) {
-    const norm = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
-    const name = norm(fullName);
-    const parts = name.split(' ');
+  // Common first-name variants so "Patti" matches "Patricia", "Mike" matches "Michael", etc.
+  const NICKNAME_GROUPS = [
+    ['patricia', 'patti', 'pattie', 'patty', 'pat', 'trish', 'tricia', 'patsy'],
+    ['michael', 'mike', 'mick', 'mikey'],
+    ['christopher', 'chris', 'topher'],
+    ['christine', 'christina', 'chris', 'christy', 'tina'],
+    ['robert', 'rob', 'bob', 'bobby', 'robbie'],
+    ['william', 'will', 'bill', 'billy', 'willy'],
+    ['richard', 'rick', 'rich', 'dick', 'richie'],
+    ['james', 'jim', 'jimmy', 'jamie'],
+    ['john', 'jon', 'johnny', 'jack'],
+    ['jonathan', 'jon', 'jonny'],
+    ['joseph', 'joe', 'joey'],
+    ['thomas', 'tom', 'tommy'],
+    ['daniel', 'dan', 'danny'],
+    ['matthew', 'matt'],
+    ['anthony', 'tony'],
+    ['andrew', 'andy', 'drew'],
+    ['steven', 'stephen', 'steve'],
+    ['charles', 'charlie', 'chuck', 'chas'],
+    ['edward', 'ed', 'eddie', 'ted', 'teddy'],
+    ['timothy', 'tim', 'timmy'],
+    ['kenneth', 'ken', 'kenny'],
+    ['donald', 'don', 'donny'],
+    ['gregory', 'greg'],
+    ['jeffrey', 'jeff', 'geoff', 'geoffrey'],
+    ['nicholas', 'nick', 'nicky'],
+    ['alexander', 'alex', 'xander', 'sasha'],
+    ['alexandra', 'alex', 'alexis', 'sandra'],
+    ['benjamin', 'ben', 'benny'],
+    ['samuel', 'sam', 'sammy'],
+    ['elizabeth', 'liz', 'lizzie', 'beth', 'betty', 'eliza', 'liza', 'libby'],
+    ['katherine', 'catherine', 'kathryn', 'kate', 'katie', 'kathy', 'cathy', 'kat', 'kit'],
+    ['jennifer', 'jen', 'jenny', 'jenn'],
+    ['jessica', 'jess', 'jessie'],
+    ['margaret', 'maggie', 'meg', 'peggy', 'marge', 'greta'],
+    ['deborah', 'debra', 'deb', 'debbie'],
+    ['susan', 'sue', 'suzy', 'susie'],
+    ['rebecca', 'becky', 'becca'],
+    ['barbara', 'barb', 'barbie'],
+    ['victoria', 'vicky', 'vicki', 'tori'],
+    ['samantha', 'sam', 'sammy'],
+    ['stephanie', 'steph', 'stephie'],
+    ['kimberly', 'kim', 'kimmy'],
+    ['theresa', 'teresa', 'terri', 'terry', 'tess'],
+    ['dorothy', 'dot', 'dottie'],
+    ['nancy', 'nan'],
+    ['joanne', 'joann', 'jo']
+  ];
+
+  const NAME_NOISE = new Set([
+    'jr', 'sr', 'ii', 'iii', 'iv', 'md', 'phd', 'rn', 'np', 'cpa', 'mba', 'msn', 'dnp',
+    'dr', 'mr', 'mrs', 'ms', 'cpc', 'pmp', 'lpn', 'bsn', 'chc'
+  ]);
+
+  function normName(s) {
+    return String(s || '')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   // strip accents
+      .toLowerCase()
+      .replace(/[^a-z0-9\s'-]/g, ' ')                     // punctuation → space
+      .replace(/['’]/g, '')
+      .replace(/-/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t && !NAME_NOISE.has(t))
+      .join(' ');
+  }
+
+  function sameFirstName(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    return NICKNAME_GROUPS.some((g) => g.includes(a) && g.includes(b));
+  }
+
+  function levenshtein(a, b) {
+    if (a === b) return 0;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+    let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i];
+      for (let j = 1; j <= b.length; j++) {
+        cur[j] = Math.min(
+          prev[j] + 1,
+          cur[j - 1] + 1,
+          prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+        );
+      }
+      prev = cur;
+    }
+    return prev[b.length];
+  }
+
+  function similarity(a, b) {
+    if (!a || !b) return 0;
+    return 1 - levenshtein(a, b) / Math.max(a.length, b.length);
+  }
+
+  function linkedInSlug(url) {
+    const m = String(url || '').toLowerCase().match(/linkedin\.com\/in\/([^/?#\s]+)/);
+    return m ? decodeURIComponent(m[1]).replace(/\/+$/, '') : '';
+  }
+
+  /**
+   * Score how well each HeyReach sender account matches a person.
+   * Returns candidates (score > 0) sorted best-first, each as
+   * { account, score, reason }. Scores ≥ 75 are treated as a confident match
+   * for auto-selection; anything lower is shown to the user as "possible".
+   *
+   * Signals: LinkedIn profile URL, email, exact/nickname/initial/prefix/fuzzy
+   * name match (accent + credential-insensitive; handles first/last swapped or
+   * crammed into one field).
+   */
+  function findAccountMatches(accounts, fullName, email, linkedInUrl) {
+    const name = normName(fullName);
+    const parts = name.split(' ').filter(Boolean);
     const first = parts[0] || '';
     const last = parts.length > 1 ? parts[parts.length - 1] : '';
-    const emailLocal = norm(email).split('@')[0] || '';
+    const emailNorm = String(email || '').trim().toLowerCase();
+    const emailLocal = emailNorm.split('@')[0] || '';
+    const slug = linkedInSlug(linkedInUrl);
 
     const scored = accounts.map((a) => {
-      const aFirst = norm(a.firstName);
-      const aLast = norm(a.lastName);
-      const aFull = norm(`${a.firstName} ${a.lastName}`);
-      const aEmail = norm(a.email);
+      const aFirst = normName(a.firstName).split(' ')[0] || '';
+      const aLastParts = normName(a.lastName).split(' ').filter(Boolean);
+      const aLast = aLastParts[aLastParts.length - 1] || '';
+      const aFull = normName(`${a.firstName} ${a.lastName}`);
+      const aTokens = aFull.split(' ').filter(Boolean);
+      const aEmail = String(a.email || '').trim().toLowerCase();
 
       let score = 0;
-      if (name && aFull === name) score = 100;
-      else if (first && last && aFirst === first && aLast === last) score = 95;
-      else if (first && last && aFirst === first && (aLast.startsWith(last) || last.startsWith(aLast))) score = 75;
-      else if (first && aFirst === first && !last) score = 60;
-      else if (first && aFirst === first) score = 50;
-      else if (last && aLast === last) score = 40;
+      let reason = '';
+      const bump = (s, r) => { if (s > score) { score = s; reason = r; } };
+
+      // Strongest: same LinkedIn profile
+      if (slug && linkedInSlug(a.profileUrl) === slug) bump(99, 'same LinkedIn profile URL');
 
       // Email signals
-      if (email && aEmail && aEmail === norm(email)) score = Math.max(score, 98);
-      else if (emailLocal && aEmail && aEmail.split('@')[0] === emailLocal) score = Math.max(score, 80);
+      if (emailNorm && aEmail && aEmail === emailNorm) bump(98, 'same email');
+      else if (emailLocal && aEmail && aEmail.split('@')[0] === emailLocal) bump(80, 'email username matches');
 
-      return { account: a, score };
+      // Name signals
+      if (name) {
+        if (aFull === name) bump(100, 'exact name match');
+        else if (first && last && aFirst === first && aLast === last) bump(95, 'first + last name match');
+        else if (first && last && sameFirstName(first, aFirst) && aLast === last) bump(90, `nickname match ("${aFirst}" ≈ "${first}")`);
+        else if (first && last && parts.length >= 2 && parts.every((p) => aTokens.includes(p))) bump(85, 'all name parts present (different order/fields)');
+        else if (first && last && aFirst === first && aLast && (aLast.startsWith(last) || last.startsWith(aLast))) bump(75, 'first name + similar last name');
+        else if (first && last && aLast === last && aFirst && aFirst[0] === first[0]) bump(70, 'same last name + first initial');
+        else if (first && aFirst === first && !last) bump(60, 'first name match');
+        else if (first && aFirst === first) bump(50, 'first name matches only');
+        else if (first && last && sameFirstName(first, aFirst)) bump(45, 'similar first name only');
+        else if (last && aLast === last) bump(40, 'last name matches only');
+
+        // Fuzzy catch-all (typos, spelling variants) — capped below the auto-select threshold
+        if (score < 74 && aFull) {
+          const sim = similarity(name, aFull);
+          if (sim >= 0.7) bump(Math.min(74, Math.round(40 + sim * 34)), `similar name (${Math.round(sim * 100)}%)`);
+        }
+      }
+
+      return { account: a, score, reason };
     });
 
     return scored.filter((s) => s.score > 0).sort((x, y) => y.score - x.score);

@@ -5748,11 +5748,12 @@ HealthLuminate
         hrAccount = senders.find(a => String(a.id) === String(liDoc.heyreachAccountId)) || null;
         hrHow = 'from linked LinkedIn account record';
       }
+      let hrMatches = [];
       if (!hrAccount) {
-        const matches = lib.findAccountMatches(senders, bdr.name, assocEmail);
-        if (matches.length > 0 && matches[0].score >= 75) {
-          hrAccount = matches[0].account;
-          hrHow = `matched by name (score ${matches[0].score})`;
+        hrMatches = lib.findAccountMatches(senders, bdr.name, assocEmail, liDoc?.linkedInProfileUrl || liDoc?.linkedInUrl || linkedInUrlHint);
+        if (hrMatches.length > 0 && hrMatches[0].score >= 75) {
+          hrAccount = hrMatches[0].account;
+          hrHow = `matched automatically (${hrMatches[0].reason}, score ${hrMatches[0].score})`;
         }
       }
 
@@ -5768,6 +5769,14 @@ HealthLuminate
         hrAccount
           ? `${hrAccount.firstName} ${hrAccount.lastName} (ID ${hrAccount.id}) — ${hrHow}`
           : hrMissingDetail);
+      if (!hrAccount && senders.length > 0) {
+        // Let the UI offer a manual picker: scored matches first, then everyone else
+        const matchedIds = new Set(hrMatches.map(m => String(m.account.id)));
+        checks[checks.length - 1].candidates = [
+          ...hrMatches,
+          ...senders.filter(s => !matchedIds.has(String(s.id))).map(s => ({ account: s, score: 0, reason: '' }))
+        ];
+      }
 
       // ── 5. linkedin_accounts record ────────────────────────────────────────
       // Created even without a HeyReach account (placeholder heyreachAccountId)
@@ -5808,7 +5817,10 @@ HealthLuminate
       } else {
         // Record exists — make sure the key fields are filled in
         const updates = {};
-        if (!liDoc.heyreachAccountId && hrAccount) updates.heyreachAccountId = String(hrAccount.id);
+        if (hrAccount && (!liDoc.heyreachAccountId
+            || (preferredHeyreachAccountId && String(liDoc.heyreachAccountId) !== String(hrAccount.id)))) {
+          updates.heyreachAccountId = String(hrAccount.id);   // explicit pick overrides a stale/wrong ID
+        }
         if (!liDoc.bdrLeaderId) updates.bdrLeaderId = bdr.id;
         if (!liDoc.bdrEmail) updates.bdrEmail = primaryEmail;
         if (!liDoc.linkedInProfileUrl && (linkedInUrlHint || hrAccount?.profileUrl)) {
@@ -6027,8 +6039,57 @@ HealthLuminate
       }
       body.innerHTML = headline + renderAuditChecklist(checks);
 
+      // Manual HeyReach account picker — shown when no confident match was found
+      const hrCheck = checks.find(c => c.key === 'heyreach_account' && !c.ok && c.candidates?.length);
+      window._auditCandidates = hrCheck ? hrCheck.candidates : null;
+      if (hrCheck) {
+        const rows = hrCheck.candidates.map(r => `
+          <label class="enroll-candidate">
+            <input type="radio" name="audit-hr-account" value="${r.account.id}">
+            <div>
+              <strong>${escapeAuditHtml(`${r.account.firstName} ${r.account.lastName}`.trim() || '(no name)')}</strong>
+              ${r.score >= 75 ? '<span class="enroll-match-tag">LIKELY</span>' : r.score > 0 ? '<span class="enroll-match-tag weak">possible</span>' : ''}
+              ${r.account.active ? '' : '<span style="color:#991b1b; font-size:0.75rem;"> (inactive)</span>'}
+              <div style="font-size: 0.8rem; color: #666;">
+                ID: ${r.account.id}${r.account.email ? ' · ' + escapeAuditHtml(r.account.email) : ''}${r.reason ? ' · ' + escapeAuditHtml(r.reason) : ''}
+              </div>
+              ${r.account.profileUrl ? `<div style="font-size: 0.75rem; color: #888; word-break: break-all;">${escapeAuditHtml(r.account.profileUrl)}</div>` : ''}
+            </div>
+          </label>`).join('');
+        body.innerHTML += `
+          <div style="margin-top: 1rem;">
+            <div style="font-weight: 600; margin-bottom: 0.4rem;">
+              <i class="fas fa-link"></i> Pick the HeyReach account for ${escapeAuditHtml(bdr.name)}
+            </div>
+            <div style="font-size: 0.8rem; color: #666; margin-bottom: 0.5rem;">
+              ${hrCheck.candidates.length} account(s) in this HeyReach workspace — closest matches first.
+            </div>
+            <div style="max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;">${rows}</div>
+          </div>`;
+      }
+
       actions.innerHTML = '';
-      if (fixable.length > 0) {
+      if (hrCheck) {
+        actions.innerHTML = `
+          <label style="display: flex; align-items: center; gap: 8px; flex-basis: 100%; font-size: 0.9rem; font-weight: 600;">
+            Connect / Message delay after liking the post:
+            <select id="audit-delay-choice" style="padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px;">
+              <option value="3h" selected>3 hours</option>
+              <option value="2d">2 days</option>
+            </select>
+          </label>
+          <button onclick="runBDRAuditFix(true)" class="btn btn-success">
+            <i class="fas fa-link"></i> Link Selected Account &amp; Fix
+          </button>
+          ${fixable.length > 0 ? `<button onclick="runBDRAuditFix()" class="btn btn-secondary" title="Fix the other items and skip HeyReach for now">
+            <i class="fas fa-wrench"></i> Fix Other Issues Only
+          </button>` : ''}
+          <button onclick="closeBDRAuditModal()" class="btn btn-secondary">Close</button>
+          <small style="flex-basis: 100%; color: #666;">
+            Linking saves the HeyReach account ID on their LinkedIn record, then sets the LinkedIn email
+            association, caches the account in Firebase, and builds + launches any missing campaigns.
+          </small>`;
+      } else if (fixable.length > 0) {
         const willBuildCampaigns = fixable.some(c => c.key === 'campaigns');
         actions.innerHTML = `
           ${willBuildCampaigns ? `
@@ -6053,19 +6114,37 @@ HealthLuminate
       }
     }
 
-    window.runBDRAuditFix = async () => {
+    function escapeAuditHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, ch => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+    }
+
+    window.runBDRAuditFix = async (useSelectedAccount = false) => {
       const bdr = window.bdrLeaders.find(b => b.id === window._currentAuditBdrId);
       if (!bdr) return;
+
+      let preferredHeyreachAccountId = null;
+      if (useSelectedAccount === true) {
+        preferredHeyreachAccountId = document.querySelector('input[name="audit-hr-account"]:checked')?.value || null;
+        if (!preferredHeyreachAccountId) {
+          showAlert('Select a HeyReach account from the list first.', 'warning');
+          return;
+        }
+      }
 
       const sequenceDelay = document.getElementById('audit-delay-choice')?.value || '3h';
       const actions = document.getElementById('bdr-audit-actions');
       actions.innerHTML = '<div style="color: #666;"><i class="fas fa-spinner fa-spin"></i> Fixing — do not close this window...</div>';
-      document.getElementById('bdr-audit-log').innerHTML = '';
+      const logEl = document.getElementById('bdr-audit-log');
+      logEl.innerHTML = '';
+      logEl.style.display = 'block';
 
       try {
         const checks = await auditAndFixBDR(bdr, {
           apply: true,
           sequenceDelay,
+          preferredHeyreachAccountId,
+          skipCampaigns: false,
           onLog: (msg, level) => appendAuditLog('bdr-audit-log', msg, level)
         });
         renderAuditResults(bdr, checks);
@@ -6226,7 +6305,7 @@ HealthLuminate
       try {
         const lib = window.HeyReachCampaigns;
         const senders = await lib.fetchLinkedInSenders({ railwayUrl: window.railwayApiUrl, apiKey: customer.heyreachApiKey });
-        const matches = lib.findAccountMatches(senders, name, email);
+        const matches = lib.findAccountMatches(senders, name, email, linkedInUrl);
 
         window._enrollState = { customerId, name, email, linkedInUrl, phone, twoFaGuid, senders };
 
@@ -6234,8 +6313,8 @@ HealthLuminate
         const matchedIds = new Set(matches.map(m => String(m.account.id)));
         const others = senders.filter(a => !matchedIds.has(String(a.id)));
         const rows = [];
-        matches.forEach((m, i) => rows.push({ account: m.account, score: m.score, checked: i === 0 }));
-        others.forEach(a => rows.push({ account: a, score: 0, checked: false }));
+        matches.forEach((m, i) => rows.push({ account: m.account, score: m.score, reason: m.reason, checked: i === 0 && m.score >= 75 }));
+        others.forEach(a => rows.push({ account: a, score: 0, reason: '', checked: false }));
 
         let html;
         if (rows.length === 0) {
@@ -6253,11 +6332,11 @@ HealthLuminate
                 <strong>${r.account.firstName} ${r.account.lastName}</strong>
                 ${r.score >= 75 ? '<span class="enroll-match-tag">BEST MATCH</span>' : r.score > 0 ? '<span class="enroll-match-tag weak">possible</span>' : ''}
                 ${r.account.active ? '' : '<span style="color:#991b1b; font-size:0.75rem;"> (inactive)</span>'}
-                <div style="font-size: 0.8rem; color: #666;">ID: ${r.account.id}${r.account.email ? ' · ' + r.account.email : ''}</div>
+                <div style="font-size: 0.8rem; color: #666;">ID: ${r.account.id}${r.account.email ? ' · ' + r.account.email : ''}${r.reason ? ' · ' + r.reason : ''}</div>
               </div>
             </label>`).join('') +
             `<label class="enroll-candidate">
-              <input type="radio" name="enroll-account" value="">
+              <input type="radio" name="enroll-account" value="" ${rows.some(r => r.checked) ? '' : 'checked'}>
               <div><strong>None of these / no HeyReach account yet</strong> — still set up the BDR + LinkedIn
                 records, /connect access, and review settings (link HeyReach later with Audit &amp; Fix)</div>
             </label>`;
