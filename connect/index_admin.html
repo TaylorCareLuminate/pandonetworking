@@ -1981,6 +1981,31 @@
             gap: 14px;
         }
 
+        /* Older unresolved replies accordion (closed by default) */
+        .li-older-accordion {
+            margin: 0 16px 16px;
+            background: rgba(255,255,255,0.08);
+            border: 1.5px solid rgba(255,255,255,0.25);
+            border-radius: 12px;
+        }
+        .li-older-accordion > summary {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            color: white;
+            font-weight: 700;
+            font-size: 0.95rem;
+            cursor: pointer;
+            list-style: none;
+            user-select: none;
+        }
+        .li-older-accordion > summary::-webkit-details-marker { display: none; }
+        .li-older-hint { font-weight: 400; font-size: 0.78rem; opacity: 0.75; }
+        .li-older-chevron { transition: transform 0.15s; font-size: 0.8rem; }
+        .li-older-accordion[open] .li-older-chevron { transform: rotate(90deg); }
+        .li-older-accordion > .li-alerts-list { padding-top: 4px; }
+
         /* Filter bar: jump straight to one BDR's / one contact's card */
         .li-alerts-filter-bar {
             display: flex;
@@ -3719,6 +3744,14 @@
 <body>
     <div class="container">
 
+        <!-- ── Reload LinkedIn Replies (always visible, even when the banner below is hidden) ── -->
+        <div id="liReloadBar" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:16px;">
+            <button type="button" id="liReloadBtn" onclick="window.liReloadReplies()" title="Ask the backend to search LinkedIn (HeyReach inbox) for new replies right now, then refresh the list" style="display:inline-flex; align-items:center; gap:8px; padding:10px 18px; border-radius:10px; border:none; background:linear-gradient(135deg, #0d3b66 0%, #1565c0 100%); color:#fff; font-size:0.9rem; font-weight:600; cursor:pointer; box-shadow:0 2px 8px rgba(13,59,102,0.25);">
+                <i class="fas fa-sync-alt"></i> Reload LinkedIn Messages
+            </button>
+            <span id="liReloadStatus" style="font-size:0.85rem; color:#555;"></span>
+        </div>
+
         <!-- ── LinkedIn Reply Alerts ─────────────────────────────────────────── -->
         <style>
             /* AI suggested-reply bar (inside each reply alert card's compose section) */
@@ -4037,6 +4070,17 @@
                 <span></span>
             </div>
             <div class="li-alerts-list" id="liAlertsList"></div>
+
+            <!-- Older unresolved replies: closed by default; cards render on first open -->
+            <details class="li-older-accordion" id="liOlderDetails" style="display:none;" ontoggle="window.liOlderToggled()">
+                <summary>
+                    <i class="fas fa-chevron-right li-older-chevron"></i>
+                    <span>Older Unresolved Replies</span>
+                    <span class="li-alerts-badge" id="liOlderBadge">0</span>
+                    <span class="li-older-hint" id="liOlderHint">Not dismissed yet, but older than the newest replies above</span>
+                </summary>
+                <div class="li-alerts-list" id="liOlderAlertsList"></div>
+            </details>
         </div>
 
         <!-- Add Quick Text Insert Modal (for LinkedIn Reply Alerts) -->
@@ -8431,6 +8475,12 @@ Rules:
                 const key = _liAlertDedupeKey(a);
 
                 const existing = byKey.get(key);
+                if (existing) {
+                    // If either twin is in the main (recent) list, the merged card belongs there too.
+                    const bothOlder = !!(a._liOlder && existing._liOlder);
+                    a._liOlder = bothOlder;
+                    existing._liOlder = bothOlder;
+                }
                 if (!existing) {
                     byKey.set(key, a);
                 } else if (isBetter(a, existing)) {
@@ -8445,12 +8495,17 @@ Rules:
 
         async function _liLoadAlerts() {
             try {
-                const resp = await fetch(`${RAILWAY_BASE}/api/linkedin-reply-alerts`);
+                const resp = await fetch(`${RAILWAY_BASE}/api/linkedin-reply-alerts?includeOlder=1`);
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const data = await resp.json();
                 if (!data.success) throw new Error(data.error || 'Unknown error');
 
-                const rawAlerts = data.alerts || [];
+                // Unresolved alerts beyond the newest page used to silently drop off.
+                // They're kept, flagged `_liOlder`, and shown in the collapsed
+                // "Older Unresolved Replies" accordion instead.
+                (data.alerts || []).forEach(a => { a._liOlder = false; });
+                (data.olderAlerts || []).forEach(a => { a._liOlder = true; });
+                const rawAlerts = [...(data.alerts || []), ...(data.olderAlerts || [])];
                 // Must resolve canonical BDR emails BEFORE deduping — that's what lets a BDR's
                 // work-email alert and LinkedIn-login-email alert for the same lead collapse
                 // into a single card instead of looking like two different BDRs.
@@ -8627,7 +8682,7 @@ Rules:
          *  background. If Llama fails the fuzzy candidates are shown with a notice. */
         async function liCheckDNCInBackground() {
             try {
-                const unseen = (_liAlerts || []).filter(a => !_liDncCheckedIds.has(a.id));
+                const unseen = (_liAlerts || []).filter(a => _liIsCardOpenable(a) && !_liDncCheckedIds.has(a.id));
                 if (!unseen.length) return;
 
                 const { collection, getDocs } = window.clemailFirestore;
@@ -8909,7 +8964,9 @@ Rules:
 
             const composeState = _liCaptureComposeState();
 
-            badge.textContent = _liAlerts.length;
+            const mainAlerts = _liAlerts.filter(a => !a._liOlder);
+            const olderAlerts = _liAlerts.filter(a => a._liOlder);
+            badge.textContent = mainAlerts.length;
 
             // Meta line: last scan time
             if (meta && meta.lastScanAt) {
@@ -8925,14 +8982,84 @@ Rules:
             }
 
             banner.style.display = 'block';
-            list.innerHTML = _liAlerts.map(a => _liRenderCard(a)).join('');
+            list.innerHTML = mainAlerts.map(a => _liRenderCard(a)).join('');
 
+            // Older unresolved replies live in a collapsed accordion. Their cards
+            // are only built while it's open (hundreds of cards each firing
+            // notes / calendar / AI-draft lookups would be wasteful otherwise).
+            const olderDetails = document.getElementById('liOlderDetails');
+            const olderList = document.getElementById('liOlderAlertsList');
+            const olderOpen = !!(olderDetails && olderDetails.open && olderAlerts.length);
+            if (olderDetails) {
+                olderDetails.style.display = olderAlerts.length ? '' : 'none';
+                if (!olderAlerts.length) olderDetails.open = false;
+                const olderBadge = document.getElementById('liOlderBadge');
+                if (olderBadge) olderBadge.textContent = olderAlerts.length;
+                olderList.innerHTML = olderOpen ? olderAlerts.map(a => _liRenderCard(a)).join('') : '';
+            }
+
+            const hydrated = olderOpen ? _liAlerts : mainAlerts;
+            _liHydrateCards(hydrated);
+
+            // Re-apply any active BDR/name filter so a refresh (poll or manual scan)
+            // doesn't blow away a search someone is in the middle of using. This also
+            // hides not-Pando-originated replies (unless toggled on) and fixes the badge.
+            window.liApplyFilter();
+
+            // Look up connect_queue in the background for alerts we haven't classified yet;
+            // re-applies the filter itself if any turn out to be not Pando-originated.
+            _liClassifyPandoOrigin(hydrated).catch(err => console.warn('[LiAlerts] Pando-origin classification failed:', err.message));
+
+            // Re-render wipes the compose textareas, so re-seed each card with its
+            // stored AI draft (and restore generating/error status indicators).
+            _liApplyAllAiDrafts();
+
+            // Now put back anything the user had actually typed (which always
+            // wins over the re-seeded AI draft) and restore their cursor/focus
+            // so an in-progress reply survives this refresh untouched.
+            _liRestoreComposeState(composeState);
+        }
+
+        // True when this alert's card is (or would be) on screen: every main-list
+        // alert, plus older alerts only while their accordion is open.
+        function _liIsCardOpenable(a) {
+            if (!a._liOlder) return true;
+            const details = document.getElementById('liOlderDetails');
+            return !!(details && details.open);
+        }
+
+        // Fires when the "Older Unresolved Replies" accordion is opened/closed.
+        // Cards are built lazily on open, then get the same per-card setup
+        // (notes, calendar widget, AI draft, filters) as the main list.
+        window.liOlderToggled = function() {
+            const details = document.getElementById('liOlderDetails');
+            const olderList = document.getElementById('liOlderAlertsList');
+            if (!details || !olderList) return;
+            const olderAlerts = _liAlerts.filter(a => a._liOlder);
+            if (details.open) {
+                if (olderList.childElementCount) return; // already rendered
+                olderList.innerHTML = olderAlerts.map(a => _liRenderCard(a)).join('');
+                _liHydrateCards(olderAlerts);
+                window.liApplyFilter();
+                _liClassifyPandoOrigin(olderAlerts).catch(err => console.warn('[LiAlerts] Pando-origin classification failed:', err.message));
+                _liApplyAllAiDrafts();
+                _liEnsureAiDrafts().catch(err => console.warn('[LiAlerts][AI] Draft pass failed:', err.message));
+                liCheckDNCInBackground().catch(e => console.warn('DNC check failed:', e));
+            } else {
+                // Free the DOM; it's rebuilt next time it's opened.
+                olderList.innerHTML = '';
+            }
+        };
+
+        // Per-card setup shared by the main list and the older-replies accordion:
+        // CRM notes history + the Conference Meeting Scheduling widget.
+        function _liHydrateCards(alerts) {
             // Load CRM notes for each alert
-            _liAlerts.forEach(a => _liLoadNotesHistory(a.id));
+            alerts.forEach(a => _liLoadNotesHistory(a.id));
 
             // Mount the Conference Meeting Scheduling widget for each alert card
             if (window.ConferenceScheduling) {
-                _liAlerts.forEach(async a => {
+                alerts.forEach(async a => {
                     const wrap = document.getElementById(`li-conf-widget-${a.id}`);
                     if (!wrap) return;
                     const leadName = a.leadName || [a.leadFirstName, a.leadLastName].filter(Boolean).join(' ') || 'Unknown';
@@ -8957,24 +9084,6 @@ Rules:
                     }).catch(err => console.warn('[ConferenceScheduling] mount failed for', a.id, err));
                 });
             }
-
-            // Re-apply any active BDR/name filter so a refresh (poll or manual scan)
-            // doesn't blow away a search someone is in the middle of using. This also
-            // hides not-Pando-originated replies (unless toggled on) and fixes the badge.
-            window.liApplyFilter();
-
-            // Look up connect_queue in the background for alerts we haven't classified yet;
-            // re-applies the filter itself if any turn out to be not Pando-originated.
-            _liClassifyPandoOrigin(_liAlerts).catch(err => console.warn('[LiAlerts] Pando-origin classification failed:', err.message));
-
-            // Re-render wipes the compose textareas, so re-seed each card with its
-            // stored AI draft (and restore generating/error status indicators).
-            _liApplyAllAiDrafts();
-
-            // Now put back anything the user had actually typed (which always
-            // wins over the re-seeded AI draft) and restore their cursor/focus
-            // so an in-progress reply survives this refresh untouched.
-            _liRestoreComposeState(composeState);
         }
 
         // ── "Not originated by Pando" detection (mirrors company_review_replies.html) ─────
@@ -9153,21 +9262,36 @@ Rules:
             let visibleCount = 0;
             let notPandoCount = 0;     // all not-Pando-originated alerts (hidden or not)
             let hiddenNotPando = 0;    // the ones currently hidden by the toggle
+            // Older (accordion) replies are tallied separately so they never inflate
+            // the main list's badge / counts.
+            let olderTotal = 0, olderVisible = 0, mainTotal = 0;
             _liAlerts.forEach(alert => {
+                const isOlder = !!alert._liOlder;
                 const isNotPando = _liIsNotPandoOriginated(alert);
-                if (isNotPando) notPandoCount++;
                 const hiddenNP = !_liShowNotPando && isNotPando;
-                if (hiddenNP) hiddenNotPando++;
+                if (!isOlder) {
+                    mainTotal++;
+                    if (isNotPando) notPandoCount++;
+                    if (hiddenNP) hiddenNotPando++;
+                }
                 const card = document.getElementById(`li-card-${alert.id}`);
-                if (!card) return;
                 const matches = !hiddenNP && _liAlertMatchesBdrFilter(alert, bdrEmail) && _liAlertMatchesSearchFilter(alert, q);
+                if (isOlder) {
+                    if (!hiddenNP) olderTotal++;
+                    // Cards for a collapsed accordion don't exist yet; still count them from data.
+                    if (matches) olderVisible++;
+                }
+                if (!card) return;
                 card.style.display = matches ? '' : 'none';
-                if (matches) visibleCount++;
+                if (matches && !isOlder) visibleCount++;
             });
 
-            const totalShown = _liAlerts.length - hiddenNotPando;
+            const olderBadge = document.getElementById('liOlderBadge');
+            if (olderBadge) olderBadge.textContent = hasFilter ? `${olderVisible} of ${olderTotal}` : olderTotal;
+
+            const totalShown = mainTotal - hiddenNotPando;
             if (countEl) countEl.textContent = hasFilter ? `Showing ${visibleCount} of ${totalShown}` : '';
-            if (emptyEl) emptyEl.style.display = (hasFilter && visibleCount === 0) ? 'flex' : 'none';
+            if (emptyEl) emptyEl.style.display = (hasFilter && visibleCount === 0 && olderVisible === 0) ? 'flex' : 'none';
 
             // Header badge reflects what's actually visible (not hidden not-Pando replies)
             const badge = document.getElementById('liAlertsBadge');
@@ -9186,7 +9310,7 @@ Rules:
             // If everything is hidden because it's not from Pando, say so rather than showing a blank banner
             const npEmpty = document.getElementById('liNotPandoEmptyState');
             if (npEmpty) {
-                const allHidden = _liAlerts.length > 0 && totalShown === 0;
+                const allHidden = mainTotal > 0 && totalShown === 0;
                 npEmpty.style.display = allHidden ? 'flex' : 'none';
                 const span = npEmpty.querySelector('span');
                 if (span && allHidden) span.textContent = `${hiddenNotPando} repl${hiddenNotPando === 1 ? 'y is' : 'ies are'} hidden because they didn't originate with Pando outreach. Click "Show Not-Pando" to see ${hiddenNotPando === 1 ? 'it' : 'them'}.`;
@@ -9403,7 +9527,8 @@ Rules:
 
         window.liDismissAll = async function() {
             // Hidden not-Pando replies are not "currently shown", so they are left alone.
-            const toDismiss = _liAlerts.filter(a => !_liIsHiddenNotPando(a));
+            // Older (accordion) replies are also left alone — dismiss those individually.
+            const toDismiss = _liAlerts.filter(a => !a._liOlder && !_liIsHiddenNotPando(a));
             if (!toDismiss.length) return;
             // Only dismiss what's currently shown to THIS viewer (only their own
             // scoped BDRs, or literally everyone if "Show all BDRs" is on)
@@ -9462,6 +9587,48 @@ Rules:
                 console.error('[LiAlerts] Scan error:', err);
                 if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i> Scan Now'; }
                 alert('Scan failed. Check Railway logs.');
+            }
+        };
+
+        // Top-of-page "Reload LinkedIn Messages" button. Same active rescan as "Scan Now"
+        // (asks Railway to search the HeyReach inbox over the last 24h) followed by a list
+        // reload, but reports results inline instead of via alert() popups, and lives
+        // outside #liReplyAlertsBanner so it is still visible when the banner is hidden
+        // (i.e. when no replies are currently showing).
+        window.liReloadReplies = async function() {
+            const btn = document.getElementById('liReloadBtn');
+            const status = document.getElementById('liReloadStatus');
+            const setStatus = (msg, color) => { if (status) { status.textContent = msg; status.style.color = color || '#555'; } };
+            if (btn) { btn.disabled = true; btn.style.opacity = '0.7'; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Searching…'; }
+            setStatus('Asking the backend to check LinkedIn for new messages…');
+            try {
+                const resp = await fetch(`${RAILWAY_BASE}/api/linkedin-reply-alerts/scan`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ windowMinutes: 1440 }) // last 24h
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                console.log('[LiAlerts] Reload scan result:', data);
+                setStatus('Scan finished — refreshing list…');
+                await _liLoadAlerts();
+                const newCount = data.results?.newAlerts || 0;
+                const updatedCount = data.results?.updated || 0;
+                const time = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+                if (newCount || updatedCount) {
+                    const parts = [];
+                    if (newCount) parts.push(`${newCount} new`);
+                    if (updatedCount) parts.push(`${updatedCount} updated`);
+                    setStatus(`✅ ${time} — found ${parts.join(', ')} reply alert(s).`, '#15803d');
+                } else {
+                    setStatus(`✅ ${time} — scan complete, no new replies found.`, '#15803d');
+                }
+            } catch (err) {
+                console.error('[LiAlerts] Reload error:', err);
+                setStatus(`⚠️ Scan failed (${err.message}). Showing cached alerts — check Railway logs.`, '#b91c1c');
+                try { await _liLoadAlerts(); } catch (_) { /* already logged */ }
+            } finally {
+                if (btn) { btn.disabled = false; btn.style.opacity = ''; btn.innerHTML = '<i class="fas fa-sync-alt"></i> Reload LinkedIn Messages'; }
             }
         };
 
@@ -10082,6 +10249,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         // small concurrency limit so we don't hammer Railway/OpenRouter.
         async function _liEnsureAiDrafts() {
             const pending = _liAlerts.filter(a => {
+                if (!_liIsCardOpenable(a)) return false; // collapsed older replies: drafted once the accordion is opened
                 if (_liAiDraftInFlight.has(a.id)) return false;
                 if (_liIsHiddenNotPando(a)) return false; // don't spend AI calls on hidden replies
                 return !(a.aiDraft && a.aiDraftKey === _liDraftKey(a));
