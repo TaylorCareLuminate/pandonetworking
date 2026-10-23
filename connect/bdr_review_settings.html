@@ -2376,24 +2376,56 @@
 
             const newStatus = bdr.status === 'active' ? 'inactive' : 'active';
             const badge = document.getElementById(`statusBadge_${bdrId}`);
-            if (!confirm(`Mark ${bdr.name || 'this BDR'} as ${newStatus === 'active' ? 'Active' : 'Inactive'}?\n\n${newStatus === 'inactive' ? 'They will stop appearing in BDR-selection dropdowns across the site.' : 'They will start appearing in BDR-selection dropdowns across the site again.'}`)) {
+            if (!confirm(`Mark ${bdr.name || 'this BDR'} as ${newStatus === 'active' ? 'Active' : 'Inactive'}?\n\n${newStatus === 'inactive' ? 'They will stop appearing in BDR-selection dropdowns across the site, and ALL of their emails (daily review, pipeline, weekly/daily/alert summaries, meeting reminders) will be turned off.' : 'They will start appearing in BDR-selection dropdowns across the site again.'}`)) {
                 return;
             }
 
             if (badge) badge.disabled = true;
             try {
-                await updateDoc(doc(emailDB, 'bdr_leaders', bdrId), {
-                    status: newStatus,
-                    updatedAt: new Date().toISOString()
-                });
+                const update = { status: newStatus, updatedAt: new Date().toISOString() };
+                if (newStatus === 'inactive') {
+                    // Inactive BDRs get no emails (backend also skips inactive BDRs)
+                    update.dailyEmailEnabled = false;
+                    update.inProcessEmailEnabled = false;
+                    update.meetingReminderEmailEnabled = false;
+                }
+                await updateDoc(doc(emailDB, 'bdr_leaders', bdrId), update);
                 bdr.status = newStatus;
+
+                let emailNote = '';
+                if (newStatus === 'inactive') {
+                    bdr.dailyEmailEnabled = false;
+                    bdr.inProcessEmailEnabled = false;
+                    bdr.meetingReminderEmailEnabled = false;
+                    // Keep the card's checkboxes in sync so a later "Save" doesn't re-enable them
+                    const dailyCb = document.getElementById(`enableDailyEmail_${bdrId}`);
+                    if (dailyCb) { dailyCb.checked = false; dailyCb.dispatchEvent(new Event('change')); }
+                    const pipelineCb = document.getElementById(`inProcessEmailEnabled_${bdrId}`);
+                    if (pipelineCb) { pipelineCb.checked = false; pipelineCb.dispatchEvent(new Event('change')); }
+
+                    // Weekly / daily / alert summary schedules live on Railway
+                    try {
+                        const token = window.auth?.currentUser ? await window.auth.currentUser.getIdToken() : null;
+                        if (!token) throw new Error('not signed in');
+                        const resp = await fetch(`https://railwayclemail-production.up.railway.app/api/linkedin-summary/schedules/${encodeURIComponent(bdrId)}/disable`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+                        });
+                        const json = await resp.json().catch(() => ({}));
+                        if (!resp.ok || json.success === false) throw new Error(json.error || `HTTP ${resp.status}`);
+                        emailNote = ' All of their emails were turned off.';
+                    } catch (schedErr) {
+                        console.error('Error disabling summary schedules:', schedErr);
+                        emailNote = ` Review/pipeline emails are off, but the weekly/daily summary schedules could not be turned off (${schedErr.message}) — turn them off in Email Summary.`;
+                    }
+                }
                 if (badge) {
                     const isActive = newStatus === 'active';
                     badge.className = `status-badge ${isActive ? 'active' : 'inactive'}`;
                     badge.innerHTML = `<i class="fas fa-circle" style="font-size:0.5rem;"></i>${isActive ? 'Active' : 'Inactive'}`;
                     badge.title = `Click to mark this BDR as ${isActive ? 'Inactive' : 'Active'}`;
                 }
-                showAlert(`${bdr.name || 'BDR'} marked as ${newStatus === 'active' ? 'Active' : 'Inactive'}.`, 'success');
+                showAlert(`${bdr.name || 'BDR'} marked as ${newStatus === 'active' ? 'Active' : 'Inactive'}.${emailNote}`, emailNote.includes('could not') ? 'danger' : 'success');
             } catch (error) {
                 console.error('Error updating BDR status:', error);
                 showAlert('Error updating status: ' + error.message, 'danger');

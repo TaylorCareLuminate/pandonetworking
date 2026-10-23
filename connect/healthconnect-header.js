@@ -44,7 +44,6 @@ const HEALTHCONNECT_CONFIG = {
             items: [
                 { label: 'My Connections', href: 'my_leads.html', icon: 'fa-users' },
                 { label: 'Harvest Pool', href: 'harvest_pool.html', icon: 'fa-seedling' },
-                { label: 'Prospect Contacts', href: 'prospect_contacts.html', icon: 'fa-address-book' },
                 { label: 'Prospect Organizations', href: 'prospect_organizations.html', icon: 'fa-building' },
                 // Company-level workspace (explicitly enabled per BDR in BDR Settings)
                 { label: 'Company Reporting', href: 'company_reporting.html', icon: 'fa-chart-pie', requiresCompanyReporting: true }

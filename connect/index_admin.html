@@ -12594,12 +12594,39 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             try {
                 const { doc, updateDoc } = window.clemailFirestore;
                 const emailDB = window.clemailDb;
-                await updateDoc(doc(emailDB, 'bdr_leaders', bdrId), { status: newStatus });
+                // Inactive BDRs get no emails: turn off the daily review, pipeline and meeting-reminder
+                // emails in the same write as the status change (backend also skips inactive BDRs).
+                const update = { status: newStatus };
+                if (newStatus === 'inactive') {
+                    update.dailyEmailEnabled = false;
+                    update.inProcessEmailEnabled = false;
+                    update.meetingReminderEmailEnabled = false;
+                }
+                await updateDoc(doc(emailDB, 'bdr_leaders', bdrId), update);
                 bdr.status = newStatus;
                 renderBdrManageTable();
                 invalidateBdrAssignmentMap();
                 refreshBdrDashboardScope();
-                showBdrManageStatus(`${bdr.name || 'BDR'} marked as ${newStatus}.`, false);
+
+                let emailNote = '';
+                if (newStatus === 'inactive') {
+                    // Weekly / daily / alert summary schedules live on Railway
+                    try {
+                        const token = window.auth?.currentUser ? await window.auth.currentUser.getIdToken() : null;
+                        if (!token) throw new Error('not signed in');
+                        const resp = await fetch(`https://railwayclemail-production.up.railway.app/api/linkedin-summary/schedules/${encodeURIComponent(bdrId)}/disable`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+                        });
+                        const json = await resp.json().catch(() => ({}));
+                        if (!resp.ok || json.success === false) throw new Error(json.error || `HTTP ${resp.status}`);
+                        emailNote = ' All of their emails were turned off.';
+                    } catch (schedErr) {
+                        console.error('Error disabling summary schedules:', schedErr);
+                        emailNote = ` Review/pipeline emails are off, but the weekly/daily summary schedules could not be turned off (${schedErr.message}) — turn them off in Email Summary.`;
+                    }
+                }
+                showBdrManageStatus(`${bdr.name || 'BDR'} marked as ${newStatus}.${emailNote}`, emailNote.includes('could not'));
             } catch (err) {
                 showBdrManageStatus('Error updating status: ' + err.message, true);
             }
