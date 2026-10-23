@@ -93,6 +93,13 @@
  *   MATCH — it keeps trying tiers until one actually yields a non-empty
  *   transcript, since a matched heyreach_inbox/linkedinMessages doc can be a
  *   metadata-only stub with no messages.
+ * @version 1.12.0 — "paste text → AI → open slots": parseAvailabilityText()
+ *   sends free-form availability text (plus the conference's real dates for
+ *   weekday/"Day N" resolution) to the new Railway route
+ *   POST /api/conference/parse-availability, then validates and merges the
+ *   returned windows (normalizeWindows/mergeWindows). applyAvailabilityText()
+ *   does parse → merge into the BDR's existing windows → saveAvailability()
+ *   in one call.
  */
 (function () {
     'use strict';
@@ -1033,6 +1040,164 @@
         };
     }
 
+    // ── AI: paste free text → open meeting windows → slots ──────────────
+    // A BDR (or whoever manages their calendar) can paste a blob like
+    //   "Tues 9-11:30 and 2-4, Wednesday free all day except lunch, Thursday AM only"
+    // and have it turned into the same `windows` structure the manual
+    // "Add Window" form produces, which saveAvailability() then expands into
+    // open slots. Parsing is done by the Railway backend
+    // (POST /api/conference/parse-availability → Gemini); everything the AI
+    // returns is re-validated/normalized here before it's trusted.
+
+    function _pad2(n) { return String(n).padStart(2, '0'); }
+
+    function _dateFromIso(iso) {
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+        if (!m) return null;
+        const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+        // Reject rollovers like 2026-02-31
+        return (d.getFullYear() === Number(m[1]) && d.getMonth() === Number(m[2]) - 1 && d.getDate() === Number(m[3])) ? d : null;
+    }
+
+    function _isoFromDate(d) {
+        return `${d.getFullYear()}-${_pad2(d.getMonth() + 1)}-${_pad2(d.getDate())}`;
+    }
+
+    /** [{ date:'YYYY-MM-DD', weekday:'Tuesday' }] for each day of the conference (capped at 31). */
+    function buildConferenceCalendar(conference) {
+        const start = _dateFromIso(conference && conference.startDate);
+        if (!start) return [];
+        const endCandidate = _dateFromIso(conference.endDate);
+        const end = (endCandidate && endCandidate >= start) ? endCandidate : start;
+        const out = [];
+        for (let d = new Date(start); d <= end && out.length < 31; d.setDate(d.getDate() + 1)) {
+            out.push({ date: _isoFromDate(d), weekday: d.toLocaleDateString('en-US', { weekday: 'long' }) });
+        }
+        return out;
+    }
+
+    function _normalizeHHMM(value) {
+        const m = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim());
+        if (!m) return null;
+        const h = Number(m[1]), min = Number(m[2]);
+        if (h > 23 || min > 59) return null;
+        return `${_pad2(h)}:${_pad2(min)}`;
+    }
+
+    /**
+     * Validate a list of raw windows, drop anything malformed, and collapse
+     * overlapping/touching windows on the same date into one.
+     * Returns { windows, dropped } where dropped is a count of rejected entries.
+     */
+    function normalizeWindows(rawWindows) {
+        const byDate = new Map();
+        let dropped = 0;
+        (Array.isArray(rawWindows) ? rawWindows : []).forEach(w => {
+            const date = w && _dateFromIso(w.date) ? w.date : null;
+            const startTime = w && _normalizeHHMM(w.startTime);
+            const endTime = w && _normalizeHHMM(w.endTime);
+            if (!date || !startTime || !endTime || hhmmToMinutes(endTime) <= hhmmToMinutes(startTime)) {
+                dropped++;
+                return;
+            }
+            if (!byDate.has(date)) byDate.set(date, []);
+            byDate.get(date).push({ startMin: hhmmToMinutes(startTime), endMin: hhmmToMinutes(endTime) });
+        });
+
+        const windows = [];
+        [...byDate.keys()].sort().forEach(date => {
+            const spans = byDate.get(date).sort((a, b) => a.startMin - b.startMin);
+            let cur = null;
+            const flush = () => {
+                if (cur) windows.push({
+                    id: 'w_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
+                    date, startTime: minutesToHHMM(cur.startMin), endTime: minutesToHHMM(cur.endMin)
+                });
+            };
+            spans.forEach(s => {
+                if (cur && s.startMin <= cur.endMin) cur.endMin = Math.max(cur.endMin, s.endMin);
+                else { flush(); cur = { ...s }; }
+            });
+            flush();
+        });
+        return { windows, dropped };
+    }
+
+    /** Union of two window lists, with overlaps/adjacent blocks merged. */
+    function mergeWindows(existingWindows, incomingWindows) {
+        return normalizeWindows([...(existingWindows || []), ...(incomingWindows || [])]).windows;
+    }
+
+    /**
+     * Ask the AI to turn pasted free text into open-meeting windows.
+     *
+     * @param {string} text        Whatever the user pasted (emails, notes, calendar text…)
+     * @param {object} [conference] The working conference ({ name, startDate, endDate }) —
+     *                              gives the AI the real dates to resolve "Tuesday"/"Day 2" against.
+     * @returns {Promise<{ windows: Array, warnings: string[] }>}
+     *          windows are validated + merged: [{ id, date, startTime, endTime }]
+     */
+    async function parseAvailabilityText(text, conference) {
+        const trimmed = String(text || '').trim();
+        if (!trimmed) throw new Error('Paste some text describing when the BDR is available first.');
+        if (!window.auth || !window.auth.currentUser) throw new Error('You must be signed in to use AI parsing.');
+
+        const token = await window.auth.currentUser.getIdToken();
+        const resp = await fetch(`${RAILWAY_BASE}/api/conference/parse-availability`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            body: JSON.stringify({
+                text: trimmed.slice(0, 12000),
+                conferenceName: (conference && conference.name) || '',
+                startDate: (conference && conference.startDate) || '',
+                endDate: (conference && conference.endDate) || '',
+                today: _isoFromDate(new Date()),
+                calendar: buildConferenceCalendar(conference)
+            })
+        });
+
+        let data = null;
+        try { data = await resp.json(); } catch (_) { /* handled below */ }
+        if (!resp.ok || !data || !data.success) {
+            throw new Error((data && data.error) || `AI parsing failed (HTTP ${resp.status}). If this is new, the Railway backend may need to be redeployed with the /api/conference/parse-availability route.`);
+        }
+
+        const warnings = Array.isArray(data.warnings) ? data.warnings.slice() : [];
+        const { windows, dropped } = normalizeWindows(data.windows);
+        if (dropped > 0) warnings.push(`${dropped} window(s) from the AI were invalid and skipped.`);
+
+        // Flag (but keep) windows that land outside the conference's dates — likely
+        // a wrong-year or wrong-day guess the user should eyeball before saving.
+        const cal = buildConferenceCalendar(conference);
+        if (cal.length > 0) {
+            const inRange = new Set(cal.map(c => c.date));
+            const outside = [...new Set(windows.filter(w => !inRange.has(w.date)).map(w => w.date))];
+            if (outside.length > 0) {
+                warnings.push(`Outside the conference dates (${cal[0].date} – ${cal[cal.length - 1].date}): ${outside.join(', ')} — double-check these.`);
+            }
+        }
+        return { windows, warnings };
+    }
+
+    /**
+     * One-shot: parse pasted text, merge the resulting windows into the BDR's
+     * existing windows for this conference, and save + generate open slots.
+     * Existing booked/held slots are preserved (see generateSlots()).
+     *
+     * @returns {Promise<{ availability, addedWindows, warnings }>}
+     */
+    async function applyAvailabilityText(conferenceId, bdrEmail, bdrName, text, conference, slotDurationMinutes) {
+        const { windows: added, warnings } = await parseAvailabilityText(text, conference);
+        if (added.length === 0) {
+            return { availability: await getAvailabilityDoc(conferenceId, bdrEmail), addedWindows: [], warnings };
+        }
+        const existing = await getAvailabilityDoc(conferenceId, bdrEmail);
+        const merged = mergeWindows(existing && existing.windows, added);
+        const duration = slotDurationMinutes || (existing && existing.slotDurationMinutes) || 30;
+        const availability = await saveAvailability(conferenceId, bdrEmail, bdrName, merged, duration);
+        return { availability, addedWindows: added, warnings };
+    }
+
     // ── Embeddable widget for review pages ──────────────────────────────
     // Renders a compact "Conference Meeting" control block inside `containerEl`
     // for a single contact/BDR pair, and wires up all its own event handlers.
@@ -1390,6 +1555,8 @@
         saveMeetingRequest, cancelMeetingRequest, updateMeetingRequestFields, setMeetingRequestHoldState,
         // Scanning / transcripts
         regexScan, aiScan, scanContactInfo, findConversationTextForContact,
+        // AI availability parsing (paste free text → windows → slots)
+        parseAvailabilityText, applyAvailabilityText, normalizeWindows, mergeWindows, buildConferenceCalendar,
         findConversationsForContacts, conversationKeyFor,
         // Widget
         mountWidget,

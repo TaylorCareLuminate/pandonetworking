@@ -74,6 +74,85 @@ router.post('/scan-contact-info', requireAuth, async (req, res) => {
     }
 });
 
+// ── POST /parse-availability ────────────────────────────────────────────────────
+//
+// Turns a pasted blob of free text ("I'm free Tuesday 9-11:30 and 2 to 4, all
+// day Wednesday except lunch…") into structured open-meeting windows that
+// conference-scheduling.js → parseAvailabilityText() feeds into the normal
+// "Save & Generate Slots" flow.
+//
+// Body: { text, conferenceName?, startDate?, endDate?, today?,
+//         calendar?: [{ date: 'YYYY-MM-DD', weekday: 'Tuesday' }] }
+// Resp: { success, windows: [{ date, startTime, endTime }], warnings: [string] }
+
+router.post('/parse-availability', requireAuth, async (req, res) => {
+    const { text, conferenceName, startDate, endDate, today, calendar } = req.body || {};
+
+    if (!text || !String(text).trim()) {
+        return res.json({ success: true, windows: [], warnings: ['No text provided.'] });
+    }
+    if (!GEMINI_API_KEY) {
+        return res.status(503).json({
+            success: false,
+            error: 'GEMINI_API_KEY is not configured on the server. Set it as a Railway environment variable.'
+        });
+    }
+
+    try {
+        const result = await extractAvailabilityWindows({
+            text: String(text).slice(0, 12000),
+            conferenceName: String(conferenceName || ''),
+            startDate: String(startDate || ''),
+            endDate: String(endDate || ''),
+            today: String(today || ''),
+            calendar: Array.isArray(calendar) ? calendar.slice(0, 31) : []
+        });
+        return res.json({
+            success: true,
+            windows: Array.isArray(result.windows) ? result.windows : [],
+            warnings: Array.isArray(result.warnings) ? result.warnings.map(String) : []
+        });
+    } catch (err) {
+        console.error('[Conference Scan] Error parsing availability:', err);
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+async function extractAvailabilityWindows({ text, conferenceName, startDate, endDate, today, calendar }) {
+    const calendarLines = calendar
+        .filter(c => c && c.date)
+        .map(c => `- ${c.date} (${c.weekday || ''})`)
+        .join('\n');
+
+    const prompt = `You convert a business development rep's free-text description of when they are available to take meetings at a conference into structured OPEN MEETING WINDOWS.
+
+Conference: ${conferenceName || '(unnamed)'}
+Conference dates: ${startDate || '?'} to ${endDate || startDate || '?'}
+Today's date: ${today || '?'}
+${calendarLines ? `Conference calendar (use this to resolve weekday names and "Day 1 / Day 2" to real dates):\n${calendarLines}` : ''}
+
+Rules:
+- Output a window for each continuous block of time the person is FREE to meet. Times are the conference's local time, exactly as the person wrote them — do not convert time zones.
+- Convert every time to 24-hour "HH:MM". If am/pm is missing, assume normal business hours (e.g. "9-11" = 09:00-11:00, "2-4" = 14:00-16:00, "1-5" = 13:00-17:00).
+- Resolve weekdays ("Tuesday"), relative days ("Day 1", "the first day", "tomorrow") and written dates ("Oct 14", "10/14") to a "YYYY-MM-DD" date. Prefer dates on the conference calendar above. If a date has no year, use the conference's year.
+- "All day" with no hours given means 09:00-17:00. "Mornings" = 09:00-12:00. "Afternoons" = 13:00-17:00. "Lunch" is not a meeting time.
+- When the person lists times they are UNAVAILABLE or BUSY ("free all day Wednesday except 12-1", "booked 3-4"), subtract those from the free time and output the remaining free blocks as separate windows.
+- If the same days/times apply to several days ("every day 9-11", "Tuesday and Wednesday 2-4"), output one window per day.
+- Windows must have endTime later than startTime and must not span midnight.
+- Only use information actually present in the text. NEVER invent availability. If something is ambiguous or can't be resolved to a date/time, leave it out and add a short note to "warnings" explaining what was skipped.
+
+Availability text:
+"""
+${text}
+"""
+
+Respond with ONLY valid JSON — no markdown, no explanation outside the JSON:
+{"windows": [{"date": "YYYY-MM-DD", "startTime": "HH:MM", "endTime": "HH:MM"}], "warnings": []}`;
+
+    const raw = await callGemini(prompt, 2048);
+    return extractJson(raw) || { windows: [], warnings: ['The AI response could not be understood.'] };
+}
+
 // ── Gemini: extract email / phone from free text ──────────────────────────────
 
 async function extractContactInfo(conversationText) {
@@ -98,10 +177,10 @@ Respond with ONLY valid JSON — no explanation outside the JSON:
     return extractJson(text) || { email: '', phone: '' };
 }
 
-async function callGemini(prompt) {
+async function callGemini(prompt, maxOutputTokens = 256) {
     const body = {
         contents:         [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0, maxOutputTokens: 256 }
+        generationConfig: { temperature: 0, maxOutputTokens }
     };
 
     const response = await axios.post(
