@@ -4389,6 +4389,10 @@
                         <i class="fas fa-sync-alt"></i>
                         Refresh
                     </button>
+                    <button class="bdr-dashboard-refresh" id="bdrQueuesRefreshBtn" style="background:linear-gradient(135deg,#7c3aed,#db2777);" onclick="refreshAllBdrQueues()" title="Re-count Queue 1 (admin review) and Queue 2 (BDR review) for every BDR shown below and save the new counts to the dashboard cache, so they're still there after a page reload (fast — no HeyReach calls)">
+                        <i class="fas fa-inbox"></i>
+                        Refresh Queues
+                    </button>
                     <button class="bdr-dashboard-refresh" style="background:linear-gradient(135deg,#6366f1,#4f46e5);" onclick="recalculateBdrDashboard()" title="Force Railway to recalculate stats now, including a live HeyReach status check per BDR (takes 1-3 min)">
                         <i class="fas fa-calculator"></i>
                         Recalculate
@@ -10959,6 +10963,10 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             const m1 = counts.queue1Message ?? 0;
             const c2 = counts.queue2Connect ?? counts.queue2 ?? 0;
             const m2 = counts.queue2Message ?? 0;
+            // Keep the To-Do button's "waiting for review" threshold (100+ → Review & Push
+            // Live, else Run New Messages) in sync with the freshly-counted numbers.
+            const todoBtnEl = document.querySelector(`.todo-add-bdr-btn[data-bdr-email="${cssAttrEscape(primaryEmail)}"]`);
+            if (todoBtnEl) todoBtnEl.dataset.waiting = String((c1 || 0) + (m1 || 0) + (c2 || 0) + (m2 || 0));
             if (q1Cell) {
                 q1Cell.innerHTML = `<strong style="color:#7c3aed;">${Number(c1).toLocaleString()}</strong>`
                     + `<span style="color:var(--gray-400);margin:0 3px;">/</span>`
@@ -10993,6 +11001,150 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                     applyQueue1Queue2ToRow(bdr.primaryEmail, null);
                 }
             }
+        }
+
+        // ── Manual "Refresh Queues" (Queue 1 + Queue 2) ─────────────────────────
+        // Re-counts Queue 1 / Queue 2 live from connect_queue for one BDR or every BDR
+        // currently shown, updates the table in place, then saves the new counts into
+        // the cached dashboard doc (admin_cache/bdr_dashboard via
+        // POST /api/bdr-dashboard/update-queues) so a page reload — which renders from
+        // that cache — shows the same up-to-date numbers instead of the last full
+        // Recalculate's. The next Recalculate / cron run supersedes them as usual.
+        let _queueRefreshInFlight = false;
+
+        const QUEUE_SPINNER_HTML = '<i class="fas fa-spinner fa-spin" style="color:var(--gray-400);"></i>';
+
+        async function persistQueueCounts(updates) {
+            if (!updates.length) return { ok: true, missing: [] };
+            const token = await getRailwayToken();
+            if (!token) throw new Error('Not authenticated');
+            const resp = await fetch(`${RAILWAY_BASE}/api/bdr-dashboard/update-queues`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ updates })
+            });
+            const json = await resp.json().catch(() => null);
+            if (!resp.ok || !json || !json.success) {
+                throw new Error((json && json.error) || `HTTP ${resp.status}`);
+            }
+            return { ok: true, missing: (json.data && json.data.missing) || [] };
+        }
+
+        // Mirror the fresh counts into the in-memory copies the page re-renders from
+        // (toggling "Show all BDRs", the To-Do BDR picker) so they don't flash back to
+        // the stale numbers until the next full dashboard fetch.
+        function patchLocalQueueCounts(updates) {
+            const byEmail = new Map(updates.map(u => [u.bdrEmail.toLowerCase(), u]));
+            const patch = (b) => {
+                const u = b && byEmail.get((b.primaryEmail || '').toLowerCase());
+                if (!u) return;
+                b.queue1Connect = u.queue1Connect; b.queue1Message = u.queue1Message;
+                b.queue2Connect = u.queue2Connect; b.queue2Message = u.queue2Message;
+                b.hasCachedQueues = true;
+            };
+            if (_lastBdrDashArgs && _lastBdrDashArgs.data && Array.isArray(_lastBdrDashArgs.data.bdrs)) {
+                _lastBdrDashArgs.data.bdrs.forEach(patch);
+            }
+            if (Array.isArray(window._lastEnrichedBdrsForTodo)) {
+                window._lastEnrichedBdrsForTodo.forEach(patch);
+                if (typeof window.populateTodoBdrSelect === 'function') {
+                    window.populateTodoBdrSelect(window._lastEnrichedBdrsForTodo);
+                }
+            }
+        }
+
+        async function refreshQueueCounts(emails, { onProgress } = {}) {
+            const authToLinkedIn = await loadAuthToLinkedInMap();
+            const updates = [];
+            const failed = [];
+            let done = 0;
+            for (const email of emails) {
+                const lower = (email || '').toLowerCase();
+                document.querySelectorAll(`td[data-queue1-cell="${cssAttrEscape(email)}"], td[data-queue2-cell="${cssAttrEscape(email)}"]`)
+                    .forEach(td => { td.innerHTML = QUEUE_SPINNER_HTML; });
+                try {
+                    const c = await loadQueue1Queue2CountsForBdr(email, authToLinkedIn);
+                    applyQueue1Queue2ToRow(email, c);
+                    updates.push({
+                        bdrEmail: lower,
+                        queue1Connect: c.queue1Connect, queue1Message: c.queue1Message,
+                        queue2Connect: c.queue2Connect, queue2Message: c.queue2Message
+                    });
+                } catch (e) {
+                    console.warn(`[bdr-dashboard] Queue refresh failed for ${email}:`, e);
+                    applyQueue1Queue2ToRow(email, null);
+                    failed.push(email);
+                }
+                done++;
+                if (onProgress) onProgress(done, emails.length);
+            }
+            patchLocalQueueCounts(updates);
+            let saveError = null;
+            try {
+                await persistQueueCounts(updates);
+            } catch (e) {
+                saveError = e;
+                console.warn('[bdr-dashboard] Could not save refreshed queue counts to the cache:', e);
+            }
+            return { refreshed: updates.length, failed, saveError };
+        }
+
+        window.refreshAllBdrQueues = async function() {
+            if (_queueRefreshInFlight) return;
+            const emails = (window._lastEnrichedBdrsForTodo || []).map(b => b.primaryEmail).filter(Boolean);
+            if (!emails.length) { alert('No BDRs are loaded on the dashboard yet.'); return; }
+            const btn = document.getElementById('bdrQueuesRefreshBtn');
+            const originalHtml = btn.innerHTML;
+            _queueRefreshInFlight = true;
+            btn.disabled = true;
+            document.querySelectorAll('.refresh-queues-btn').forEach(b => { b.disabled = true; });
+            try {
+                const res = await refreshQueueCounts(emails, {
+                    onProgress: (d, t) => { btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${d}/${t}`; }
+                });
+                const notes = [];
+                if (res.failed.length) notes.push(`${res.failed.length} BDR(s) failed to refresh (see console)`);
+                if (res.saveError) notes.push(`counts updated on screen but could NOT be saved to the cache (${res.saveError.message}) — a reload will show the old numbers`);
+                if (notes.length) alert('Queue refresh finished: ' + notes.join('; ') + '.');
+            } catch (e) {
+                console.error('[bdr-dashboard] refreshAllBdrQueues failed:', e);
+                alert('Queue refresh failed: ' + (e.message || e));
+            } finally {
+                btn.innerHTML = originalHtml;
+                btn.disabled = false;
+                document.querySelectorAll('.refresh-queues-btn').forEach(b => { b.disabled = false; });
+                _queueRefreshInFlight = false;
+            }
+        };
+
+        async function refreshSingleBdrQueues(btn) {
+            const email = btn.dataset.bdrEmail;
+            if (!email || _queueRefreshInFlight) return;
+            const originalHtml = btn.innerHTML;
+            _queueRefreshInFlight = true;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            try {
+                const res = await refreshQueueCounts([email]);
+                if (res.failed.length) alert('Could not refresh Queue 1/2 for this BDR — see console.');
+                else if (res.saveError) alert(`Counts updated on screen but could NOT be saved to the cache (${res.saveError.message}) — a reload will show the old numbers.`);
+            } catch (e) {
+                console.error(`[bdr-dashboard] Queue refresh failed for ${email}:`, e);
+                alert('Queue refresh failed: ' + (e.message || e));
+            } finally {
+                btn.innerHTML = originalHtml;
+                btn.disabled = false;
+                _queueRefreshInFlight = false;
+            }
+        }
+
+        function bindRefreshQueuesButtons(container) {
+            if (container.dataset.refreshQueuesBound) return;
+            container.dataset.refreshQueuesBound = '1';
+            container.addEventListener('click', (e) => {
+                const btn = e.target.closest('.refresh-queues-btn');
+                if (btn) refreshSingleBdrQueues(btn);
+            });
         }
 
         window.runHeyreachPendingReport = async function() {
@@ -11877,7 +12029,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                             <td class="bdr-table-rank">${i + 1}</td>
                             <td>
                                 <div class="bdr-table-name"><i class="fas fa-user-circle" style="color:var(--primary);margin-right:6px;"></i>${name || 'Unnamed BDR'}</div>
-                                <div class="bdr-table-email">${primaryEmail || ''}</div>
+                                <div class="bdr-table-email">${primaryEmail || ''}${primaryEmail ? `<button type="button" class="refresh-queues-btn" data-bdr-email="${emailAttr}" title="Re-count Queue 1 and Queue 2 for ${escapeHtmlLocal(name || 'this BDR')} and save to the cache" style="margin-left:8px;border:none;background:none;color:#7c3aed;cursor:pointer;font-size:0.9em;padding:0;"><i class="fas fa-inbox"></i> <i class="fas fa-sync-alt" style="font-size:0.8em;"></i></button>` : ''}</div>
                             </td>
                             <td class="num-cell" style="background:rgba(14,165,233,0.06);" data-pending-cell="${emailAttr}" data-pending-connect-cell="${emailAttr}" data-reserve="${reservePending || 0}">${connectDisplay}</td>
                             <td class="num-cell" style="background:rgba(139,92,246,0.06);" data-pending-message-cell="${emailAttr}">${messageDisplay}</td>
@@ -11918,6 +12070,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
 
             container.innerHTML = html;
             bindVerifyButtons(container);
+            bindRefreshQueuesButtons(container);
             if (typeof window.bindTodoAddButtons === 'function') window.bindTodoAddButtons(container);
             // Only fall back to a live Firestore scan when the cached dashboard doc
             // predates the Queue 1/2 fields (legacy cache before this change).
