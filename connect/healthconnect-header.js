@@ -1,10 +1,16 @@
 /**
  * HealthConnect Common Header Component
- * Version: 3.5.0 - Permission-gated Company Reporting workspace
+ * Version: 3.6.0 - Manage Data suite + embed mode
  * 
  * Provides a beautiful, consistent header across all HealthConnect pages
  * with organized dropdown navigation sections.
  * 
+ * Changelog v3.6.0:
+ * - Embed mode: when a page is loaded with ?embed=1 (inside manage_data.html)
+ *   the header chrome is NOT rendered, but page-usage tracking still runs
+ * - Prospect/contact management + search tools now deep-link into the
+ *   unified manage_data.html suite (manage_data.html?tool=<key>)
+ * - Active nav item matching ignores query strings
  * Changelog v3.5.0:
  * - Added per-BDR Company Reporting navigation access
  * - Consolidated company results and conversations into one workspace
@@ -42,9 +48,12 @@ const HEALTHCONNECT_CONFIG = {
             label: 'Network and Prospects',
             icon: 'fa-network-wired',
             items: [
-                { label: 'My Connections', href: 'my_leads.html', icon: 'fa-users' },
+                // Unified management + search suite (My Connections, Prospect Contacts,
+                // Prospect Organizations, and — for admins — the search/cleanup tools)
+                { label: 'Manage Data', href: 'manage_data.html', icon: 'fa-database' },
+                { label: 'My Connections', href: 'manage_data.html?tool=my_leads', icon: 'fa-users' },
                 { label: 'Harvest Pool', href: 'harvest_pool.html', icon: 'fa-seedling' },
-                { label: 'Prospect Organizations', href: 'prospect_organizations.html', icon: 'fa-building' },
+                { label: 'Prospect Organizations', href: 'manage_data.html?tool=prospect_organizations', icon: 'fa-building' },
                 // Company-level workspace (explicitly enabled per BDR in BDR Settings)
                 { label: 'Company Reporting', href: 'company_reporting.html', icon: 'fa-chart-pie', requiresCompanyReporting: true }
             ]
@@ -100,9 +109,10 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Filtered Messages', href: 'filtered_messages.html', icon: 'fa-filter' },
                 { label: 'divider' },
                 // Contact & Search Tools
-                { label: 'Prospect Org Admin', href: 'prospect_organizations_admin.html', icon: 'fa-building-circle-check' },
+                { label: 'Manage Data (Suite)', href: 'manage_data.html', icon: 'fa-database' },
+                { label: 'Prospect Org Admin', href: 'manage_data.html?tool=prospect_organizations_admin', icon: 'fa-building-circle-check' },
                 { label: 'LinkedIn Contact Search', href: 'linkedin_contact_search.html', icon: 'fa-search' },
-                { label: 'Contact Search by Keyword', href: 'contact_search_by_keyword.html', icon: 'fa-key' },
+                { label: 'Contact Search by Keyword', href: 'manage_data.html?tool=contact_search_by_keyword', icon: 'fa-key' },
                 { label: 'divider' },
                 // Analytics & Reporting
                 { label: 'Cost/Revenue Tracking', href: 'cost_revenue_tracking.html', icon: 'fa-dollar-sign' },
@@ -139,13 +149,13 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Quick Message Cleanup', href: 'quick_message_cleanup.html', icon: 'fa-broom' },
                 { label: 'BDR Send Audit', href: 'bdr_send_audit.html', icon: 'fa-clipboard-check' },
                 { label: 'Process Exclusions', href: 'process_exclusions.html', icon: 'fa-ban' },
-                { label: 'Prospect Cleanup (AI)', href: 'prospect_cleanup.html', icon: 'fa-broom' },
-                { label: 'Manage Org Contacts', href: 'manage_organization_contacts.html', icon: 'fa-users-gear' },
+                { label: 'Prospect Cleanup (AI)', href: 'manage_data.html?tool=prospect_cleanup', icon: 'fa-broom' },
+                { label: 'Manage Org Contacts', href: 'manage_data.html?tool=manage_organization_contacts', icon: 'fa-users-gear' },
                 { label: 'Cleanup Jobs', href: 'cleanup_jobs.html', icon: 'fa-chart-line' },
                 { label: 'divider' },
                 // Database Access
                 { label: 'Health System IT Contacts', href: 'all_contacts_database.html', icon: 'fa-database' },
-                { label: 'AI Database Screener', href: 'contact_ai_screen.html', icon: 'fa-magnifying-glass-chart' }
+                { label: 'AI Database Screener', href: 'manage_data.html?tool=contact_ai_screen', icon: 'fa-magnifying-glass-chart' }
             ]
         }
     ]
@@ -1039,9 +1049,36 @@ function getAvatarColor(user) {
     return colors[Math.abs(hash) % colors.length];
 }
 
+// True when the page is being shown inside the Manage Data suite (manage_data.html).
+// The suite owns the chrome, so the header must not render a second copy.
+function isEmbeddedInSuite() {
+    try {
+        return new URLSearchParams(window.location.search).get('embed') === '1';
+    } catch (e) {
+        return false;
+    }
+}
+
+// Does a nav item point at the page the user is currently on?
+// Item hrefs may carry a query string (e.g. manage_data.html?tool=my_leads);
+// the file name must match, and if the item names a ?tool= it must match too.
+function navItemIsActive(item) {
+    if (!item || !item.href) return false;
+    const currentPage = window.location.pathname.split('/').pop();
+    const [itemPage, itemQuery] = String(item.href).split('?');
+    if (currentPage !== itemPage) return false;
+    if (!itemQuery) return true;
+    try {
+        const want = new URLSearchParams(itemQuery).get('tool');
+        const have = new URLSearchParams(window.location.search).get('tool');
+        return !want || want === have;
+    } catch (e) {
+        return false;
+    }
+}
+
 // Create header HTML
 function createHeaderHTML(user = null, bdrCount = 1) {
-    const currentPage = window.location.pathname.split('/').pop();
     const isAdmin = isAdminUser(user);
     
     // Filter sections based on admin status
@@ -1055,7 +1092,7 @@ function createHeaderHTML(user = null, bdrCount = 1) {
             if (item.label === 'divider') return false;
             if (item.requiresMultipleBDRs && bdrCount < 2) return false;
             if (item.requiresCompanyReporting) return false;
-            return currentPage === item.href;
+            return navItemIsActive(item);
         });
         
         const dropdownItemsHTML = section.items.map(item => {
@@ -1071,7 +1108,7 @@ function createHeaderHTML(user = null, bdrCount = 1) {
             // Permission is resolved asynchronously after authentication.
             if (item.requiresCompanyReporting) return '';
             
-            const isActive = currentPage === item.href ? 'active' : '';
+            const isActive = navItemIsActive(item) ? 'active' : '';
             return `
                 <a href="${item.href}" class="healthconnect-nav-dropdown-item ${isActive}">
                     <i class="fas ${item.icon}"></i>
@@ -1356,7 +1393,6 @@ async function updateNavigationItems(user) {
     navigationUpdateInProgress = true;
     
     try {
-        const currentPage = window.location.pathname.split('/').pop();
         const isAdmin = isAdminUser(user);
         
         // Check company BDR count (will use cached value if available)
@@ -1387,7 +1423,7 @@ async function updateNavigationItems(user) {
                     return '';
                 }
                 
-                const isActive = currentPage === item.href ? 'active' : '';
+                const isActive = navItemIsActive(item) ? 'active' : '';
                 return `
                     <a href="${item.href}" class="healthconnect-nav-dropdown-item ${isActive}">
                         <i class="fas ${item.icon}"></i>
@@ -1472,8 +1508,34 @@ async function trackConnectPageUsage(user) {
     }
 }
 
+// Embedded in manage_data.html: no header chrome, but still record the page view
+// so Page Usage analytics keep counting each tool individually.
+async function initializeEmbeddedMode() {
+    console.log('🧩 HealthConnect header: embed mode (inside Manage Data suite) — chrome suppressed');
+    document.documentElement.classList.add('hc-embedded');
+    try {
+        if (!window.firebaseReady) return;
+        await window.firebaseReady;
+        await new Promise(resolve => setTimeout(resolve, 200));
+        if (window.auth && window.auth.currentUser) {
+            trackConnectPageUsage(window.auth.currentUser);
+            return;
+        }
+        if (window.auth) {
+            const { onAuthStateChanged } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js');
+            onAuthStateChanged(window.auth, (user) => { if (user) trackConnectPageUsage(user); });
+        }
+    } catch (error) {
+        console.warn('Embed-mode tracking skipped:', error?.message || error);
+    }
+}
+
 // Initialize header
 async function initializeHealthConnectHeader() {
+    if (isEmbeddedInSuite()) {
+        return initializeEmbeddedMode();
+    }
+
     console.log('🚀 Initializing HealthConnect header...');
     
     try {
