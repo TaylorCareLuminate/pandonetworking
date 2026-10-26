@@ -2203,6 +2203,29 @@
             margin-top: 2px;
         }
 
+        /* Current-employer summaries (web-enabled AI) shown under the contact header */
+        .li-alert-employers {
+            background: #f0f6fc;
+            border-bottom: 1px solid #d6e4f2;
+            padding: 12px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .li-employers-heading {
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: #0d3b66;
+        }
+        .li-employer-item { font-size: 0.85rem; line-height: 1.5; color: #1f2937; }
+        .li-employer-name { font-weight: 700; color: #0d3b66; }
+        .li-employer-role { color: #64748b; font-size: 0.8rem; }
+        .li-employer-summary { margin-top: 2px; }
+        .li-employer-status { color: #64748b; font-style: italic; }
+        .li-employer-error { color: #b91c1c; }
+
         .li-alert-badges {
             display: flex;
             flex-wrap: wrap;
@@ -6880,6 +6903,7 @@
             if (!ts) return '';
             let date;
             if (typeof ts === 'object' && ts.seconds) date = new Date(ts.seconds * 1000);
+            else if (typeof ts === 'object' && ts._seconds) date = new Date(ts._seconds * 1000);
             else if (typeof ts === 'string' || typeof ts === 'number') date = new Date(ts);
             else if (ts instanceof Date) date = ts;
             else return '';
@@ -6919,6 +6943,25 @@
             // Unknown-but-empty message (no text, no recognized attachment markers) —
             // still show something rather than a blank bubble.
             return '📎 Sent an attachment or unsupported message';
+        }
+
+        // Alerts saved before the scanner fix may contain a `_synthetic` stand-in
+        // reply (built from HeyReach's stale conversation summary) that just
+        // repeats a lead message already in the thread. Drop those so the same
+        // reply doesn't render twice; genuine stand-ins (text not in the thread
+        // and newer than the last real message) are kept.
+        function _liDropStaleSyntheticMessages(messages) {
+            const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const isLead = m => !(m.sender === 'ME' || m.sender === 'account' || String(m.sender || '').toLowerCase() === 'me' || String(m.sender || '').toLowerCase() === 'outbound');
+            return messages.filter((m, i) => {
+                if (!m || !m._synthetic) return true;
+                const text = norm(m.body || m.text || m.message);
+                const dupText = text && messages.some((o, j) => j !== i && !o._synthetic && isLead(o) && norm(o.body || o.text || o.message) === text);
+                if (dupText) return false;
+                const synMs = _liToMillis(m.createdAt || m.timestamp);
+                const realMax = Math.max(0, ...messages.filter(o => !o._synthetic).map(o => _liToMillis(o.createdAt || o.timestamp)));
+                return !(synMs && realMax && synMs <= realMax);
+            });
         }
 
         function _liRenderMessages(messages, leadName) {
@@ -7005,6 +7048,8 @@
                         </button>
                     </div>
                 </div>
+
+                <div class="li-alert-employers" id="li-employers-${_liEscHtml(id)}">${_liRenderEmployersInner(alert)}</div>
 
                 <div class="li-alert-convo" data-li-alert-id="${_liEscHtml(id)}">
                     <div class="li-alert-convo-header">
@@ -8649,6 +8694,7 @@ Rules:
                 (data.alerts || []).forEach(a => { a._liOlder = false; });
                 (data.olderAlerts || []).forEach(a => { a._liOlder = true; });
                 const rawAlerts = [...(data.alerts || []), ...(data.olderAlerts || [])];
+                rawAlerts.forEach(a => { if (Array.isArray(a.messages)) a.messages = _liDropStaleSyntheticMessages(a.messages); });
                 // Must resolve canonical BDR emails BEFORE deduping — that's what lets a BDR's
                 // work-email alert and LinkedIn-login-email alert for the same lead collapse
                 // into a single card instead of looking like two different BDRs.
@@ -10264,8 +10310,9 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     provider: 'openrouter',
-                    model: LI_AI_MODEL,
+                    model: opts.model || LI_AI_MODEL,
                     prompt,
+                    ...(opts.lowReasoning ? { lowReasoning: true } : {}),
                     temperature: opts.temperature ?? 0.4,
                     max_tokens: opts.max_tokens ?? 1200
                 })
@@ -10405,6 +10452,9 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         // Generate drafts for every alert that doesn't have a fresh one, with a
         // small concurrency limit so we don't hammer Railway/OpenRouter.
         async function _liEnsureAiDrafts() {
+            // Same trigger points as reply drafting: every render/poll that brings in
+            // alerts also (re)checks each lead's current employers.
+            _liEnsureEmployerSummaries().catch(err => console.warn('[LiAlerts][Employers] Pass failed:', err.message));
             const pending = _liAlerts.filter(a => {
                 if (!_liIsCardOpenable(a)) return false; // collapsed older replies: drafted once the accordion is opened
                 if (_liAiDraftInFlight.has(a.id)) return false;
@@ -10424,6 +10474,265 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             });
             await Promise.all(workers);
         }
+
+        // ── Current-employer summaries ───────────────────────────────────────
+        // Whenever a new reply lands on an alert (same _liDraftKey change that
+        // triggers a fresh AI reply draft), read the lead's profile — the
+        // prospect_contacts `experience` field — pull out every employer the
+        // profile says they are STILL working for (no end date / "Present"), and
+        // ask a web-enabled model (OpenRouter ":online") for a one-paragraph
+        // summary of each company. Shown on the card and persisted on the alert
+        // doc (currentEmployers / currentEmployersKey); a company already
+        // summarized on the alert is reused instead of searched again.
+        const LI_EMPLOYER_MODEL = LI_AI_MODEL + ':online';
+        const LI_EMPLOYER_MAX_ALERTS_PER_PASS = 25;   // cost guard per poll cycle
+        const LI_EMPLOYER_CONCURRENCY = 2;
+        const _liEmployerState = new Map();           // alert id -> { key, status, employers:[{name, role, summary, error}] }
+        const _liEmployersInFlight = new Set();
+        const _liCompanySummaryCache = new Map();     // normalized company name -> Promise<string>
+        // Names that mean "no company" rather than an employer worth summarizing.
+        const LI_NON_EMPLOYER_RE = /^(self[\s-]*employed|freelance(r)?|independent( consultant)?|stealth( startup| mode)?|confidential|n\/?a|none|unemployed|retired)$/i;
+
+        function _liNormCompany(name) {
+            return String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+        }
+
+        function _liParseExperienceArray(raw) {
+            if (!raw) return [];
+            if (Array.isArray(raw)) return raw;
+            if (typeof raw === 'string') {
+                try { const p = JSON.parse(raw); return Array.isArray(p) ? p : []; } catch (_) { return []; }
+            }
+            return [];
+        }
+
+        function _liExpDateText(d) {
+            if (d == null) return '';
+            if (typeof d === 'object') return String(d.text || [d.month, d.year].filter(Boolean).join(' ') || '').trim();
+            return String(d).trim();
+        }
+
+        function _liExpHasDates(e) {
+            if (!e || typeof e !== 'object') return false;
+            return !!(_liExpDateText(e.startDate ?? e.start_date ?? e.start) ||
+                      _liExpDateText(e.endDate ?? e.end_date ?? e.end) ||
+                      e.isCurrent === true || e.current === true ||
+                      /\b(19|20)\d\d\b/.test(String(e.duration || e.dateRange || e.dates || e.caption || '')));
+        }
+
+        // True when this single role is one the profile says is ongoing.
+        function _liExpRoleIsCurrent(e) {
+            if (!e || typeof e !== 'object') return false;
+            if (e.isCurrent === true || e.current === true || e.is_current === true) return true;
+            const endRaw = e.endDate ?? e.end_date ?? e.end ?? e.endsAt;
+            const endTxt = _liExpDateText(endRaw);
+            if (endTxt) return /\b(present|current|now|today)\b/i.test(endTxt);
+            const range = String(e.duration || e.dateRange || e.dates || e.caption || '');
+            if (/\b(19|20)\d\d\b/.test(range)) return /\b(present|current)\b/i.test(range);
+            // Start date but a blank end date = still in the role.
+            return !!_liExpDateText(e.startDate ?? e.start_date ?? e.start);
+        }
+
+        function _liExpIsGrouped(e) {
+            return Array.isArray(e?.child) && e.child.length > 0 && !!e.child[0].title;
+        }
+
+        function _liExpCompany(e) {
+            let v = e?.companyName || e?.company || e?.organization || '';
+            if (!v) {
+                if (_liExpIsGrouped(e)) v = e?.title || '';
+                else if (e?.subtitle) v = String(e.subtitle).replace(/\s*·\s*(Full-time|Part-time|Contract|Internship|Freelance|Self-employed|Seasonal|Apprenticeship).*$/i, '').trim();
+            }
+            if (v && typeof v === 'object') v = v.name || v.companyName || '';
+            return String(v || '').trim();
+        }
+
+        // Every distinct employer the profile says the lead is still working for.
+        // Returns { employers:[{name, role}], source:'experience'|'leadCompany'|'none' }.
+        function _liExtractCurrentEmployers(alertObj, ctx) {
+            let roles = [];
+            for (const d of (ctx.prospectDocs || [])) {
+                roles = _liParseExperienceArray(d.experience || d.experiences || d.EXPERIENCE);
+                if (roles.length) break;
+            }
+            if (!roles.length) {
+                // No stored experience: fall back to the current company HeyReach gave us.
+                const name = (alertObj.leadCompany || '').trim();
+                return name && !LI_NON_EMPLOYER_RE.test(name)
+                    ? { employers: [{ name, role: (alertObj.leadPosition || '').trim() }], source: 'leadCompany' }
+                    : { employers: [], source: 'none' };
+            }
+            const seen = new Set();
+            const employers = [];
+            roles.forEach(e => {
+                if (!e || typeof e !== 'object') return;
+                const name = _liExpCompany(e);
+                if (!name || LI_NON_EMPLOYER_RE.test(name)) return;
+                let current, role;
+                if (_liExpIsGrouped(e)) {
+                    const kids = e.child.filter(c => c && typeof c === 'object');
+                    const currentKids = kids.filter(_liExpRoleIsCurrent);
+                    current = currentKids.length > 0 || (!kids.some(_liExpHasDates) && _liExpRoleIsCurrent(e));
+                    role = String((currentKids[0] || kids[0] || {}).title || '').trim();
+                } else {
+                    current = _liExpRoleIsCurrent(e);
+                    role = String(e.title || e.jobTitle || e.position || '').trim();
+                }
+                if (!current) return;
+                const norm = _liNormCompany(name);
+                if (!norm || seen.has(norm)) return;
+                seen.add(norm);
+                employers.push({ name, role });
+            });
+            return { employers, source: 'experience' };
+        }
+
+        function _liCleanCompanySummary(text) {
+            return String(text || '')
+                .replace(/```[a-z]*\n?/gi, '')
+                .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1')   // markdown links -> text
+                .replace(/\[\d+\]/g, '')                                  // [1] style citations
+                .replace(/\*\*|__/g, '')
+                .replace(/\s*\n+\s*/g, ' ')
+                .replace(/\s{2,}/g, ' ')
+                .trim();
+        }
+
+        function _liSummarizeCompany(name, role) {
+            const key = _liNormCompany(name);
+            if (_liCompanySummaryCache.has(key)) return _liCompanySummaryCache.get(key);
+            const prompt = `Use web search to research the company "${name}"${role ? ` (a person works there as "${role}", which may help you pick the right company if the name is ambiguous)` : ''}.
+
+Write ONE paragraph (3-5 sentences, under 700 characters) summarizing what the company is and what it does: the kind of company, its main products or services, who its customers or markets are, and (only if easy to find) its headquarters and approximate size.
+
+Rules:
+- Plain text only: no markdown, no bullet points, no headings, no citations or links, no preamble.
+- Only state facts you found; never invent details.
+- If you cannot confidently identify the company, say so in a single sentence instead of guessing.`;
+            const p = (async () => {
+                const text = _liCleanCompanySummary(await _liCallAiModel(prompt, {
+                    model: LI_EMPLOYER_MODEL, temperature: 0.2, max_tokens: 700, lowReasoning: true
+                }));
+                if (!text) throw new Error('Empty summary');
+                return text;
+            })();
+            _liCompanySummaryCache.set(key, p);
+            p.catch(() => _liCompanySummaryCache.delete(key)); // let a later pass retry
+            return p;
+        }
+
+        function _liRenderEmployersInner(alertObj) {
+            const st = _liEmployerState.get(alertObj.id);
+            const employers = st ? st.employers : (Array.isArray(alertObj.currentEmployers) ? alertObj.currentEmployers : null);
+            const heading = '<div class="li-employers-heading"><i class="fas fa-briefcase"></i> Current employers</div>';
+            if (!employers) {
+                return `${heading}<div class="li-employer-status"><i class="fas fa-spinner fa-spin"></i> Checking the lead's profile…</div>`;
+            }
+            if (!employers.length) {
+                if (st && st.status === 'error') return `${heading}<div class="li-employer-error">Couldn't read this lead's profile. Will retry on the next refresh.</div>`;
+                return st && st.status === 'loading'
+                    ? `${heading}<div class="li-employer-status"><i class="fas fa-spinner fa-spin"></i> Checking the lead's profile…</div>`
+                    : `${heading}<div class="li-employer-status">No current employer found in this lead's profile.</div>`;
+            }
+            const items = employers.map(e => {
+                let body;
+                if (e.summary) body = _liEscHtml(e.summary);
+                else if (e.error) body = `<span class="li-employer-error">Couldn't summarize this company (${_liEscHtml(e.error)}). Will retry on the next refresh.</span>`;
+                else body = '<span class="li-employer-status"><i class="fas fa-spinner fa-spin"></i> Searching the web…</span>';
+                return `<div class="li-employer-item"><span class="li-employer-name">${_liEscHtml(e.name)}</span>${e.role ? ` <span class="li-employer-role">· ${_liEscHtml(e.role)}</span>` : ''}<div class="li-employer-summary">${body}</div></div>`;
+            }).join('');
+            return heading + items;
+        }
+
+        function _liRefreshEmployersBlock(id) {
+            const el = document.getElementById(`li-employers-${id}`);
+            const alertObj = (_liAlerts || []).find(a => a.id === id);
+            if (el && alertObj) el.innerHTML = _liRenderEmployersInner(alertObj);
+        }
+
+        async function _liLoadEmployersForAlert(alertObj) {
+            const id = alertObj.id;
+            if (_liEmployersInFlight.has(id)) return;
+            _liEmployersInFlight.add(id);
+            const key = _liDraftKey(alertObj);
+            // Summaries already on this alert are reused by company name.
+            const prior = new Map();
+            const priorList = (_liEmployerState.get(id) || {}).employers || alertObj.currentEmployers || [];
+            priorList.forEach(e => { if (e && e.name && e.summary) prior.set(_liNormCompany(e.name), e.summary); });
+            const state = { key, status: 'loading', employers: [] };
+            _liEmployerState.set(id, state);
+            _liRefreshEmployersBlock(id);
+            try {
+                if (!_liAlertCanonicalEmail.has(id)) await _liPreloadBdrProfiles([alertObj]);
+                const canonicalEmail = _liCanonicalEmailForCard(id, alertObj.bdrEmail);
+                const emails = [...new Set([canonicalEmail, (alertObj.bdrEmail || '').toLowerCase(), alertObj.bdrEmail].filter(Boolean))];
+                const bdrEmailVariants = [...new Set(emails.map(e => e.toLowerCase()))];
+                // Shares the cache the reply-draft pass uses, so pass the same variants
+                // (they gate which hypothesis group gets picked up).
+                const ctx = await _liGetContactContext(alertObj, bdrEmailVariants);
+
+                const { employers } = _liExtractCurrentEmployers(alertObj, ctx);
+                employers.forEach(e => { const s = prior.get(_liNormCompany(e.name)); if (s) e.summary = s; });
+                state.employers = employers;
+                _liRefreshEmployersBlock(id);
+
+                await Promise.all(employers.filter(e => !e.summary).map(async e => {
+                    try { e.summary = await _liSummarizeCompany(e.name, e.role); }
+                    catch (err) { e.error = err.message || 'lookup failed'; }
+                    _liRefreshEmployersBlock(id);
+                }));
+
+                state.status = employers.every(e => e.summary) ? 'ready' : 'partial';
+                const toSave = employers.map(e => ({ name: e.name, role: e.role || '', summary: e.summary || '' }));
+                alertObj.currentEmployers = toSave;
+                if (state.status === 'ready') {
+                    alertObj.currentEmployersKey = key;
+                    try {
+                        if (window.clemailFirestore && window.clemailDb) {
+                            const { doc, updateDoc } = window.clemailFirestore;
+                            await updateDoc(doc(window.clemailDb, 'linkedin_reply_alerts', id), {
+                                currentEmployers: toSave,
+                                currentEmployersKey: key,
+                                currentEmployersAt: new Date(),
+                                currentEmployersModel: LI_EMPLOYER_MODEL
+                            });
+                        }
+                    } catch (persistErr) {
+                        console.warn('[LiAlerts][Employers] Could not persist employers:', persistErr.message);
+                    }
+                }
+            } catch (err) {
+                console.error('[LiAlerts][Employers] Failed for', id, err);
+                state.status = 'error';
+                if (!state.employers.length) state.employers = Array.isArray(alertObj.currentEmployers) ? alertObj.currentEmployers : [];
+            } finally {
+                _liEmployersInFlight.delete(id);
+                _liRefreshEmployersBlock(id);
+            }
+        }
+
+        // For every alert whose conversation has changed since its employers were
+        // last looked up (new reply, or never looked up), redo the lookup.
+        async function _liEnsureEmployerSummaries() {
+            const pending = _liAlerts.filter(a => {
+                if (!_liIsCardOpenable(a)) return false;
+                if (_liEmployersInFlight.has(a.id)) return false;
+                if (_liIsHiddenNotPando(a)) return false;
+                const key = _liDraftKey(a);
+                const st = _liEmployerState.get(a.id);
+                if (st) return !(st.key === key && st.status === 'ready');
+                return a.currentEmployersKey !== key || !Array.isArray(a.currentEmployers);
+            }).slice(0, LI_EMPLOYER_MAX_ALERTS_PER_PASS);
+            // Alerts that already have fresh persisted employers just need their block shown.
+            _liAlerts.forEach(a => { if (!_liEmployerState.has(a.id) && Array.isArray(a.currentEmployers) && a.currentEmployersKey === _liDraftKey(a)) _liRefreshEmployersBlock(a.id); });
+            if (!pending.length) return;
+            const queue = [...pending];
+            const workers = Array.from({ length: Math.min(LI_EMPLOYER_CONCURRENCY, queue.length) }, async () => {
+                while (queue.length) await _liLoadEmployersForAlert(queue.shift());
+            });
+            await Promise.all(workers);
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         window.liRegenerateAiDraft = function(id) {
             const alertObj = _liAlerts.find(a => a.id === id);
