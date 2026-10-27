@@ -1,6 +1,6 @@
 /**
  * Manage Data — embed-mode bridge
- * Version: 2.0.0
+ * Version: 2.1.0
  *
  * Loaded by every page whose panels are composed into manage_data.html
  * (Prospect Organizations, Prospect Org Admin, Contact Search by Keyword,
@@ -69,7 +69,12 @@
             contextSelects: ['bdrSelectKeyword', 'bdrSelectSmart', 'bdrSelectLowConn', 'bdrSelectOverlap', 'aiProfileBdrSelect', 'groupBdrSelect', 'dupBdrSelect'],
             chromeHide: ['.warning-box', '.tabs']
         },
-        manage_organization_contacts: { contextSelects: [], chromeHide: [] },
+        manage_organization_contacts: {
+            // Only the "Export contacts with enrichment" panel is bound to the suite's working context;
+            // the other panels of this page have their own source/destination pickers.
+            contextSelects: ['exportSourceSelect'],
+            chromeHide: ['#exportEnrichedSection .export-source-group']
+        },
         contact_ai_screen: { contextSelects: [], chromeHide: ['.page-header a[href="index.html"]'] }
     };
 
@@ -278,6 +283,74 @@
         reportState();
     }
 
+    // ── Workspaces: tell the suite when one is created / renamed / merged / deleted ──
+    // Every page writes to the `workspaces` collection through the CLEmail wrapper's
+    // CollectionReference.add / DocumentReference.set|update|delete. Wrapping those (on the
+    // prototypes, so it works no matter how a page imported them) lets the suite learn about a
+    // change made from ANY panel and refresh every other panel's dropdowns.
+    // Only structural changes count — not the frequent `lastActivity` touches.
+    const WS_SHAPE_KEYS = ['name', 'mergedInto', 'isSource', 'clientIds', 'routingWorkspaceIds', 'sourceWorkspaceId'];
+    const touchesWorkspaceShape = data => !!data && typeof data === 'object' && WS_SHAPE_KEYS.some(k => k in data);
+    function notifyWorkspaceChange(kind, id) { post({ action: 'workspacesChanged', kind: kind, id: id || '' }); }
+
+    function installWorkspaceWatch() {
+        const F = window.clemailFirestore;
+        if (!F || !F.CollectionReference || !F.DocumentReference) return false;
+        if (F.__mdWorkspaceWatch) return true;
+        F.__mdWorkspaceWatch = true;
+        const CR = F.CollectionReference.prototype, DR = F.DocumentReference.prototype;
+        const add = CR.add, set = DR.set, update = DR.update, del = DR.delete;
+        CR.add = async function (data) {
+            const ref = await add.call(this, data);
+            if (this._collectionName === 'workspaces') notifyWorkspaceChange('created', ref && (ref.id || ref._docId));
+            return ref;
+        };
+        DR.set = async function (data, options) {
+            const r = await set.call(this, data, options);
+            if (this._collectionName === 'workspaces' && touchesWorkspaceShape(data)) notifyWorkspaceChange('updated', this._docId);
+            return r;
+        };
+        DR.update = async function (data) {
+            const r = await update.call(this, data);
+            if (this._collectionName === 'workspaces' && touchesWorkspaceShape(data)) notifyWorkspaceChange('updated', this._docId);
+            return r;
+        };
+        DR.delete = async function () {
+            const r = await del.call(this);
+            if (this._collectionName === 'workspaces') notifyWorkspaceChange('deleted', this._docId);
+            return r;
+        };
+        return true;
+    }
+    if (!installWorkspaceWatch()) {
+        let n = 0;
+        const t = setInterval(() => { if (installWorkspaceWatch() || ++n > 300) clearInterval(t); }, 100);
+    }
+
+    // The suite says the workspace list changed: run the page's own refresh (each page defines
+    // window.__mdRefreshWorkspaces next to the code that fills its workspace dropdowns), keeping
+    // whatever the user had selected, then re-assert the shared working context.
+    let wsRefreshRunning = false, wsRefreshAgain = false;
+    async function refreshWorkspaces() {
+        if (wsRefreshRunning) { wsRefreshAgain = true; return; }
+        const fn = window.__mdRefreshWorkspaces;
+        if (typeof fn !== 'function') return;
+        wsRefreshRunning = true;
+        try {
+            do {
+                wsRefreshAgain = false;
+                const keep = new Map();
+                document.querySelectorAll('select[id]').forEach(s => { if (s.value) keep.set(s.id, s.value); });
+                try { await fn(); } catch (err) { console.warn('Manage Data: workspace refresh failed', err); }
+                keep.forEach((v, id) => {
+                    const s = document.getElementById(id);
+                    if (s && s.value !== v && Array.from(s.options).some(o => o.value === v)) s.value = v;
+                });
+            } while (wsRefreshAgain);
+        } finally { wsRefreshRunning = false; }
+        if (wantedContext) applyContext(wantedContext);
+    }
+
     // ── Messages from the shell ──────────────────────────────────────────────
     window.addEventListener('message', function (e) {
         if (e.origin !== window.location.origin) return;
@@ -285,6 +358,8 @@
         if (!m || m.type !== MESSAGE_TYPE) return;
         if (m.action === 'setContext') {
             applyContext(m.value || '');
+        } else if (m.action === 'refreshWorkspaces') {
+            refreshWorkspaces();
         } else if (m.action === 'showSections') {
             requestedIds = Array.isArray(m.ids) ? m.ids.slice() : null;
             applySections();

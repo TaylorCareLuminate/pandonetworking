@@ -190,6 +190,16 @@
         .md-unavail h3 { color: var(--navy); margin: .3rem 0 .5rem; }
         .md-unavail .opts { display: flex; gap: .4rem; justify-content: center; flex-wrap: wrap; margin-top: 1rem; }
 
+        .md-toast {
+            position: fixed; right: 1.25rem; bottom: 1.25rem; z-index: 50; max-width: 420px;
+            padding: .75rem 1rem; border-radius: 6px; background: var(--navy, #12314C); color: #fff;
+            border-left: 4px solid var(--gold, #B9A77E); box-shadow: 0 10px 30px rgba(18,49,76,.3);
+            font-size: .84rem; line-height: 1.4; opacity: 0; transform: translateY(8px); pointer-events: none;
+            transition: opacity .2s, transform .2s;
+        }
+        .md-toast.show { opacity: 1; transform: none; }
+        .md-toast i { color: var(--gold, #B9A77E); margin-right: .35rem; }
+
         @media (max-width: 920px) {
             body { overflow: auto; }
             .md-app { height: auto; min-height: calc(100vh - var(--md-header-h)); }
@@ -286,6 +296,8 @@
     </div>
 </div>
 
+<div class="md-toast" id="mdToast" role="status" aria-live="polite"></div>
+
 <script>
 (function () {
     'use strict';
@@ -361,7 +373,8 @@
         ]},
         { key: 'contacts', label: 'Contacts', icon: 'fa-address-book', color: 'var(--g-contacts)', q: 'What do we have, and who connected?', views: [
             { key: 'contacts-all',      label: 'All prospects & connection progress', help: 'Every prospect with connection status, filters, duplicates finder, export — plus admin actions (delete, batches, move). For a workspace, snapshot or the pool this shows its contacts table.', parts: [ P('prospect_contacts', null, ['self', 'bdr']), P('prospect_organizations_admin', ['prospectsTableSection'], ['ws', 'snapshot', 'pool'], { admin: true }) ] },
-            { key: 'contacts-download', label: 'Download organizations & contacts', admin: true, help: 'CSV export of the organizations and/or contacts for a BDR, workspace or snapshot.', parts: [ P('prospect_organizations_admin', ['downloadProspectsSection']) ] },
+            { key: 'contacts-export',   label: 'Export with enrichment', admin: true, help: 'Download every contact in the current workspace or BDR with their education, experience, skills, about, headline, connections and more — Excel (with an All Fields sheet) or CSV.', parts: [ P('manage_organization_contacts', ['exportEnrichedSection'], ['bdr', 'ws'], { ctxBound: true }) ] },
+            { key: 'contacts-download', label: 'Download organizations & contacts (raw)', admin: true, help: 'Quick CSV of the organizations and/or contacts exactly as stored, for a BDR, workspace or snapshot. For education / experience in readable form use “Export with enrichment”.', parts: [ P('prospect_organizations_admin', ['downloadProspectsSection']) ] },
             { key: 'contacts-excluded', label: 'Excluded contacts', admin: true, help: 'Browse and download excluded contacts; re-include them, or include by pasting LinkedIn URLs.', parts: [ P('manage_organization_contacts', ['massIncludeSection']) ] },
             { key: 'contacts-batches',  label: 'Batches', admin: true, help: 'Transfer unused batch contacts, reconcile a duplicated batch, or delete a batch\'s contacts.', parts: [ P('manage_organization_contacts', ['unusedBatchTransferSection', 'reconcileBatchSection', 'deleteBatchContactsSection']) ] }
         ]},
@@ -399,6 +412,7 @@
         ['See coverage and progress', 'dashboard'],
         ['Move or split contacts between workspaces / BDRs', 'move-split'],
         ['Two BDRs hold the same people at one organization', 'move-dupes'],
+        ['Export contacts with Education, Experience and the rest of their enrichment', 'contacts-export'],
         ['Bring back contacts that were excluded', 'contacts-excluded'],
         ['Remove junk / off-target prospects', 'clean-smart'],
         ['Block an organization (Do Not Contact)', 'org-dnc'],
@@ -415,8 +429,15 @@
     const VIEWS = {};
     GROUPS.forEach(g => g.views.forEach(v => { v.group = g; VIEWS[v.key] = v; }));
 
+    // Pages whose own panels have no use for the shared context: an "unsupported context"
+    // report from them only matters when the open panel is explicitly context-bound (part.ctxBound).
+    const CTX_OPTIONAL_PAGES = new Set(['manage_organization_contacts']);
+    // Pages with an explicit "create workspace" UI: a workspace created there becomes the working context.
+    const AUTO_SELECT_NEW_WS_FROM = new Set(['prospect_organizations_admin', 'manage_organization_contacts']);
+
     const state = {
         user: null, isAdmin: false, authKnown: false,
+        wsById: new Map(),      // workspace id -> { id, name, mergedInto } (admin only)
         ctx: '', ctxKind: 'self', ctxLabel: '',
         view: 'overview', activePage: null, pending: null,
         frames: new Map(),      // page -> iframe
@@ -489,6 +510,7 @@
 
             if (wsSnap && WR) {
                 const ws = []; wsSnap.forEach(d => ws.push({ id: d.id, ...d.data() }));
+                state.wsById = new Map(ws.map(w => [w.id, { id: w.id, name: w.name || w.id, mergedInto: w.mergedInto || '' }]));
                 WR.appendWorkspaceOptgroups(sel, WR.filterActiveWorkspaces(ws), { customerMap: customers });
             }
             if (snapSnap && snapSnap.size) {
@@ -529,6 +551,52 @@
         if (!opts.silent) writeUrl();
         // Re-resolve the current view (its backing part may change with the kind)
         if (state.view !== 'overview') open(state.view, { silent: true, push: false });
+    }
+
+    // ── Workspace list changed anywhere (create / rename / merge / delete) ───────────
+    // The bridge in each panel reports structural changes to the `workspaces` collection.
+    // We (1) tell every loaded panel to rebuild its workspace dropdowns, (2) reload the
+    // working-context list above, and (3) keep the working context valid.
+    let wsChangeTimer = null, wsChange = { created: null, from: null };
+    function onWorkspacesChanged(from, m) {
+        if (m.kind === 'created' && m.id) { wsChange.created = m.id; wsChange.from = from; }
+        clearTimeout(wsChangeTimer);
+        wsChangeTimer = setTimeout(runWorkspaceRefresh, 600);   // a create is add + set: coalesce
+    }
+    async function runWorkspaceRefresh() {
+        const { created, from } = wsChange; wsChange = { created: null, from: null };
+        state.frames.forEach((f, page) => { if (state.ready.has(page)) send(page, { action: 'refreshWorkspaces' }); });
+        if (!state.isAdmin) return;
+        await loadContextOptions(state.ctx);
+        reconcileContextAfterRefresh();
+        if (created && AUTO_SELECT_NEW_WS_FROM.has(from) && state.wsById.has(created)) {
+            setContext('__ws__:' + created, '', {});
+            toast(`Now working in the new workspace <b>${esc(state.wsById.get(created).name)}</b>.`);
+        }
+    }
+    function reconcileContextAfterRefresh() {
+        if (state.ctxKind !== 'ws') return;
+        const sel = document.getElementById('ctxSelect');
+        if (sel.querySelector(`option[value="${CSS.escape(state.ctx)}"]`)) { sel.value = state.ctx; return; }
+        // The current workspace is gone from the list: merged into another, or deleted
+        const oldName = state.ctxLabel || 'The workspace';
+        let cur = state.wsById.get(state.ctx.slice('__ws__:'.length)), hops = 0;
+        while (cur && cur.mergedInto && hops++ < 24) cur = state.wsById.get(cur.mergedInto);
+        if (cur && !cur.mergedInto) {
+            setContext('__ws__:' + cur.id, '', {});
+            toast(`<b>${esc(oldName)}</b> was merged into <b>${esc(cur.name)}</b> — now working in <b>${esc(cur.name)}</b>.`);
+        } else {
+            setContext('', '', {});
+            toast(`<b>${esc(oldName)}</b> no longer exists — choose what to work in.`);
+        }
+    }
+    let toastTimer = null;
+    function toast(html) {
+        const t = document.getElementById('mdToast');
+        t.innerHTML = `<i class="fas fa-circle-info"></i> ${html}`;
+        t.classList.add('show');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => t.classList.remove('show'), 8000);
     }
 
     function renderContextKind() {
@@ -835,9 +903,15 @@
             case 'contextChanged':
                 if (state.isAdmin && m.value !== state.ctx) setContext(m.value, m.label, { from: page });
                 break;
-            case 'contextUnsupported':
-                if (state.activePage === page) hint(`<b>${esc(PAGES[page].label)}</b> can't work in <b>${esc(KIND_LABEL[state.ctxKind])}</b> (${esc(state.ctxLabel)}). Pick a different context at the top, or use a function that supports this kind.`);
+            case 'workspacesChanged':
+                onWorkspacesChanged(page, m);
                 break;
+            case 'contextUnsupported': {
+                const v = VIEWS[state.view]; const part = v && resolvePart(v);
+                const bound = part && part.page === page && (part.ctxBound || !CTX_OPTIONAL_PAGES.has(page));
+                if (state.activePage === page && bound) hint(`<b>${esc(PAGES[page].label)}</b> can't work in <b>${esc(KIND_LABEL[state.ctxKind])}</b> (${esc(state.ctxLabel)}). Pick a different context at the top, or use a function that supports this kind.`);
+                break;
+            }
             case 'sectionsState':
                 state.lastState = { page, visible: m.visible, requested: m.requested };
                 if (state.activePage === page && m.visible > 0) hint('');
