@@ -46,9 +46,7 @@
         // ── Medium cost ──
         { slug: 'google/gemini-3.5-flash',         label: 'Gemini 3.5 Flash',       group: 'medium', note: 'Arguably the best overall value today — highly recommended for most runs.' },
         { slug: 'google/gemini-3.1-pro-preview',   label: 'Gemini 3.1 Pro',         group: 'medium', note: 'Excellent research model — great at synthesizing web search data.' },
-        { slug: 'anthropic/claude-sonnet-5',       label: 'Claude Sonnet 5',        group: 'medium', note: 'Current default for message writing and Opus review — excellent quality.', isDefault: true },
-        { slug: 'anthropic/claude-sonnet-4.6',     label: 'Claude Sonnet 4.6',      group: 'medium', note: 'Fantastic writing and analysis — top-tier reasoning at mid range cost.' },
-        { slug: 'anthropic/claude-sonnet-4',       label: 'Claude Sonnet 4',        group: 'medium', note: 'Proven enterprise favorite — reliable, accurate, moderate cost.' },
+        { slug: 'anthropic/claude-sonnet-5.5',       label: 'Claude Sonnet 5.5',        group: 'medium', note: 'Current default for message writing and Opus review — excellent quality.', isDefault: true },
         { slug: 'openai/gpt-5.2',                  label: 'GPT-5.2',                group: 'medium', note: 'Strong general-purpose model — excellent classification accuracy.' },
         { slug: 'openai/gpt-5.2-chat',             label: 'GPT-5.2 Chat',           group: 'medium', note: 'Cheaper GPT-5 family option — good balance of quality and cost.' },
         { slug: 'openai/gpt-5.4',                  label: 'GPT-5.4',                group: 'medium', note: 'Excellent reasoning — handles nuanced criteria well.' },
@@ -62,10 +60,7 @@
         { slug: 'openai/gpt-5.5-pro',              label: 'GPT-5.5 Pro',            group: 'high',   note: 'Maximum capability — best possible accuracy, highest cost.' },
         { slug: 'openai/gpt-5.4-pro',              label: 'GPT-5.4 Pro',            group: 'high',   note: 'Premium GPT — exceptional reasoning and accuracy.' },
         { slug: 'openai/gpt-5.2-pro',              label: 'GPT-5.2 Pro',            group: 'high',   note: 'Premium GPT — strong general-purpose at premium tier.' },
-        { slug: 'anthropic/claude-opus-4.7',       label: 'Claude Opus 4.7',        group: 'high',   note: 'Premium Claude — outstanding analysis and nuanced judgment.' },
-        { slug: 'anthropic/claude-opus-4.7-fast',  label: 'Claude Opus 4.7 Fast',   group: 'high',   note: 'Fast premium Claude — Opus 4.7 quality at higher throughput.' },
-        { slug: 'anthropic/claude-opus-4.6',       label: 'Claude Opus 4.6',        group: 'high',   note: 'Elite writing and analysis — excellent for complex org research.' },
-        { slug: 'anthropic/claude-opus-4',         label: 'Claude Opus 4',          group: 'high',   note: 'Enterprise flagship Claude — proven, highly accurate, premium cost.' },
+        { slug: 'anthropic/claude-opus-5.5',       label: 'Claude Opus 5.5',        group: 'high',   note: 'Premium Claude — outstanding analysis and nuanced judgment.' },
     ].map((m, i) => ({ active: true, sortOrder: i, ...m }));
 
     const GROUP_LABELS = {

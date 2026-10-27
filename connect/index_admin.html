@@ -6564,6 +6564,8 @@
     <script src="../js/clemail-firestore-wrapper.js"></script>
     <!-- html2canvas for LinkedIn reply alert conversation snapshots -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <!-- "Notify BDR" meeting-booked email dialog (shared with company_review_replies.html) -->
+    <script src="meeting-notify.js?v=1.0"></script>
     <!-- Conference Scheduling (widget embedded in each reply alert card) -->
     <script src="conference-scheduling.js?v=1.12"></script>
 
@@ -7037,6 +7039,9 @@
                         </div>
                     </div>
                     <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;">
+                        <button type="button" class="li-alert-open-btn" id="li-notify-btn-${_liEscHtml(id)}" onclick="window.liNotifyBdr('${_liEscHtml(id)}')" title="A meeting was just scheduled for this contact. Opens a dialog to adjust and send the heads-up email to the BDR, from Taylor, Sam or Joe's mailbox with their signature.">
+                            ${(window.PandoMeetingNotify && window.PandoMeetingNotify.wasNotified('li:' + id)) ? '<i class="fas fa-check"></i> BDR Notified' : '<i class="fas fa-calendar-check"></i> Notify BDR'}
+                        </button>
                         <button type="button" class="li-alert-open-btn" onclick="window.liMakeReferral('${_liEscHtml(id)}')" title="This person recommended we reach out to someone else. Opens Quick Outreach with the BDR and the referred person filled in, finds their LinkedIn URL, and drafts a &quot;${_liEscHtml(leadName)} recommended I reach out to you&quot; message.">
                             <i class="fas fa-share-nodes"></i> Make Referral
                         </button>
@@ -7370,12 +7375,25 @@ Rules:
         // ── Conversation Snapshot (screenshot) ───────────────────────────────
         // Renders an off-screen clone of the contact card + message history so
         // it can be captured as a clean, shareable PNG (no buttons/toolbars).
-        window.liCaptureSnapshot = async function(id) {
-            const btn = document.querySelector(`.li-alert-convo[data-li-alert-id="${id}"] .btn-li-screenshot`);
+        //
+        // opts.silent  -> don't touch the Screenshot button or open the preview modal; resolve with the
+        //                 PNG data URL instead (used by the "Notify BDR" email dialog).
+        // opts.includeDraft (silent mode only, default false) -> show the unsent text in the Send Reply
+        //                 box as if it were sent. The normal Screenshot button always does this so a
+        //                 planned reply can be shown; the email dialog makes it opt-in because Opus
+        //                 pre-fills that box with an unsent draft.
+        window.liCaptureSnapshot = async function(id, opts) {
+            const silent = !!(opts && opts.silent);
+            const includeDraft = silent ? !!opts.includeDraft : true;
+            const btn = silent ? null : document.querySelector(`.li-alert-convo[data-li-alert-id="${id}"] .btn-li-screenshot`);
             if (btn) { btn.classList.add('capturing'); btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Capturing…'; }
 
             const card = document.getElementById(`li-card-${id}`);
-            if (!card) { if (btn) { btn.classList.remove('capturing'); btn.innerHTML = '<i class="fas fa-camera"></i> Screenshot'; } return; }
+            if (!card) {
+                if (btn) { btn.classList.remove('capturing'); btn.innerHTML = '<i class="fas fa-camera"></i> Screenshot'; }
+                if (silent) throw new Error('Conversation card not found on the page');
+                return;
+            }
 
             const wrapper = document.createElement('div');
             wrapper.style.cssText = [
@@ -7424,7 +7442,7 @@ Rules:
                 // snapshot as though it had already been sent, so the BDR can screenshot
                 // their planned reply without actually sending it first.
                 const draftTextarea = document.getElementById(`li-reply-${id}`);
-                const draftText = draftTextarea ? draftTextarea.value.trim() : '';
+                const draftText = (includeDraft && draftTextarea) ? draftTextarea.value.trim() : '';
                 if (draftText) {
                     const draftMsg = document.createElement('div');
                     draftMsg.className = 'li-msg li-msg-me';
@@ -7470,6 +7488,8 @@ Rules:
                 outCtx.imageSmoothingQuality = 'high';
                 outCtx.drawImage(canvas, 0, 0, outputCanvas.width, outputCanvas.height);
 
+                if (silent) return outputCanvas.toDataURL('image/png');
+
                 _liScreenshotDataUrl = outputCanvas.toDataURL('image/png');
 
                 const nameEl = card.querySelector('.li-alert-name');
@@ -7484,6 +7504,7 @@ Rules:
 
             } catch (err) {
                 console.error('[LiAlerts] Screenshot failed:', err);
+                if (silent) throw err; // the email dialog shows its own message
                 alert('Screenshot failed: ' + err.message);
             } finally {
                 document.body.removeChild(wrapper);
@@ -7518,6 +7539,63 @@ Rules:
         window.liCloseScreenshotModal = function() {
             const modal = document.getElementById('liScreenshotPreviewModal');
             if (modal) modal.classList.remove('open');
+        };
+
+        // ── Notify BDR: "we just scheduled a meeting for you" email ──────────────
+        // Opens the shared dialog in meeting-notify.js. It drafts the note with AI using the BDR's
+        // "Meeting Booked Email" settings (bdr_review_settings.html), adds the employer paragraph(s)
+        // already shown on this card plus the same conversation snapshot the Screenshot button makes,
+        // and sends from Taylor/Sam/Joe's pandonetworking.com mailbox with their signature.
+        window.liNotifyBdr = function(id) {
+            const alertObj = (_liAlerts || []).find(a => a.id === id);
+            if (!alertObj) { alert('Could not find this conversation. Refresh the page and try again.'); return; }
+            if (!window.PandoMeetingNotify) { alert('The Notify BDR dialog did not load. Refresh the page and try again.'); return; }
+
+            const leadName = alertObj.leadName || [alertObj.leadFirstName, alertObj.leadLastName].filter(Boolean).join(' ') || 'Unknown';
+            const canonicalEmail = _liCanonicalEmailForCard(id, alertObj.bdrEmail);
+
+            window.PandoMeetingNotify.open({
+                key: 'li:' + id,
+                contact: {
+                    name: leadName,
+                    firstName: alertObj.leadFirstName || leadName.split(/\s+/)[0],
+                    title: alertObj.leadPosition || '',
+                    company: alertObj.leadCompany || '',
+                    location: alertObj.leadLocation || '',
+                    linkedinUrl: alertObj.leadProfileUrl || ''
+                },
+                bdr: {
+                    emails: [...new Set([canonicalEmail, alertObj.bdrEmail].filter(Boolean))],
+                    name: _liBdrDisplayNameForCard(id, alertObj.bdrEmail)
+                },
+                meetingDate: null,
+                messages: _liDropStaleSyntheticMessages(alertObj.messages || []).map(m => ({
+                    fromBdr: m.sender === 'ME' || m.sender === 'account',
+                    text: _liExtractMessageText(m),
+                    at: _liToMillis(m.createdAt || m.timestamp) ? new Date(_liToMillis(m.createdAt || m.timestamp)) : null
+                })),
+                getEmployers: async () => {
+                    const read = () => {
+                        const st = _liEmployerState.get(id);
+                        const list = (st && st.employers && st.employers.length) ? st.employers
+                            : (Array.isArray(alertObj.currentEmployers) ? alertObj.currentEmployers : []);
+                        return list.map(e => ({ name: e.name, role: e.role || '', summary: e.summary || '' }));
+                    };
+                    let list = read();
+                    if (!list.length) {
+                        // Not looked up yet for this card: reuse the same lookup the card's employer block runs.
+                        try { await _liLoadEmployersForAlert(alertObj); } catch (_) { /* fall back below */ }
+                        list = read();
+                    }
+                    return list;
+                },
+                captureSnapshot: ({ includeDraft }) => window.liCaptureSnapshot(id, { silent: true, includeDraft: !!includeDraft }),
+                hasDraft: () => !!((document.getElementById(`li-reply-${id}`) || {}).value || '').trim(),
+                onSent: () => {
+                    const btn = document.getElementById(`li-notify-btn-${id}`);
+                    if (btn) btn.innerHTML = '<i class="fas fa-check"></i> BDR Notified';
+                }
+            });
         };
 
         // Per-alert resolved canonical email, keyed by alert.id. Populated by
@@ -9985,7 +10063,7 @@ Rules:
         // Drafts persist on the linkedin_reply_alerts doc (aiDraft/aiDraftKey), so
         // each is generated once per new prospect message and survives refreshes.
 
-        const LI_AI_MODEL = 'anthropic/claude-opus-4.7';
+        const LI_AI_MODEL = 'anthropic/claude-opus-5.5';
         const LI_AI_MAX_DRAFTS_PER_PASS = 25;    // cost guard per 5-min poll cycle
         const LI_AI_CONCURRENCY = 2;
 
