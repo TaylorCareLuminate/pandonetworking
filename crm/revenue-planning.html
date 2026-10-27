@@ -487,6 +487,46 @@
       background: #fee2e2;
     }
 
+    .month-sort {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.8em;
+      color: #666;
+    }
+
+    .month-sort select {
+      flex: 1;
+      padding: 4px 6px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 1em;
+      background: white;
+      cursor: pointer;
+    }
+
+    .amount-edit {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .amount-edit input {
+      width: 110px;
+      padding: 3px 6px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 1em;
+      font-weight: 600;
+      color: var(--primary);
+    }
+
+    .amount-edit input:focus {
+      outline: none;
+      border-color: var(--secondary);
+      box-shadow: 0 0 0 2px rgba(42, 157, 143, 0.15);
+    }
+
     .calendar-item-details {
       font-size: 0.85em;
       color: #666;
@@ -1355,6 +1395,7 @@
     let allCustomers = [];
     let calendarData = {}; // { monthKey: [items] }
     let productItemIdCounter = 1;
+    let monthSortModes = {}; // { monthKey: 'added' | 'name-asc' | 'name-desc' | 'amount-desc' | 'amount-asc' }
     let currentForecastId = null;
     let currentForecastName = null;
     let allForecasts = [];
@@ -1527,7 +1568,7 @@
       const owner = getOwnerForCustomer(customerId);
       
       const item = {
-        id: `product-${productItemIdCounter++}`,
+        id: `product-${Date.now()}-${productItemIdCounter++}`,
         customerId: customerId,
         customerName: customerName,
         owner: owner,
@@ -1638,6 +1679,19 @@
                 </div>
               </div>
 
+              <div class="month-sort">
+                <label for="sort-${month.key}"><i class="fas fa-sort"></i> Sort:</label>
+                <select id="sort-${month.key}" onchange="window.setMonthSort('${month.key}', this.value)">
+                  ${[
+                    ['added', 'Order added'],
+                    ['name-asc', 'Vendor A → Z'],
+                    ['name-desc', 'Vendor Z → A'],
+                    ['amount-desc', 'Amount high → low'],
+                    ['amount-asc', 'Amount low → high']
+                  ].map(([val, label]) => `<option value="${val}" ${(monthSortModes[month.key] || 'added') === val ? 'selected' : ''}>${label}</option>`).join('')}
+                </select>
+              </div>
+
               <div class="owner-stats">
                 <div class="owner-stats-title">Revenue &amp; Min Pay by Owner</div>
                 ${OWNERS.map(owner => `
@@ -1658,8 +1712,8 @@
             </div>
             
             <div class="month-items" id="month-${month.key}">
-              ${items.length === 0 ? '<div style="text-align: center; color: #999; padding: 40px 20px; font-size: 0.9em;">Drop products here</div>' : 
-                items.map(item => renderCalendarItem(item, month.key)).join('')}
+                ${items.length === 0 ? '<div style="text-align: center; color: #999; padding: 40px 20px; font-size: 0.9em;">Drop products here</div>' : 
+                sortItems(items, monthSortModes[month.key]).map(item => renderCalendarItem(item, month.key)).join('')}
             </div>
           </div>
         `;
@@ -1685,6 +1739,101 @@
       }, { revenue: 0, costs: 0, profit: 0 });
     }
 
+    // Return a sorted copy of a month's items (display only; stored order is untouched)
+    function sortItems(items, mode) {
+      const sorted = items.slice();
+      const byName = (a, b) => (a.customerName || '').localeCompare(b.customerName || '', undefined, { sensitivity: 'base' });
+      switch (mode) {
+        case 'name-asc':
+          sorted.sort((a, b) => byName(a, b) || b.revenue - a.revenue);
+          break;
+        case 'name-desc':
+          sorted.sort((a, b) => byName(b, a) || b.revenue - a.revenue);
+          break;
+        case 'amount-desc':
+          sorted.sort((a, b) => b.revenue - a.revenue || byName(a, b));
+          break;
+        case 'amount-asc':
+          sorted.sort((a, b) => a.revenue - b.revenue || byName(a, b));
+          break;
+      }
+      return sorted;
+    }
+
+    window.setMonthSort = function(monthKey, mode) {
+      monthSortModes[monthKey] = mode;
+      renderCalendar();
+    };
+
+    // Find the placed item uniquely identified by its placementId
+    function findPlacement(monthKey, placementId) {
+      return (calendarData[monthKey] || []).find(i => i.placementId === placementId);
+    }
+
+    // Does `other` belong to the same recurring series as `item`?
+    function isSameSeries(item, other) {
+      if (item.seriesId) return other.seriesId === item.seriesId;
+      // Legacy saved items without a seriesId
+      return other.customerId === item.customerId && other.product === item.product;
+    }
+
+    // Apply a new monthly amount to an item, recalculating costs/payroll
+    function applyRevenue(item, revenue) {
+      const cfg = PRODUCT_COGS[item.product] || PRODUCT_COGS.other;
+      item.revenue = revenue;
+      item.costs = revenue * cfg.total;
+      item.profit = revenue - item.costs;
+      item.cogsBreakdown = {
+        aiServices: revenue * cfg.aiServices,
+        callTeam: revenue * cfg.callTeam
+      };
+    }
+
+    window.updateItemRevenue = function(monthKey, placementId, rawValue) {
+      const item = findPlacement(monthKey, placementId);
+      if (!item) return;
+
+      const revenue = parseFloat(rawValue);
+      if (isNaN(revenue) || revenue < 0) {
+        showToast('Please enter a valid amount', 'error');
+        renderCalendar();
+        return;
+      }
+      if (revenue === item.revenue) {
+        renderCalendar();
+        return;
+      }
+
+      let applyFuture = false;
+      if (item.isOngoing) {
+        const months = getNext12Months();
+        const idx = months.findIndex(m => m.key === monthKey);
+        const hasFuture = months.slice(idx + 1).some(m =>
+          (calendarData[m.key] || []).some(i => i !== item && isSameSeries(item, i))
+        );
+        if (hasFuture) {
+          applyFuture = confirm(
+            `Change this recurring item to ${formatCurrency(revenue)}/mo for this and all future months?\n\n` +
+            `OK = this and future months\nCancel = this month only`
+          );
+        }
+      }
+
+      applyRevenue(item, revenue);
+
+      if (applyFuture) {
+        const months = getNext12Months();
+        const idx = months.findIndex(m => m.key === monthKey);
+        for (let i = idx + 1; i < months.length; i++) {
+          (calendarData[months[i].key] || []).forEach(other => {
+            if (other !== item && isSameSeries(item, other)) applyRevenue(other, revenue);
+          });
+        }
+      }
+
+      renderCalendar();
+    };
+
     // Render calendar item
     function renderCalendarItem(item, monthKey) {
       const owner = getOwnerForCustomer(item.customerId);
@@ -1692,8 +1841,8 @@
       return `
         <div class="calendar-item ${item.product}">
           <div class="calendar-item-header">
-            <div class="calendar-item-title">${item.customerName} - ${item.productName}</div>
-            <button class="calendar-item-remove" onclick="window.removeItem('${monthKey}', '${item.id}')">
+            <div class="calendar-item-title">${escapeHtml(item.customerName)} - ${item.productName}</div>
+            <button class="calendar-item-remove" title="Remove" onclick="window.removeItem('${monthKey}', '${item.placementId}')">
               <i class="fas fa-times"></i>
             </button>
           </div>
@@ -1708,7 +1857,12 @@
           </div>
           ${item.description ? `<div class="calendar-item-details" style="font-style: italic; color: #666; margin-bottom: 8px;">${escapeHtml(item.description)}</div>` : ''}
           <div class="calendar-item-details">
-            <div><strong>Revenue:</strong> ${formatCurrency(item.revenue)}</div>
+            <div class="amount-edit">
+              <strong>Revenue: $</strong>
+              <input type="number" min="0" step="100" value="${item.revenue}" title="Edit amount, then press Enter or click away"
+                     onchange="window.updateItemRevenue('${monthKey}', '${item.placementId}', this.value)"
+                     onkeydown="if (event.key === 'Enter') this.blur()">
+            </div>
             <div><strong>Costs:</strong> ${formatCurrency(item.costs)}</div>
             <div><strong>Payroll:</strong> ${formatCurrency(item.profit)}</div>
           </div>
@@ -1750,10 +1904,12 @@
       }
       
       // Create new item with unique ID for this placement
+      const seriesId = itemData.isOngoing ? `series-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` : undefined;
       const newItem = {
         ...itemData,
-        placementId: `placement-${Date.now()}-${Math.random()}`
+        placementId: `placement-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
       };
+      if (seriesId) newItem.seriesId = seriesId;
       
       calendarData[monthKey].push(newItem);
       
@@ -1777,7 +1933,8 @@
             if (!alreadyExists) {
               calendarData[futureMonth].push({
                 ...itemData,
-                placementId: `placement-${Date.now()}-${Math.random()}-${i}`
+                seriesId,
+                placementId: `placement-${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${i}`
               });
             }
           }
@@ -1788,17 +1945,23 @@
     }
 
     // Remove item from calendar
-    window.removeItem = function(monthKey, itemId) {
+    // Items are identified by their unique placementId. (item.id is the id of the
+    // product template, shared by every placement of it and reused across sessions,
+    // so removing by it could delete the wrong/multiple items.)
+    window.removeItem = function(monthKey, placementId) {
       if (!calendarData[monthKey]) return;
       
-      const item = calendarData[monthKey].find(i => i.id === itemId);
+      const item = findPlacement(monthKey, placementId);
+      if (!item) return;
       
-      // If recurring, ask if they want to remove from all months
-      if (item && item.isOngoing) {
-        const removeAll = confirm('This is a recurring item. Remove from all future months?');
+      // If recurring, ask if they want to remove from all future months
+      if (item.isOngoing) {
+        const removeAll = confirm(
+          `"${item.customerName} - ${item.productName}" is recurring.\n\n` +
+          `OK = remove from this and all future months\nCancel = remove from this month only`
+        );
         
         if (removeAll) {
-          // Remove from this month and all future months
           const months = getNext12Months();
           const currentIndex = months.findIndex(m => m.key === monthKey);
           
@@ -1806,17 +1969,15 @@
             const month = months[i].key;
             if (calendarData[month]) {
               calendarData[month] = calendarData[month].filter(
-                calItem => !(calItem.customerId === item.customerId && calItem.product === item.product)
+                calItem => calItem !== item && !isSameSeries(item, calItem)
               );
             }
           }
         } else {
-          // Just remove from this month
-          calendarData[monthKey] = calendarData[monthKey].filter(i => i.id !== itemId);
+          calendarData[monthKey] = calendarData[monthKey].filter(i => i !== item);
         }
       } else {
-        // Remove single item
-        calendarData[monthKey] = calendarData[monthKey].filter(i => i.id !== itemId);
+        calendarData[monthKey] = calendarData[monthKey].filter(i => i !== item);
       }
       
       renderCalendar();
