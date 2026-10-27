@@ -164,6 +164,7 @@
             .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1')
             .replace(/\[\d+\]/g, '')
             .replace(/\*\*|__/g, '')
+            .replace(/\s*[\u2014\u2013]\s*/g, ', ')   // no em/en dashes anywhere in these emails
             .replace(/\s*\n+\s*/g, ' ')
             .replace(/\s{2,}/g, ' ')
             .trim();
@@ -577,7 +578,14 @@ BODY:
             if (S.closed) return;
             if (!url) throw new Error('No image returned');
             S.snapshotUrl = url;
-            await new Promise(res => { const im = new Image(); im.onload = () => { S.snapshotW = im.naturalWidth || 720; res(); }; im.onerror = res; im.src = url; });
+            // Read the real pixel width so the <img> is pasted at its native size (never stalls the dialog).
+            await new Promise(res => {
+                const im = new Image();
+                const t = setTimeout(res, 2000);
+                im.onload = () => { clearTimeout(t); S.snapshotW = im.naturalWidth || 720; res(); };
+                im.onerror = () => { clearTimeout(t); res(); };
+                im.src = url;
+            });
             el.snapHint.textContent = `Snapshot ready (${S.snapshotW}px wide). It is pasted into the email like a screenshot.`;
         } catch (err) {
             if (S.closed) return;
