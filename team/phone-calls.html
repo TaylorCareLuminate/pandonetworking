@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en" class="protection-hide">
 <head>
-    <!-- CACHE BUSTER v4.17.0 - PER-CALLER ORDER: queue stays oldest-first but each window of 25 contacts is shuffled per caller (seeded by email, stable across reloads) so teammates stop colliding; callbacks still first. Previous v4.16.1 - CLAIM GUARD: claims refuse activities a teammate already completed; recording your own call no longer marks the shared call log as fresh (teammates' calls are re-read before each contact); queue recheck window 15s -> 5s. Previous v4.16.0 - BAD NUMBERS: all-time bad-number block from completed outcomes, 10-digit matching, auto-switch to alternate numbers, bad-number attempts no longer start the 72h contact cooldown, call card shows the activity's current number -->
+    <!-- CACHE BUSTER v4.17.2 - BACKGROUND COUNTS: campaign buttons render immediately with a "counting…" badge; available-call counts load one campaign at a time in the background and re-render (selected campaign kept). Previous v4.17.1 - FEWER READS: declined/wrong-person lookups shared between campaign counts and loadCalls (one sequential fetch, 5-min cache; parallel version caused 502s); bad-number pass reuses the main pool and applies its writes locally instead of two extra full-campaign reads. Previous v4.17.0 - PER-CALLER ORDER: queue stays oldest-first but each window of 25 contacts is shuffled per caller (seeded by email, stable across reloads) so teammates stop colliding; callbacks still first. Previous v4.16.1 - CLAIM GUARD: claims refuse activities a teammate already completed; recording your own call no longer marks the shared call log as fresh (teammates' calls are re-read before each contact); queue recheck window 15s -> 5s. Previous v4.16.0 - BAD NUMBERS: all-time bad-number block from completed outcomes, 10-digit matching, auto-switch to alternate numbers, bad-number attempts no longer start the 72h contact cooldown, call card shows the activity's current number -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
@@ -2472,7 +2472,7 @@
 
     <script type="module">
         // 🔐 PAGE VERSION FOR CACHE BUSTING
-            const PAGE_VERSION = 'v2.15.0-per-caller-order';
+            const PAGE_VERSION = 'v2.15.2-background-campaign-counts';
         console.log(`📄 Phone Calls Page Version: ${PAGE_VERSION}`);
         console.log('🛡️ Duplicate Call Checking: ENABLED (72-hour / 3-day cooldown)');
         console.log('🔒 Assignment System: FIXED (respects assignment expiry - prevents queue overlaps)');
@@ -4761,20 +4761,19 @@
             await populateCampaignSelect();
         };
 
-        // Populate campaign select dropdown
+        let campaignCountsRun = 0;
+
+        // Campaign buttons render immediately; the available-call counts are display-only and fill
+        // in afterwards so agents can start calling without waiting on full-campaign reads.
         async function populateCampaignSelect() {
-            console.log('🎯 Populating campaign buttons with reservation info...');
-            
-            const container = document.getElementById('campaignButtonsContainer');
+            console.log('🎯 Populating campaign buttons (counts load in background)...');
+            const run = ++campaignCountsRun;
+            renderCampaignButtons(availableCampaigns.map((campaign) => ({ ...campaign, availableCalls: null })), true);
+            loadCampaignCallCounts(run);
+        }
+
+        async function loadCampaignCallCounts(run) {
             const subtitle = document.getElementById('campaignSelectionSubtitle');
-            
-            container.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; padding: 2rem; color: var(--gray);">Loading your campaigns...</div>';
-            
-            // Get today's date
-            const today = new Date();
-            const todayStr = today.getFullYear() + '-' + 
-                           String(today.getMonth() + 1).padStart(2, '0') + '-' + 
-                           String(today.getDate()).padStart(2, '0');
             
             // SINGLE SOURCE OF TRUTH: Get reservations from phone_activities (assigned/claimed calls)
             try {
@@ -4813,9 +4812,11 @@
                 // Load declined contacts filter (uses cache)
                 const declinedContacts = await loadDeclinedContacts();
                 
-                // Query available calls for each campaign
-                const campaignsWithData = await Promise.all(
-                    availableCampaigns.map(async (campaign) => {
+                // One campaign at a time so these background reads don't compete with loadCalls.
+                const campaignsWithData = [];
+                for (const campaign of availableCampaigns) {
+                    if (run !== campaignCountsRun) return;
+                    campaignsWithData.push(await (async () => {
                         const reservedCalls = campaignReservations.get(campaign.id) || 0;
                         
                         try {
@@ -4922,86 +4923,102 @@
                                 hasCallsAvailable: false
                             };
                         }
-                    })
-                );
+                    })());
+                }
                 
                 const endTime = performance.now();
                 console.log(`✅ Call counts loaded in ${Math.round(endTime - startTime)}ms`);
                 
-                // FILTER: Only show campaigns with available calls
-                const campaignsWithCalls = campaignsWithData.filter(c => c.hasCallsAvailable);
-                
-                // Sort: campaigns with most calls first
-                campaignsWithCalls.sort((a, b) => b.availableCalls - a.availableCalls);
-                
-                if (campaignsWithCalls.length === 0) {
-                    subtitle.textContent = 'No campaigns with available calls right now - check Campaign Overview';
-                    container.innerHTML = `
-                        <div style="grid-column: 1 / -1; text-align: center; padding: 3rem 2rem; color: var(--gray);">
-                            <i class="fas fa-check-circle" style="font-size: 3rem; margin-bottom: 1rem; color: var(--success); opacity: 0.5;"></i>
-                            <h3 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.5rem; color: var(--secondary);">All Caught Up! 🎉</h3>
-                            <p style="font-size: 0.875rem; margin-bottom: 1.5rem;">No calls available in your assigned campaigns right now.</p>
-                            <button onclick="showCampaignOverviewModal()" class="btn btn-primary">
-                                <i class="fas fa-eye"></i> View Campaign Overview
-                            </button>
-                        </div>
-                    `;
-                    return;
-                }
-                
-                subtitle.textContent = `${campaignsWithCalls.length} of ${availableCampaigns.length} campaigns have calls available - Click to start calling`;
-                
-                container.innerHTML = campaignsWithCalls.map(campaign => {
-                    // Determine urgency styling
-                    let urgencyColor = 'var(--primary)';
-                    let urgencyBg = '#eff6ff';
-                    let buttonClass = 'campaign-button has-reservation';
-                    
-                    if (campaign.availableCalls >= 50) {
-                        urgencyColor = '#dc2626';
-                        urgencyBg = '#fef2f2';
-                        buttonClass += ' has-urgent-calls';
-                    } else if (campaign.availableCalls >= 20) {
-                        urgencyColor = '#f59e0b';
-                        urgencyBg = '#fffbeb';
-                    } else if (campaign.availableCalls <= 5) {
-                        urgencyColor = '#10b981';
-                        urgencyBg = '#f0fdf4';
-                    }
-                    
-                    return `
-                        <button 
-                            class="${buttonClass}" 
-                            data-campaign-id="${campaign.id}"
-                            onclick="selectCampaignButton('${campaign.id}')"
-                            style="border-left: 4px solid ${urgencyColor};"
-                        >
-                            <div class="campaign-button-header">
-                                <div class="campaign-button-name">${escapeHtml(campaign.name)}</div>
-                                <div class="campaign-button-badge" style="background: ${urgencyColor}; display: flex; align-items: center; gap: 0.35rem;">
-                                    <i class="fas fa-phone"></i>
-                                    <strong>${campaign.availableCalls}</strong> call${campaign.availableCalls !== 1 ? 's' : ''}
-                                </div>
-                            </div>
-                            ${campaign.ringCentralAccount ? `
-                                <div class="campaign-button-phone">
-                                    <i class="fas fa-phone-alt"></i> ${campaign.ringCentralAccount.phoneNumber}
-                                </div>
-                            ` : ''}
-                        </button>
-                    `;
-                }).join('');
-                
-                console.log(`✅ Displayed ${campaignsWithCalls.length} campaigns with available calls (filtered from ${availableCampaigns.length} total)`);
-                
+                if (run !== campaignCountsRun) return;
+                renderCampaignButtons(campaignsWithData, false);
             } catch (error) {
-                console.error('❌ Error loading campaign reservations:', error);
+                if (run !== campaignCountsRun) return;
+                console.error('❌ Error loading campaign call counts:', error);
+                subtitle.textContent = "Couldn't count available calls - click a campaign to start calling";
+            }
+        }
+
+        function renderCampaignButtons(campaigns, countsPending) {
+            const container = document.getElementById('campaignButtonsContainer');
+            const subtitle = document.getElementById('campaignSelectionSubtitle');
+            
+            // A campaign the agent already opened stays visible even if its count comes back 0.
+            const campaignsWithCalls = countsPending
+                ? campaigns
+                : campaigns.filter(c => c.hasCallsAvailable || c.id === selectedCampaign);
+            
+            if (!countsPending) {
+                campaignsWithCalls.sort((a, b) => b.availableCalls - a.availableCalls);
+            }
+            
+            if (campaignsWithCalls.length === 0) {
+                subtitle.textContent = 'No campaigns with available calls right now - check Campaign Overview';
                 container.innerHTML = `
-                    <div style="grid-column: 1 / -1; text-align: center; padding: 2rem; color: var(--danger);">
-                        <i class="fas fa-exclamation-triangle"></i> Error loading campaigns
+                    <div style="grid-column: 1 / -1; text-align: center; padding: 3rem 2rem; color: var(--gray);">
+                        <i class="fas fa-check-circle" style="font-size: 3rem; margin-bottom: 1rem; color: var(--success); opacity: 0.5;"></i>
+                        <h3 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.5rem; color: var(--secondary);">All Caught Up! 🎉</h3>
+                        <p style="font-size: 0.875rem; margin-bottom: 1.5rem;">No calls available in your assigned campaigns right now.</p>
+                        <button onclick="showCampaignOverviewModal()" class="btn btn-primary">
+                            <i class="fas fa-eye"></i> View Campaign Overview
+                        </button>
                     </div>
                 `;
+                return;
             }
+            
+            subtitle.textContent = countsPending
+                ? `Counting available calls in ${campaignsWithCalls.length} campaign${campaignsWithCalls.length !== 1 ? 's' : ''}... You can click a campaign to start calling now`
+                : `${campaigns.filter(c => c.hasCallsAvailable).length} of ${availableCampaigns.length} campaigns have calls available - Click to start calling`;
+            
+            container.innerHTML = campaignsWithCalls.map(campaign => {
+                // Determine urgency styling
+                let urgencyColor = 'var(--primary)';
+                let buttonClass = 'campaign-button has-reservation';
+                
+                if (countsPending) {
+                    // neutral until the count arrives
+                } else if (campaign.availableCalls >= 50) {
+                    urgencyColor = '#dc2626';
+                    buttonClass += ' has-urgent-calls';
+                } else if (campaign.availableCalls >= 20) {
+                    urgencyColor = '#f59e0b';
+                } else if (campaign.availableCalls <= 5) {
+                    urgencyColor = '#10b981';
+                }
+                if (campaign.id === selectedCampaign) {
+                    buttonClass += ' selected';
+                }
+                
+                const badge = countsPending
+                    ? `<div class="campaign-button-badge-empty"><i class="fas fa-spinner fa-spin"></i> counting…</div>`
+                    : `<div class="campaign-button-badge" style="background: ${urgencyColor}; display: flex; align-items: center; gap: 0.35rem;">
+                            <i class="fas fa-phone"></i>
+                            <strong>${campaign.availableCalls}</strong> call${campaign.availableCalls !== 1 ? 's' : ''}
+                        </div>`;
+                
+                return `
+                    <button 
+                        class="${buttonClass}" 
+                        data-campaign-id="${campaign.id}"
+                        onclick="selectCampaignButton('${campaign.id}')"
+                        style="border-left: 4px solid ${urgencyColor};"
+                    >
+                        <div class="campaign-button-header">
+                            <div class="campaign-button-name">${escapeHtml(campaign.name)}</div>
+                            ${badge}
+                        </div>
+                        ${campaign.ringCentralAccount ? `
+                            <div class="campaign-button-phone">
+                                <i class="fas fa-phone-alt"></i> ${campaign.ringCentralAccount.phoneNumber}
+                            </div>
+                        ` : ''}
+                    </button>
+                `;
+            }).join('');
+            
+            console.log(countsPending
+                ? `✅ Displayed ${campaignsWithCalls.length} campaigns (counting calls in background)`
+                : `✅ Displayed ${campaignsWithCalls.length} campaigns with available calls (filtered from ${availableCampaigns.length} total)`);
         }
 
         // Handle campaign button click
@@ -6135,14 +6152,12 @@
                     // ⚡ OPTIMIZATION: Mark ALL pending activities with bad numbers (not just assigned ones)
                     // This prevents re-assigning the same bad numbers over and over
                     console.log('🔍 Checking ALL campaign activities for bad numbers (prevents re-assignment)...');
-                    const allPendingQuery = query(
-                        collection(db, 'phone_activities'),
-                        where('campaignId', '==', selectedCampaign),
-                        where('status', 'in', ['pending', 'scheduled'])
-                    );
-                    const allPendingSnapshot = await getDocs(allPendingQuery);
+                    // The main query already holds the campaign's full pending/scheduled pool.
+                    const allPendingSnapshot = querySnapshot;
                     
                     const autoMarkBadPromises = [];
+                    const autoClosedIds = new Set();
+                    const alternateUpdates = new Map();
                     
                     let switchedToAlternateCount = 0;
                     allPendingSnapshot.docs.forEach((docSnapshot) => {
@@ -6157,21 +6172,24 @@
                             : null;
                         if (alternatePhone) {
                             console.log(`🔁 Switching ${data.contactName || data.orgName || 'Unknown'} from bad number ${activityPhone} to ${alternatePhone}`);
+                            const alternateUpdate = {
+                                phoneNumber: alternatePhone,
+                                phone: alternatePhone,
+                                previousPhoneNumber: activityPhone,
+                                phoneNumberUpdated: true,
+                                phoneNumberUpdatedAt: new Date().toISOString(),
+                                phoneNumberUpdatedReason: 'previous-number-bad'
+                            };
+                            alternateUpdates.set(docSnapshot.id, alternateUpdate);
                             autoMarkBadPromises.push(
-                                updateDoc(doc(db, 'phone_activities', docSnapshot.id), {
-                                    phoneNumber: alternatePhone,
-                                    phone: alternatePhone,
-                                    previousPhoneNumber: activityPhone,
-                                    phoneNumberUpdated: true,
-                                    phoneNumberUpdatedAt: new Date().toISOString(),
-                                    phoneNumberUpdatedReason: 'previous-number-bad'
-                                })
+                                updateDoc(doc(db, 'phone_activities', docSnapshot.id), alternateUpdate)
                             );
                             switchedToAlternateCount++;
                             return;
                         }
 
                         console.log(`🚫 Auto-marking activity for ${data.contactName || 'Unknown'} - phone ${activityPhone} was previously marked as bad`);
+                        autoClosedIds.add(docSnapshot.id);
                         autoMarkBadPromises.push(
                             updateDoc(doc(db, 'phone_activities', docSnapshot.id), {
                                 status: 'completed',
@@ -6196,14 +6214,19 @@
                         await Promise.all(autoMarkBadPromises);
                         console.log(`✅ Automatically marked ${autoMarkedCount} activities as bad numbers`);
                         
-                        // Reload the query to get the updated results
-                        console.log('🔄 Reloading activities after auto-marking bad numbers...');
-                        const refreshedSnapshot = await getDocs(phoneActivitiesQuery);
-                        
-                        // Clear and rebuild the querySnapshot reference
-                        // We'll reassign querySnapshot to the refreshed data
-                        querySnapshot = refreshedSnapshot;
-                        console.log(`✅ Refreshed query: now ${querySnapshot.docs.length} activities remain`);
+                        // Apply the writes to the loaded pool instead of re-reading the whole campaign.
+                        const remainingDocs = querySnapshot.docs.filter((docSnap) => !autoClosedIds.has(docSnap.id));
+                        remainingDocs.forEach((docSnap) => {
+                            const update = alternateUpdates.get(docSnap.id);
+                            if (update) Object.assign(docSnap.data(), update);
+                        });
+                        querySnapshot = {
+                            docs: remainingDocs,
+                            size: remainingDocs.length,
+                            empty: remainingDocs.length === 0,
+                            forEach: (fn) => remainingDocs.forEach(fn)
+                        };
+                        console.log(`✅ Updated pool: now ${querySnapshot.docs.length} activities remain`);
                         
                         // ⚠️ CRITICAL: If we marked many calls as bad and have few remaining, assign more!
                         // Threshold: If we have < 5 calls after auto-marking, top up the rolling window
@@ -6251,38 +6274,15 @@
                 try {
                     console.log('🔍 Loading permanent failure contacts from phone_activities...');
                     
-                    // List of outcomes that should permanently remove contacts from queue
-                    // NOTE: bad-number and bad-number-disconnected are NOT included because they have
-                    // alternate phone number logic - those contacts may reappear with different numbers
-                    const permanentFailureOutcomes = [
-                        'spoke-declined',
-                        'declined',  // legacy / alternate outcome value
-                        'contact-left-no-replacement',
-                        'bad-number-wrong-person'  // Only wrong person - other bad numbers may have alternates
-                    ];
-                    
+                    // bad-number and bad-number-disconnected are NOT in PERMANENT_FAILURE_OUTCOMES because
+                    // those contacts may come back with an alternate number.
                     let permanentFailureCount = 0;
                     
-                    // Query each outcome separately (Firestore limitation - can't use 'in' with multiple conditions).
-                    // Fetched in parallel, then processed in list order so first-seen ids stay the same.
-                    const failedOutcomeResults = await Promise.all(permanentFailureOutcomes.map(async (outcomeType) => {
-                        try {
-                            const snapshot = await getDocs(query(
-                                collection(db, 'phone_activities'),
-                                where('outcome', '==', outcomeType),
-                                where('status', '==', 'completed')
-                            ));
-                            return { outcomeType, snapshot };
-                        } catch (error) {
-                            return { outcomeType, error };
-                        }
-                    }));
-                    for (const { outcomeType, snapshot: failedOutcomeSnapshot, error: failedOutcomeError } of failedOutcomeResults) {
+                    const failedOutcomeResults = await getPermanentFailureRecords();
+                    for (const { outcomeType, records: failedOutcomeRecords, error: failedOutcomeError } of failedOutcomeResults) {
                         try {
                             if (failedOutcomeError) throw failedOutcomeError;
-                            failedOutcomeSnapshot.docs.forEach((doc) => {
-                                const data = doc.data();
-                                
+                            failedOutcomeRecords.forEach((data) => {
                                 // Add by outreachSetId if available
                                 if (data.outreachSetId && !declinedContactsSet.has(data.outreachSetId)) {
                                     declinedContactsSet.add(data.outreachSetId);
@@ -9655,6 +9655,7 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 if (isContactUnavailable) {
                     declinedContactsCache = null;
                     declinedContactsLastLoaded = 0;
+                    permanentFailureRecordsCache = null;
                 }
                 
                 // CALLBACK HANDLING: If this is a callback outcome, create a new phone activity for the callback
@@ -12582,6 +12583,55 @@ Would you have 15 minutes available this week or next for a quick call?`;
         const DECLINED_CONTACTS_CACHE_DURATION = 300000; // 5 minutes (declined status changes infrequently)
         let campaignOrganizationBlocksCache = null;
         let campaignOrganizationBlocksLastLoaded = 0;
+
+        // Completed phone_activities whose outcome permanently removes the contact (all campaigns).
+        // Shared by the campaign counts and loadCalls; fetched one outcome at a time because the
+        // backend returns 502s when these multi-thousand-row reads run in parallel.
+        const PERMANENT_FAILURE_OUTCOMES = [
+            'spoke-declined',
+            'declined',
+            'contact-left-no-replacement',
+            'bad-number-wrong-person'
+        ];
+        let permanentFailureRecordsCache = null;
+        let permanentFailureRecordsLoadedAt = 0;
+        let permanentFailureRecordsInFlight = null;
+
+        async function getPermanentFailureRecords(forceRefresh = false) {
+            if (!forceRefresh && permanentFailureRecordsCache &&
+                Date.now() - permanentFailureRecordsLoadedAt < DECLINED_CONTACTS_CACHE_DURATION) {
+                return permanentFailureRecordsCache;
+            }
+            if (permanentFailureRecordsInFlight) return permanentFailureRecordsInFlight;
+
+            permanentFailureRecordsInFlight = (async () => {
+                const startedAt = Date.now();
+                const results = [];
+                for (const outcomeType of PERMANENT_FAILURE_OUTCOMES) {
+                    try {
+                        const snapshot = await getDocs(query(
+                            collection(db, 'phone_activities'),
+                            where('outcome', '==', outcomeType),
+                            where('status', '==', 'completed')
+                        ));
+                        results.push({ outcomeType, records: snapshot.docs.map((docSnap) => docSnap.data()) });
+                    } catch (error) {
+                        results.push({ outcomeType, records: [], error });
+                    }
+                }
+                if (results.every((result) => !result.error)) {
+                    permanentFailureRecordsCache = results;
+                    permanentFailureRecordsLoadedAt = startedAt;
+                }
+                return results;
+            })();
+
+            try {
+                return await permanentFailureRecordsInFlight;
+            } finally {
+                permanentFailureRecordsInFlight = null;
+            }
+        }
         
         // SHARED DECLINED MATCHING: checks a phone_activities record against the declined
         // identifier collections (outreachSetId, contact email, normalized phone).
@@ -12669,22 +12719,14 @@ Would you have 15 minutes available this week or next for a quick call?`;
             try {
                 // SINGLE SOURCE OF TRUTH: Query phone_activities ONLY for permanent failures
                 // No longer querying outreach_sets
-                const permanentFailureOutcomes = [
-                    'spoke-declined',
-                    'declined',
-                    'contact-left-no-replacement',
-                    'bad-number-wrong-person'
-                ];
+                const failureResults = await getPermanentFailureRecords(forceRefresh);
+                const hadFailureErrors = failureResults.some((result) => result.error);
+                failureResults.forEach(({ outcomeType, error }) => {
+                    if (error) console.warn(`⚠️ Error querying ${outcomeType}:`, error);
+                });
                 
-                for (const outcomeType of permanentFailureOutcomes) {
-                    const failedOutcomeQuery = query(
-                        collection(db, 'phone_activities'),
-                        where('outcome', '==', outcomeType),
-                        where('status', '==', 'completed')
-                    );
-                    const failedOutcomeSnapshot = await getDocs(failedOutcomeQuery);
-                    failedOutcomeSnapshot.docs.forEach((doc) => {
-                        const data = doc.data();
+                for (const { records } of failureResults) {
+                    records.forEach((data) => {
                         if (data.outreachSetId) {
                             declinedContacts.ids.add(data.outreachSetId);
                         }
@@ -12703,9 +12745,10 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 
                 console.log(`✅ Loaded declined contacts: ${declinedContacts.ids.size} ids, ${declinedContacts.emails.size} emails, ${declinedContacts.phones.size} phones, ${declinedContacts.organizations.length} campaign organization blocks (cached for 5 minutes)`);
                 
-                // Cache the results
-                declinedContactsCache = declinedContacts;
-                declinedContactsLastLoaded = nowTimestamp;
+                if (!hadFailureErrors) {
+                    declinedContactsCache = declinedContacts;
+                    declinedContactsLastLoaded = nowTimestamp;
+                }
                 
                 return declinedContacts;
             } catch (error) {
