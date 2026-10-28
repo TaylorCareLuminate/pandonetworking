@@ -4990,6 +4990,11 @@
                         <option value="">— Load workspaces first —</option>
                     </select>
                     <div id="fpmWorkspaceMemoryNote" style="font-size:12px; color:#065f46; margin-bottom:8px; display:none;"></div>
+                    <label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:13px; color:var(--gray-700); margin:0 0 10px 0;">
+                        <input type="checkbox" id="fpmWorkspaceIgnoreMemory" checked
+                            style="accent-color:#0d9488; width:14px; height:14px; cursor:pointer; margin-top:2px; flex-shrink:0;">
+                        <span><strong>Include contacts already pulled from this workspace</strong> — workspace memory is not cleared when messages are deleted, so leave this on to re-message contacts whose messages you deleted. Contacts already on this BDR's list are re-used (not duplicated); anyone with a live queued/sent message, an existing connection, or an exclusion is still skipped.</span>
+                    </label>
                     <div class="form-help" style="margin-top:0; color:#065f46;">
                         Pulls the top N workspace contacts by <strong>most LinkedIn connections first</strong>, after skipping contacts already pulled from this workspace (workspace memory),
                         already connected to this BDR, already in this BDR's prospect list / queue, another BDR in the selected Hypothesis Group has already reached out to, and
@@ -18367,7 +18372,12 @@
          * Pull eligible contacts from a workspace into the BDR's prospect list.
          * Returns { moveBatchId, pulled, stats } where `pulled` are the new prospect_contacts docs.
          */
-        async function fullAiPullContactsFromWorkspace({ workspaceId, bdrEmail, count, hypothesisGroupId, groupUrlSet, addLog }) {
+        // ignoreMemory (opt-in, used by Fast Prospect Messaging): don't skip contacts just because this
+        // workspace's pull memory says they were pulled before. Memory is workspace-wide and is NOT cleared
+        // when their messages are later deleted, so without this a re-pull after deleting messages finds
+        // nothing. Contacts already on THIS BDR's prospect list are re-used (re-tagged with the new batch,
+        // not duplicated); everything else still has to pass the connected / queued / excluded checks.
+        async function fullAiPullContactsFromWorkspace({ workspaceId, bdrEmail, count, hypothesisGroupId, groupUrlSet, addLog, ignoreMemory = false }) {
             const WR = window.WorkspaceRouting;
             if (!WR) throw new Error('WorkspaceRouting helper not loaded');
             if (!workspaceId) throw new Error('No workspace selected');
@@ -18431,6 +18441,7 @@
 
             addLog(`   📋 Loading this BDR's existing prospect list + queue + exclusions...`, 'info');
             const existingProspectUrls = new Set();
+            const reusableProspects = new Map(); // normUrl -> existing doc on THIS BDR (only used when ignoreMemory)
             const existingQueueUrls = new Set();
             const excludedUrls = new Set();
             try {
@@ -18442,6 +18453,9 @@
                     const data = d.data();
                     const u = normalizeLinkedInUrl(data.linkedInUrl || data.li_url || '');
                     if (u) existingProspectUrls.add(u);
+                    if (u && !data.excludedFromCampaign && !data.movedToHarvest && !reusableProspects.has(u)) {
+                        reusableProspects.set(u, { id: d.id, ...data });
+                    }
                     // Soft-excluded contacts still on the BDR list — don't re-pull clones from workspace
                     if (data.excludedFromCampaign && u) excludedUrls.add(u);
                 });
@@ -18495,8 +18509,10 @@
             let skippedNoUrl = 0, skippedMemory = 0, skippedConnected = 0;
             let skippedAlreadyOnBdr = 0, skippedQueued = 0, skippedGroupOutreach = 0;
             let skippedHarvest = 0, skippedConnCount = 0, skippedExcluded = 0, skippedNotInGroup = 0;
+            let reusedFromMemory = 0;
             const connFilterOn = typeof isConnectionFilterEnabled === 'function' && isConnectionFilterEnabled();
             const minConn = typeof getConnectionFilterMin === 'function' ? getConnectionFilterMin() : 250;
+            if (ignoreMemory) addLog(`   ♻️ Ignoring workspace pull memory — contacts already on ${bdrEmail}'s list are re-used (messages you deleted don't block them).`, 'info');
 
             const eligible = [];
             const seen = new Set();
@@ -18508,10 +18524,13 @@
                 if (seen.has(url)) continue;
                 seen.add(url);
                 if (groupUrlSet && !groupUrlSet.has(url)) { skippedNotInGroup++; continue; }
-                if (pulledMemory.has(url)) { skippedMemory++; continue; }
+                if (!ignoreMemory && pulledMemory.has(url)) { skippedMemory++; continue; }
                 if (excludedUrls.has(url)) { skippedExcluded++; continue; }
                 if (connectedUrls.has(url)) { skippedConnected++; continue; }
-                if (existingProspectUrls.has(url)) { skippedAlreadyOnBdr++; continue; }
+                // Already on this BDR's list: normally skipped; with ignoreMemory a live (non-excluded,
+                // non-harvest) copy is re-used instead of duplicated.
+                const reuseDoc = ignoreMemory ? reusableProspects.get(url) : null;
+                if (existingProspectUrls.has(url) && !reuseDoc) { skippedAlreadyOnBdr++; continue; }
                 if (existingQueueUrls.has(url)) { skippedQueued++; continue; }
                 if (groupOutreachUrls.has(url)) { skippedGroupOutreach++; continue; }
                 const connCount = fullAiParseConnectionCount(c);
@@ -18524,6 +18543,7 @@
                 eligible.push({
                     ...c,
                     _normUrl: url,
+                    _reuseDoc: reuseDoc || null,
                     linkedInConnectionCount: connCount ?? c.linkedInConnectionCount
                 });
             }
@@ -18583,8 +18603,24 @@
 
             addLog(`   📥 Copying ${toPull.length} contact(s) into ${bdrEmail}'s prospect list...`, 'info');
             for (const contact of toPull) {
-                const { id: _srcId, _normUrl, ...contactData } = contact;
+                const { id: _srcId, _normUrl, _reuseDoc, ...contactData } = contact;
                 const connCount = fullAiParseConnectionCount(contact);
+                if (_reuseDoc) {
+                    // Already on this BDR's list from an earlier pull — re-tag it into this batch instead of duplicating.
+                    const updates = {
+                        moveBatchId,
+                        moveBatchLabel,
+                        ...(connCount != null && _reuseDoc.linkedInConnectionCount == null ? { linkedInConnectionCount: connCount } : {})
+                    };
+                    try {
+                        await ud(docFn(db, 'prospect_contacts', _reuseDoc.id), updates);
+                        pulled.push({ ..._reuseDoc, ...updates, _normUrl });
+                        reusedFromMemory++;
+                    } catch (e) {
+                        addLog(`   ⚠️ Failed to re-use ${contact.firstName || ''} ${contact.lastName || ''} (${_normUrl}): ${e.message}`, 'warning');
+                    }
+                    continue;
+                }
                 const newDoc = {
                     ...contactData,
                     userEmail: bdrEmail,
@@ -18649,7 +18685,8 @@
                 addLog(`   🧠 Workspace memory updated (+${Object.keys(newMemoryEntries).length} → ${mergedUrls.length} total)`, 'success');
             }
 
-            addLog(`   ✅ Pulled ${pulled.length} contact(s) from "${wsName}" → ${bdrEmail} (batch ${moveBatchId})`, 'success');
+            addLog(`   ✅ Pulled ${pulled.length} contact(s) from "${wsName}" → ${bdrEmail} (batch ${moveBatchId})` +
+                (reusedFromMemory ? ` — ${reusedFromMemory} were already on this BDR's list and were re-used` : ''), 'success');
             return {
                 moveBatchId,
                 pulled,
@@ -24640,7 +24677,10 @@
                 if (src === 'urlList') {
                     result = await fullAiPullContactsFromUrlList({ bdrEmail, entries: urlListParsed.entries, groupUrlSet: scopeGroupUrlSet, addLog });
                 } else if (src === 'workspace') {
-                    result = await fullAiPullContactsFromWorkspace({ workspaceId, bdrEmail, count, hypothesisGroupId: hypGroupId, groupUrlSet: scopeGroupUrlSet, addLog });
+                    result = await fullAiPullContactsFromWorkspace({
+                        workspaceId, bdrEmail, count, hypothesisGroupId: hypGroupId, groupUrlSet: scopeGroupUrlSet, addLog,
+                        ignoreMemory: !!document.getElementById('fpmWorkspaceIgnoreMemory')?.checked
+                    });
                 } else if (src === 'colleagues') {
                     let sourceHypUrlSet = await fpmGetSelectedColHypGroupUrls(addLog);
                     if (sourceHypUrlSet) addLog(`🔬 Source hypothesis group filter: ${sourceHypUrlSet.size} contact URL(s) across selected group(s).`, 'info');
