@@ -1,6 +1,6 @@
 /**
  * Manage Data — embed-mode bridge
- * Version: 2.1.0
+ * Version: 2.2.0 (adds linkedin_url_finder)
  *
  * Loaded by every page whose panels are composed into manage_data.html
  * (Prospect Organizations, Prospect Org Admin, Contact Search by Keyword,
@@ -39,7 +39,8 @@
         'manage_organization_contacts.html': 'manage_organization_contacts',
         'prospect_cleanup.html': 'prospect_cleanup',
         'prospect_contacts.html': 'prospect_contacts',
-        'my_leads.html': 'my_leads'
+        'my_leads.html': 'my_leads',
+        'linkedin_url_finder.html': 'linkedin_url_finder'
     };
 
     // Per-page knowledge: which <select>s hold the working context, and which
@@ -75,7 +76,10 @@
             contextSelects: ['exportSourceSelect'],
             chromeHide: ['#exportEnrichedSection .export-source-group']
         },
-        contact_ai_screen: { contextSelects: [], chromeHide: ['.page-header a[href="index.html"]'] }
+        contact_ai_screen: { contextSelects: [], chromeHide: ['.page-header a[href="index.html"]'] },
+        // Steps 1-4 (upload, map, search, review) don't depend on the context; Step 5's destination does,
+        // and it stays visible so you can always see where "Save" will put the contacts.
+        linkedin_url_finder: { contextSelects: ['wsTargetSelect'], chromeHide: [] }
     };
 
     // Elements that count as "panels" — the only things showSections hides.

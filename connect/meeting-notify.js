@@ -34,8 +34,16 @@
     const RAILWAY = 'https://railwayclemail-production.up.railway.app';
     const AI_MODEL = 'anthropic/claude-opus-4.7';
     const EMPLOYER_MODEL = AI_MODEL + ':online'; // web-enabled, same as the employer cards on Index Admin
-    const SENDER_DOMAIN = 'pandonetworking.com';
-    const SENDER_FIRST_NAMES = ['taylor', 'sam', 'joe'];
+    // The only people these emails can come from, each tied to their PRIMARY address. The mailbox
+    // connected on OAuth Email Connections under exactly that address is the one that sends. The
+    // other local parts / domains are used only to find a person's existing signature (they have
+    // also been connected as taylordavis@, @healthluminate.com, @careluminate.com, etc.).
+    const SENDERS = [
+        { key: 'taylor', name: 'Taylor Davis',  primary: 'taylor@pandonetworking.com', localParts: ['taylor', 'taylordavis', 'taylor.davis'] },
+        { key: 'sam',    name: 'Sam Ellsworth', primary: 'sam@pandonetworking.com',    localParts: ['sam', 'samellsworth', 'sam.ellsworth'] },
+        { key: 'joe',    name: 'Joe Annoreno',  primary: 'joe@pandonetworking.com',    localParts: ['joe', 'joeannoreno', 'joe.annoreno'] }
+    ];
+    const ORG_DOMAINS = ['pandonetworking.com', 'healthluminate.com', 'careluminate.com'];
     const NOTIFIED_KEY_PREFIX = 'pandoMeetingNotified:';
     const MAX_TRANSCRIPT_MESSAGES = 25;
     const MAX_MESSAGE_CHARS = 700;
@@ -126,28 +134,74 @@
         const res = await fetch(`${RAILWAY}/oauth/accounts/signatures`, { headers: await authHeaders() });
         if (!res.ok) throw new Error(`Could not load mailboxes (HTTP ${res.status})`);
         const { accounts } = await res.json();
-        const org = (accounts || []).filter(a =>
-            a.status !== 'expired' && lower(a.email).endsWith('@' + SENDER_DOMAIN));
-        const first = (s) => lower(s).split(/[\s._-]+/)[0];
-        const named = org.filter(a =>
-            SENDER_FIRST_NAMES.includes(first(String(a.email).split('@')[0])) || SENDER_FIRST_NAMES.includes(first(a.displayName)));
-        const list = (named.length ? named : org).map(a => ({
-            accountId: a.accountId,
-            provider: a.provider,
-            email: lower(a.email),
-            displayName: a.displayName && !String(a.displayName).includes('@') ? a.displayName : '',
-            signatureHtml: a.signatureHtml || '',
-            signatureText: a.signatureText || ''
-        }));
+        const all = accounts || [];
+        const hasSig = (a) => !!a && !!String(a.signatureHtml || '').replace(/<[^>]*>/g, '').trim();
+        const personOf = (email) => {
+            const [local, domain] = lower(email).split('@');
+            return ORG_DOMAINS.includes(domain) ? SENDERS.find(p => p.localParts.includes(local)) || null : null;
+        };
+
+        const list = SENDERS.map(p => {
+            // Sending mailbox: exactly the primary address, and it must still be authorized.
+            const primaryAcct = all.find(a => lower(a.email) === p.primary && a.status !== 'expired') || null;
+            const connectedElsewhere = all.filter(a => personOf(a.email) === p && lower(a.email) !== p.primary && a.status !== 'expired').map(a => lower(a.email));
+
+            // Signature: the primary mailbox's own saved HTML signature if it has one. Otherwise borrow
+            // the same person's signature from another of their accounts (pandonetworking.com ones first),
+            // then the backend's name-match suggestion. The dialog flags borrowed ones and offers to save them.
+            let sigAcct = hasSig(primaryAcct) ? primaryAcct : null;
+            const own = !!sigAcct;
+            if (!sigAcct) {
+                const others = all.filter(a => a !== primaryAcct && personOf(a.email) === p && hasSig(a))
+                    .sort((a, b) => Number(lower(b.email).endsWith('@pandonetworking.com')) - Number(lower(a.email).endsWith('@pandonetworking.com')));
+                sigAcct = others[0] || null;
+                if (!sigAcct && primaryAcct) {
+                    const sug = (primaryAcct.suggestions || []).find(s => String(s.signatureHtml || '').trim());
+                    if (sug) sigAcct = { email: sug.fromEmail, signatureHtml: sug.signatureHtml, signatureText: sug.signatureText };
+                }
+            }
+            return {
+                key: p.key,
+                displayName: p.name,
+                email: p.primary,
+                connected: !!primaryAcct,
+                accountId: primaryAcct ? primaryAcct.accountId : '',
+                provider: primaryAcct ? primaryAcct.provider : '',
+                connectedElsewhere,
+                signatureHtml: sigAcct ? sigAcct.signatureHtml || '' : '',
+                signatureText: sigAcct ? sigAcct.signatureText || '' : '',
+                signatureOwn: own,
+                signatureSource: sigAcct ? lower(sigAcct.email) : ''
+            };
+        });
         _sendersCache = { at: Date.now(), list };
         return list;
     }
 
+    /** Which of the three senders is this logged-in address (any of their org addresses)? */
+    function senderForLoginEmail(senders, email) {
+        const [local, domain] = lower(email).split('@');
+        if (!ORG_DOMAINS.includes(domain)) return null;
+        const p = SENDERS.find(x => x.localParts.includes(local));
+        return p ? senders.find(s => s.key === p.key && s.connected) || null : null;
+    }
+
     function senderFirstName(sender) {
-        if (!sender) return '';
-        if (sender.displayName) return firstNameOf(sender.displayName);
-        const local = sender.email.split('@')[0].split(/[._-]/)[0];
-        return local ? local.charAt(0).toUpperCase() + local.slice(1) : '';
+        return sender ? firstNameOf(sender.displayName) : '';
+    }
+
+    /** Saves a borrowed signature onto the primary mailbox so it is tied to that address from now on. */
+    async function adoptSignature(sender) {
+        const res = await fetch(`${RAILWAY}/oauth/accounts/${encodeURIComponent(sender.accountId)}/signature`, {
+            method: 'PUT',
+            headers: await authHeaders(),
+            body: JSON.stringify({ html: sender.signatureHtml, text: sender.signatureText || undefined })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        sender.signatureOwn = true;
+        sender.signatureSource = sender.email;
+        _sendersCache = { at: 0, list: null };
     }
 
     function signatureHtmlFor(sender) {
@@ -488,21 +542,24 @@ BODY:
         const { el, bdrDoc, ctx } = S;
         const warnings = [];
 
-        // Sender dropdown
+        // Sender dropdown: always Taylor, Sam and Joe by their primary addresses. Anyone whose primary
+        // mailbox is not connected is listed but disabled, with the reason below.
         if (S.senders.length) {
             el.from.innerHTML = S.senders.map(a =>
-                `<option value="${esc(a.email)}">${esc((a.displayName ? a.displayName + ' ' : '') + '<' + a.email + '>')}</option>`).join('');
-            const me = lower(window.auth && window.auth.currentUser && window.auth.currentUser.email);
-            const pick = S.senders.find(a => a.email === lower(bdrDoc && bdrDoc.meetingEmailFromEmail))
-                || S.senders.find(a => a.email === me)
-                || S.senders[0];
-            el.from.value = pick.email;
-            S.sender = pick;
+                `<option value="${esc(a.email)}"${a.connected ? '' : ' disabled'}>${esc(a.displayName + ' <' + a.email + '>' + (a.connected ? '' : '  (not connected)'))}</option>`).join('');
+            const usable = S.senders.filter(a => a.connected);
+            const me = window.auth && window.auth.currentUser && window.auth.currentUser.email;
+            const pick = usable.find(a => a.email === lower(bdrDoc && bdrDoc.meetingEmailFromEmail))
+                || senderForLoginEmail(S.senders, me)
+                || usable[0] || null;
+            if (pick) { el.from.value = pick.email; S.sender = pick; }
+            S.senders.filter(a => !a.connected).forEach(a => {
+                warnings.push({ bad: !pick, text: `${esc(a.displayName)} can't send yet: <b>${esc(a.email)}</b> is not connected${a.connectedElsewhere.length
+                    ? ` (only ${esc(a.connectedElsewhere.join(', '))} is). Connect the primary address` : ''} on the OAuth Email Connections page.` });
+            });
         } else {
             el.from.innerHTML = '<option value="">No sending mailbox available</option>';
-            warnings.push({ bad: true, text: S.sendersError
-                ? `Could not load the connected mailboxes (${esc(S.sendersError)}). Refresh and try again.`
-                : `No connected @${SENDER_DOMAIN} mailbox was found. Connect Taylor, Sam or Joe on the OAuth Email Connections page first.` });
+            warnings.push({ bad: true, text: `Could not load the connected mailboxes${S.sendersError ? ' (' + esc(S.sendersError) + ')' : ''}. Refresh and try again.` });
         }
 
         // Recipients
@@ -524,10 +581,27 @@ BODY:
     }
 
     function updateSigHint(S) {
-        const sig = signatureHtmlFor(S.sender);
-        S.el.sigHint.innerHTML = !S.sender ? ''
-            : sig ? `<span style="color:#15803d"><i class="fas fa-check-circle"></i> ${esc(senderFirstName(S.sender))}'s saved signature will be added.</span>`
-                  : `<span style="color:#b91c1c"><i class="fas fa-exclamation-triangle"></i> No signature is saved for ${esc(S.sender.email)}. Add one on the OAuth Email Connections page, or it will send without one.</span>`;
+        const s = S.sender;
+        const sig = signatureHtmlFor(s);
+        const hint = S.el.sigHint;
+        if (!s) { hint.innerHTML = ''; return; }
+        if (sig && s.signatureOwn) {
+            hint.innerHTML = `<span style="color:#15803d"><i class="fas fa-check-circle"></i> ${esc(senderFirstName(s))}'s signature saved on ${esc(s.email)} will be added.</span>`;
+        } else if (sig) {
+            // Borrowed from another of this person's accounts: say so, and offer to tie it to the primary address.
+            hint.innerHTML = `<span style="color:#92400e"><i class="fas fa-info-circle"></i> ${esc(s.email)} has no saved signature, so ${esc(senderFirstName(s))}'s signature from <b>${esc(s.signatureSource || 'another account')}</b> will be used. Check it in the preview. </span>
+                <button type="button" class="pmn-btn sec" id="pmn-sig-save" style="padding:.2rem .6rem;font-size:.75rem"><i class="fas fa-save"></i> Save it to ${esc(s.email)}</button>`;
+            const btn = hint.querySelector('#pmn-sig-save');
+            btn.onclick = async () => {
+                btn.disabled = true;
+                btn.textContent = 'Saving…';
+                try { await adoptSignature(s); toast(`Signature saved to ${s.email}`); }
+                catch (err) { S.setStatus('Could not save the signature: ' + err.message, 'err'); }
+                if (!S.closed) updateSigHint(S);
+            };
+        } else {
+            hint.innerHTML = `<span style="color:#b91c1c"><i class="fas fa-exclamation-triangle"></i> No signature is saved for ${esc(s.email)} or any other account for ${esc(senderFirstName(s))}. Add one on the OAuth Email Connections page, or it will send without one.</span>`;
+        }
     }
 
     // ── Employers ────────────────────────────────────────────────────────────────

@@ -1,9 +1,12 @@
 /**
  * HealthConnect Common Header Component
- * Version: 3.6.0 - Manage Data suite + embed mode
+ * Version: 3.7.0 - Manage Data suite + embed mode
  * 
  * Provides a beautiful, consistent header across all HealthConnect pages
  * with organized dropdown navigation sections.
+ * 
+ * Changelog v3.7.0:
+ * - LinkedIn URL Finder now opens inside manage_data.html (?tool=linkedin_url_finder)
  * 
  * Changelog v3.6.0:
  * - Embed mode: when a page is loaded with ?embed=1 (inside manage_data.html)
@@ -113,6 +116,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Prospect Org Admin', href: 'manage_data.html?tool=prospect_organizations_admin', icon: 'fa-building-circle-check' },
                 { label: 'LinkedIn Contact Search', href: 'linkedin_contact_search.html', icon: 'fa-search' },
                 { label: 'Contact Search by Keyword', href: 'manage_data.html?tool=contact_search_by_keyword', icon: 'fa-key' },
+                { label: 'LinkedIn URL Finder', href: 'manage_data.html?tool=linkedin_url_finder', icon: 'fa-link' },
                 { label: 'divider' },
                 // Analytics & Reporting
                 { label: 'Cost/Revenue Tracking', href: 'cost_revenue_tracking.html', icon: 'fa-dollar-sign' },
