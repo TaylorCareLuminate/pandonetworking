@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en" class="protection-hide">
 <head>
-    <!-- CACHE BUSTER v4.15.2 - FEWER READS: completed-calls cache for follow-up info, shared history slice, single performance-stats read, no unused weekly leaderboard read, parallel declined queries -->
+    <!-- CACHE BUSTER v4.17.0 - PER-CALLER ORDER: queue stays oldest-first but each window of 25 contacts is shuffled per caller (seeded by email, stable across reloads) so teammates stop colliding; callbacks still first. Previous v4.16.1 - CLAIM GUARD: claims refuse activities a teammate already completed; recording your own call no longer marks the shared call log as fresh (teammates' calls are re-read before each contact); queue recheck window 15s -> 5s. Previous v4.16.0 - BAD NUMBERS: all-time bad-number block from completed outcomes, 10-digit matching, auto-switch to alternate numbers, bad-number attempts no longer start the 72h contact cooldown, call card shows the activity's current number -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
@@ -2472,7 +2472,7 @@
 
     <script type="module">
         // 🔐 PAGE VERSION FOR CACHE BUSTING
-            const PAGE_VERSION = 'v2.13.2-fewer-reads';
+            const PAGE_VERSION = 'v2.15.0-per-caller-order';
         console.log(`📄 Phone Calls Page Version: ${PAGE_VERSION}`);
         console.log('🛡️ Duplicate Call Checking: ENABLED (72-hour / 3-day cooldown)');
         console.log('🔒 Assignment System: FIXED (respects assignment expiry - prevents queue overlaps)');
@@ -2620,6 +2620,32 @@
             return removed;
         }
 
+        // Phone numbers (10-digit keys) ever reported bad in the selected campaign. Rebuilt by
+        // loadCalls, and extended when this agent records a bad-number outcome.
+        const knownBadPhones = new Set();
+
+        function isBadNumberOutcome(outcome) {
+            return typeof outcome === 'string' && outcome.includes('bad-number');
+        }
+
+        function activityPhoneKey(record) {
+            return extractMainPhoneNumber(record?.phoneNumber || record?.phone ||
+                record?.contactData?.workphone || record?.contactData?.phone || '');
+        }
+
+        // Next number to try after currentKey, in phone → phone2 → phone3 order, skipping
+        // numbers already known to be bad. Returns the raw stored value or null.
+        function pickAlternatePhone(record, currentKey) {
+            const slots = [record.phone || record.phoneNumber || '', record.phone2 || '', record.phone3 || ''];
+            const keys = slots.map((raw) => extractMainPhoneNumber(raw));
+            const currentIndex = keys.indexOf(currentKey);
+            for (let i = currentIndex + 1; i < slots.length; i++) {
+                const key = keys[i];
+                if (key.length >= 10 && key !== currentKey && !knownBadPhones.has(key)) return slots[i];
+            }
+            return null;
+        }
+
         function isActivityInCooldown(activity, cooldownSet, phoneLastCalledThreshold) {
             if (phoneLastCalledThreshold && activity.phoneLastCalledAt && activity.phoneLastCalledAt > phoneLastCalledThreshold) {
                 return true;
@@ -2697,8 +2723,9 @@
             recentCallLog = recentCallLog.filter((existing) => existing.id !== entry.id);
             recentCallLog.unshift(entry);
             recentCallLog.sort((a, b) => b.calledAt - a.calledAt);
+            // Deliberately leaves recentCallLogLoadedAt alone: this agent's own call isn't a server
+            // read, and treating it as one hid teammates' calls from the next queue recheck.
             recentCallLogCampaignId = entry.campaignId || recentCallLogCampaignId;
-            recentCallLogLoadedAt = Date.now();
         }
 
         // maxAgeMs lets a caller accept a recent copy instead of re-reading the log every call.
@@ -2746,11 +2773,14 @@
             return recentCallLog;
         }
 
-        function loggedCallsForActivity(activity, { withinHours = null, skipSameActivity = false } = {}) {
+        // ignoreBadNumbers: for the cooldown, a bad-number attempt didn't reach the contact, so it
+        // must not hold back their alternate number. The bad number itself is blocked via knownBadPhones.
+        function loggedCallsForActivity(activity, { withinHours = null, skipSameActivity = false, ignoreBadNumbers = false } = {}) {
             const cutoff = withinHours == null ? null : Date.now() - withinHours * 60 * 60 * 1000;
             const matches = [];
             for (const entry of recentCallLog) {
                 if (cutoff != null && entry.calledAt.getTime() < cutoff) continue;
+                if (ignoreBadNumbers && isBadNumberOutcome(entry.outcome)) continue;
                 if (skipSameActivity && activity?.id && entry.callId && entry.callId === activity.id) continue;
                 const reason = matchCalledParty(activity, entry);
                 if (!reason) continue;
@@ -2762,7 +2792,7 @@
         // The queue is a snapshot from when the campaign was selected, and pre-claimed calls skip
         // the claim-time check. Teammates keep calling after that, so every remaining contact is
         // re-matched against the shared call log before the next one is shown.
-        const QUEUE_RECHECK_MAX_AGE_MS = 15 * 1000;
+        const QUEUE_RECHECK_MAX_AGE_MS = 5 * 1000;
 
         async function pruneQueueAgainstCallLog() {
             if (!selectedCampaign || !callQueue.length) return 0;
@@ -2777,8 +2807,14 @@
             let keptBeforeIndex = 0;
             let removed = 0;
             callQueue.forEach((call, i) => {
+                const phoneKey = activityPhoneKey(call);
+                if (phoneKey && knownBadPhones.has(phoneKey)) {
+                    removed++;
+                    console.log(`⏭️ Queue recheck: dropped ${call.contactName || call.orgName || 'Unknown'} — phone ${phoneKey} was reported bad`);
+                    return;
+                }
                 const isCallback = call.isCallback || call.status === 'callback-scheduled';
-                const loggedMatch = isCallback ? null : loggedCallsForActivity(call, { withinHours: 72 })[0];
+                const loggedMatch = isCallback ? null : loggedCallsForActivity(call, { withinHours: 72, ignoreBadNumbers: true })[0];
                 if (loggedMatch) {
                     removed++;
                     console.log(`⏭️ Queue recheck: dropped ${call.contactName || call.orgName || 'Unknown'} — ${loggedMatch.matchReason}, called ${loggedMatch.calledAt.toLocaleString()} by ${loggedMatch.callerName || loggedMatch.userEmail || 'unknown'}`);
@@ -4122,6 +4158,13 @@
                         }
                     }
                     
+                    // A bad-number attempt blocks only that number, not the contact (same rule as loadCalls)
+                    if (isBadNumberOutcome(data.outcome)) {
+                        const badMainPhone = extractMainPhoneNumber(data.phoneNumber || data.phone || '');
+                        if (badMainPhone) contactsCalledInLast24Hours.add(badMainPhone);
+                        return;
+                    }
+
                     if (completedAt && completedAt >= cooldownStart) {
                         callsWithinCooldown++;
                         const identifiersAdded = [];
@@ -4192,7 +4235,7 @@
                 const contactsWithBadNumbers = new Set();
                 recentCallsSnapshot.docs.forEach(doc => {
                     const data = doc.data();
-                    if (data.outcome && (data.outcome.includes('bad-number') || data.outcome === 'contact-left-no-replacement')) {
+                    if (data.outcome === 'contact-left-no-replacement') {
                         if (data.outreachSetId) contactsWithBadNumbers.add(data.outreachSetId);
                         if (data.contactEmail) contactsWithBadNumbers.add(data.contactEmail.toLowerCase());
                     }
@@ -5915,6 +5958,13 @@
                             contactsCalledToday.add(data.contactEmail.toLowerCase());
                         }
                     }
+
+                    // A bad-number attempt never reached the contact: it doesn't start a cooldown or push
+                    // out their next attempt, so an alternate number can be called right away. The bad
+                    // number itself is blocked by knownBadPhones; wrong-person by the declined filter.
+                    if (isBadNumberOutcome(data.outcome)) {
+                        return;
+                    }
                     
                     // Track contacts called within COOLDOWN PERIOD (for filtering)
                     if (completedAt >= cooldownStart) {
@@ -5940,9 +5990,9 @@
                         callsOutsideCooldown++;
                     }
                     
-                    // Track bad numbers (from today's calls only)
+                    // Track contacts that left with no replacement (from today's calls only)
                     if (completedAt >= startOfToday) {
-                        if (data.outcome && (data.outcome.includes('bad-number') || data.outcome === 'contact-left-no-replacement')) {
+                        if (data.outcome === 'contact-left-no-replacement') {
                             if (data.outreachSetId) {
                                 contactsWithBadNumbers.add(data.outreachSetId);
                             }
@@ -5991,61 +6041,34 @@
                 // Query ALL historical bad numbers (not just today) and automatically mark pending activities with those numbers
                 console.log('🔍 Checking for phone numbers previously marked as bad (already loaded in parallel)...');
                 
-                // historicalSnapshot already loaded in parallel query above
-                const badPhoneNumbers = new Set(); // Store normalized phone numbers that are bad
-                
-                // Helper function to normalize phone numbers for comparison
-                const normalizePhone = (phone) => {
-                    if (!phone) return '';
-                    return phone.replace(/\D/g, ''); // Remove all non-digits
+                // Bad numbers are keyed by the 10-digit main number, so "+1 (555) 123-4567" and
+                // "555-123-4567 x12" match, and a DIFFERENT number for the same contact still works.
+                const badPhoneNumbers = knownBadPhones;
+                badPhoneNumbers.clear();
+                const normalizePhone = (phone) => extractMainPhoneNumber(phone);
+                // Wrong-person is a permanent contact failure, so only invalid/disconnected numbers
+                // are eligible for a switch to the contact's alternate number.
+                const alternateEligiblePhones = new Set();
+                const addBadPhoneFrom = (data) => {
+                    if (!isBadNumberOutcome(data.outcome) && !data.markedAsBadNumber && !data.autoMarkedAsBad) return;
+                    const key = activityPhoneKey(data);
+                    if (key.length < 10) return;
+                    badPhoneNumbers.add(key);
+                    const reason = data.badNumberReason || data.outcome;
+                    if (reason !== 'bad-number-wrong-person') alternateEligiblePhones.add(key);
                 };
-                
-                historicalSnapshot.docs.forEach((doc) => {
-                    const data = doc.data();
-                    
-                    // Check if this was marked as a bad number outcome
-                    if (data.outcome && (
-                        data.outcome.includes('bad-number') || 
-                        data.outcome === 'bad-number-disconnected' || 
-                        data.outcome === 'bad-number-wrong-person' ||
-                        data.outcome === 'bad-number'
-                    )) {
-                        const phoneNumber = data.phoneNumber || data.phone;
-                        if (phoneNumber) {
-                            const normalized = normalizePhone(phoneNumber);
-                            if (normalized) {
-                                badPhoneNumbers.add(normalized);
-                            }
-                        }
-                    }
-                });
-                
+
+                historicalSnapshot.docs.forEach((doc) => addBadPhoneFrom(doc.data()));
                 console.log(`📞 Found ${badPhoneNumbers.size} unique phone numbers marked as bad in recent window`);
 
-                // FIX: historicalSnapshot is actually only the last 72h (same query as the cooldown),
-                // so bad numbers reported earlier than that were escaping and reappearing in the queue.
-                // Pull EVERY number ever reported bad in this campaign (all-time) so a bad number can
-                // never come back. Keyed by phone, so a DIFFERENT number for the same contact still works.
+                // historicalSnapshot is only the last 72h. Every completed call in the campaign is needed
+                // so a number reported bad weeks ago can't come back. The bad call itself was never
+                // flagged markedAsBadNumber, so the outcome is what identifies it.
                 try {
-                    const allTimeBadSnapshot = await getDocs(query(
-                        collection(db, 'phone_activities'),
-                        where('campaignId', '==', selectedCampaign),
-                        where('markedAsBadNumber', '==', true)
-                    ));
-                    let allTimeAdded = 0;
-                    allTimeBadSnapshot.docs.forEach((docSnap) => {
-                        const d = docSnap.data();
-                        const raw = d.phoneNumber || d.phone || (d.contactData && (d.contactData.workphone || d.contactData.phone)) || '';
-                        const normalized = normalizePhone(raw);
-                        if (normalized && normalized.length >= 10 && !badPhoneNumbers.has(normalized)) {
-                            badPhoneNumbers.add(normalized);
-                            allTimeAdded++;
-                        }
-                    });
-                    console.log(`📞 All-time bad-number sweep added ${allTimeAdded} more (total blocked: ${badPhoneNumbers.size})`);
+                    const recentCount = badPhoneNumbers.size;
+                    (await getCompletedCallsForCampaign(selectedCampaign)).forEach((docSnap) => addBadPhoneFrom(docSnap.data()));
+                    console.log(`📞 All-time bad-number sweep added ${badPhoneNumbers.size - recentCount} more (total blocked: ${badPhoneNumbers.size})`);
                 } catch (allTimeBadErr) {
-                    // If a composite index (campaignId + markedAsBadNumber) isn't present yet, fail open:
-                    // the recent-window set still applies. Console will include a link to create the index.
                     console.warn('⚠️ All-time bad-number sweep failed (using recent window only):', allTimeBadErr?.message || allTimeBadErr);
                 }
                 
@@ -6121,32 +6144,52 @@
                     
                     const autoMarkBadPromises = [];
                     
+                    let switchedToAlternateCount = 0;
                     allPendingSnapshot.docs.forEach((docSnapshot) => {
                         const data = docSnapshot.data();
-                        const activityPhone = data.phoneNumber || data.phone;
-                        
-                        if (activityPhone) {
-                            const normalizedActivityPhone = normalizePhone(activityPhone);
-                            
-                            // If this phone number was previously marked as bad, auto-mark this activity
-                            if (badPhoneNumbers.has(normalizedActivityPhone)) {
-                                console.log(`🚫 Auto-marking activity for ${data.contactName || 'Unknown'} - phone ${activityPhone} was previously marked as bad`);
-                                
-                                autoMarkBadPromises.push(
-                                    updateDoc(doc(db, 'phone_activities', docSnapshot.id), {
-                                        status: 'completed',
-                                        outcome: 'bad-number',
-                                        completedAt: new Date().toISOString(),
-                                        completedBy: 'system-auto-bad-number',
-                                        notes: `Automatically marked as bad number - this phone number (${activityPhone}) was previously reported as bad`,
-                                        autoMarkedAsBad: true,
-                                        autoMarkedAt: new Date().toISOString()
-                                    })
-                                );
-                                autoMarkedCount++;
-                            }
+                        const normalizedActivityPhone = activityPhoneKey(data);
+                        if (!normalizedActivityPhone || !badPhoneNumbers.has(normalizedActivityPhone)) return;
+                        const activityPhone = data.phoneNumber || data.phone || data.contactData?.workphone || data.contactData?.phone;
+
+                        // A contact with another number on file gets that number instead of being closed out.
+                        const alternatePhone = alternateEligiblePhones.has(normalizedActivityPhone)
+                            ? pickAlternatePhone(data, normalizedActivityPhone)
+                            : null;
+                        if (alternatePhone) {
+                            console.log(`🔁 Switching ${data.contactName || data.orgName || 'Unknown'} from bad number ${activityPhone} to ${alternatePhone}`);
+                            autoMarkBadPromises.push(
+                                updateDoc(doc(db, 'phone_activities', docSnapshot.id), {
+                                    phoneNumber: alternatePhone,
+                                    phone: alternatePhone,
+                                    previousPhoneNumber: activityPhone,
+                                    phoneNumberUpdated: true,
+                                    phoneNumberUpdatedAt: new Date().toISOString(),
+                                    phoneNumberUpdatedReason: 'previous-number-bad'
+                                })
+                            );
+                            switchedToAlternateCount++;
+                            return;
                         }
+
+                        console.log(`🚫 Auto-marking activity for ${data.contactName || 'Unknown'} - phone ${activityPhone} was previously marked as bad`);
+                        autoMarkBadPromises.push(
+                            updateDoc(doc(db, 'phone_activities', docSnapshot.id), {
+                                status: 'completed',
+                                outcome: 'bad-number',
+                                completedAt: new Date().toISOString(),
+                                completedBy: 'system-auto-bad-number',
+                                notes: `Automatically marked as bad number - this phone number (${activityPhone}) was previously reported as bad`,
+                                autoMarkedAsBad: true,
+                                markedAsBadNumber: true,
+                                badNumberReason: 'bad-number',
+                                autoMarkedAt: new Date().toISOString()
+                            })
+                        );
+                        autoMarkedCount++;
                     });
+                    if (switchedToAlternateCount > 0) {
+                        console.log(`🔁 Switched ${switchedToAlternateCount} activities to an alternate number`);
+                    }
                     
                     // Execute all auto-mark updates
                     if (autoMarkBadPromises.length > 0) {
@@ -6388,6 +6431,12 @@
                 // scheduled prospect. Drop those before they get pinned to the front of the queue.
                 if (dueCallbacks.length > 0) {
                     dueCallbacks = dueCallbacks.filter((cb) => {
+                        const callbackPhoneKey = activityPhoneKey(cb);
+                        if (callbackPhoneKey && knownBadPhones.has(callbackPhoneKey)) {
+                            console.log(`📵 Removing callback for ${cb.contactName || cb.orgName || 'Unknown'} - phone ${callbackPhoneKey} was reported bad`);
+                            callsFilteredBadNumber++;
+                            return false;
+                        }
                         const meetingMatch = companyHasScheduledMeeting(cb);
                         if (meetingMatch) {
                             console.log(`🏢 Removing callback for ${cb.contactName || cb.orgName || 'Unknown'} - company already has a meeting (${meetingMatch.match}: ${meetingMatch.details?.originalName || meetingMatch.key})`);
@@ -6508,7 +6557,7 @@
                         }
                     }
                     if (!wasCalledRecently) {
-                        const loggedMatch = loggedCallsForActivity(data, { withinHours: cooldownHours })[0];
+                        const loggedMatch = loggedCallsForActivity(data, { withinHours: cooldownHours, ignoreBadNumbers: true })[0];
                         if (loggedMatch) {
                             wasCalledRecently = true;
                             cooldownMatchReason = `call log (${loggedMatch.matchReason}, ${loggedMatch.calledAt.toLocaleString()} by ${loggedMatch.userEmail || 'unknown'})`;
@@ -6539,6 +6588,12 @@
                     
                     if (hasBadNumber) {
                         console.log(`📵 Skipping ${data.contactName || 'Unknown'} - has bad number (already attempted today)`);
+                        callsFilteredBadNumber++;
+                        continue;
+                    }
+                    const queuePhoneKey = activityPhoneKey(data);
+                    if (queuePhoneKey && knownBadPhones.has(queuePhoneKey)) {
+                        console.log(`📵 Skipping ${data.contactName || data.orgName || 'Unknown'} - phone ${queuePhoneKey} was reported bad`);
                         callsFilteredBadNumber++;
                         continue;
                     }
@@ -6849,11 +6904,33 @@
 
                 console.log(`📦 Retrieved ${callQueue.length} phone activities from Firestore (after filtering future-scheduled and out-of-hours calls)`);
 
-                // Sort calls by scheduled time (oldest/overdue first)
+                // Oldest-first overall, but each window of QUEUE_SPREAD_WINDOW contacts is shuffled
+                // per caller (stable across reloads) so teammates working the shared pool don't
+                // all reach for the same contact at the same time.
+                const QUEUE_SPREAD_WINDOW = 25;
+                const queueTime = (call) => {
+                    const raw = call.scheduledAt || call.scheduledDate || call.createdAt;
+                    const date = raw && raw.toDate ? raw.toDate() : new Date(raw || Date.now());
+                    const time = date.getTime();
+                    return Number.isNaN(time) ? Infinity : time;
+                };
+                const callerSeed = currentUser?.email || '';
+                const callerRank = (call) => {
+                    let hash = 2166136261;
+                    const key = `${callerSeed}|${call.id}`;
+                    for (let i = 0; i < key.length; i++) {
+                        hash ^= key.charCodeAt(i);
+                        hash = Math.imul(hash, 16777619);
+                    }
+                    return hash >>> 0;
+                };
+                const queueTimes = new Map(callQueue.map((call) => [call, queueTime(call)]));
+                callQueue.sort((a, b) => (queueTimes.get(a) - queueTimes.get(b)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+                const queueOrder = new Map(callQueue.map((call, index) => [call, { window: Math.floor(index / QUEUE_SPREAD_WINDOW), rank: callerRank(call) }]));
                 callQueue.sort((a, b) => {
-                    const aTime = a.scheduledAt || a.scheduledDate || a.createdAt || new Date().toISOString();
-                    const bTime = b.scheduledAt || b.scheduledDate || b.createdAt || new Date().toISOString();
-                    return new Date(aTime) - new Date(bTime);
+                    const ao = queueOrder.get(a);
+                    const bo = queueOrder.get(b);
+                    return (ao.window - bo.window) || (ao.rank - bo.rank);
                 });
 
                 // PRIORITIZE CALLBACKS: Add due callbacks to the FRONT of the queue
@@ -7317,6 +7394,10 @@
                     
                     const callData = callDoc.data();
                     
+                    if (callData.status === 'completed') {
+                        throw new Error(`This contact was already called recently by ${callData.completedBy || 'a teammate'}.`);
+                    }
+                    
                     // Check if already claimed by someone else
                     if (callData.claimedBy && callData.claimedBy !== currentUser.email) {
                         // Check if claim has expired
@@ -7442,7 +7523,11 @@
                         return completedMain && mainPhone === completedMain;
                     })();
                     
-                    if (matchByEmail || matchByOutreachId || matchByPhone) {
+                    // A bad-number attempt only blocks that same number, not the contact's other numbers
+                    const contactMatch = isBadNumberOutcome(data.outcome)
+                        ? matchByPhone
+                        : (matchByEmail || matchByOutreachId || matchByPhone);
+                    if (contactMatch) {
                         foundRecentCall = true;
                         
                         // completedAt already extracted above for filtering
@@ -7465,7 +7550,7 @@
                         // Race guard: accept a copy up to 15s old so a call logged by another agent
                         // moments ago is still caught without re-reading the log for every contact.
                         await loadRecentCallLog(selectedCampaign, false, 15 * 1000);
-                        const loggedMatch = loggedCallsForActivity(callData, { withinHours: cooldownHours })[0];
+                        const loggedMatch = loggedCallsForActivity(callData, { withinHours: cooldownHours, ignoreBadNumbers: true })[0];
                         if (loggedMatch) {
                             foundRecentCall = true;
                             recentCallInfo = {
@@ -7590,7 +7675,7 @@
                 let recentMatchingCalls = [];
                 try {
                     await loadRecentCallLog(selectedCampaign, false, 15 * 1000);
-                    recentMatchingCalls = loggedCallsForActivity(currentCall, { withinHours: cooldownHours }).map((entry) => ({
+                    recentMatchingCalls = loggedCallsForActivity(currentCall, { withinHours: cooldownHours, ignoreBadNumbers: true }).map((entry) => ({
                         timestamp: entry.calledAt.toISOString(),
                         userEmail: entry.callerName ? `${entry.callerName} (${entry.userEmail})` : (entry.userEmail || 'Unknown'),
                         outcome: entry.outcome,
@@ -7707,15 +7792,17 @@
                     
                     let isMatch = false;
                     let matchReason = '';
+                    // A bad-number attempt only counts against that same number
+                    const badNumberAttempt = isBadNumberOutcome(data.outcome);
                     
                     // Check for match by email (most reliable)
-                    if (contactEmail && data.contactEmail && 
+                    if (!badNumberAttempt && contactEmail && data.contactEmail && 
                         contactEmail.toLowerCase() === data.contactEmail.toLowerCase()) {
                         isMatch = true;
                         matchReason = 'Same Email';
                     }
                     // Check by name + company
-                    else if (contactName && companyName && 
+                    else if (!badNumberAttempt && contactName && companyName && 
                             data.contactName && data.companyName &&
                             contactName.toLowerCase() === data.contactName.toLowerCase() &&
                             companyName.toLowerCase() === data.companyName.toLowerCase()) {
@@ -7869,11 +7956,11 @@
             if (droppedByRecheck > 0) {
                 if (!callQueue.length) {
                     currentCall = null;
-                    showAlert('Everyone left in your queue was just called by a teammate. Reloading...', 'info');
+                    showAlert('Everyone left in your queue was just called or has a bad number. Reloading...', 'info');
                     setTimeout(() => loadCalls(), 2000);
                     return;
                 }
-                showAlert(`Skipped ${droppedByRecheck} contact${droppedByRecheck === 1 ? '' : 's'} a teammate called after your queue loaded.`, 'info');
+                showAlert(`Skipped ${droppedByRecheck} contact${droppedByRecheck === 1 ? '' : 's'} that were just called or have a bad number.`, 'info');
             }
 
             currentCall = callQueue[currentCallIndex];
@@ -8052,8 +8139,10 @@
             // Update contact info
             document.getElementById('contactName').textContent = displayName;
             document.getElementById('contactCompany').textContent = displayCompany;
-            document.getElementById('contactPhone').textContent = 
-                contact.workphone || contact.phone || 'No phone number';
+            // phoneNumber/phone is what gets switched to an alternate after a bad number;
+            // legacy contactData.workphone can still hold the old bad one.
+            document.getElementById('contactPhone').textContent =
+                currentCall.phoneNumber || currentCall.phone || contact.workphone || contact.phone || 'No phone number';
             document.getElementById('contactEmail').textContent = 
                 contact.workemail || contact.email || 'No email';
             document.getElementById('contactTitle').textContent = 
@@ -8376,7 +8465,7 @@
             console.log('📱 Loading new call - undo button remains available for previous call');
             
             // Load call history
-            const phoneNumber = contact.workphone || contact.phone || '';
+            const phoneNumber = currentCall.phoneNumber || currentCall.phone || contact.workphone || contact.phone || '';
             loadCallHistory(phoneNumber);
             
             // Load campaign script for this call
@@ -8586,20 +8675,15 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 let nextPhone = null;
                 let nextPhoneLabel = '';
                 
-                // Normalize phone numbers for comparison (remove formatting)
-                const normalizePhone = (p) => p.replace(/\D/g, '');
+                // Compare 10-digit main numbers so formatting, a leading 1, or an extension don't matter
+                const normalizePhone = (p) => extractMainPhoneNumber(p || '');
                 const currentNormalized = normalizePhone(currentPhone);
                 
-                if (normalizePhone(phone1) === currentNormalized && phone2) {
-                    nextPhone = phone2;
-                    nextPhoneLabel = 'Phone 2';
-                } else if (normalizePhone(phone2) === currentNormalized && phone3) {
-                    nextPhone = phone3;
-                    nextPhoneLabel = 'Phone 3';
-                } else if (normalizePhone(phone1) === currentNormalized && phone3) {
-                    // If phone1 failed and phone2 doesn't exist, try phone3
-                    nextPhone = phone3;
-                    nextPhoneLabel = 'Phone 3';
+                nextPhone = pickAlternatePhone(currentCall, currentNormalized);
+                if (nextPhone) {
+                    const nextKey = normalizePhone(nextPhone);
+                    nextPhoneLabel = nextKey === normalizePhone(phone3) ? 'Phone 3'
+                        : nextKey === normalizePhone(phone2) ? 'Phone 2' : 'Phone 1';
                 }
                 
                 if (nextPhone) {
@@ -8621,7 +8705,7 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     
                     badPhoneActivitiesSnapshot.docs.forEach((docSnap) => {
                         const activityData = docSnap.data();
-                        const activityPhone = normalizePhone(activityData.phoneNumber || '');
+                        const activityPhone = activityPhoneKey(activityData);
                         
                         // CRITICAL: Skip the current call - it will be updated separately by the main recordOutcome logic
                         if (docSnap.id === currentCall.id) {
@@ -8631,7 +8715,7 @@ Would you have 15 minutes available this week or next for a quick call?`;
                         
                         // Mark as completed ONLY if it has the EXACT SAME bad phone number
                         // This could be for ANY contact, not just the current one
-                        if (activityPhone === currentNormalized) {
+                        if (currentNormalized && activityPhone === currentNormalized) {
                             batchBadNumberUpdates.push(
                                 updateDoc(doc(db, 'phone_activities', docSnap.id), {
                                     status: 'completed',
@@ -8668,7 +8752,7 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     let existingAlternateActivity = null;
                     alternatePhoneSnapshot.docs.forEach((docSnap) => {
                         const activityData = docSnap.data();
-                        const activityPhone = normalizePhone(activityData.phoneNumber || '');
+                        const activityPhone = activityPhoneKey(activityData);
                         if (activityPhone === normalizedNextPhone) {
                             existingAlternateActivity = { id: docSnap.id, data: activityData };
                         }
@@ -8767,7 +8851,7 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     
                     badPhoneActivitiesSnapshot.docs.forEach((docSnap) => {
                         const activityData = docSnap.data();
-                        const activityPhone = normalizePhone(activityData.phoneNumber || '');
+                        const activityPhone = activityPhoneKey(activityData);
                         
                         // CRITICAL: Only mark as completed if phone numbers match AND are not empty
                         // This prevents accidentally marking ALL calls as bad when the phone number is missing
@@ -8992,6 +9076,13 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 
                 if (additionalData) {
                     updateData.additionalData = additionalData;
+                }
+
+                if (isBadNumberOutcome(outcome)) {
+                    updateData.markedAsBadNumber = true;
+                    updateData.badNumberReason = outcome;
+                    const badKey = extractMainPhoneNumber(phoneNumber);
+                    if (badKey.length >= 10) knownBadPhones.add(badKey);
                 }
                 
                 if (contactCorrectionData) {
@@ -9618,15 +9709,19 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 
                 callQueue.splice(currentCallIndex, 1);
 
-                // Block sibling attempts (call 2/3, duplicate outreach records) from appearing next
-                addRecordToCooldownIdentifiers(sessionCooldownIdentifiers, {
-                    ...currentCall,
-                    phoneNumber: phoneNumber || currentCall.phoneNumber || currentCall.phone
-                });
-                purgeCallQueueForContact({
-                    ...currentCall,
-                    phoneNumber: phoneNumber || currentCall.phoneNumber || currentCall.phone
-                });
+                // Block sibling attempts (call 2/3, duplicate outreach records) from appearing next.
+                // A bad number blocks only that number (knownBadPhones), so the contact's
+                // alternate number stays callable.
+                if (!isBadNumberOutcome(outcome)) {
+                    addRecordToCooldownIdentifiers(sessionCooldownIdentifiers, {
+                        ...currentCall,
+                        phoneNumber: phoneNumber || currentCall.phoneNumber || currentCall.phone
+                    });
+                    purgeCallQueueForContact({
+                        ...currentCall,
+                        phoneNumber: phoneNumber || currentCall.phoneNumber || currentCall.phone
+                    });
+                }
 
                 // A meeting books the whole company, not just this contact. Drop every other
                 // queued call at that company before the next call is shown.
@@ -11101,9 +11196,15 @@ Would you have 15 minutes available this week or next for a quick call?`;
             await deleteDoc(doc(db, 'campaign_call_tracking', trackingId));
             recentCallLog = recentCallLog.filter((entry) => entry.id !== trackingId);
             invalidateCompletedCallsCache();
+            if (isBadNumberOutcome(trackingData.outcome)) {
+                knownBadPhones.delete(extractMainPhoneNumber(
+                    trackingData.phoneNumber || activityData.phoneNumber || activityData.phone || ''));
+            }
             await updateDoc(activityRef, {
                 status: restoredActivityStatus(activityData),
                 outcome: deleteField(),
+                markedAsBadNumber: deleteField(),
+                badNumberReason: deleteField(),
                 completedAt: deleteField(),
                 completedBy: deleteField(),
                 basePayment: deleteField(),
