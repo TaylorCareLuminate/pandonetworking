@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en" class="protection-hide">
 <head>
-    <!-- CACHE BUSTER v4.15.0 - CALL LOG: cooldown and previous outcomes read the call backlog, not a partial phone_activities scan -->
+    <!-- CACHE BUSTER v4.15.2 - FEWER READS: completed-calls cache for follow-up info, shared history slice, single performance-stats read, no unused weekly leaderboard read, parallel declined queries -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
@@ -2472,7 +2472,7 @@
 
     <script type="module">
         // 🔐 PAGE VERSION FOR CACHE BUSTING
-            const PAGE_VERSION = 'v2.13.0-call-log-cooldown';
+            const PAGE_VERSION = 'v2.13.2-fewer-reads';
         console.log(`📄 Phone Calls Page Version: ${PAGE_VERSION}`);
         console.log('🛡️ Duplicate Call Checking: ENABLED (72-hour / 3-day cooldown)');
         console.log('🔒 Assignment System: FIXED (respects assignment expiry - prevents queue overlaps)');
@@ -2757,6 +2757,59 @@
                 matches.push({ ...entry, matchReason: reason });
             }
             return matches;
+        }
+
+        // The queue is a snapshot from when the campaign was selected, and pre-claimed calls skip
+        // the claim-time check. Teammates keep calling after that, so every remaining contact is
+        // re-matched against the shared call log before the next one is shown.
+        const QUEUE_RECHECK_MAX_AGE_MS = 15 * 1000;
+
+        async function pruneQueueAgainstCallLog() {
+            if (!selectedCampaign || !callQueue.length) return 0;
+            try {
+                await loadRecentCallLog(selectedCampaign, false, QUEUE_RECHECK_MAX_AGE_MS);
+            } catch (err) {
+                console.warn('⚠️ Queue recheck: call log could not be refreshed:', err);
+                return 0;
+            }
+
+            const kept = [];
+            let keptBeforeIndex = 0;
+            let removed = 0;
+            callQueue.forEach((call, i) => {
+                const isCallback = call.isCallback || call.status === 'callback-scheduled';
+                const loggedMatch = isCallback ? null : loggedCallsForActivity(call, { withinHours: 72 })[0];
+                if (loggedMatch) {
+                    removed++;
+                    console.log(`⏭️ Queue recheck: dropped ${call.contactName || call.orgName || 'Unknown'} — ${loggedMatch.matchReason}, called ${loggedMatch.calledAt.toLocaleString()} by ${loggedMatch.callerName || loggedMatch.userEmail || 'unknown'}`);
+                    return;
+                }
+                if (i < currentCallIndex) keptBeforeIndex++;
+                kept.push(call);
+            });
+
+            if (removed > 0) {
+                callQueue = kept;
+                currentCallIndex = Math.min(keptBeforeIndex, Math.max(0, callQueue.length - 1));
+            }
+            return removed;
+        }
+
+        // The recent-contact check and the call history panel issue the same limit(1000)
+        // completed-calls query for the same call about a second apart. History reuses it.
+        let completedSlice = null;
+        const COMPLETED_SLICE_REUSE_MS = 10 * 1000;
+
+        function rememberCompletedSlice(campaignId, callId, snapshot) {
+            completedSlice = { campaignId, callId, snapshot, at: Date.now() };
+        }
+
+        function takeCompletedSlice(campaignId, callId) {
+            const slice = completedSlice;
+            completedSlice = null;
+            if (!slice || slice.campaignId !== campaignId || slice.callId !== callId) return null;
+            if (Date.now() - slice.at > COMPLETED_SLICE_REUSE_MS) return null;
+            return slice.snapshot;
         }
 
         function historyMatchType(reason) {
@@ -3417,6 +3470,43 @@
             };
         }
 
+        // getPreviousCallInfo needs every completed call in the campaign, which used to be a full
+        // re-read for each contact shown. Keep one copy per campaign, top it up with calls completed
+        // since the last read, and re-read in full every 10 minutes or after an undo.
+        const completedCallsCache = { campaignId: null, byId: new Map(), syncedAt: 0, fullAt: 0 };
+        const COMPLETED_CACHE_FULL_REFRESH_MS = 10 * 60 * 1000;
+        const COMPLETED_CACHE_OVERLAP_MS = 5 * 60 * 1000;
+
+        function invalidateCompletedCallsCache() {
+            completedCallsCache.campaignId = null;
+            completedCallsCache.byId = new Map();
+            completedCallsCache.syncedAt = 0;
+            completedCallsCache.fullAt = 0;
+        }
+
+        async function getCompletedCallsForCampaign(campaignId) {
+            const cache = completedCallsCache;
+            const startedAt = Date.now();
+            const baseConstraints = [
+                where('campaignId', '==', campaignId),
+                where('status', '==', 'completed')
+            ];
+            if (cache.campaignId !== campaignId || startedAt - cache.fullAt > COMPLETED_CACHE_FULL_REFRESH_MS) {
+                const snapshot = await getDocs(query(collection(db, 'phone_activities'), ...baseConstraints));
+                cache.campaignId = campaignId;
+                cache.byId = new Map(snapshot.docs.map((d) => [d.id, d]));
+                cache.fullAt = startedAt;
+                cache.syncedAt = startedAt;
+            } else {
+                const since = new Date(cache.syncedAt - COMPLETED_CACHE_OVERLAP_MS).toISOString();
+                const delta = await getDocs(query(collection(db, 'phone_activities'), ...baseConstraints,
+                    where('completedAt', '>=', since)));
+                delta.docs.forEach((d) => cache.byId.set(d.id, d));
+                cache.syncedAt = startedAt;
+            }
+            return [...cache.byId.values()];
+        }
+
         async function getPreviousCallInfo(currentCall) {
             let logMatches = [];
             try {
@@ -3441,18 +3531,12 @@
                 console.log(`🔍 Checking for previous calls - Campaign: ${currentCall.campaignId}`);
                 console.log(`   Identifiers: contactId=${contactId}, email=${contactEmail}, phone=${mainPhone}, name=${contactName}, company=${companyName}`);
                 
-                // Query ALL completed calls in this campaign (we'll filter client-side for matches)
-                const completedCallsQuery = query(
-                    collection(db, 'phone_activities'),
-                    where('campaignId', '==', currentCall.campaignId),
-                    where('status', '==', 'completed')
-                );
-                
-                const completedSnapshot = await getDocs(completedCallsQuery);
-                console.log(`📞 Retrieved ${completedSnapshot.docs.length} completed calls from campaign`);
+                // ALL completed calls in this campaign (we'll filter client-side for matches)
+                const completedDocs = await getCompletedCallsForCampaign(currentCall.campaignId);
+                console.log(`📞 Retrieved ${completedDocs.length} completed calls from campaign`);
                 
                 // Filter for matching contacts using ANY identifier (same logic as 72h cooldown check)
-                const matchingDocs = completedSnapshot.docs.filter(doc => {
+                const matchingDocs = completedDocs.filter(doc => {
                     if (doc.id === currentCall.id) return false; // Skip the current call itself
                     
                     const data = doc.data();
@@ -6136,16 +6220,23 @@
                     
                     let permanentFailureCount = 0;
                     
-                    // Query each outcome separately (Firestore limitation - can't use 'in' with multiple conditions)
-                    for (const outcomeType of permanentFailureOutcomes) {
+                    // Query each outcome separately (Firestore limitation - can't use 'in' with multiple conditions).
+                    // Fetched in parallel, then processed in list order so first-seen ids stay the same.
+                    const failedOutcomeResults = await Promise.all(permanentFailureOutcomes.map(async (outcomeType) => {
                         try {
-                            const failedOutcomeQuery = query(
+                            const snapshot = await getDocs(query(
                                 collection(db, 'phone_activities'),
                                 where('outcome', '==', outcomeType),
                                 where('status', '==', 'completed')
-                            );
-                            
-                            const failedOutcomeSnapshot = await getDocs(failedOutcomeQuery);
+                            ));
+                            return { outcomeType, snapshot };
+                        } catch (error) {
+                            return { outcomeType, error };
+                        }
+                    }));
+                    for (const { outcomeType, snapshot: failedOutcomeSnapshot, error: failedOutcomeError } of failedOutcomeResults) {
+                        try {
+                            if (failedOutcomeError) throw failedOutcomeError;
                             failedOutcomeSnapshot.docs.forEach((doc) => {
                                 const data = doc.data();
                                 
@@ -7530,6 +7621,7 @@
                 
                 try {
                     recentCallsSnapshot = await getDocs(recentCallsQuery);
+                    rememberCompletedSlice(selectedCampaign, currentCall.id, recentCallsSnapshot);
                     console.log(`📊 Retrieved ${recentCallsSnapshot.docs.length} completed calls from campaign for duplicate checking`);
                     
                     // Sort client-side by completedAt (most recent first)
@@ -7772,6 +7864,17 @@
 
             // Log reservation status (no popup, just tracking)
             await checkReservationLimit();
+
+            const droppedByRecheck = await pruneQueueAgainstCallLog();
+            if (droppedByRecheck > 0) {
+                if (!callQueue.length) {
+                    currentCall = null;
+                    showAlert('Everyone left in your queue was just called by a teammate. Reloading...', 'info');
+                    setTimeout(() => loadCalls(), 2000);
+                    return;
+                }
+                showAlert(`Skipped ${droppedByRecheck} contact${droppedByRecheck === 1 ? '' : 's'} a teammate called after your queue loaded.`, 'info');
+            }
 
             currentCall = callQueue[currentCallIndex];
 
@@ -10002,12 +10105,8 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
                 const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
                 
-                // Query calls for different time periods
-                const [hourlyData, weeklyData, monthlyData] = await Promise.all([
-                    getCallsInRange(userEmail, hourAgo, now),
-                    getCallsInRange(userEmail, weekAgo, now),
-                    getCallsInRange(userEmail, monthAgo, now)
-                ]);
+                // One month read; the hour and week windows are subsets of it.
+                const [hourlyData, weeklyData, monthlyData] = await getCallsInRanges(userEmail, [hourAgo, weekAgo, monthAgo], now);
                 
                 // Update dashboard (with null checks)
                 const hourlyEarningsEl = document.getElementById('hourlyEarnings');
@@ -10033,31 +10132,33 @@ Would you have 15 minutes available this week or next for a quick call?`;
             }
         }
 
-        // Get calls in date range for a user
-        async function getCallsInRange(userEmail, startDate, endDate) {
+        // Totals for several windows ending at endDate, from a single read of the widest one.
+        async function getCallsInRanges(userEmail, startDates, endDate) {
+            const empty = startDates.map(() => ({ earnings: 0, calls: 0 }));
             try {
-                const q = query(
+                const startISOs = startDates.map((d) => d.toISOString());
+                const endISO = endDate.toISOString();
+                const snapshot = await getDocs(query(
                     collection(db, 'campaign_call_tracking'),
                     where('userEmail', '==', userEmail),
-                    where('timestamp', '>=', startDate.toISOString()),
-                    where('timestamp', '<=', endDate.toISOString())
-                );
-                
-                const snapshot = await getDocs(q);
-                let totalEarnings = 0;
-                let totalCalls = 0;
-                
+                    where('timestamp', '>=', startISOs.reduce((a, b) => (a < b ? a : b))),
+                    where('timestamp', '<=', endISO)
+                ));
+                const totals = startDates.map(() => ({ earnings: 0, calls: 0 }));
                 snapshot.docs.forEach((doc) => {
                     const data = doc.data();
-                    totalEarnings += data.totalPayment || 0;
-                    totalCalls++;
+                    const ts = data.timestamp;
+                    startISOs.forEach((startISO, i) => {
+                        if (ts >= startISO && ts <= endISO) {
+                            totals[i].earnings += data.totalPayment || 0;
+                            totals[i].calls++;
+                        }
+                    });
                 });
-                
-                return { earnings: totalEarnings, calls: totalCalls };
-                
+                return totals;
             } catch (error) {
                 console.error('❌ Error getting calls in range:', error);
-                return { earnings: 0, calls: 0 };
+                return empty;
             }
         }
 
@@ -10998,6 +11099,8 @@ Would you have 15 minutes available this week or next for a quick call?`;
             ).replace(/\D/g, '').slice(-10);
 
             await deleteDoc(doc(db, 'campaign_call_tracking', trackingId));
+            recentCallLog = recentCallLog.filter((entry) => entry.id !== trackingId);
+            invalidateCompletedCallsCache();
             await updateDoc(activityRef, {
                 status: restoredActivityStatus(activityData),
                 outcome: deleteField(),
@@ -11547,7 +11650,8 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     // NO orderBy to avoid Firestore index requirements - we'll sort client-side
                     limit(1000) // Increased from 200 to 1000 to ensure we catch recent call history
                 );
-                const allActivitiesSnapshot = await getDocs(callHistoryQuery);
+                const allActivitiesSnapshot = takeCompletedSlice(currentCall.campaignId || selectedCampaign, currentCall.id)
+                    || await getDocs(callHistoryQuery);
                 
                 // CLIENT-SIDE SORT: Sort by completedAt descending to get most recent first
                 const sortedDocs = allActivitiesSnapshot.docs.sort((a, b) => {
@@ -12615,9 +12719,6 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 document.getElementById('teamStatsGoalProgress').textContent = `${totalCallsToday}/${teamGoal}`;
                 document.getElementById('teamStatsGoalPercentage').textContent = `${goalPercentage}%`;
                 
-                // Get scheduled meetings this week
-                await getScheduledThisWeek();
-                
                 // Update last update time
                 document.getElementById('leaderboardLastUpdate').innerHTML = `
                     <i class="fas fa-sync"></i> Updated ${new Date().toLocaleTimeString()}
@@ -12627,55 +12728,6 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 
             } catch (error) {
                 console.error('❌ Error loading leaderboard:', error);
-            }
-        }
-        
-        // Get scheduled meetings this week
-        async function getScheduledThisWeek() {
-            try {
-                const now = new Date();
-                const startOfWeek = new Date(now);
-                startOfWeek.setDate(now.getDate() - now.getDay()); // Go to Sunday
-                startOfWeek.setHours(0, 0, 0, 0);
-                
-                const endOfWeek = new Date(startOfWeek);
-                endOfWeek.setDate(startOfWeek.getDate() + 6); // Saturday
-                endOfWeek.setHours(23, 59, 59, 999);
-                
-                const trackingSnapshot = await getDocs(query(
-                    collection(db, 'campaign_call_tracking'),
-                    where('timestamp', '>=', startOfWeek.toISOString())
-                ));
-                
-                let scheduledCount = 0;
-                trackingSnapshot.docs.forEach((doc) => {
-                    const data = doc.data();
-                    
-                    // Check if outcome is a scheduled meeting (not callback)
-                    const outcome = data.outcome || '';
-                    if (outcome === 'spoke-scheduled-meeting') {
-                        // Parse timestamp
-                        let timestamp = data.timestamp || data.completedAt;
-                        if (typeof timestamp === 'string') {
-                            timestamp = new Date(timestamp);
-                        } else if (typeof timestamp === 'object' && timestamp.toDate) {
-                            timestamp = timestamp.toDate();
-                        } else if (typeof timestamp === 'object' && timestamp.seconds) {
-                            timestamp = new Date(timestamp.seconds * 1000);
-                        }
-                        
-                        // Check if within this week
-                        if (timestamp && timestamp >= startOfWeek && timestamp <= endOfWeek) {
-                            scheduledCount++;
-                        }
-                    }
-                });
-                
-                // Note: scheduledCount calculated but no longer displayed in bottom section
-                console.log(`📅 Scheduled meetings this week: ${scheduledCount}`);
-                
-            } catch (error) {
-                console.error('❌ Error getting scheduled this week:', error);
             }
         }
         
