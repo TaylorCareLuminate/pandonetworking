@@ -1095,7 +1095,11 @@ window.isTrulyLoggedOut = function() {
 window.redirectToLogin = function(message = null) {
   console.log('🔒 Redirecting to login page...');
   
-  const currentUrl = window.location.pathname + window.location.search + window.location.hash;
+  // Pages embedded in the demos/index.html shell (window.__pandoTopNav) must send the
+  // whole window to login, not just their iframe.
+  let navWin = window;
+  if (window.__pandoTopNav) { try { void window.top.location.href; navWin = window.top; } catch (e) { navWin = window; } }
+  const currentUrl = navWin.location.pathname + navWin.location.search + navWin.location.hash;
   const encodedReturnUrl = encodeURIComponent(currentUrl);
   
   if (message) {
@@ -1117,10 +1121,10 @@ window.redirectToLogin = function(message = null) {
     
     setTimeout(() => {
       document.body.removeChild(overlay);
-      window.location.href = `../login.html?returnUrl=${encodedReturnUrl}`;
+      navWin.location.href = `../login.html?returnUrl=${encodedReturnUrl}`;
     }, 2500);
   } else {
-    window.location.href = `../login.html?returnUrl=${encodedReturnUrl}`;
+    navWin.location.href = `../login.html?returnUrl=${encodedReturnUrl}`;
   }
 };
 
@@ -1788,10 +1792,13 @@ console.log('📋 Auth script loaded, waiting for initialization...');
       return; // No sessionStorage access — skip rather than retry every navigation
     }
 
-    const returnUrl = window.location.href;
+    // Embedded in the demos/index.html shell: bridge at the top level and come back to the shell.
+    let navWin = window;
+    if (window.__pandoTopNav) { try { void window.top.location.href; navWin = window.top; } catch (e) { navWin = window; } }
+    const returnUrl = navWin.location.href;
     const bridgeUrl = BRIDGE_URL + '?return=' + encodeURIComponent(returnUrl);
     console.log('🔄 [SSO Bridge] Not signed in locally — redirecting through HealthLuminate to check for an existing session...');
-    window.location.assign(bridgeUrl);
+    navWin.location.assign(bridgeUrl);
   }
 
   (async () => {
