@@ -10496,6 +10496,41 @@
             return target.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 60);
         }
 
+        /** Resolve all routing sentinels (incl. merged workspaces) for a __ws__:<id> target */
+        async function resolveWsSentinelsForTarget(target) {
+            if (target === currentBDR) return await wsRoutingSentinelsForCurrentContext();
+            return await WR.getRoutingSentinelsForCanonical(db, { getDoc, doc }, WR.parseIdFromSentinel(target));
+        }
+
+        /**
+         * Fetch contacts for a BDR or workspace using the same logic as the on-screen table:
+         * workspaces = union across all routing sentinels (merged workspaces) and all owner fields;
+         * BDRs = first email field that returns results.
+         */
+        async function fetchContactsForTarget(target) {
+            const emailFields = ['userEmail', 'bdrEmail', 'linkedInAccountEmail', 'accountEmail'];
+            if (target && target.startsWith('__ws__:')) {
+                const sens = await resolveWsSentinelsForTarget(target);
+                const byId = new Map();
+                for (const field of emailFields) {
+                    const rows = await WR.queryUnionByField(db, 'prospect_contacts', field, sens, window.clemailFirestore);
+                    rows.forEach(r => { if (!byId.has(r.id)) byId.set(r.id, r); });
+                }
+                const out = [...byId.values()].map(({ id, ...rest }) => ({ firestoreId: id, ...rest }));
+                console.log(`📊 Found ${out.length} contacts for workspace (merged union)`);
+                return out;
+            }
+            const prospectsRef = collection(db, 'prospect_contacts');
+            for (const field of emailFields) {
+                const snap = await getDocs(query(prospectsRef, where(field, '==', target)));
+                if (snap.size > 0) {
+                    console.log(`📊 Found ${snap.size} contacts via field "${field}"`);
+                    return snap.docs.map(d => ({ firestoreId: d.id, ...d.data() }));
+                }
+            }
+            return [];
+        }
+
         /** Download organizations for a chosen BDR / workspace, queried directly from Firestore */
         window.downloadOrgsForTarget = async function() {
             const target = document.getElementById('downloadTarget').value;
@@ -10508,12 +10543,19 @@
             status.textContent = '';
 
             try {
-                const snap = await getDocs(
-                    query(collection(db, 'prospect_organizations'), where('bdrEmail', '==', target))
-                );
-                if (snap.empty) { status.textContent = 'No organizations found.'; return; }
+                let rows;
+                if (target.startsWith('__ws__:')) {
+                    const sens = await resolveWsSentinelsForTarget(target);
+                    const union = await WR.queryUnionByField(db, 'prospect_organizations', 'bdrEmail', sens, window.clemailFirestore);
+                    rows = union.map(({ id: _id, ...rest }) => rest);
+                } else {
+                    const snap = await getDocs(
+                        query(collection(db, 'prospect_organizations'), where('bdrEmail', '==', target))
+                    );
+                    rows = snap.docs.map(d => { const { id: _id, ...rest } = { id: d.id, ...d.data() }; return rest; });
+                }
+                if (rows.length === 0) { status.textContent = 'No organizations found.'; return; }
 
-                const rows = snap.docs.map(d => { const { id: _id, ...rest } = { id: d.id, ...d.data() }; return rest; });
                 const csv  = objectsToCSV(rows);
                 const date = new Date().toISOString().slice(0, 10);
                 triggerDownload(csv, `organizations_${sanitizeDownloadLabel(target)}_${date}.csv`);
@@ -10539,16 +10581,7 @@
             status.textContent = '';
 
             try {
-                const prospectsRef  = collection(db, 'prospect_contacts');
-                const emailFields   = ['userEmail', 'bdrEmail', 'linkedInAccountEmail', 'accountEmail'];
-                let allContacts     = [];
-                for (const field of emailFields) {
-                    const snap = await getDocs(query(prospectsRef, where(field, '==', target)));
-                    if (snap.size > 0) {
-                        allContacts = snap.docs.map(d => ({ firestoreId: d.id, ...d.data() }));
-                        break;
-                    }
-                }
+                const allContacts = await fetchContactsForTarget(target);
                 if (allContacts.length === 0) { status.textContent = 'No contacts found.'; return; }
 
                 allContacts.sort((a, b) => {
@@ -10657,20 +10690,7 @@
             if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Downloading…'; }
 
             try {
-                const prospectsRef = collection(db, 'prospect_contacts');
-                const emailFields = ['userEmail', 'bdrEmail', 'linkedInAccountEmail', 'accountEmail'];
-
-                let allContacts = [];
-                for (const field of emailFields) {
-                    const snap = await getDocs(
-                        query(prospectsRef, where(field, '==', currentBDR))
-                    );
-                    if (snap.size > 0) {
-                        allContacts = snap.docs.map(d => ({ firestoreId: d.id, ...d.data() }));
-                        console.log(`📊 Found ${allContacts.length} contacts via field "${field}"`);
-                        break;
-                    }
-                }
+                const allContacts = await fetchContactsForTarget(currentBDR);
 
                 if (allContacts.length === 0) {
                     alert('No contacts found for the current selection.');
