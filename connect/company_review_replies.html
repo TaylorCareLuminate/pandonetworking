@@ -2305,10 +2305,14 @@
                 <button id="showFollowUpDraftsBtn" class="flag-filter-btn" onclick="toggleShowOnlyFollowUpDrafts()" style="background: linear-gradient(135deg, #f0fdfa 0%, #99f6e4 100%); color: #115e59; border: 2px solid #0d9488;">
                     <i class="fas fa-paper-plane"></i> Follow-Ups Ready (<span id="followUpDraftCount">0</span>)
                 </button>
+                <button id="followUpsOnlyModeBtn" class="flag-filter-btn" onclick="toggleFollowUpsOnlyMode()" title="Fast single-window view: loads ONLY the conversations that have a follow-up drafted and waiting for review, instead of every conversation. Admins get every BDR in one window.">
+                    <i class="fas fa-bolt"></i> <span id="followUpsOnlyModeBtnLabel">Load Only Follow-Ups</span>
+                </button>
             </div>
             <div id="flagFilterInfo" style="margin-top: 0.75rem; font-size: 0.85rem; color: #78350f; font-weight: 600;">
                 <i class="fas fa-info-circle"></i> Showing all conversations
             </div>
+            <div id="followUpsOnlyBanner" style="display: none; margin-top: 0.75rem; font-size: 0.85rem; color: #115e59; background: #f0fdfa; border: 1px solid #99f6e4; border-radius: 10px; padding: 0.6rem 0.9rem; font-weight: 600;"></div>
         </div>
 
         <!-- 2D Category Grid -->
@@ -3012,6 +3016,13 @@
         const emailDB = window.clemailDb;
         const companyReportParams = new URLSearchParams(window.location.search);
         const companyReportMode = companyReportParams.get('companyReporting') === '1';
+
+        // "Follow-ups only" mode (?followUps=1, or the "Load Only Follow-Ups" button): instead of
+        // pulling every conversation for every BDR, the three loaders ask Firestore for ONLY the
+        // conversations that have a drafted follow-up waiting (followUpSequence.status ==
+        // 'pending_review' — the drafts the Wednesday-night run and "Draft Follow-Up Sequences"
+        // write). For admins this opens All BDRs in a single window. Turn it off to load everything.
+        let followUpsOnlyMode = companyReportParams.get('followUps') === '1';
 
         let currentUser = null;
         let currentUserEmail = null;
@@ -4023,6 +4034,65 @@
             return getDocs(query(collRef, where(fieldName, '==', email), limit(5000)), opts);
         }
 
+        // ── Follow-ups-only mode helpers ────────────────────────────────────────────────────
+        // Lowercased set of every email the current scope covers (company/All-BDRs list, or the
+        // single signed-in BDR plus their LinkedIn alias) — drafted docs outside it are ignored.
+        function getFollowUpsOnlyScopeEmails(fallbackEmail) {
+            const emails = new Set();
+            if (selectedCompanyBDREmails && selectedCompanyBDREmails.length > 0) {
+                selectedCompanyBDREmails.forEach(e => { if (e) emails.add(String(e).toLowerCase()); });
+            } else {
+                const base = (fallbackEmail || '').toLowerCase();
+                if (base) {
+                    emails.add(base);
+                    const li = linkedInEmailAssociations.get(base);
+                    if (li) emails.add(String(li).toLowerCase());
+                }
+            }
+            return emails;
+        }
+
+        // Every doc in `collName` whose follow-up draft is waiting for review. A plain equality
+        // filter on one field, so Firestore needs no composite index.
+        async function queryFollowUpDraftDocs(collName, timeoutMs = 90000) {
+            return getDocs(
+                query(collection(emailDB, collName), where('followUpSequence.status', '==', 'pending_review'), limit(5000)),
+                { timeoutMs }
+            );
+        }
+
+        // Wraps a filtered doc array so downstream code can use it like a real query snapshot.
+        function makeDocSnapshot(docs) {
+            return { size: docs.length, empty: docs.length === 0, docs, forEach(cb) { docs.forEach(cb); } };
+        }
+
+        // First of `fields` on `data` that holds an email inside `scope` ('' if none do).
+        function firstScopeEmailMatch(data, fields, scope) {
+            for (const f of fields) {
+                const v = String(data[f] || '').toLowerCase();
+                if (v && scope.has(v)) return v;
+            }
+            return '';
+        }
+
+        // In follow-ups-only mode, CRM notes / category overrides only need the BDRs that actually
+        // have a draft on screen (plus all of their email aliases) — not all ~100 BDR emails.
+        function getSideLoadScopeEmails() {
+            const base = (selectedCompanyBDREmails && selectedCompanyBDREmails.length > 0)
+                ? selectedCompanyBDREmails
+                : [accountEmail].filter(Boolean);
+            // Only admins load allBDRs; a single BDR's scope is already tiny, so leave it alone.
+            if (!followUpsOnlyMode || allBDRs.length === 0) return base;
+            const present = new Set(allConversations.map(c => (c.bdrEmail || '').toLowerCase()).filter(Boolean));
+            const keep = new Set(present);
+            allBDRs.forEach(b => {
+                const primary = (b.primaryEmail || '').toLowerCase();
+                const aliases = [primary, (b.linkedInEmail || '').toLowerCase(), String(linkedInEmailAssociations.get(primary) || '').toLowerCase()].filter(Boolean);
+                if (aliases.some(a => present.has(a))) aliases.forEach(a => keep.add(a));
+            });
+            return base.filter(e => keep.has(String(e).toLowerCase()));
+        }
+
         window.setTimeFilter = function(days) {
             const previousCutoff = _dbLoadCutoffDate;
 
@@ -4400,6 +4470,59 @@
                 button.innerHTML = `<i class="fas fa-paper-plane"></i> Follow-Ups Ready (<span id="followUpDraftCount">${count}</span>)`;
             }
             applyAllFilters();
+        };
+
+        // Syncs the "Load Only Follow-Ups" button and the info banner with followUpsOnlyMode.
+        function updateFollowUpsOnlyModeUi() {
+            const btn = document.getElementById('followUpsOnlyModeBtn');
+            const label = document.getElementById('followUpsOnlyModeBtnLabel');
+            const banner = document.getElementById('followUpsOnlyBanner');
+            if (!btn || !label || !banner) return;
+            if (followUpsOnlyMode) {
+                btn.style.background = 'linear-gradient(135deg, #0d9488 0%, #0f766e 100%)';
+                btn.style.color = 'white';
+                btn.style.border = '2px solid #0f766e';
+                label.textContent = 'Follow-Ups Only: ON (click to load everything)';
+                const drafted = allConversations.filter(conversationHasFollowUpDraft);
+                const bdrCount = new Set(drafted.map(c => (c.bdrEmail || '').toLowerCase()).filter(Boolean)).size;
+                banner.style.display = 'block';
+                banner.innerHTML = `<i class="fas fa-bolt"></i> Follow-ups-only view: loaded ${drafted.length} conversation${drafted.length === 1 ? '' : 's'} with a drafted follow-up waiting${bdrCount ? `, across ${bdrCount} BDR${bdrCount === 1 ? '' : 's'}` : ''}. Nothing else was loaded, so the grid counts and filters below cover only these.`;
+            } else {
+                btn.style.background = 'linear-gradient(135deg, #ccfbf1 0%, #5eead4 100%)';
+                btn.style.color = '#115e59';
+                btn.style.border = '2px solid #0d9488';
+                label.textContent = isAdmin ? 'Load Only Follow-Ups (All BDRs)' : 'Load Only Follow-Ups';
+                banner.style.display = 'none';
+            }
+        }
+
+        // Switches between the fast follow-ups-only load and the normal full load. For admins with
+        // no company chosen yet, turning it on opens "All BDRs (All Companies)" so every BDR's
+        // drafts land in this one window.
+        window.toggleFollowUpsOnlyMode = async function() {
+            const turningOn = !followUpsOnlyMode;
+            const selector = document.getElementById('bdrSelect');
+            const adminScope = isAdmin && selector ? selector.value : null; // null = not an admin view
+            if (!turningOn && adminScope === '__ALL_BDRS__') {
+                if (!confirm('Load EVERY conversation for ALL BDRs?\n\nThat is the slow, full load and can take a minute or more. (Cancel keeps the fast follow-ups-only view.)')) return;
+            }
+            followUpsOnlyMode = turningOn;
+            if (!turningOn && showOnlyFollowUpDrafts) window.toggleShowOnlyFollowUpDrafts();
+            updateFollowUpsOnlyModeUi();
+
+            if (isAdmin && !adminScope) {
+                if (turningOn) {
+                    selector.value = '__ALL_BDRS__';
+                    selector.dispatchEvent(new Event('change')); // its handler reloads everything in scope
+                }
+                return; // admin with nothing chosen and turning it off: nothing is loaded yet
+            }
+            document.getElementById('repliesContainer').innerHTML = `
+                <div class="empty-state">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    <h3>${turningOn ? 'Loading follow-ups…' : 'Loading all conversations…'}</h3>
+                </div>`;
+            await loadConversations();
         };
 
         // Toggle a filter that shows ONLY conversations with a pending AI-suggested category change —
@@ -6357,7 +6480,10 @@
                     loadHeyreachInbox(accountEmail),
                     loadLinkedInMessages(accountEmail),
                     loadHeyreachActivity(accountEmail, viewingBdrEmail),
-                    loadConnectQueueContacts(emailsForConnectQueue)
+                    // Follow-ups-only mode: every draft belongs to a thread we started, so the
+                    // "not in connect queue → gray card" check isn't needed. Skipping it avoids one
+                    // query per BDR email. (An empty set disables that check — see convNotInConnectQueue.)
+                    followUpsOnlyMode ? Promise.resolve(connectQueueContacts = new Set()) : loadConnectQueueContacts(emailsForConnectQueue)
                 ]);
                 
                 console.log(`📊 Found ${heyreachConversations.length} HeyReach conversations`);
@@ -6520,6 +6646,12 @@
 
                 // Update follow-up date counts from localStorage
                 if (typeof updateFollowUpDateCounts === 'function') updateFollowUpDateCounts();
+
+                // Follow-ups-only mode: land directly on the drafts (the "Follow-Ups Ready" filter)
+                if (followUpsOnlyMode && !showOnlyFollowUpDrafts) {
+                    window.toggleShowOnlyFollowUpDrafts(); // also calls applyAllFilters()
+                }
+                updateFollowUpsOnlyModeUi();
                 
                 // Show conversations with time filter applied
                 applyAllFilters();
@@ -6546,9 +6678,7 @@
                 // not just the single `accountEmail` — which for a company/"All BDRs" view is
                 // just whichever BDR happens to be first in that group's email list. Querying
                 // only that one BDR silently drops CRM notes for every other BDR in the group.
-                const emailsInScope = (selectedCompanyBDREmails && selectedCompanyBDREmails.length > 0)
-                    ? selectedCompanyBDREmails
-                    : [accountEmail].filter(Boolean);
+                const emailsInScope = getSideLoadScopeEmails();
                 console.log('📝 Loading CRM notes for:', emailsInScope);
                 
                 // Use CLEmail wrapper to query CRM notes
@@ -6606,9 +6736,7 @@
                 // conversation that a BDR intentionally (or accidentally) ignored can look like
                 // it's simply missing when viewed from a company-wide/All-BDRs view, instead of
                 // consistently applying the same ignored state everywhere.
-                const emailsInScope = (selectedCompanyBDREmails && selectedCompanyBDREmails.length > 0)
-                    ? selectedCompanyBDREmails
-                    : [accountEmail].filter(Boolean);
+                const emailsInScope = getSideLoadScopeEmails();
                 console.log('🔒 Loading category overrides for:', emailsInScope);
                 
                 const { collection, query, where, getDocs } = window.clemailFirestore;
@@ -6881,15 +7009,32 @@
 
             const inboxColl = collection(emailDB, 'heyreach_inbox');
             const inboxTimeoutMs = emailsToQuery.length > 8 ? 90000 : 60000;
-            const queryFns = [];
-            emailsToQuery.forEach(email => {
-                queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'accountEmail',         email, cutoffTs, inboxTimeoutMs));
-                queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'bdrEmail',             email, cutoffTs, inboxTimeoutMs));
-                queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'linkedInAccountEmail', email, cutoffTs, inboxTimeoutMs));
-                queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'uploadedByEmail',      email, cutoffTs, inboxTimeoutMs));
-            });
-            
-            const results = await runQueryFnsInBatches(queryFns, emailsToQuery.length > 8 ? 12 : 16);
+            let results;
+            if (followUpsOnlyMode) {
+                // ONE query for just the threads with a follow-up draft waiting, instead of
+                // (emails × 4 fields) queries over the whole inbox. Keep only docs that belong to a
+                // BDR in scope, and stamp bdrEmail when the doc only carries one of the other fields.
+                const scope = getFollowUpsOnlyScopeEmails(accountEmail);
+                const draftSnap = await queryFollowUpDraftDocs('heyreach_inbox');
+                const scopedDocs = [];
+                draftSnap.forEach(doc => {
+                    const d = doc.data();
+                    const matched = firstScopeEmailMatch(d, ['bdrEmail', 'accountEmail', 'linkedInAccountEmail', 'uploadedByEmail'], scope);
+                    if (!matched) return;
+                    scopedDocs.push({ id: doc.id, data: () => (d.bdrEmail ? d : { ...d, bdrEmail: matched }) });
+                });
+                console.log(`📨 Follow-ups-only: ${scopedDocs.length}/${draftSnap.size} drafted heyreach_inbox threads are in scope`);
+                results = [makeDocSnapshot(scopedDocs)];
+            } else {
+                const queryFns = [];
+                emailsToQuery.forEach(email => {
+                    queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'accountEmail',         email, cutoffTs, inboxTimeoutMs));
+                    queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'bdrEmail',             email, cutoffTs, inboxTimeoutMs));
+                    queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'linkedInAccountEmail', email, cutoffTs, inboxTimeoutMs));
+                    queryFns.push(() => tryFilteredCollectionQuery(inboxColl, 'uploadedByEmail',      email, cutoffTs, inboxTimeoutMs));
+                });
+                results = await runQueryFnsInBatches(queryFns, emailsToQuery.length > 8 ? 12 : 16);
+            }
             const inboxFailed = results.filter(s => s === EMPTY_QUERY_SNAPSHOT).length;
             if (inboxFailed > 0) {
                 console.warn(`⚠️ ${inboxFailed}/${results.length} heyreach_inbox queries failed or timed out — some threads may be incomplete`);
@@ -7013,10 +7158,16 @@
                 const liCutoffTs = liCutoffDate ? Timestamp.fromDate(liCutoffDate) : null;
                 if (liCutoffTs) console.log(`🕐 Filtering linkedinMessages with server-side cutoff: ${liCutoffDate.toLocaleString()}`);
 
-                for (const fieldName of possibleFields) {
+                // Follow-ups-only mode: a single query for drafted threads (filtered to the BDRs in
+                // scope below) replaces the per-field-name probing.
+                const liFieldsToTry = followUpsOnlyMode ? ['__followUpDrafts__'] : possibleFields;
+                const liScope = followUpsOnlyMode ? getFollowUpsOnlyScopeEmails(accountEmail) : null;
+                for (const fieldName of liFieldsToTry) {
                     try {
                         let messagesQuery;
-                        if (liCutoffTs) {
+                        if (followUpsOnlyMode) {
+                            messagesQuery = null; // handled below — uses queryFollowUpDraftDocs()
+                        } else if (liCutoffTs) {
                             try {
                                 messagesQuery = query(collection(emailDB, 'linkedinMessages'), where(fieldName, '==', accountEmail), where('lastMessageAt', '>=', liCutoffTs), limit(500));
                             } catch (e) {
@@ -7026,7 +7177,22 @@
                             messagesQuery = query(collection(emailDB, 'linkedinMessages'), where(fieldName, '==', accountEmail), limit(500));
                         }
                         
-                        const snapshot = await getDocs(messagesQuery);
+                        let snapshot;
+                        const liMatchedEmailByDocId = new Map();
+                        if (followUpsOnlyMode) {
+                            const draftSnap = await queryFollowUpDraftDocs('linkedinMessages');
+                            const scopedDocs = [];
+                            draftSnap.forEach(doc => {
+                                const matched = firstScopeEmailMatch(doc.data(), possibleFields, liScope);
+                                if (!matched) return;
+                                liMatchedEmailByDocId.set(doc.id, matched);
+                                scopedDocs.push(doc);
+                            });
+                            console.log(`📨 Follow-ups-only: ${scopedDocs.length}/${draftSnap.size} drafted linkedinMessages threads are in scope`);
+                            snapshot = makeDocSnapshot(scopedDocs);
+                        } else {
+                            snapshot = await getDocs(messagesQuery);
+                        }
                         
                         if (snapshot.size > 0) {
                             console.log(`✅ Found ${snapshot.size} LinkedIn messages using field: ${fieldName}`);
@@ -7063,7 +7229,7 @@
                                         leadName: data.leadName || data.name || 'Unknown',
                                         companyName: data.companyName || data.company || 'Unknown Company',
                                         leadLinkedInUrl: data.linkedInUrl || data.profileUrl || '',
-                                        bdrEmail: accountEmail,
+                                        bdrEmail: followUpsOnlyMode ? (liMatchedEmailByDocId.get(doc.id) || accountEmail) : accountEmail,
                                         lastMessageAt: data.lastMessageAt || data.timestamp || data.last_message_date,
                                         responseCategory: data.responseCategory,
                                         followUpCategory: data.followUpCategory,
@@ -7529,20 +7695,27 @@
                 console.log(`🕐 Loading heyreach_activity since: ${activityCutoff.toLocaleString()}`);
 
                 let snapshot;
-                try {
-                    snapshot = await getDocs(query(
-                        collection(emailDB, 'heyreach_activity'),
-                        where('eventType', 'in', REPLY_EVENT_TYPES),
-                        where('timestamp', '>=', cutoffTs),
-                        orderBy('timestamp', 'desc')
-                    ), { timeoutMs: 90000 });
-                } catch (filteredErr) {
-                    console.warn('⚠️ Reply-event activity query failed (missing index?), falling back to timestamp-only pagination:', filteredErr.message);
-                    snapshot = await getDocs(query(
-                        collection(emailDB, 'heyreach_activity'),
-                        where('timestamp', '>=', cutoffTs),
-                        orderBy('timestamp', 'desc')
-                    ), { timeoutMs: 90000 });
+                if (followUpsOnlyMode) {
+                    // Only the webhook docs carrying a drafted follow-up — no time window, no
+                    // platform-wide scan. The BDR-match loop below still scopes them to this view.
+                    snapshot = await queryFollowUpDraftDocs('heyreach_activity');
+                    console.log(`📨 Follow-ups-only: ${snapshot.size} drafted heyreach_activity docs`);
+                } else {
+                    try {
+                        snapshot = await getDocs(query(
+                            collection(emailDB, 'heyreach_activity'),
+                            where('eventType', 'in', REPLY_EVENT_TYPES),
+                            where('timestamp', '>=', cutoffTs),
+                            orderBy('timestamp', 'desc')
+                        ), { timeoutMs: 90000 });
+                    } catch (filteredErr) {
+                        console.warn('⚠️ Reply-event activity query failed (missing index?), falling back to timestamp-only pagination:', filteredErr.message);
+                        snapshot = await getDocs(query(
+                            collection(emailDB, 'heyreach_activity'),
+                            where('timestamp', '>=', cutoffTs),
+                            orderBy('timestamp', 'desc')
+                        ), { timeoutMs: 90000 });
+                    }
                 }
                 console.log(`📊 Found ${snapshot.size} webhook activities`);
                 if (snapshot.size > 0) {
@@ -11290,16 +11463,25 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer �
                     document.getElementById('connectedNoReplySection').style.display = 'block';
                     await loadBDRsForSelector();
                     
-                    // For admins, don't auto-load - wait for company selection
-                    console.log('🏢 Admin user - please select a company to view conversations');
-                    const container = document.getElementById('repliesContainer');
-                    container.innerHTML = `
-                        <div class="empty-state">
-                            <i class="fas fa-building" style="font-size: 3rem; color: var(--primary); margin-bottom: 1rem;"></i>
-                            <h3>Select a Company to View Conversations</h3>
-                            <p>Use the dropdown above to choose which company's conversations to display</p>
-                        </div>
-                    `;
+                    updateFollowUpsOnlyModeUi();
+                    if (followUpsOnlyMode) {
+                        // ?followUps=1 — open every BDR's drafted follow-ups in this one window
+                        console.log('⚡ Follow-ups-only mode — opening All BDRs');
+                        const companySelector = document.getElementById('bdrSelect');
+                        companySelector.value = '__ALL_BDRS__';
+                        companySelector.dispatchEvent(new Event('change'));
+                    } else {
+                        // For admins, don't auto-load - wait for company selection
+                        console.log('🏢 Admin user - please select a company to view conversations');
+                        const container = document.getElementById('repliesContainer');
+                        container.innerHTML = `
+                            <div class="empty-state">
+                                <i class="fas fa-building" style="font-size: 3rem; color: var(--primary); margin-bottom: 1rem;"></i>
+                                <h3>Select a Company to View Conversations</h3>
+                                <p>Use the dropdown above to choose which company's conversations to display</p>
+                            </div>
+                        `;
+                    }
                 } else {
                     // For regular users, auto-load their own conversations
                     try {
