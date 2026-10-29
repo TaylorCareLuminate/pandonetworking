@@ -1838,7 +1838,33 @@
                 return lines.join('\n');
             }
 
+            // Who sent the first message in the thread? A showcase is meant to demonstrate OUR outbound
+            // outreach, so a thread the prospect started (inbound) can never be a top showcase.
+            const PROSPECT_FIRST_CAP = 2;
+            function initiatorOf(rec) {
+                const first = (rec.messages || []).find(m => String(m.body || m.text || m.message || '').trim());
+                if (!first) return 'unknown';
+                return first.sender === 'ME' ? 'us' : 'prospect';
+            }
+            // Applies the initiator rule to an analysis (new or previously saved), in place.
+            function applyInitiatorRule(rec, a) {
+                if (!a) return a;
+                a.initiatedBy = initiatorOf(rec);
+                if (a.initiatedBy === 'prospect' && a.showcaseScore > PROSPECT_FIRST_CAP) {
+                    a.rawShowcaseScore = a.rawShowcaseScore || a.showcaseScore;
+                    a.showcaseScore = PROSPECT_FIRST_CAP;
+                    a.showcaseReason = 'Capped at ' + PROSPECT_FIRST_CAP + '/5 because the prospect reached out first — a showcase should demonstrate our outbound outreach. ' + (a.showcaseReason || '');
+                }
+                return a;
+            }
+
             function buildPrompt(rec) {
+                const initiator = initiatorOf(rec);
+                const initiatorLine = initiator === 'prospect'
+                    ? 'FACT: the PROSPECT sent the first message in this thread (inbound — we did NOT reach out first).'
+                    : initiator === 'us'
+                        ? 'FACT: US sent the first message in this thread (outbound outreach).'
+                        : '';
                 return `You are reviewing a LinkedIn outreach conversation that ended with a scheduled meeting.
 "US" is an executive's LinkedIn account managed by Pando Executive Networking; we reached out first. "PROSPECT" is the person we contacted. The meeting WAS scheduled — your job is to analyze the conversation.
 
@@ -1846,6 +1872,8 @@ Prospect profile — Title/headline: ${rec.title || 'not available'} | Company: 
 
 CONVERSATION (chronological; dates and gaps shown where known):
 ${buildTranscript(rec)}
+
+${initiatorLine}
 
 Answer these five questions about the PROSPECT and the conversation:
 
@@ -1861,7 +1889,8 @@ Answer these five questions about the PROSPECT and the conversation:
    "unclear" = cannot tell from the transcript.
    Also give "follow_up_count" = how many follow-up messages from US were sent after an unanswered message, before the prospect agreed to meet (0 if first_time), and "scheduling_note" = one short sentence justifying your answer.
 
-4. "showcase_score" — integer 1-5: how well does this conversation demonstrate Pando's ability to schedule meetings and engage prospects? 5 = excellent showcase (natural, warm, professional exchange; a senior prospect clearly engaged; the ask and the scheduling are handled smoothly). 3 = acceptable but unremarkable. 1 = poor showcase (very thin, awkward, confusing, or the meeting looks incidental). Also give "showcase_reason" = 1-2 sentences explaining the score.
+4. "showcase_score" — integer 1-5: how well does this conversation demonstrate Pando's ability to schedule meetings and engage prospects? 5 = excellent showcase (OUR account reached out first with a cold/outbound message; the prospect responded warmly; a senior prospect clearly engaged; the ask and the scheduling are handled smoothly).
+   HARD RULE: a showcase must demonstrate OUR outreach. If the PROSPECT sent the first message (they reached out to us, or the thread starts with their message), the score can be AT MOST ${PROSPECT_FIRST_CAP}, no matter how polished or friendly the exchange is — we did not generate this meeting. Only conversations that START with a message from US can score 4 or 5. 3 = acceptable but unremarkable. 1 = poor showcase (very thin, awkward, confusing, or the meeting looks incidental). Also give "showcase_reason" = 1-2 sentences explaining the score.
 
 5. "traceability_risk" — if we anonymize this conversation (remove names, company names, links) and show it publicly, how easily could a reader still work out WHO OUR CLIENT is (the executive / organization behind the "US" account)? Choose EXACTLY one of: low | medium | high.
    "high" = easy to trace: the messages say enough about the client's company or the executive to pin them down even without the name — e.g. a distinctive description of the organization (size, location, unique services or products, named programs), a recognizable career story or role at a specific kind of organization, specific facts, numbers, events or relationships only one organization or person would have. Also "high" if the prospect's own replies reveal who the client is (e.g. they mention the client's company, a mutual connection, or a well-known detail).
@@ -1969,6 +1998,7 @@ Respond with ONLY one JSON object, no markdown, in exactly this shape:
                     <span class="ai-chip industry${unk(a.industry)}" title="Prospect industry"><i class="fas fa-building"></i> ${esc(a.industry)}</span>
                     <span class="ai-chip path-${esc(a.schedulingPath)}" title="How the meeting got scheduled"><i class="fas fa-${a.schedulingPath === 'follow_up' ? 'redo' : a.schedulingPath === 'first_time' ? 'bolt' : 'question'}"></i> ${esc(PATHS[a.schedulingPath] || 'Unclear')}${esc(fu)}</span>
                     ${scoreChip}
+                    ${a.initiatedBy === 'prospect' ? `<span class="ai-chip trace-medium" title="The prospect sent the first message, so this is not an example of our outbound outreach"><i class="fas fa-arrow-left"></i> Prospect reached out first</span>` : ''}
                     ${a.traceability ? `<span class="ai-chip trace-${esc(a.traceability)}" title="How easily the anonymized conversation could be traced back to our client"><i class="fas fa-${a.traceability === 'high' ? 'user-secret' : a.traceability === 'medium' ? 'search' : 'shield-alt'}"></i> ${esc(TRACE_SHORT[a.traceability])}</span>` : ''}
                     <span class="ai-strip-model" title="Model used for this analysis">${esc(a.model || '')}</span>
                     ${a.schedulingNote ? `<div class="ai-strip-note"><b>Scheduling:</b> ${esc(a.schedulingNote)}</div>` : ''}
@@ -2150,7 +2180,7 @@ Respond with ONLY one JSON object, no markdown, in exactly this shape:
                         const rec = todo[idx++];
                         try {
                             const raw = await callAi(buildPrompt(rec), model);
-                            const result = normalizeResult(raw);
+                            const result = applyInitiatorRule(rec, normalizeResult(raw));
                             try { await saveOne(rec.id, result, model); }
                             catch (e) {
                                 // keep the result in memory so the user still sees it this session
@@ -2206,6 +2236,8 @@ Respond with ONLY one JSON object, no markdown, in exactly this shape:
                     console.error('[DemoAnalysis] could not load saved analysis:', e);
                     setStatus('Could not load previously saved AI reviews: ' + esc(e.message), true);
                 }
+                // Re-apply the "prospect reached out first" cap to analyses saved before that rule existed.
+                records.forEach(r => applyInitiatorRule(r, byId.get(r.id)));
                 renderAllStrips();
                 updateSummary();
                 refreshFilterOptions();
