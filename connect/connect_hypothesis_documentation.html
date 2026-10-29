@@ -12106,22 +12106,33 @@
 
             let locateJob = null;
             const POLL_INTERVAL_MS = 3000;
-            const POLL_MAX_MS = 6 * 60 * 1000; // 6 minutes
+            // The scan is a server-side job, so a fixed wall-clock limit is the wrong
+            // yardstick: a big, healthy scan can legitimately run for many minutes. Give
+            // up only if the server stops reporting progress (job died, e.g. Railway
+            // restart) or an absolute safety cap is hit.
+            const POLL_MAX_MS     = 30 * 60 * 1000; // absolute safety cap
+            const POLL_STALL_MS   = 3 * 60 * 1000;  // no progress/heartbeat change for this long => dead job
             const pollStart = Date.now();
+            let lastSignature = null;
+            let lastChangeAt  = Date.now();
             while (true) {
                 await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
                 const jobResp = await fetch(`${RAILWAY_BASE}/api/hypothesis/locate-scan/job/${locateJobId}?includeResults=false`).catch(() => null);
                 const jobData = jobResp && jobResp.ok ? await jobResp.json().catch(() => null) : null;
                 if (!jobData || !jobData.success) {
-                    if (Date.now() - pollStart > POLL_MAX_MS) throw new Error('Locate scan timed out waiting for a status update.');
+                    if (Date.now() - lastChangeAt > POLL_STALL_MS) throw new Error('Lost contact with the server while waiting for locate scan status — try again.');
                     continue;
                 }
                 locateJob = jobData.job;
                 if (locateJob.status === 'complete' || locateJob.status === 'error') break;
                 const p = locateJob.progress || {};
+                const sig = `${locateJob.lastHeartbeat || ''}|${p.message || ''}`;
+                if (sig !== lastSignature) { lastSignature = sig; lastChangeAt = Date.now(); }
+                const elapsedSec = Math.round((Date.now() - pollStart) / 1000);
                 document.getElementById('locateContent').innerHTML =
-                    `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> ${escHtml(p.message || 'Scanning…')}</div>`;
-                if (Date.now() - pollStart > POLL_MAX_MS) throw new Error('Locate scan timed out after 6 minutes — try again, or check server logs.');
+                    `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> ${escHtml(p.message || 'Scanning…')} <span style="color:var(--gray-500);">(${Math.floor(elapsedSec / 60)}m ${String(elapsedSec % 60).padStart(2, '0')}s elapsed)</span></div>`;
+                if (Date.now() - lastChangeAt > POLL_STALL_MS) throw new Error('Locate scan stopped reporting progress for 3 minutes (the server job likely restarted) — try again.');
+                if (Date.now() - pollStart > POLL_MAX_MS) throw new Error('Locate scan is still running after 30 minutes — check server logs.');
             }
             if (!locateJob || locateJob.status === 'error') throw new Error(locateJob?.error || 'Locate scan failed.');
 

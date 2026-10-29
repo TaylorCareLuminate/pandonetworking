@@ -54,7 +54,7 @@ const HEALTHCONNECT_CONFIG = {
                 // Unified management + search suite (My Connections, Prospect Contacts,
                 // Prospect Organizations, and — for admins — the search/cleanup tools)
                 { label: 'Manage Data', href: 'manage_data.html', icon: 'fa-database' },
-                { label: 'My Connections', href: 'manage_data.html?tool=my_leads', icon: 'fa-users' },
+                { label: 'My Connections', href: 'my_leads.html', icon: 'fa-users' },
                 { label: 'Harvest Pool', href: 'harvest_pool.html', icon: 'fa-seedling' },
                 { label: 'Prospect Organizations', href: 'manage_data.html?tool=prospect_organizations', icon: 'fa-building' },
                 // Company-level workspace (explicitly enabled per BDR in BDR Settings)

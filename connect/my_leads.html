@@ -1161,6 +1161,8 @@
         let harvestManualByUrl = new Map(); // normalized URL -> manual harvest_pool_manual_contacts row
         let harvestPoolFilterState = new Map(); // poolId|'__eligible' -> 'include'|'exclude'
         const RAILWAY_HARVEST_API = 'https://railwayclemail-production.up.railway.app';
+        let leadsLoadSeq = 0;                          // bumped per loadLeads(); lets stale async work bail out
+        let harvestReadyPromise = Promise.resolve();   // resolves when harvest pool context for the current BDR is loaded
 
         /** One-shot: ?harvest=eligible opens the "All harvest-eligible (30d+ Connect)" filter */
         let harvestUrlParamsConsumed = false;
@@ -1246,13 +1248,51 @@
         /**
          * Load LinkedIn email associations
          */
+        /**
+         * Small lookup collections (associations, BDR list, customers, company research, linkedin accounts)
+         * rarely change but were re-downloaded in full through the Railway proxy on every page view / BDR switch.
+         * Cache them in sessionStorage for a few minutes and de-dupe concurrent requests.
+         * Add ?nocache=1 to the URL to force a fresh read.
+         * Returns { size, forEach(fn(docSnap)) } where docSnap = { id, data() }.
+         */
+        const LOOKUP_CACHE_TTL_MS = 5 * 60 * 1000;
+        const lookupInflight = new Map();
+        async function getCachedCollection(name) {
+            const key = 'myLeads:v1:' + name;
+            const bypass = /[?&]nocache=1/.test(window.location.search);
+            let rows = null;
+            if (!bypass) {
+                try {
+                    const raw = sessionStorage.getItem(key);
+                    if (raw) {
+                        const o = JSON.parse(raw);
+                        if (o && Array.isArray(o.rows) && Date.now() - o.t < LOOKUP_CACHE_TTL_MS) rows = o.rows;
+                    }
+                } catch (_) { /* ignore corrupt cache */ }
+            }
+            if (!rows) {
+                if (!lookupInflight.has(name)) {
+                    lookupInflight.set(name, (async () => {
+                        const { collection, getDocs } = window.clEmailFunctions;
+                        const snap = await getDocs(collection(window.clEmailDb, name));
+                        const fresh = [];
+                        snap.forEach(d => fresh.push({ id: d.id, data: d.data() }));
+                        try { sessionStorage.setItem(key, JSON.stringify({ t: Date.now(), rows: fresh })); } catch (_) { /* quota — skip caching */ }
+                        return fresh;
+                    })().finally(() => lookupInflight.delete(name)));
+                }
+                rows = await lookupInflight.get(name);
+            }
+            return {
+                size: rows.length,
+                forEach: (fn) => rows.forEach(r => fn({ id: r.id, data: () => r.data }))
+            };
+        }
+
         async function loadLinkedInEmailAssociations() {
             try {
                 console.log('🔗 Loading LinkedIn email associations...');
-                const { collection, getDocs } = window.clEmailFunctions;
-                const db = window.clEmailDb;
-                
-                const associationsSnapshot = await getDocs(collection(db, 'linkedin_email_associations'));
+                const associationsSnapshot = await getCachedCollection('linkedin_email_associations');
                 
                 linkedInEmailAssociations.clear();
                 associationsSnapshot.forEach((docSnap) => {
@@ -1277,11 +1317,12 @@
         async function loadBDRLeaders() {
             try {
                 console.log('👥 Loading BDR leaders from CLEmail...');
-                const { collection, getDocs } = window.clEmailFunctions;
-                const db = window.clEmailDb;
-                
-                const bdrCollection = collection(db, 'bdr_leaders');
-                const bdrSnapshot = await getDocs(bdrCollection);
+                // bdr_leaders and customerList are independent — fetch (or read from cache) in parallel
+                const customersPromise = getCachedCollection('customerList').catch(err => {
+                    console.warn('⚠️ Could not load customerList:', err.message);
+                    return null;
+                });
+                const bdrSnapshot = await getCachedCollection('bdr_leaders');
                 
                 bdrLeaders = [];
                 bdrSnapshot.forEach((docSnap) => {
@@ -1297,14 +1338,12 @@
 
                 // Load customerList to map customerId -> company name
                 const customerMap = new Map();
-                try {
-                    const customersSnapshot = await getDocs(collection(db, 'customerList'));
+                const customersSnapshot = await customersPromise;
+                if (customersSnapshot) {
                     customersSnapshot.forEach(doc => {
                         const data = doc.data();
                         customerMap.set(doc.id, data.name || data.shortName || doc.id);
                     });
-                } catch (err) {
-                    console.warn('⚠️ Could not load customerList:', err.message);
                 }
                 
                 // Populate selector grouped by company
@@ -1387,14 +1426,15 @@
                         console.log('🔑 Is admin:', isAdmin);
                         
                         // Load LinkedIn email associations first
-                        await loadLinkedInEmailAssociations();
+                        // (started now, awaited below — runs in parallel with BDR resolution / BDR list loading)
+                        const associationsPromise = loadLinkedInEmailAssociations();
                         
                         if (isAdmin) {
                             // Show admin UI
                             document.getElementById('adminBadge').style.display = 'block';
                             document.getElementById('bdrSelectorSection').style.display = 'block';
                             document.getElementById('exportLeadsCSVBtn').style.display = 'flex';
-                            await loadBDRLeaders();
+                            await Promise.all([associationsPromise, loadBDRLeaders()]);
                             const { harvest, bdr: bdrParam } = readHarvestUrlParams();
                             const bdrSelect = document.getElementById('bdrSelect');
                             if (bdrParam && bdrSelect && [...bdrSelect.options].some((o) => o.value.toLowerCase() === bdrParam.toLowerCase())) {
@@ -1425,6 +1465,7 @@
                                 }
                             }
                             currentViewingEmail = effectiveEmail;
+                            await associationsPromise;
                             await loadLeads(effectiveEmail);
                         }
                     } else {
@@ -1464,9 +1505,7 @@
         async function loadHarvestHeyreachAccountIdMap() {
             const map = new Map();
             try {
-                const { collection, getDocs } = window.clEmailFunctions;
-                const db = window.clEmailDb;
-                const snap = await getDocs(collection(db, 'linkedin_accounts'));
+                const snap = await getCachedCollection('linkedin_accounts');
                 snap.forEach((docSnap) => {
                     const d = docSnap.data();
                     if (d.heyreachAccountId && d.bdrEmail) {
@@ -1566,23 +1605,31 @@
             if (li && li !== bdrAuthEmail) prospectEmails.push(li);
 
             // Fire all activity queries and prospect queries in parallel
+            // NOTE: we used to run a broad, all-BDR timestamp-windowed query here (up to 25k docs) and
+            // filter it in the browser. It is replaced by narrow equality queries on this BDR only:
+            // per-bdrEmail (events stamped with the BDR) + per-account (below).
+            const activityEmailVariants = [...new Set(
+                [bdrAuthEmail, ...bdrSet].filter(Boolean)
+            )];
             const activityQueries = [
-                // Broad timestamp-windowed query
-                getDocs(query(
-                    collection(db, 'heyreach_activity'),
-                    where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
-                    where('timestamp', '>=', Timestamp.fromDate(twoYearsAgo)),
-                    limit(25000)
-                )).catch(e => { console.warn('Harvest activity load (windowed):', e.message); return { forEach: () => {} }; }),
-                // Per-account queries — all fired simultaneously
-                ...myHeyreachAccountIds.map(aid =>
+                ...activityEmailVariants.map(em =>
                     getDocs(query(
                         collection(db, 'heyreach_activity'),
                         where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
-                        where('linkedInAccountId', '==', aid),
+                        where('bdrEmail', '==', em),
+                        limit(20000)
+                    )).catch(e => { console.warn('Harvest activity load (bdrEmail ' + em + '):', e.message); return { forEach: () => {} }; })
+                ),
+                // Per-account queries — all fired simultaneously
+                // (linkedInAccountId may be stored as a string or a number depending on sync version)
+                ...myHeyreachAccountIds.flatMap(aid => (/^\d+$/.test(aid) ? [aid, Number(aid)] : [aid]).map(v =>
+                    getDocs(query(
+                        collection(db, 'heyreach_activity'),
+                        where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
+                        where('linkedInAccountId', '==', v),
                         limit(20000)
                     )).catch(e => { console.warn('Harvest activity load (account ' + aid + '):', e.message); return { forEach: () => {} }; })
-                )
+                ))
             ];
             const prospectQueries = prospectEmails.map(em =>
                 getDocs(query(collection(db, 'prospect_contacts'), where('userEmail', '==', em), limit(25000)))
@@ -1608,6 +1655,11 @@
                 });
             });
 
+            renderHarvestPoolControls();
+        }
+
+        /** Build the harvest pool pill filter + bulk "assign to pool" dropdown from harvestPoolConfigDoc */
+        function renderHarvestPoolControls() {
             let pools = (harvestPoolConfigDoc && harvestPoolConfigDoc.pools) || [];
             if (!pools.length) {
                 pools = [{ id: 'default', name: 'Harvest pool' }];
@@ -1624,6 +1676,44 @@
                     o.textContent = p.name || p.id;
                     bulkHp.appendChild(o);
                 });
+            }
+        }
+
+        /**
+         * Fast path: one Railway call returns the pool config, connection dates, scan jobs and
+         * manual labels (computed server-side). Returns true on success; false → caller falls back
+         * to the slower browser-side Firestore queries.
+         */
+        async function loadHarvestContextFromServer(bdrAuthEmail, seq) {
+            try {
+                const u = window.auth && window.auth.currentUser;
+                if (!u) return false;
+                const token = await u.getIdToken();
+                const r = await fetch(`${RAILWAY_HARVEST_API}/api/connect/harvest-pool/leads-context/${encodeURIComponent(bdrAuthEmail)}`, {
+                    headers: { Authorization: 'Bearer ' + token }
+                });
+                if (!r.ok) return false;
+                const j = await r.json();
+                if (!j || !j.success || !Array.isArray(j.connections)) return false;
+                if (seq !== leadsLoadSeq) return true; // a newer BDR load superseded this one — don't clobber its state
+
+                harvestPoolConfigDoc = (j.config && j.config.pools) ? j.config : (j.config || null);
+                harvestConnectionUrlToDate = new Map();
+                j.connections.forEach(([url, iso]) => {
+                    const d = new Date(iso);
+                    if (url && !isNaN(d.getTime())) harvestConnectionUrlToDate.set(url, d);
+                });
+                harvestProspectUrlToScanJob = new Map(j.scanJobs || []);
+                harvestManualByUrl = new Map();
+                (j.manualEntries || []).forEach((e) => {
+                    const n = normalizeLinkedInUrl(e.linkedInUrl || e.normalizedUrl);
+                    if (n) harvestManualByUrl.set(n, e);
+                });
+                renderHarvestPoolControls();
+                return true;
+            } catch (e) {
+                console.warn('Harvest leads-context (server) unavailable, falling back:', e.message);
+                return false;
             }
         }
 
@@ -1701,6 +1791,24 @@
             }
         }
 
+        /**
+         * Load harvest-pool context for a BDR. Tries the single server-side call first; if that endpoint
+         * isn't available (older backend deploy, network error) falls back to the browser-side queries.
+         * Never rejects.
+         */
+        async function loadHarvestContext(bdrAuthEmail, seq) {
+            try {
+                if (!bdrAuthEmail) return;
+                if (await loadHarvestContextFromServer(bdrAuthEmail, seq)) return;
+                await Promise.all([
+                    loadHarvestFilterContext(bdrAuthEmail),
+                    loadHarvestManualLabels(bdrAuthEmail)
+                ]);
+            } catch (e) {
+                console.warn('Harvest context load failed:', e.message);
+            }
+        }
+
         function getHarvestManualLabelCell(lead) {
             if (!lead.harvestManualOrigin) {
                 return '<span style="color: var(--gray-400);">—</span>';
@@ -1764,7 +1872,7 @@
                 // and conversations (filtered by user email = 1–2 requests) in parallel before
                 // contacts finish loading so everything arrives concurrently.
                 console.log('📊 Starting parallel background data loading...');
-                const researchPromise = getDocs(collection(db, 'connect_company_background')).then(snapshot => {
+                const researchPromise = getCachedCollection('connect_company_background').then(snapshot => {
                     snapshot.forEach(doc => {
                         const data = doc.data();
                         companyResearch.set(data.company, data);
@@ -1799,6 +1907,13 @@
                     console.log(`✅ Loaded ${conversationData.size} conversations`);
                 });
                 
+                // Harvest-pool context (pool config, connection dates, manual labels) is independent of the
+                // contacts query, so start it NOW (in parallel) but never block the table on it. When it
+                // lands we enrich the leads and re-apply filters.
+                const loadSeq = ++leadsLoadSeq;
+                const harvestPromise = loadHarvestContext(userEmail, loadSeq);
+                harvestReadyPromise = harvestPromise;
+
                 // Load contacts - query for both auth email AND LinkedIn email
                 const contactsArray = [];
                 
@@ -1846,7 +1961,7 @@
                         const seatEmails = new Set();
 
                         // linkedin_accounts: bdrEmail -> heyreachAccountId
-                        const liAccountsSnap = await getDocs(collection(db, 'linkedin_accounts'));
+                        const liAccountsSnap = await getCachedCollection('linkedin_accounts');
                         liAccountsSnap.forEach(d => {
                             const a = d.data();
                             if (String(a.bdrEmail || '').toLowerCase() === bdrLower && a.heyreachAccountId) {
@@ -1960,16 +2075,14 @@
                 // Load custom groups (silently)
                 loadCustomGroups();
 
-                await Promise.all([
-                    loadHarvestFilterContext(userEmail),
-                    loadHarvestManualLabels(userEmail)
-                ]);
-                enrichLeadsWithHarvestPools();
-                filteredLeads = [...allLeads];
-                updateStats();
-                renderTable();
-
-                maybeApplyHarvestUrlParamsFromUrl();
+                // Harvest data was started in parallel with the contacts query above. Don't block on it:
+                // enrich + re-apply filters whenever it is ready (immediately if it already finished).
+                harvestPromise.then(() => {
+                    if (loadSeq !== leadsLoadSeq) return; // superseded by a newer load
+                    enrichLeadsWithHarvestPools();
+                    applyFilters();
+                    maybeApplyHarvestUrlParamsFromUrl();
+                });
 
                 // Disable bulk apply button initially
                 document.getElementById('bulkApplyBtn').disabled = true;
@@ -3490,6 +3603,7 @@ Return ONLY a raw JSON array:
          * activity + null referenceDate as long-ago connected so they count in the pool.
          */
         async function applyBulkHarvestPoolAssign() {
+            await harvestReadyPromise; // pool config / eligibility load in the background
             const poolId = document.getElementById('bulkHarvestPoolSelect').value;
             if (!poolId) {
                 alert('Select a harvest pool first.');
@@ -3656,6 +3770,7 @@ Return ONLY a raw JSON array:
          *   2. Custom group-based pool membership → remove the group from customGroups
          */
         async function applyBulkHarvestPoolRemove() {
+            await harvestReadyPromise;
             if (selectedLeads.size === 0) {
                 alert('Select contacts first.');
                 return;
@@ -3795,7 +3910,8 @@ Return ONLY a raw JSON array:
          * Exports the currently filtered view so admins can apply filters first.
          * If no filters are active, this equals all loaded leads.
          */
-        function exportLeadsCSV() {
+        async function exportLeadsCSV() {
+            await harvestReadyPromise; // exports include harvest pool columns
             const leads = filteredLeads.length > 0 ? filteredLeads : allLeads;
             if (leads.length === 0) {
                 alert('⚠️ No connections loaded yet. Please select a BDR and wait for leads to load before exporting.');
@@ -3925,6 +4041,7 @@ Return ONLY a raw JSON array:
          * Export the currently filtered lead list to a well-formatted .xlsx file.
          */
         async function exportLeadsExcel() {
+            await harvestReadyPromise; // exports include harvest pool columns
             const leads = filteredLeads.length > 0 ? filteredLeads : allLeads;
             if (leads.length === 0) {
                 alert('⚠️ No leads loaded yet. Please wait for leads to load before exporting.');
