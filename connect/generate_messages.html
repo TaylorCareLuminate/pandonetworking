@@ -4833,6 +4833,33 @@
                             onchange="fpmToggleContactSource()">
                         <span><strong>Paste LinkedIn URLs</strong> — drop in a list of contacts' LinkedIn profile URLs, look up each profile, add them to this BDR's prospect list, then load them here</span>
                     </label>
+                    <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;font-size:14px;">
+                        <input type="radio" name="fpmContactSource" value="ourConnections" id="fpmSourceOurConnections"
+                            style="accent-color:#0d9488;width:15px;height:15px;margin-top:2px;cursor:pointer;flex-shrink:0;"
+                            onchange="fpmToggleContactSource()">
+                        <span><strong>Our connections (Pando/HeyReach)</strong> — everyone this BDR is already connected to <em>because of a Pando/HeyReach connection request</em> (not connections that pre-date us). They are loaded here to receive a <strong>Direct Message</strong></span>
+                    </label>
+                </div>
+
+                <!-- Our connections (Pando/HeyReach) -->
+                <div id="fpmOurConnSourcePanel" style="display:none; padding-top:12px; border-top:1px solid #a7f3d0;">
+                    <div style="display:flex; align-items:flex-end; gap:16px; flex-wrap:wrap; margin-bottom:10px;">
+                        <div>
+                            <label for="fpmOurConnMinDays" style="font-size:12px; font-weight:600; color:var(--gray-700); display:block; margin-bottom:4px;">Connected at least (days)</label>
+                            <input type="number" id="fpmOurConnMinDays" min="0" max="3650" value="0"
+                                style="width:120px; padding:8px 12px; border:1px solid #6ee7b7; border-radius:6px; font-size:14px;">
+                        </div>
+                        <div>
+                            <label for="fpmOurConnExcludeDays" style="font-size:12px; font-weight:600; color:var(--gray-700); display:block; margin-bottom:4px;">Skip if messaged in last (days)</label>
+                            <input type="number" id="fpmOurConnExcludeDays" min="0" max="3650" value="30"
+                                style="width:120px; padding:8px 12px; border:1px solid #6ee7b7; border-radius:6px; font-size:14px;">
+                        </div>
+                    </div>
+                    <div class="form-help" style="margin-top:0; color:#065f46;">
+                        Uses the same rules as the Harvest Pool: only connections made by a HeyReach connection request we sent (a <code>CONNECTION_REQUEST_ACCEPTED</code> event on this BDR's seat) or manually labeled
+                        <strong>"Pando Executive Networking originated"</strong>. Contacts on this BDR's exclusion list (and, when <strong>Contact scope</strong> is "Only contacts already in the selected hypothesis group", contacts outside that group) are skipped.
+                        <strong>Skip if messaged in last</strong> uses any message or connection request in the queue/inbox (0 = don't skip anyone). Contacts are <em>not</em> added to the prospect list, and the message type is switched to <strong>Direct Message</strong> once they load.
+                    </div>
                 </div>
 
                 <!-- Paste LinkedIn URLs -->
@@ -18330,6 +18357,95 @@
             };
         }
 
+        /**
+         * "Our connections (Pando/HeyReach)" Contact Source — shared by Full AI Generate and Fast
+         * Prospect Messaging.
+         *
+         * Pulls the selected BDR's OWN existing LinkedIn connections that Pando/HeyReach created
+         * (a HeyReach CONNECTION_REQUEST_ACCEPTED on their seat, or manually labeled "Pando
+         * originated" — never connections that pre-date us). Same server rules as the Harvest
+         * Pool (/api/connect/harvest-pool/eligible-contacts with onlyOurConnections=true), minus the
+         * pool's min-days gate, which is overridable here.
+         *
+         * Unlike the other pull helpers this does NOT copy anything into prospect_contacts: these
+         * people are already connected, so they are messaged directly (message_type 'message')
+         * rather than being added to the prospect list that connection requests are drawn from.
+         * Returned contacts carry synthetic ids (same approach as Harvest Fast Prospect).
+         *
+         * Returns { pulled, stats }.
+         */
+        async function fullAiPullContactsFromOurConnections({ bdrEmail, count, minDaysSinceConnection, excludeRecentDays, groupUrlSet, addLog }) {
+            if (!bdrEmail) throw new Error('No BDR selected');
+            const minDays = Number.isFinite(minDaysSinceConnection) ? Math.max(0, minDaysSinceConnection) : 0;
+            const recentDays = Number.isFinite(excludeRecentDays) ? Math.max(0, excludeRecentDays) : 30;
+
+            addLog(`🤝 Loading ${bdrEmail}'s connections created by Pando/HeyReach ` +
+                `(connected at least ${minDays} day(s) ago${recentDays ? `, not messaged in the last ${recentDays} day(s)` : ''})...`, 'info');
+
+            const payload = await fetchHarvestEligibleFromServer(bdrEmail, '', true, {
+                excludeRecentDays: recentDays,
+                minDaysSinceConnection: minDays
+            });
+            const serverContacts = (payload.contacts || []).filter(c => c && c.linkedInUrl);
+            addLog(`   ✅ Server returned ${serverContacts.length} Pando/HeyReach connection(s).`, serverContacts.length ? 'success' : 'warning');
+            if (payload.excludedPreExistingCount) {
+                addLog(`   🤝 Skipped ${payload.excludedPreExistingCount} pre-existing connection(s) that were not made by us.`, 'info');
+            }
+            if (payload.excludeMessagedWithinDays) {
+                addLog(`   🚫 Skipped ${payload.excludedRecentlyMessagedCount || 0} contact(s) already messaged in the last ${payload.excludeMessagedWithinDays} day(s).`, 'info');
+            }
+            if (payload.recentlyMessagedLookupErrors && payload.recentlyMessagedLookupErrors.length) {
+                addLog(`   ⚠️ Recently-messaged lookup had errors — some recent contacts may not have been excluded: ${payload.recentlyMessagedLookupErrors.join('; ')}`, 'warning');
+            }
+            if (payload.minDaysSinceConnection != null && Number(payload.minDaysSinceConnection) > minDays) {
+                addLog(`   ℹ️ The server applied its own ${payload.minDaysSinceConnection}-day minimum since connection (the Harvest Pool setting) — the server needs the latest deploy to honor a lower value.`, 'warning');
+            }
+
+            // Dedupe + per-BDR exclusion list + optional hypothesis-group membership
+            let excludedUrls = new Set();
+            try {
+                excludedUrls = await loadBdrExclusionUrls(bdrEmail, { addLog });
+            } catch (e) { addLog(`   ⚠️ Could not load exclusion lists: ${e.message}`, 'warning'); }
+
+            const seen = new Set();
+            let skippedExcluded = 0, skippedNotInGroup = 0;
+            const candidates = [];
+            for (const c of serverContacts) {
+                const norm = normalizeLinkedInUrl(c.linkedInUrl);
+                if (!norm || seen.has(norm)) continue;
+                seen.add(norm);
+                if (excludedUrls.has(norm)) { skippedExcluded++; continue; }
+                if (groupUrlSet && !groupUrlSet.has(norm)) { skippedNotInGroup++; continue; }
+                candidates.push({ ...c, _normUrl: norm });
+            }
+            if (skippedExcluded) addLog(`   🚫 ${skippedExcluded} contact(s) skipped — on this BDR's exclusion list.`, 'info');
+            if (groupUrlSet) addLog(`   🔬 Hypothesis group filter: ${skippedNotInGroup} contact(s) skipped as outside the selected group.`, 'info');
+
+            // Server order is already "never messaged first, then oldest outreach" — keep it.
+            const toPull = candidates.slice(0, count);
+            const pulled = toPull.map((c, i) => ({
+                ...c,
+                id: `ourconn-${i}-${c._normUrl.replace(/[^a-z0-9]/gi, '').slice(-14)}`,
+                source: 'our_pando_connections',
+                alreadyConnected: true
+            }));
+
+            addLog(`✅ ${pulled.length} Pando/HeyReach connection(s) ready to message` +
+                (candidates.length > pulled.length ? ` (capped at ${count} of ${candidates.length} eligible)` : '') + '.',
+                pulled.length ? 'success' : 'warning');
+
+            return {
+                pulled,
+                stats: {
+                    eligible: candidates.length,
+                    pulled: pulled.length,
+                    excludedPreExisting: payload.excludedPreExistingCount || 0,
+                    excludedRecentlyMessaged: payload.excludedRecentlyMessagedCount || 0,
+                    skippedExcluded, skippedNotInGroup
+                }
+            };
+        }
+
         function fullAiParseConnectionCount(c) {
             const raw = c?.linkedInConnectionCount ?? c?.connectionCount ?? c?.connectionsCount ?? null;
             if (raw == null || raw === '') return null;
@@ -21268,13 +21384,23 @@
         }
 
         /** Eligible contacts + pool list from Railway — same membership as Harvest Pool / weekly pipeline. */
-        async function fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections) {
+        // opts (optional): { excludeRecentDays, minDaysSinceConnection } override the Harvest tab's
+        // own inputs — used by the "Our connections (Pando/HeyReach)" Contact Source in Full AI
+        // Generate and Fast Prospect Messaging. minDaysSinceConnection requires the matching
+        // server param (older servers ignore it and fall back to the Harvest Pool config's min days).
+        async function fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections, opts = {}) {
             const h = await harvestAuthHeaders();
             const qs = new URLSearchParams();
             if (poolId) qs.set('poolId', poolId);
             if (onlyOurConnections) qs.set('onlyOurConnections', 'true');
-            const excludeDays = parseInt(document.getElementById('harvestExcludeRecentDays')?.value, 10);
+            const excludeDays = opts.excludeRecentDays != null
+                ? parseInt(opts.excludeRecentDays, 10)
+                : parseInt(document.getElementById('harvestExcludeRecentDays')?.value, 10);
             if (!Number.isNaN(excludeDays)) qs.set('excludeRecentDays', String(Math.max(0, excludeDays)));
+            if (opts.minDaysSinceConnection != null) {
+                const md = parseInt(opts.minDaysSinceConnection, 10);
+                if (!Number.isNaN(md)) qs.set('minDaysSinceConnection', String(Math.max(0, md)));
+            }
             const url = `${HARVEST_RAILWAY_API}/api/connect/harvest-pool/eligible-contacts/${encodeURIComponent(bdrEmail)}?${qs}`;
             const r = await heavyFetch(url, { headers: h });
             const j = await r.json();
@@ -24667,7 +24793,8 @@
                 colleagues:  'the source BDR(s)\' connections',
                 recentSends: 'contacts in the source BDR\'s recent-send cohort',
                 urlList:     'pasted LinkedIn URLs',
-                bdrPool:     'contacts on the source BDR(s)\' prospect list'
+                bdrPool:     'contacts on the source BDR(s)\' prospect list',
+                ourConnections: 'this BDR\'s Pando/HeyReach connections'
             };
             if (scope === 'group') {
                 const what = whatBySource[fpmGetContactSource()] || 'pulled contacts';
@@ -24688,6 +24815,7 @@
             show('fpmBdrPoolSourcePanel',    src === 'bdrPool');
             show('fpmWorkspaceSourcePanel',  src === 'workspace');
             show('fpmRecentSendSourcePanel', src === 'recentSends');
+            show('fpmOurConnSourcePanel',    src === 'ourConnections');
             show('fpmPullBlock',             pulled);
             show('fpmHypScopeBlock',         pulled);
             const bdrBlock = document.getElementById('fpmBdrListBlock');
@@ -25127,15 +25255,22 @@
                 workspace:   `Workspace "${(document.getElementById('fpmWorkspaceSelect')?.selectedOptions?.[0]?.textContent || workspaceId).trim()}"`,
                 colleagues:  `Other BDR connections — ${selectedColleagues.map(c => c.name || c.primaryEmail).join(', ')}`,
                 bdrPool:     `Prospect pool of ${selectedPoolBdrs.map(c => c.name || c.primaryEmail).join(', ')} (${poolUntouchedOnly ? 'untouched only' : 'including contacts with outreach'}, ${poolTransferMode})`,
-                recentSends: `Same contacts ${recentSendSourceBdr?.name || recentSendEmail} sent in the last ${recentSendDays} day(s)`
+                recentSends: `Same contacts ${recentSendSourceBdr?.name || recentSendEmail} sent in the last ${recentSendDays} day(s)`,
+                ourConnections: `Our connections (Pando/HeyReach) — ${bdrLabel}'s existing connections created by our connection requests`
             }[src];
+            const ourConnMinDays = parseInt(document.getElementById('fpmOurConnMinDays')?.value, 10);
+            const ourConnExcludeDays = parseInt(document.getElementById('fpmOurConnExcludeDays')?.value, 10);
             const scopeNote = hypGroupId
                 ? (hypScope === 'group'
                     ? `\n\nContact scope: ONLY contacts already in hypothesis group "${hypGroupName}".`
                     : `\n\nContact scope: any contacts (hypothesis group membership not required).`)
                 : '';
-            if (!confirm(`Pull ${src === 'urlList' ? count : 'up to ' + count} contact(s) into ${bdrLabel}'s prospect list?\n\nContact source: ${sourceDescr}\n\n` +
-                `They are added to this BDR's prospect list (${src === 'bdrPool' && poolTransferMode === 'move' ? 'MOVED away from the source BDR' : 'copied'}), then loaded here so you can message them.` + scopeNote)) {
+            const pullConfirmMsg = src === 'ourConnections'
+                ? `Load up to ${count} of ${bdrLabel}'s Pando/HeyReach connections?\n\nContact source: ${sourceDescr}\n\n` +
+                  `They are NOT added to the prospect list. They are loaded here and the message type is switched to Direct Message, since they are already connected.` + scopeNote
+                : `Pull ${src === 'urlList' ? count : 'up to ' + count} contact(s) into ${bdrLabel}'s prospect list?\n\nContact source: ${sourceDescr}\n\n` +
+                  `They are added to this BDR's prospect list (${src === 'bdrPool' && poolTransferMode === 'move' ? 'MOVED away from the source BDR' : 'copied'}), then loaded here so you can message them.` + scopeNote;
+            if (!confirm(pullConfirmMsg)) {
                 return;
             }
 
@@ -25232,6 +25367,13 @@
                         lookbackDays: recentSendDays, requirePushed: recentSendRequirePushed,
                         groupUrlSet: scopeGroupUrlSet, addLog
                     });
+                } else if (src === 'ourConnections') {
+                    result = await fullAiPullContactsFromOurConnections({
+                        bdrEmail, count,
+                        minDaysSinceConnection: ourConnMinDays,
+                        excludeRecentDays: ourConnExcludeDays,
+                        groupUrlSet: scopeGroupUrlSet, addLog
+                    });
                 }
 
                 const pulledDocs = (result?.pulled || []).filter(c => c && c.id);
@@ -25240,10 +25382,13 @@
                     fpmShowAlert('No eligible contacts were found to pull after filters. See the log below for the reasons.', 'warning');
                     return;
                 }
-                if (fpmCancelRequested) addLog(`⛔ Cancelled — ${pulledDocs.length} contact(s) were already added to ${bdrLabel}'s prospect list, so they are loaded below.`, 'warning');
+                if (fpmCancelRequested) addLog(src === 'ourConnections'
+                    ? `⛔ Cancelled — ${pulledDocs.length} connection(s) were already found, so they are loaded below.`
+                    : `⛔ Cancelled — ${pulledDocs.length} contact(s) were already added to ${bdrLabel}'s prospect list, so they are loaded below.`, 'warning');
 
                 // Same ordering the other fast-prospect loaders use: known connection counts first (highest first).
-                const sorted = fullAiSortContactsByConnections(pulledDocs);
+                // Our-connections keeps the server's order (never-messaged first, then oldest outreach).
+                const sorted = src === 'ourConnections' ? pulledDocs : fullAiSortContactsByConnections(pulledDocs);
                 const beforeConn = sorted.length;
                 const connFiltered = fpmApplyConnectionsFilter(sorted);
                 const lowConn = beforeConn - connFiltered.length;
@@ -25256,8 +25401,18 @@
                 }
                 fpmShowContacts(connFiltered, 0, 0);
                 addLog(`✅ ${connFiltered.length} contact(s) loaded into Step 3` + (lowConn ? ` (${lowConn} below ${minConnThreshold} connections excluded)` : ''), 'success');
-                fpmShowAlert(`✅ Pulled ${pulledDocs.length} contact(s) into ${bdrLabel}'s prospect list — ${connFiltered.length} loaded below` +
-                    (lowConn ? `, ${lowConn} below ${minConnThreshold} connections excluded` : '') + '.', 'success');
+                if (src === 'ourConnections') {
+                    // Already connected → connection requests make no sense; default to a Direct Message.
+                    const dmRadio = document.querySelector('input[name="fpmMessageType"][value="message"]');
+                    if (dmRadio) { dmRadio.checked = true; fpmUpdateCharCounter(); }
+                    addLog('💬 Message type switched to Direct Message (these contacts are already connected).', 'info');
+                    fpmShowAlert(`✅ ${connFiltered.length} Pando/HeyReach connection(s) loaded below` +
+                        (lowConn ? `, ${lowConn} below ${minConnThreshold} connections excluded` : '') +
+                        ' — message type set to Direct Message.', 'success');
+                } else {
+                    fpmShowAlert(`✅ Pulled ${pulledDocs.length} contact(s) into ${bdrLabel}'s prospect list — ${connFiltered.length} loaded below` +
+                        (lowConn ? `, ${lowConn} below ${minConnThreshold} connections excluded` : '') + '.', 'success');
+                }
             } catch (err) {
                 console.error('fpmPullAndLoad error:', err);
                 addLog(`❌ Error: ${err.message}`, 'error');
@@ -25709,6 +25864,15 @@
             }
         }
 
+        // Contacts loaded from the "Our connections (Pando/HeyReach)" source are already connected, so a
+        // connection request can't be sent to them. Returns true when it is OK to continue.
+        function fpmConfirmConnectedNeedsDm(messageType, contacts) {
+            if (messageType === 'message') return true;
+            const n = (contacts || []).filter(c => c && c.alreadyConnected).length;
+            if (!n) return true;
+            return confirm(`${n} of these contact(s) are already connected (Our connections — Pando/HeyReach), so a connection request can't be delivered to them.\n\nSwitch the message type to "Direct Message" instead.\n\nSend as a connection request anyway?`);
+        }
+
         window.fpmSend = async function(targetStatus) {
             // Fast Prospect / Harvest Fast Prospect never bypass Fast Connect Review: everything goes to the admin review queue.
             targetStatus = 'pending_admin_review';
@@ -25731,6 +25895,7 @@
                 fpmShowAlert('Please enter a message for Direct Message type', 'warning');
                 return;
             }
+            if (!fpmConfirmConnectedNeedsDm(messageType, fpmContacts.filter(c => fpmSelectedContactIds.has(c.id)))) return;
             if (messageType === 'connect' && message.length > 275 && !needsLlama) {
                 if (!confirm(`Warning: Connect messages should be 275 characters or fewer. Your message is ${message.length} characters and will be sent as-is (not shortened, since no AI variation/placeholder resolution is enabled). Continue?`)) return;
             }
@@ -25900,6 +26065,7 @@
                 fpmShowAlert('Please enter a message for Direct Message type', 'warning');
                 return;
             }
+            if (!fpmConfirmConnectedNeedsDm(messageType, fpmContacts)) return;
 
             // In multi-BDR balance mode the connections filter was already applied when
             // the contacts were loaded/distributed — don't re-apply the single-BDR
