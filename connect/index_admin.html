@@ -635,6 +635,35 @@
         .bdr-dash-table td { padding: 10px 14px; vertical-align: middle; }
         .bdr-inprogress-link { text-decoration: none; cursor: pointer; }
         .bdr-inprogress-link:hover strong { text-decoration: underline; }
+        /* "Had a queue yesterday but didn't send it" flag — banner + row highlight + badge */
+        @keyframes bdrNotSentPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.55); }
+            50%      { box-shadow: 0 0 0 8px rgba(220,38,38,0); }
+        }
+        .bdr-notsent-banner {
+            background: #dc2626;
+            color: #fff;
+            border: 3px solid #7f1d1d;
+            border-radius: 10px;
+            padding: 14px 18px;
+            margin-bottom: 14px;
+            animation: bdrNotSentPulse 1.6s ease-in-out infinite;
+        }
+        .bdr-notsent-banner-title { font-size: 1.15rem; font-weight: 800; letter-spacing: 0.02em; }
+        .bdr-notsent-banner-sub { font-size: 0.82rem; opacity: 0.95; margin-top: 2px; }
+        .bdr-notsent-banner ul { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+        .bdr-notsent-banner li {
+            background: #fff; color: #991b1b; font-weight: 700; font-size: 0.88rem;
+            border-radius: 999px; padding: 4px 12px;
+        }
+        .bdr-notsent-banner li span { font-weight: 500; color: #7f1d1d; }
+        .bdr-dash-table tbody tr.bdr-row-notsent { background: #fee2e2; box-shadow: inset 6px 0 0 #dc2626; }
+        .bdr-dash-table tbody tr.bdr-row-notsent:hover { background: #fecaca; }
+        .bdr-notsent-badge {
+            display: inline-block; margin-top: 4px;
+            background: #dc2626; color: #fff; font-weight: 800; font-size: 0.72rem;
+            letter-spacing: 0.03em; border-radius: 4px; padding: 3px 8px;
+        }
         .bdr-table-rank { font-weight: 700; color: var(--gray-400); width: 32px; text-align: center; }
         .bdr-table-name { font-weight: 600; color: var(--gray-900); }
         .bdr-table-email { font-size: 0.78rem; color: var(--gray-600); margin-top: 2px; }
@@ -8349,6 +8378,12 @@ Rules:
             const alertObj = _liAlerts.find(a => a.id === id);
             if (!alertObj) return;
 
+            // Only send what actually changed — re-sending an already-saved category
+            // would be recorded as a new state in the category history.
+            const responseChanged = !!responseValue && responseValue !== (alertObj.responseCategory || '');
+            const followUpChanged = !!followUpValue && followUpValue !== (alertObj.followUpCategory || '');
+            if (!responseChanged && !followUpChanged) return;
+
             const targetConvId = alertObj.inboxDocId || alertObj.conversationId || alertObj.id;
 
             try {
@@ -8358,8 +8393,9 @@ Rules:
                     body: JSON.stringify({
                         conversationId: targetConvId,
                         collection: 'heyreach_inbox',
-                        responseCategory: responseValue || undefined,
-                        followUpCategory: followUpValue || undefined,
+                        responseCategory: responseChanged ? responseValue : undefined,
+                        followUpCategory: followUpChanged ? followUpValue : undefined,
+                        changedBy: window.auth?.currentUser?.email || undefined,
                         manualOverride: true
                     })
                 });
@@ -8826,6 +8862,19 @@ Rules:
                 return _liToMillis(a.lastMessageAt) > _liToMillis(b.lastMessageAt);
             };
 
+            // The twin that "wins" may be the one that never got a category even though
+            // the other seat's conversation with the same lead already has one. Remember
+            // the first category seen per lead+BDR so it can be carried onto the winner.
+            const carriedCategories = new Map();
+            (alerts || []).forEach(a => {
+                if (!a.responseCategory && !a.followUpCategory) return;
+                const key = _liAlertDedupeKey(a);
+                const c = carriedCategories.get(key) || {};
+                if (!c.responseCategory && a.responseCategory) c.responseCategory = a.responseCategory;
+                if (!c.followUpCategory && a.followUpCategory) c.followUpCategory = a.followUpCategory;
+                carriedCategories.set(key, c);
+            });
+
             const byKey = new Map();
             (alerts || []).forEach(a => {
                 const key = _liAlertDedupeKey(a);
@@ -8845,6 +8894,13 @@ Rules:
                 } else {
                     console.log(`[LiAlerts] Collapsing duplicate alert for "${key.substring(0, 60)}" — keeping ${existing.id}, dropping ${a.id}`);
                 }
+            });
+            // Carry over a category the winning card is missing (never overwrites one it has).
+            byKey.forEach((winner, key) => {
+                const c = carriedCategories.get(key);
+                if (!c) return;
+                if (!winner.responseCategory && c.responseCategory) winner.responseCategory = c.responseCategory;
+                if (!winner.followUpCategory && c.followUpCategory) winner.followUpCategory = c.followUpCategory;
             });
             return Array.from(byKey.values());
         }
@@ -12745,7 +12801,8 @@ Rules:
                         heyreachFailedExcluded, heyreachLiveExcluded, heyreachStaleExcluded,
                         heyreachPendingVerified, heyreachPendingVerifiedAt,
                         heyreachPausedConnect, heyreachPausedMessage,
-                        queue1Connect, queue1Message, queue2Connect, queue2Message } = bdr;
+                        queue1Connect, queue1Message, queue2Connect, queue2Message,
+                        yesterdayNotSentFlag, yesterdayAvailable, yesterdaySent, yesterdayDate } = bdr;
                 const reservePending  = (reserveCounts[(primaryEmail || '').toLowerCase()] || {}).pending || 0;
                 const bdrTarget       = bdrTargets[(primaryEmail || '').toLowerCase()] || {};
                 const targetDailyConnections   = bdrTarget.targetDailyConnections   ?? 10;
@@ -12780,6 +12837,10 @@ Rules:
                          queue1Message: queue1Message ?? null,
                          queue2Connect: queue2Connect ?? null,
                          queue2Message: queue2Message ?? null,
+                         yesterdayNotSentFlag: !!yesterdayNotSentFlag,
+                         yesterdayAvailable: yesterdayAvailable ?? null,
+                         yesterdaySent: yesterdaySent ?? null,
+                         yesterdayDate: yesterdayDate || '',
                          hasCachedQueues,
                          reservePending, targetDailyConnections, targetMonthlyConnections,
                          targetMonthlyReplies, targetMonthlyMeetings, totalQueue };
@@ -12797,7 +12858,19 @@ Rules:
             window._lastEnrichedBdrsForTodo = enriched;
             if (typeof window.populateTodoBdrSelect === 'function') window.populateTodoBdrSelect(enriched);
 
-            let html = `
+            // Big red banner: BDRs who HAD 15+ messages in the queue yesterday and DID NOT
+            // send them out (fewer than 5 went out). Computed nightly by Railway.
+            const notSentBdrs = enriched.filter(b => b.yesterdayNotSentFlag);
+            let html = '';
+            if (notSentBdrs.length) {
+                html += `
+                <div class="bdr-notsent-banner" role="alert">
+                    <div class="bdr-notsent-banner-title"><i class="fas fa-triangle-exclamation"></i> ${notSentBdrs.length} BDR${notSentBdrs.length === 1 ? '' : 'S'} DID NOT SEND THEIR QUEUE YESTERDAY${notSentBdrs[0].yesterdayDate ? ' (' + escapeHtmlLocal(notSentBdrs[0].yesterdayDate) + ')' : ''}</div>
+                    <div class="bdr-notsent-banner-sub">Had 15+ messages in the queue but fewer than 5 went out.</div>
+                    <ul>${notSentBdrs.map(b => `<li>${escapeHtmlLocal(b.name || b.primaryEmail || 'Unnamed BDR')} <span>— ${b.yesterdayAvailable} in queue, ${b.yesterdaySent} sent</span></li>`).join('')}</ul>
+                </div>`;
+            }
+            html += `
                 <table class="bdr-dash-table">
                     <thead>
                         <tr>
@@ -12820,6 +12893,7 @@ Rules:
                                  heyreachPausedConnect, heyreachPausedMessage,
                                  queue1Connect, queue1Message, queue2Connect, queue2Message,
                                  hasCachedQueues,
+                                 yesterdayNotSentFlag, yesterdayAvailable, yesterdaySent, yesterdayDate,
                                  reservePending, totalQueue }, i) => {
                 const emailAttr = escapeHtmlLocal(primaryEmail || '');
                 const verifyIcon = heyreachPendingVerified ? 'fa-rotate' : 'fa-shield-halved';
@@ -12871,11 +12945,16 @@ Rules:
                     ? `<button type="button" class="todo-add-bdr-btn" data-bdr-email="${emailAttr}" data-bdr-name="${escapeHtmlLocal(name || '')}" data-waiting="${waitingForReview}" title="Add ${escapeHtmlLocal(name || 'this BDR')}'s next step to your To-Do list"><i class="fas fa-square-plus"></i></button>`
                     : '';
 
+                const notSentBadge = yesterdayNotSentFlag
+                    ? `<div><span class="bdr-notsent-badge" title="On ${escapeHtmlLocal(yesterdayDate || 'yesterday')} this BDR had ${yesterdayAvailable} messages in the queue and only ${yesterdaySent} went out."><i class="fas fa-triangle-exclamation"></i> DID NOT SEND YESTERDAY — ${yesterdayAvailable} queued, ${yesterdaySent} sent</span></div>`
+                    : '';
+
                 html += `
-                        <tr>
+                        <tr${yesterdayNotSentFlag ? ' class="bdr-row-notsent"' : ''}>
                             <td class="bdr-table-rank">${i + 1}</td>
                             <td>
                                 <div class="bdr-table-name"><i class="fas fa-user-circle" style="color:var(--primary);margin-right:6px;"></i>${name || 'Unnamed BDR'}</div>
+                                ${notSentBadge}
                                 <div class="bdr-table-email">${primaryEmail || ''}${primaryEmail ? `<button type="button" class="refresh-queues-btn" data-bdr-email="${emailAttr}" title="Re-count Queue 1 and Queue 2 for ${escapeHtmlLocal(name || 'this BDR')} and save to the cache" style="margin-left:8px;border:none;background:none;color:#7c3aed;cursor:pointer;font-size:0.9em;padding:0;"><i class="fas fa-inbox"></i> <i class="fas fa-sync-alt" style="font-size:0.8em;"></i></button>` : ''}</div>
                             </td>
                             <td class="num-cell" style="background:rgba(14,165,233,0.06);">
