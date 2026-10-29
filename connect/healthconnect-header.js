@@ -151,6 +151,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Edit Quick Message Campaigns', href: 'edit_quick_message_in_process.html', icon: 'fa-bolt' },
                 { label: 'Fast Message Speed-Up', href: 'fast_message_speedup.html', icon: 'fa-forward-fast' },
                 { label: 'Quick Message Cleanup', href: 'quick_message_cleanup.html', icon: 'fa-broom' },
+                { label: 'Quick Message Bulk Delete', href: 'quick_message_bulk_delete.html', icon: 'fa-trash-can' },
                 { label: 'BDR Send Audit', href: 'bdr_send_audit.html', icon: 'fa-clipboard-check' },
                 { label: 'Process Exclusions', href: 'process_exclusions.html', icon: 'fa-ban' },
                 { label: 'Prospect Cleanup (AI)', href: 'manage_data.html?tool=prospect_cleanup', icon: 'fa-broom' },
