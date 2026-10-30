@@ -71,6 +71,12 @@
             width: 100%; padding: .55rem .8rem; box-sizing: border-box;
         }
         .field .hint { font-size: .78rem; color: var(--muted); line-height: 1.5; }
+        .key-on-file {
+            display: flex; align-items: center; gap: .55rem; flex-wrap: wrap; margin-top: .35rem;
+            font-size: .8rem; color: var(--sage); background: var(--sage-tint);
+            border: 1px solid var(--sage-soft); border-radius: 5px; padding: .4rem .65rem;
+        }
+        .key-on-file span { flex: 1; min-width: 180px; }
         .input-with-btn { position: relative; }
         .input-with-btn input { padding-right: 2.6rem !important; font-family: 'SF Mono', Consolas, monospace; letter-spacing: .04em; }
         .input-with-btn button {
@@ -183,7 +189,7 @@
             <div class="form-grid">
                 <div class="field">
                     <label for="bdrSelect">BDR</label>
-                    <select id="bdrSelect"></select>
+                    <select id="bdrSelect" onchange="updateKeyOnFile()"></select>
                 </div>
                 <div class="field">
                     <label for="twoFactorKey">LinkedIn 2FA key <span style="text-transform:none;letter-spacing:0;font-weight:400;">(optional)</span></label>
@@ -192,7 +198,12 @@
                                placeholder="e.g. JBSWY3DPEHPK3PXP…" data-lpignore="true">
                         <button type="button" onclick="toggleKeyVisibility()" title="Show / hide" id="keyToggle"><i class="fas fa-eye"></i></button>
                     </div>
-                    <span class="hint">The authenticator "setup key" from LinkedIn (Settings → Sign in &amp; security → Two-step verification). Saved with the invite so HeyReach can generate login codes itself. Leave blank if the account has no authenticator app; the BDR will be asked for any emailed/texted code instead.</span>
+                    <span class="hint">The authenticator "setup key" from LinkedIn (Settings → Sign in &amp; security → Two-step verification). It is encrypted and saved for this BDR so HeyReach can generate login codes itself; it is never shown again. Leave blank if the account has no authenticator app; the BDR will be asked for any emailed/texted code instead.</span>
+                    <div id="keyOnFile" class="key-on-file" hidden>
+                        <i class="fas fa-lock"></i>
+                        <span id="keyOnFileText"></span>
+                        <button type="button" class="btn btn-danger-outline btn-sm" onclick="removeSavedKey()"><i class="fas fa-trash"></i> Remove</button>
+                    </div>
                 </div>
                 <div class="field">
                     <label for="proxyCountry">Proxy country</label>
@@ -339,7 +350,51 @@ window.onCompanyChange = function() {
     document.getElementById('invitesTitle').textContent = `Invites — ${name}`;
     document.getElementById('emptyState').hidden = true;
     document.getElementById('workspace').hidden = false;
+    savedKeys = new Map();
+    updateKeyOnFile();
+    loadSavedKeys();
     loadInvites();
+};
+
+// ── Saved 2FA keys (the keys themselves are never sent back to the browser) ──
+let savedKeys = new Map(); // bdrEmail -> { updatedAt, updatedBy }
+
+async function loadSavedKeys() {
+    if (!selectedCompanyId) return;
+    const forCompany = selectedCompanyId;
+    try {
+        const { saved } = await api(`/secrets?customerId=${encodeURIComponent(forCompany)}`);
+        if (forCompany !== selectedCompanyId) return;
+        savedKeys = new Map((saved || []).map(s => [s.bdrEmail, s]));
+    } catch (e) {
+        console.warn('Could not load saved 2FA key list:', e.message);
+    }
+    updateKeyOnFile();
+}
+
+window.updateKeyOnFile = function() {
+    const box = document.getElementById('keyOnFile');
+    const email = document.getElementById('bdrSelect').value;
+    const info = savedKeys.get(email);
+    box.hidden = !info;
+    if (info) {
+        document.getElementById('keyOnFileText').textContent =
+            `A 2FA key is saved for this BDR (${info.updatedAt ? new Date(info.updatedAt).toLocaleDateString() : 'earlier'}). Leave the field blank to reuse it, or enter a new one to replace it.`;
+    }
+};
+
+window.removeSavedKey = async function() {
+    const email = document.getElementById('bdrSelect').value;
+    if (!email || !confirm('Remove the saved 2FA key for this BDR? Existing invites will no longer send a key to HeyReach.')) return;
+    try {
+        await api('/secrets', { method: 'DELETE', body: { customerId: selectedCompanyId, bdrEmail: email } });
+        savedKeys.delete(email);
+        updateKeyOnFile();
+        loadInvites();
+    } catch (e) {
+        document.getElementById('createStatus').className = 'status-line error';
+        document.getElementById('createStatus').textContent = 'Error: ' + e.message;
+    }
 };
 
 window.toggleKeyVisibility = function() {
@@ -391,10 +446,11 @@ window.createInvite = async function() {
         document.getElementById('linkOpen').href = link;
         document.getElementById('linkBoxMeta').textContent =
             `For ${invite.bdrName || invite.bdrEmail} at ${invite.companyName}. ` +
-            (invite.hasTwoFactorKey ? '2FA key saved. ' : 'No 2FA key saved. ') +
+            (invite.hasTwoFactorKey ? '2FA key saved (encrypted). ' : 'No 2FA key saved. ') +
             `Expires ${new Date(invite.expiresAt).toLocaleDateString()}.`;
         document.getElementById('linkBox').hidden = false;
         document.getElementById('twoFactorKey').value = '';
+        loadSavedKeys();
         await loadInvites();
     } catch (e) {
         status.className = 'status-line error';
@@ -420,7 +476,7 @@ function renderInvites() {
             <td>${escHtml(i.bdrName || i.bdrEmail)}<span class="sub">${escHtml(i.bdrEmail)}</span></td>
             <td><span class="badge ${escHtml(i.status)}">${escHtml(STATUS_LABEL[i.status] || i.status)}</span></td>
             <td>${detail || '<span class="sub">—</span>'}</td>
-            <td>${i.hasTwoFactorKey ? '<i class="fas fa-key" style="color:var(--sage)"></i> saved' + (i.twoFactorEncrypted ? '' : '<span class="sub">not encrypted</span>') : '<span class="sub">none</span>'}</td>
+            <td>${i.hasTwoFactorKey ? '<i class="fas fa-lock" style="color:var(--sage)"></i> saved' + (i.twoFactorEncrypted ? '<span class="sub">encrypted</span>' : '<span class="sub" style="color:var(--danger)">legacy, not encrypted</span>') : '<span class="sub">none</span>'}</td>
             <td>${fmtDate(i.createdAt)}<span class="sub">by ${escHtml(i.createdBy || '')}</span></td>
             <td>${fmtDate(i.expiresAt)}</td>
             <td class="actions">
