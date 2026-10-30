@@ -16140,6 +16140,85 @@
         // or mid-deploy), it transparently retries on the main API and keeps using the
         // main API for 5 minutes. Failures after 5s are NOT retried (avoids duplicating
         // work that may already be running on the server).
+        // ── Auth-token resilience for long runs ─────────────────────────────────
+        // Firebase ID tokens last 1 hour, and getIdToken() hands back a cached one that may have
+        // only ~5 minutes left. Big Full AI runs (and several running at once) spend longer than
+        // that between grabbing a token and using it (contact pulls, hypothesis filtering, long
+        // per-prospect loops), so the server answered "401 Invalid or expired token" and the run
+        // died. This wrapper fixes it for EVERY Railway call on the page, no call-site changes:
+        //   1. Before sending, if the Bearer token expires within 3 minutes, swap in a fresh one.
+        //   2. If the server still answers 401, force-refresh the token and replay the request once
+        //      (a 401 means the server did no work, so replaying is safe).
+        (function installRailwayAuthFetch() {
+            if (window.__railwayAuthFetchInstalled) return;
+            window.__railwayAuthFetchInstalled = true;
+            const origFetch = window.fetch.bind(window);
+
+            function jwtExpMs(tok) {
+                try {
+                    const p = tok.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                    const json = JSON.parse(atob(p + '='.repeat((4 - p.length % 4) % 4)));
+                    return json.exp ? json.exp * 1000 : 0;
+                } catch (_) { return 0; }
+            }
+            let forcedRefreshPromise = null;
+            async function freshToken(force) {
+                const u = window.auth && window.auth.currentUser;
+                if (!u) return null;
+                if (!force) return u.getIdToken();
+                // Share one forced refresh between concurrent requests/runs.
+                if (!forcedRefreshPromise) {
+                    forcedRefreshPromise = u.getIdToken(true).finally(() => { forcedRefreshPromise = null; });
+                }
+                return forcedRefreshPromise;
+            }
+            function readBearer(headers) {
+                if (!headers) return null;
+                const v = (typeof headers.get === 'function') ? headers.get('Authorization')
+                    : (headers.Authorization || headers.authorization);
+                return (v && /^Bearer /.test(v)) ? v.slice(7) : null;
+            }
+            function withBearer(options, tok) {
+                const h = options.headers;
+                let nh;
+                if (h && typeof h.get === 'function') { nh = new Headers(h); nh.set('Authorization', 'Bearer ' + tok); }
+                else {
+                    nh = Object.assign({}, h || {});
+                    if ('authorization' in nh && !('Authorization' in nh)) delete nh.authorization;
+                    nh.Authorization = 'Bearer ' + tok;
+                }
+                return Object.assign({}, options, { headers: nh });
+            }
+
+            window.fetch = async function (input, options) {
+                const isRailwayUrl = typeof input === 'string' && /^https:\/\/[^/]*railway\.app\//.test(input);
+                const sentToken = isRailwayUrl && options ? readBearer(options.headers) : null;
+                if (!sentToken) return origFetch(input, options);
+
+                let opts = options;
+                let usedToken = sentToken;
+                try {
+                    const exp = jwtExpMs(sentToken);
+                    if (exp && exp - Date.now() < 3 * 60 * 1000) {
+                        const t = await freshToken(false);
+                        if (t && t !== sentToken) { opts = withBearer(options, t); usedToken = t; }
+                    }
+                } catch (e) { console.warn('[auth-fetch] proactive token refresh skipped:', e && e.message); }
+
+                const res = await origFetch(input, opts);
+                if (res.status !== 401) return res;
+
+                try {
+                    const t = await freshToken(true);
+                    if (t && t !== usedToken) {
+                        console.warn('[auth-fetch] 401 from server — retrying once with a refreshed token:', input);
+                        return await origFetch(input, withBearer(options, t));
+                    }
+                } catch (e) { console.warn('[auth-fetch] 401 token refresh failed:', e && e.message); }
+                return res;
+            };
+        })();
+
         const MAIN_API_ORIGIN  = 'https://railwayclemail-production.up.railway.app';
         const HEAVY_API_ORIGIN = 'https://heavy-api-production.up.railway.app';
         let _heavyApiBadUntil = 0;
@@ -20557,6 +20636,10 @@
                 // BDR's contact pool / hypothesis group filtering takes server-side.
                 let initJobRes;
                 try {
+                    // The contact-pull / filtering steps above can run for minutes, so the token
+                    // grabbed at the start of the run may be near expiry. Refresh before init.
+                    try { if (window.auth.currentUser) token = await window.auth.currentUser.getIdToken(true); }
+                    catch (tokenErr) { console.warn('Pre-init token refresh skipped:', tokenErr.message); }
                     initJobRes = await fetchWithRetry('https://railwayclemail-production.up.railway.app/api/connect/full-ai-init', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
