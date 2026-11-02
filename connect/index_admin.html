@@ -3966,6 +3966,7 @@
                     </button>
                 </div>
                 <span class="li-filter-count" id="liFilterCount"></span>
+                <span id="liHumanStyleCtl" title="Rewrites the AI-drafted reply so it reads like a quick, typed-on-a-phone message. Applies to new drafts and to Regenerate (existing drafts are not changed). Default: Off."></span>
                 <button type="button" id="liShowNotPandoBtn" onclick="window.liToggleShowNotPando()" style="display:none; align-items:center; gap:6px; margin-left:auto; padding:6px 12px; border-radius:8px; border:2px solid #6b7280; background:#f3f4f6; color:#374151; font-size:0.8rem; font-weight:600; cursor:pointer;" title="Replies that didn't originate with Pando outreach (the lead messaged first, or there's no outreach record for them) are hidden by default.">
                     <i class="fas fa-eye"></i> Show Not-Pando (0)
                 </button>
@@ -5023,6 +5024,17 @@
     <script src="meeting-notify.js?v=1.0"></script>
     <!-- Conference Scheduling (widget embedded in each reply alert card) -->
     <script src="conference-scheduling.js?v=1.12"></script>
+    <!-- Human-like messaging (Off / Light / Medium) for AI reply drafts -->
+    <script src="human-style.js?v=1"></script>
+    <script>
+        // Replies only: no connect_queue save hook and no generation-endpoint fetch hook needed here.
+        if (window.HumanStyle) {
+            HumanStyle.init({ scope: 'replies', queueHook: false, fetchHook: false });
+            HumanStyle.mount('liHumanStyleCtl', {
+                scope: 'replies', compact: true, title: 'Human-like replies', hideDesc: true
+            });
+        }
+    </script>
 
     <script type="module">
         import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
@@ -8889,7 +8901,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
             return `${msgs.length}:${lastTs}`;
         }
 
-        function _liSetAiStatus(id, state, errMsg, at) {
+        function _liSetAiStatus(id, state, errMsg, at, humanStyle) {
             const el = document.getElementById(`li-ai-status-${id}`);
             const regen = document.getElementById(`li-ai-regen-${id}`);
             if (!el) return;
@@ -8899,7 +8911,8 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 if (regen) regen.disabled = true;
             } else if (state === 'ready') {
                 el.className = 'li-ai-status li-ai-status-ready';
-                const when = at ? ` · drafted ${_liTimeAgo(at)}` : '';
+                const when = (at ? ` · drafted ${_liTimeAgo(at)}` : '') +
+                    (humanStyle && humanStyle !== 'off' ? ` · human-like (${humanStyle})` : '');
                 el.innerHTML = `<i class="fas fa-robot"></i> Opus draft loaded below — review, tweak if needed, then Send${_liEscHtml(when)}`;
                 if (regen) regen.disabled = false;
             } else if (state === 'error') {
@@ -8926,7 +8939,7 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                     if (ccEl) ccEl.textContent = String(textarea.value.length);
                 }
             }
-            _liSetAiStatus(id, 'ready', null, alertObj.aiDraftAt);
+            _liSetAiStatus(id, 'ready', null, alertObj.aiDraftAt, alertObj.aiDraftHumanStyle);
         }
 
         function _liApplyAllAiDrafts() {
@@ -8964,10 +8977,39 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 let draft = _liCleanDraft(await _liCallAiModel(prompt));
                 if (draft.length > 1990) draft = draft.slice(0, 1990);
 
+                // Human-like replies (default OFF): rewrite the polished draft so it reads like a quick,
+                // typed-on-a-phone message. Falls back to the original draft on any problem.
+                let humanStyleUsed = 'off';
+                let preHumanDraft = null;
+                if (window.HumanStyle && HumanStyle.getMode('replies') !== 'off') {
+                    try {
+                        const _hsMsgs = alertObj.messages || [];
+                        const _hsLastProspect = [..._hsMsgs].reverse().find(m => !(m.sender === 'ME' || m.sender === 'account'));
+                        const hs = await HumanStyle.humanizeReply({
+                            text: draft,
+                            mode: HumanStyle.getMode('replies'),
+                            title: alertObj.leadPosition || '',
+                            firstName: alertObj.leadFirstName || String(alertObj.leadName || '').split(/\s+/)[0] || '',
+                            prospectReply: _hsLastProspect ? (_hsLastProspect.body || _hsLastProspect.text || _hsLastProspect.message || '') : ''
+                        });
+                        if (hs.changed) {
+                            preHumanDraft = draft;
+                            draft = hs.text.length > 1990 ? hs.text.slice(0, 1990) : hs.text;
+                            humanStyleUsed = hs.mode;
+                            console.log(`[LiAlerts][HumanStyle] ${hs.mode} (${hs.messageType}): ${hs.forms.join(', ')}`);
+                        } else if (hs.reason && hs.reason !== 'off') {
+                            console.warn(`[LiAlerts][HumanStyle] kept original draft - ${hs.reason}`);
+                        }
+                    } catch (hsErr) {
+                        console.warn('[LiAlerts][HumanStyle] failed, kept original draft:', hsErr.message);
+                    }
+                }
+
                 alertObj.aiDraft = draft;
                 alertObj.aiDraftKey = key;
                 alertObj.aiDraftAt = new Date();
                 alertObj.aiDraftModel = LI_AI_MODEL;
+                alertObj.aiDraftHumanStyle = humanStyleUsed;
 
                 // Persist so the draft survives refreshes and shows on any device
                 try {
@@ -8978,6 +9020,8 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                             aiDraftKey: key,
                             aiDraftAt: new Date(),
                             aiDraftModel: LI_AI_MODEL,
+                            aiDraftHumanStyle: humanStyleUsed,
+                            aiDraftPreHuman: preHumanDraft,
                             aiDraftHypothesisGroup: (ctx.hypothesisGroup && (ctx.hypothesisGroup.name || ctx.hypothesisGroup.id)) || null
                         });
                     }
