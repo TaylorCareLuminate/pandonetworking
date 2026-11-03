@@ -7330,6 +7330,92 @@
         }
         window.getHypothesisGroupUrls = getHypothesisGroupUrls;
 
+        // Associates contacts with a hypothesis group: appends their LinkedIn URLs to the group's
+        // contact list (hypothesis_groups.contactLinkedInUrls / chunks — the list Outcomes by
+        // Hypothesis Group and the "only contacts in the group" scope read as membership) and stamps
+        // hypothesisGroupId on their prospect_contacts doc when it has no group yet.
+        //
+        // Full AI Generate used to stamp hypothesisGroupId on each saved message but never touched
+        // the group's contact list, so any contact that wasn't already a member (Contact scope
+        // "Any contacts", pulled workspace / colleague / pool / URL-list contacts, …) was messaged
+        // "for" the group yet invisible in Outcomes.
+        //
+        // contacts: [{ url, id?, firstName?, lastName?, title?, company?, hypothesisGroupId? }]
+        // Returns { added, stamped }. Throws if the group list could not be written after 3 tries.
+        async function ensureContactsInHypothesisGroup(groupId, contacts, addLog) {
+            const result = { added: 0, stamped: 0 };
+            if (!groupId || !contacts || !contacts.length) return result;
+            const { doc: docFn, getDoc: gdoc, updateDoc: ud } = window.clemailFirestore;
+
+            let lastErr = null;
+            let newUrls = [];
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                    const snap = await gdoc(docFn(db, 'hypothesis_groups', groupId));
+                    if (!snapExists(snap)) throw new Error('hypothesis group document not found');
+                    const data = snap.data() || {};
+                    const { urls, tagged } = await _readHypGroupContacts(groupId, data);
+                    const have = new Set(urls.map(_normalizeHypUrl).filter(Boolean));
+                    newUrls = [];
+                    const newTagged = [];
+                    for (const c of contacts) {
+                        const raw = (c.url || c.linkedInUrl || c.li_url || c.linkedin_url || c.profile_url || '').trim();
+                        const norm = _normalizeHypUrl(raw);
+                        if (!norm || have.has(norm)) continue;
+                        have.add(norm);
+                        newUrls.push(raw || norm);
+                        newTagged.push({
+                            name: c.fullName || [c.firstName, c.lastName].filter(Boolean).join(' ') || '',
+                            linkedInUrl: raw || norm,
+                            title: c.title || c.jobTitle || '',
+                            org: c.company || c.organization || '',
+                            orgLinkedInUrl: c.searchedOrganizationLinkedInUrl || c.orgLinkedInUrl || ''
+                        });
+                    }
+                    if (newUrls.length) {
+                        await _writeHypGroupContacts(groupId, [...urls, ...newUrls], [...tagged, ...newTagged]);
+                    }
+                    lastErr = null;
+                    break;
+                } catch (e) {
+                    lastErr = e;
+                    newUrls = [];
+                    if (attempt < 3) await new Promise(r => setTimeout(r, 1500 * attempt));
+                }
+            }
+            if (lastErr) throw lastErr;
+            result.added = newUrls.length;
+
+            // Keep the in-memory membership cache in step so later filters in this page see them.
+            const cached = _hypothesisGroupUrlCache.get(groupId);
+            if (cached) newUrls.forEach(u => cached.add(_normalizeHypUrl(u)));
+            // …and the dropdown's cached copy of the group (contact count in the option label).
+            const cachedGroup = _allHypothesisGroupsCache?.find(g => g.id === groupId);
+            if (cachedGroup && newUrls.length) {
+                if (cachedGroup._chunked) cachedGroup._totalContactCount = (cachedGroup._totalContactCount || 0) + newUrls.length;
+                else cachedGroup.contactLinkedInUrls = [...(cachedGroup.contactLinkedInUrls || []), ...newUrls];
+            }
+
+            // Stamp prospect_contacts docs that don't carry a group yet (never overwrite another
+            // group's stamp — a contact can belong to several groups).
+            const taggedAt = new Date().toISOString();
+            for (const c of contacts) {
+                if (!c.id || c.hypothesisGroupId) continue;
+                try {
+                    await ud(docFn(db, 'prospect_contacts', c.id), {
+                        hypothesisGroupId: groupId,
+                        hypothesisGroupName: c.hypothesisGroupName || '',
+                        hypothesisGroupTaggedAt: taggedAt
+                    });
+                    result.stamped++;
+                } catch (e) {
+                    addLog?.(`   ⚠️ Could not stamp prospect_contacts/${c.id} with the hypothesis group (${e.message}).`, 'warning');
+                }
+            }
+            return result;
+        }
+        window.ensureContactsInHypothesisGroup = ensureContactsInHypothesisGroup;
+
         // Returns true if the contact's LinkedIn URL is in the hypothesis group (or no group selected).
         function contactInHypothesisGroup(linkedInUrl, urlSet) {
             if (!urlSet || urlSet.size === 0) return true;
@@ -20095,6 +20181,38 @@
                     fullAiHypGroupName = document.getElementById('fullAiHypothesisSelect')?.selectedOptions[0]?.text || fullAiHypGroupId;
                 }
 
+                // Hypothesis-group association: every contact that gets a message saved in this run
+                // is queued here and written onto the group's contact list (see
+                // ensureContactsInHypothesisGroup). Flushed every few contacts, at the end of the run
+                // and on error — so Outcomes by Hypothesis Group can see them whatever the Contact scope.
+                const fullAiGroupPending = new Map(); // normalized url → contact info
+                const queueFullAiGroupContact = (p) => {
+                    if (!fullAiHypGroupId || !p) return;
+                    const rawUrl = p.linkedInUrl || p.li_url || p.linkedin_url || p.profile_url || '';
+                    const key = _normalizeHypUrl(rawUrl);
+                    if (!key) return;
+                    fullAiGroupPending.set(key, {
+                        url: rawUrl, id: p.id, firstName: p.firstName, lastName: p.lastName,
+                        title: p.title, company: p.company || p.companyName,
+                        hypothesisGroupId: p.hypothesisGroupId,
+                        hypothesisGroupName: fullAiHypGroupName
+                    });
+                };
+                const flushFullAiGroupContacts = async (reason) => {
+                    if (!fullAiHypGroupId || fullAiGroupPending.size === 0) return;
+                    const batch = [...fullAiGroupPending.values()];
+                    try {
+                        const r = await ensureContactsInHypothesisGroup(fullAiHypGroupId, batch, addLog);
+                        fullAiGroupPending.clear();
+                        if (r.added > 0) {
+                            addLog(`🔬 Added ${r.added} contact(s) to hypothesis group "${fullAiHypGroupName}" (they were messaged but weren't on the group's contact list yet).`, 'success');
+                        }
+                    } catch (e) {
+                        // Keep them queued — the next flush (or the final one) retries.
+                        addLog(`⚠️ Could not add ${batch.length} messaged contact(s) to hypothesis group "${fullAiHypGroupName}" (${e.message}) — will retry. If this keeps failing, use Outcomes → "Associate sent messages with hypothesis groups".`, 'warning');
+                    }
+                };
+
                 // ── Optional: Pull contacts from a workspace into this BDR first ──
                 // Creates a moveBatchId so full-ai-init only processes the just-pulled set.
                 // Ordering is most-connections-first; survivors are remembered on the workspace.
@@ -20348,6 +20466,9 @@
                             const liveData = liveSnap.data() || {};
                             if (fullAiGroupForVariations) Object.assign(fullAiGroupForVariations, liveData);
                             else fullAiGroupForVariations = { id: fullAiHypGroupId, ...liveData };
+                            // The dropdown option's text is "🔬 Name  (N contacts)" — stamp the group's real
+                            // name on messages / prospect_contacts instead of that decorated label.
+                            if (liveData.name) fullAiHypGroupName = liveData.name;
                         }
                     } catch (e) {
                         addLog(`⚠️ Couldn't refresh hypothesis group "${fullAiHypGroupName}" before the run (${e.message}) — using the last loaded copy of its message variations.`, 'warning');
@@ -21246,6 +21367,7 @@
                                             bdrProfileDoc: finalReviewBdrProfile
                                         });
                                         fullAiCreatedDocIds.push(msgIdPM);
+                                        queueFullAiGroupContact(prospect);
                                         addLog(`   ✅ [Profile Message] saved to queue${shouldRouteToReserve ? ' → Reserve Queue' : ''}`, 'success');
                                         await reviewMessageWithOpusIfEnabled(msgIdPM, variationPM, pProfile, fallbackProfileData, {
                                             currentTitle: singleData.prospectTitle || prospect.title || '',
@@ -21364,6 +21486,7 @@
                             });
                             savedCount++;
                             fullAiCreatedDocIds.push(msgId);
+                            queueFullAiGroupContact(prospect);
                             await reviewMessageWithOpusIfEnabled(msgId, variation, pd, existingProfileData, {
                                 currentTitle: singleData.prospectTitle || prospect.title || '',
                                 currentCompany: singleData.prospectCompany || prospect.company || ''
@@ -21406,9 +21529,16 @@
                         console.error('[Full AI] prospect error:', prospectErr);
                     }
 
+                    // Write messaged contacts onto the hypothesis group's contact list in small batches
+                    // so a browser close / crash mid-run loses at most a handful of associations.
+                    if (fullAiGroupPending.size >= 10) await flushFullAiGroupContacts();
+
                     // Brief pause between prospects to avoid hammering the server
                     await new Promise(r => setTimeout(r, 1000));
                 }
+
+                // Final flush (covers the normal end of the list AND a user Stop, which `break`s out above).
+                await flushFullAiGroupContacts();
 
                 // ── Done ────────────────────────────────────────────────────────────
                 // Opus Review (when enabled) already ran message-by-message inside the loop

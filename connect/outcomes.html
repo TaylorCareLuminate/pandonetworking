@@ -1535,6 +1535,56 @@
             </div>
         </div>
 
+        <!-- Associate sent messages with hypothesis groups — repairs connect_queue docs / group contact
+             lists for connections that were already sent but never got tied to a hypothesis group
+             (or are stamped with one but missing from its contact list). Re-sends nothing. -->
+        <div class="card" id="hypoAssocCard" style="display:none; border-top:4px solid #7c3aed;">
+            <div class="card-header">
+                <h3 style="color:#6d28d9;">
+                    <i class="fas fa-link"></i> Associate Sent Messages with Hypothesis Groups
+                </h3>
+                <div class="card-meta" id="hypoAssocMeta"></div>
+            </div>
+            <div class="card-body" style="padding:1.25rem 1.75rem;">
+                <div style="font-size:0.85rem;color:var(--gray-600);background:#faf5ff;border:1px solid #ddd6fe;border-radius:8px;padding:0.75rem 1rem;margin-bottom:1rem;line-height:1.5;">
+                    <i class="fas fa-info-circle" style="color:#7c3aed;margin-right:0.3rem;"></i>
+                    These connections were already sent, but their contact isn't on any hypothesis group's contact list, so they don't show up in
+                    <em>Outcomes by Hypothesis Group</em>. The group below is a best guess from the message's own group stamp, its Full Pipeline run,
+                    or the contact's tag in your prospect list — change it if it's wrong, or pick one for rows with no guess.
+                    Saving adds each contact to the group's contact list and stamps the group on the existing <code>connect_queue</code> record(s).
+                    Nothing gets re-sent.
+                </div>
+                <div style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;margin-bottom:1rem;">
+                    <button onclick="hypoAssocSelectAll(true)" style="background:#fff;border:1.5px solid #d1d5db;color:#374151;font-weight:600;font-size:0.78rem;padding:0.4rem 0.7rem;border-radius:6px;cursor:pointer;">Select All</button>
+                    <button onclick="hypoAssocSelectAll(false)" style="background:#fff;border:1.5px solid #d1d5db;color:#374151;font-weight:600;font-size:0.78rem;padding:0.4rem 0.7rem;border-radius:6px;cursor:pointer;">Select None</button>
+                    <span style="width:1px;height:22px;background:#e5e7eb;"></span>
+                    <label style="font-size:0.8rem;color:#374151;font-weight:600;">Bulk-assign selected to:</label>
+                    <select id="hypoAssocBulkSelect" style="font-size:0.8rem;padding:0.35rem 0.6rem;border:1.5px solid #c4b5fd;border-radius:6px;background:#faf5ff;color:#6d28d9;font-weight:600;max-width:260px;"></select>
+                    <button onclick="hypoAssocApplyBulk()" style="background:#0F2D4D;color:#fff;font-weight:700;font-size:0.78rem;padding:0.45rem 0.9rem;border-radius:6px;border:none;cursor:pointer;">Apply to Selected</button>
+                    <span style="flex:1;"></span>
+                    <button onclick="hypoAssocSaveAll()" id="hypoAssocSaveBtn" style="background:#10b981;color:#fff;font-weight:700;font-size:0.8rem;padding:0.5rem 1.1rem;border-radius:6px;border:none;cursor:pointer;">
+                        <i class="fas fa-save"></i> Associate Selected
+                    </button>
+                </div>
+                <div id="hypoAssocStatus" style="font-size:0.82rem;color:var(--gray-500);margin-bottom:0.75rem;"></div>
+                <div style="max-height:520px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;">
+                    <table class="outcome-table" style="margin:0;">
+                        <thead>
+                            <tr>
+                                <th style="width:32px;"></th>
+                                <th>Contact</th>
+                                <th>BDR</th>
+                                <th>Company / Title</th>
+                                <th>Why this group</th>
+                                <th style="width:230px;">Hypothesis Group</th>
+                            </tr>
+                        </thead>
+                        <tbody id="hypoAssocBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
         <!-- Global Benchmark Comparison -->
         <div class="card" id="benchmarkCompareCard" style="display:none;">
             <div class="card-header">
@@ -2546,12 +2596,52 @@
         }
     };
 
+    // ── Hypothesis group membership ──────────────────────────────────────
+    // A sent connect_queue message belongs to a group when ANY of these is true:
+    //   1. the message itself is stamped hypothesisGroupId === group.id (Generate Messages / Full
+    //      Pipeline / Fast Connect Review write this when the message is created),
+    //   2. the contact's LinkedIn URL is on the group's contact list (contactLinkedInUrls + chunks),
+    //   3. the message came from one of the group's sourceBatchIds.
+    // Rule 1 matters: Generate Messages used to stamp messages with the group but never add the
+    // contact to the group's list, so those sends were counted by nobody ("not matched to any group").
+    function makeGroupMemberTest(group) {
+        const urlSet     = slugSet(group.contactLinkedInUrls || []);
+        const batchSet   = new Set(group.sourceBatchIds || []);
+        const hasUrls    = urlSet.size > 0;
+        const hasBatches = batchSet.size > 0;
+        const gid        = group.id;
+        return m => {
+            if (gid && m.hypothesisGroupId === gid) return true;
+            const raw = sentItemUrl(m);
+            return (hasUrls && urlInSet(raw, urlSet)) || (hasBatches && batchSet.has(m.source_batch_id));
+        };
+    }
+
+    // Pulls a chunked group's contact URLs (flat 'hypothesis_group_chunks' collection,
+    // doc IDs "{groupId}_{chunkIndex}") into group.contactLinkedInUrls, once per page load.
+    async function ensureGroupContactsLoaded(group) {
+        if (!group || !group._chunked || !(group._chunkCount > 0) || group._chunksLoaded) return;
+        try {
+            const allUrls = [];
+            for (let i = 0; i < group._chunkCount; i++) {
+                const chunkSnap = await getDoc(doc(emailDB, 'hypothesis_group_chunks', `${group.id}_${i}`));
+                if (chunkSnap && chunkSnap.exists) {
+                    allUrls.push(...(chunkSnap.data().contactLinkedInUrls || []));
+                }
+            }
+            if (allUrls.length > 0) group.contactLinkedInUrls = allUrls;
+            group._chunksLoaded = true;
+        } catch (e) { console.warn('chunk load for group', group.id, e); }
+    }
+
     // ── Hypothesis Group Breakdown (BDR / Company view) ──────────────────
+    let _hypoLastArgs = null; // args of the last renderHypothesisGroupBreakdown() call — lets the association repair re-render after saving
     async function renderHypothesisGroupBreakdown(bdrEmailSet, sentItems, sentItemsAllTime, acceptedUrls, repliedUrls, scheduledUrls) {
         const card = document.getElementById('hypothesisBreakdownCard');
         const body = document.getElementById('hypothesisBreakdownBody');
         const meta = document.getElementById('hypothesisBreakdownMeta');
         if (!card || !body) return;
+        _hypoLastArgs = [bdrEmailSet, sentItems, sentItemsAllTime, acceptedUrls, repliedUrls, scheduledUrls];
 
         // Load groups if not already done
         await ensureOutcomeGroupsLoaded();
@@ -2572,23 +2662,7 @@
         // For chunked groups, load contact URLs from subcollection chunks.
         // _chunksLoaded flag prevents redundant re-fetches across analysis runs,
         // even if ensureOutcomeGroupsLoaded() already populated _outcomeGroups without chunks.
-        for (const group of relevantGroups) {
-            if (group._chunked && group._chunkCount > 0 && !group._chunksLoaded) {
-                try {
-                    // Chunks are stored in the flat top-level 'hypothesis_group_chunks'
-                    // collection with doc IDs "{groupId}_{chunkIndex}"
-                    const allUrls = [];
-                    for (let i = 0; i < group._chunkCount; i++) {
-                        const chunkSnap = await getDoc(doc(emailDB, 'hypothesis_group_chunks', `${group.id}_${i}`));
-                        if (chunkSnap && chunkSnap.exists) {
-                            allUrls.push(...(chunkSnap.data().contactLinkedInUrls || []));
-                        }
-                    }
-                    if (allUrls.length > 0) group.contactLinkedInUrls = allUrls;
-                    group._chunksLoaded = true;
-                } catch(e) { console.warn('chunk load for group', group.id, e); }
-            }
-        }
+        for (const group of relevantGroups) await ensureGroupContactsLoaded(group);
 
         // Build a sent-item lookup keyed by slug for fast membership testing
         const sentSlugMap = new Map(); // slug → sentItem
@@ -2608,14 +2682,7 @@
         // loadScheduledMeetings) — otherwise a contact connected before the window who
         // replies or schedules a meeting inside it would be dropped from the group total.
         const groupFunnel = (group) => {
-            const urlSet  = slugSet(group.contactLinkedInUrls || []);
-            const batchSet = new Set(group.sourceBatchIds || []);
-            const hasUrls  = urlSet.size > 0;
-            const hasBatches = batchSet.size > 0;
-            const inGroupFilter = m => {
-                const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-                return (hasUrls && urlInSet(raw, urlSet)) || (hasBatches && batchSet.has(m.source_batch_id));
-            };
+            const inGroupFilter = makeGroupMemberTest(group);
 
             // Counted per (BDR, contact) pair — two BDRs reaching the same contact = 2.
             const { sent, accepted, replied, scheduled } = countContactFunnel(
@@ -2634,13 +2701,18 @@
         rows.sort((a, b) => b.f.sent - a.f.sent);
 
         const totalSent      = rows.reduce((s, r) => s + r.f.sent, 0);
-        const unassignedSent = sentItems.length - totalSent;
+
+        // Sent records that no relevant group claims — counted directly (not "total − sum of groups",
+        // which goes wrong when a contact sits in more than one group) as unique (BDR, contact) pairs.
+        const memberTests = relevantGroups.map(makeGroupMemberTest);
+        const unassignedItems = sentItems.filter(m => !memberTests.some(t => t(m)));
+        const unassignedSent  = uniqueContactPairs(unassignedItems).size;
 
         meta.textContent = `${relevantGroups.length} hypothesis group${relevantGroups.length !== 1 ? 's' : ''} · contacts matched to outreach records`;
 
         // Cache data for view switching
         _hypoBreakdownView = 'overview';
-        _hypoLastData = { rows, totalSent, unassignedSent, sentItems, acceptedUrls, repliedUrls, scheduledUrls };
+        _hypoLastData = { rows, totalSent, unassignedSent, unassignedItems, sentItems, acceptedUrls, repliedUrls, scheduledUrls };
 
         body.innerHTML = `
         <div class="hypo-view-tabs">
@@ -2662,12 +2734,372 @@
         <div style="padding:0.75rem 1.5rem;background:#faf5ff;border-top:1px solid #ede9fe;font-size:0.82rem;color:#6b7280;">
             <i class="fas fa-info-circle" style="color:#C9973D;margin-right:0.3rem;"></i>
             <strong>${unassignedSent.toLocaleString()}</strong> outreach record${unassignedSent !== 1 ? 's' : ''} not matched to any hypothesis group —
-            go to <a href="connect_hypothesis_documentation.html" target="_blank" style="color:#7c3aed;font-weight:600;">Hypothesis Documentation</a> and run the bulk classifier to assign them.
-        </div>` : ''}`;
+            <button onclick="openHypoAssocRepair()" style="background:#7c3aed;color:#fff;border:none;border-radius:6px;padding:0.3rem 0.8rem;font-size:0.78rem;font-weight:700;cursor:pointer;margin:0 0.3rem;">
+                <i class="fas fa-link"></i> Associate sent messages with hypothesis groups
+            </button>
+            or use the bulk classifier in <a href="connect_hypothesis_documentation.html" target="_blank" style="color:#7c3aed;font-weight:600;">Hypothesis Documentation</a>.
+        </div>` : `
+        <div style="padding:0.5rem 1.5rem;border-top:1px solid #ede9fe;text-align:right;">
+            <button onclick="openHypoAssocRepair()" style="background:none;border:none;color:#7c3aed;font-size:0.76rem;font-weight:600;cursor:pointer;">
+                <i class="fas fa-link"></i> Check group associations
+            </button>
+        </div>`}`;
 
         renderHypoViewContent();
         card.style.display = '';
     }
+
+    // ── Associate sent messages with hypothesis groups ─────────────────────
+    // Repair tool for connections that were already sent but never got tied to a hypothesis
+    // group. Two kinds of rows (one per BDR + contact):
+    //   "unassigned" — the contact isn't claimed by any group in view (no message stamp match,
+    //                  not on any group's contact list, not from a group's source batch);
+    //   "stamp-only" — the message is stamped with a group, but the contact was never added to
+    //                  that group's contact list (the Generate Messages bug) — counted in Outcomes
+    //                  via the stamp, but missing for every other tool that reads the list.
+    // Saving (a) appends the contact to the group's contact list (chunk-aware) and (b) stamps
+    // hypothesisGroupId/Name on the connect_queue doc(s) that don't carry it. Nothing is re-sent.
+    const HYP_ASSOC_CHUNK_LIMIT = 700 * 1024; // same 1 MB-doc workaround as Hypothesis Documentation / Full Pipeline
+    const HYP_ASSOC_MAX_ROWS    = 1000;       // rendered rows (all rows stay in state / bulk actions)
+    let _assocState = null; // { rows: [{ idx, kind, items, rep, groupId, source, selected }], groups }
+
+    const _assocSnapExists = s => !!s && (s.exists === true || (typeof s.exists === 'function' && s.exists()));
+
+    // Throws on any read problem — a partial list must never be written back over the group.
+    async function assocReadGroupContacts(gid, data) {
+        if (!data?._chunked) {
+            return { urls: [...(data?.contactLinkedInUrls || [])], tagged: [...(data?.taggedContacts || [])] };
+        }
+        const urls = [], tagged = [];
+        for (let i = 0; i < (data._chunkCount || 0); i++) {
+            const snap = await getDoc(doc(emailDB, 'hypothesis_group_chunks', `${gid}_${i}`));
+            if (!_assocSnapExists(snap)) throw new Error(`chunk ${i} of the group's contact list is missing`);
+            const d = snap.data() || {};
+            urls.push(...(d.contactLinkedInUrls || []));
+            tagged.push(...(d.taggedContacts || []));
+        }
+        return { urls, tagged };
+    }
+
+    async function assocWriteGroupContacts(gid, urls, tagged) {
+        const ref = doc(emailDB, 'hypothesis_groups', gid);
+        const trySize = JSON.stringify({ contactLinkedInUrls: urls, taggedContacts: tagged }).length;
+        if (trySize <= HYP_ASSOC_CHUNK_LIMIT) {
+            await updateDoc(ref, {
+                contactLinkedInUrls: urls, taggedContacts: tagged,
+                _chunked: false, _chunkCount: 0, _totalContactCount: urls.length, updatedAt: new Date()
+            });
+            return { chunked: false, chunkCount: 0 };
+        }
+        const chunks = [];
+        let cu = [], ct = [];
+        for (let i = 0; i < urls.length; i++) {
+            cu.push(urls[i]);
+            if (tagged[i]) ct.push(tagged[i]);
+            if (JSON.stringify({ contactLinkedInUrls: cu, taggedContacts: ct }).length >= HYP_ASSOC_CHUNK_LIMIT) {
+                cu.pop();
+                if (tagged[i]) ct.pop();
+                chunks.push({ contactLinkedInUrls: [...cu], taggedContacts: [...ct] });
+                cu = [urls[i]];
+                ct = tagged[i] ? [tagged[i]] : [];
+            }
+        }
+        if (cu.length) chunks.push({ contactLinkedInUrls: cu, taggedContacts: ct });
+        for (let i = 0; i < chunks.length; i++) {
+            await setDoc(doc(emailDB, 'hypothesis_group_chunks', `${gid}_${i}`), chunks[i]);
+        }
+        await updateDoc(ref, {
+            contactLinkedInUrls: [], taggedContacts: [],
+            _chunked: true, _chunkCount: chunks.length, _totalContactCount: urls.length, updatedAt: new Date()
+        });
+        return { chunked: true, chunkCount: chunks.length };
+    }
+
+    window.openHypoAssocRepair = async function() {
+        if (!_hypoLastData) return;
+        const card   = document.getElementById('hypoAssocCard');
+        const status = document.getElementById('hypoAssocStatus');
+        const body   = document.getElementById('hypoAssocBody');
+        card.style.display = '';
+        card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        body.innerHTML = '';
+        status.textContent = 'Checking which sent messages are missing from their hypothesis group…';
+
+        try {
+            await ensureOutcomeGroupsLoaded();
+            const groups = [..._outcomeGroups].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+            const groupMap = new Map(groups.map(g => [g.id, g]));
+            const { sentItems, unassignedItems, rows: groupRows } = _hypoLastData;
+            const relevantGroups = groupRows.map(r => r.g);
+            const unassignedSet = new Set(unassignedItems || []);
+
+            // ── Collect candidate rows, one per (BDR, contact) pair and kind ──
+            const rowByKey = new Map();
+            const addToRow = (kind, m, extraKey) => {
+                const pk = pairKeyOf(resolveBdrKey([m.account_email]), sentItemUrl(m));
+                if (!pk) return;
+                const key = `${kind}|${pk}|${extraKey || ''}`;
+                if (!rowByKey.has(key)) rowByKey.set(key, { kind, items: [], rep: m, groupId: '', source: '', selected: false });
+                rowByKey.get(key).items.push(m);
+            };
+
+            // Stamp-only: stamped with a known group, contact not on that group's list / batches.
+            const stampedGroupIds = new Set();
+            sentItems.forEach(m => { if (!unassignedSet.has(m) && m.hypothesisGroupId && groupMap.has(m.hypothesisGroupId)) stampedGroupIds.add(m.hypothesisGroupId); });
+            const listSets = new Map();
+            for (const gid of stampedGroupIds) {
+                const g = groupMap.get(gid);
+                await ensureGroupContactsLoaded(g);
+                listSets.set(gid, { urls: slugSet(g.contactLinkedInUrls || []), batches: new Set(g.sourceBatchIds || []) });
+            }
+            sentItems.forEach(m => {
+                if (unassignedSet.has(m)) { addToRow('unassigned', m); return; }
+                const gid = m.hypothesisGroupId;
+                if (!gid || !listSets.has(gid)) return;
+                const ls = listSets.get(gid);
+                if (urlInSet(sentItemUrl(m), ls.urls) || (m.source_batch_id && ls.batches.has(m.source_batch_id))) return;
+                addToRow('stamp-only', m, gid);
+            });
+
+            const rows = [...rowByKey.values()];
+
+            // ── Propose a group for every row ──
+            // 1. the message's own stamp
+            rows.forEach(r => {
+                if (r.kind === 'stamp-only') { r.groupId = r.rep.hypothesisGroupId; r.source = 'Message is stamped with this group'; return; }
+                const stamped = r.items.find(m => m.hypothesisGroupId && groupMap.has(m.hypothesisGroupId));
+                if (stamped) { r.groupId = stamped.hypothesisGroupId; r.source = 'Message is stamped with this group'; }
+            });
+
+            // 2. the Full Pipeline run that generated the message
+            let unresolved = rows.filter(r => !r.groupId);
+            const runIds = [...new Set(unresolved.flatMap(r => r.items.map(m => m.pipelineRunId)).filter(Boolean))];
+            if (runIds.length) {
+                status.textContent = `Looking up ${runIds.length.toLocaleString()} Full Pipeline run(s)…`;
+                const runGroup = new Map();
+                for (let i = 0; i < runIds.length; i += 10) {
+                    await Promise.all(runIds.slice(i, i + 10).map(async id => {
+                        try {
+                            const s = await getDoc(doc(emailDB, 'full_pipeline_runs', id));
+                            const gid = _assocSnapExists(s) ? (s.data() || {}).hypothesisGroupId : null;
+                            if (gid && groupMap.has(gid)) runGroup.set(id, gid);
+                        } catch (e) { console.warn('[HypoAssoc] run lookup failed', id, e); }
+                    }));
+                }
+                unresolved.forEach(r => {
+                    const m = r.items.find(x => x.pipelineRunId && runGroup.has(x.pipelineRunId));
+                    if (m) { r.groupId = runGroup.get(m.pipelineRunId); r.source = 'Generated by a Full Pipeline run for this group'; }
+                });
+            }
+
+            // 3. the contact's own group tag in prospect_contacts
+            unresolved = rows.filter(r => !r.groupId);
+            if (unresolved.length && relevantGroups.length) {
+                status.textContent = 'Checking prospect-list tags for the remaining contacts…';
+                const slugToGroup = new Map();
+                for (const g of relevantGroups) {
+                    try {
+                        const snap = await getDocs(query(collection(emailDB, 'prospect_contacts'), where('hypothesisGroupId', '==', g.id)));
+                        snap.forEach(d => {
+                            const c = d.data();
+                            const slug = contactSlugKey(c.linkedInUrl || c.li_url || c.linkedin_url || c.profile_url || '');
+                            if (slug && !slugToGroup.has(slug)) slugToGroup.set(slug, g.id);
+                        });
+                    } catch (e) { console.warn('[HypoAssoc] prospect_contacts lookup failed for group', g.id, e); }
+                }
+                unresolved.forEach(r => {
+                    const gid = slugToGroup.get(contactSlugKey(sentItemUrl(r.rep)));
+                    if (gid) { r.groupId = gid; r.source = "Contact is tagged with this group in the prospect list"; }
+                });
+            }
+
+            rows.forEach((r, i) => { r.idx = i; r.selected = !!r.groupId; });
+            // Unresolved first (they need a human), then by contact name
+            rows.sort((a, b) => (!!a.groupId - !!b.groupId) || _varCleanupMsgLabel(a.rep).localeCompare(_varCleanupMsgLabel(b.rep)));
+            rows.forEach((r, i) => { r.idx = i; });
+
+            _assocState = { rows, groups };
+            renderHypoAssocPanel();
+        } catch (e) {
+            console.error('[HypoAssoc] analysis failed:', e);
+            status.textContent = 'Could not analyze group associations: ' + (e.message || e);
+        }
+    };
+
+    function renderHypoAssocPanel() {
+        const st = _assocState;
+        if (!st) return;
+        const meta   = document.getElementById('hypoAssocMeta');
+        const body   = document.getElementById('hypoAssocBody');
+        const status = document.getElementById('hypoAssocStatus');
+        const bulk   = document.getElementById('hypoAssocBulkSelect');
+        const nUn   = st.rows.filter(r => r.kind === 'unassigned').length;
+        const nStamp = st.rows.filter(r => r.kind === 'stamp-only').length;
+        const nGuess = st.rows.filter(r => r.groupId).length;
+        meta.textContent = `${st.rows.length.toLocaleString()} contact${st.rows.length !== 1 ? 's' : ''} to associate`;
+        status.textContent = st.rows.length
+            ? `${nUn.toLocaleString()} not in any group · ${nStamp.toLocaleString()} stamped but missing from the group's list · ${nGuess.toLocaleString()} with a suggested group, ${(st.rows.length - nGuess).toLocaleString()} need you to pick one.` +
+              (st.rows.length > HYP_ASSOC_MAX_ROWS ? ` Showing the first ${HYP_ASSOC_MAX_ROWS.toLocaleString()} — save, then re-open for the rest.` : '')
+            : '';
+
+        const groupOpts = st.groups.map(g => `<option value="${escHtml(g.id)}">${escHtml(g.name || g.id)}</option>`).join('');
+        bulk.innerHTML = `<option value="">— Select a group —</option>${groupOpts}`;
+
+        if (!st.rows.length) {
+            body.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--gray-400);padding:1.5rem;">Nothing left to fix — every sent connection in view is associated with a hypothesis group. 🎉</td></tr>`;
+            return;
+        }
+        body.innerHTML = st.rows.slice(0, HYP_ASSOC_MAX_ROWS).map(r => {
+            const m = r.rep;
+            const company = m.prospect_company || m.contactCompany || m.company_name || '';
+            const title   = m.prospect_title || m.contactTitle || '';
+            const liUrl   = sentItemUrl(m);
+            const why = r.groupId
+                ? `<span style="font-size:0.76rem;color:#6d28d9;">${escHtml(r.source)}</span>`
+                : `<span style="background:#f3f4f6;color:#6b7280;border:1px solid #e5e7eb;border-radius:10px;padding:0.15rem 0.5rem;font-size:0.72rem;font-weight:600;">No suggestion</span>`;
+            return `<tr id="hypoAssocRow_${r.idx}">
+                <td><input type="checkbox" ${r.selected ? 'checked' : ''} onchange="hypoAssocToggleRow(${r.idx}, this.checked)"></td>
+                <td>${liUrl ? `<a href="${escHtml(liUrl)}" target="_blank" style="color:#0F2D4D;font-weight:600;text-decoration:none;">${escHtml(_varCleanupMsgLabel(m))}</a>` : `<strong>${escHtml(_varCleanupMsgLabel(m))}</strong>`}
+                    ${r.items.length > 1 ? `<span style="font-size:0.7rem;color:var(--gray-400);"> · ${r.items.length} messages</span>` : ''}</td>
+                <td style="font-size:0.78rem;color:var(--gray-600);">${escHtml(m.bdr_name || m.account_email || '')}</td>
+                <td style="font-size:0.8rem;color:var(--gray-600);">${escHtml(company)}${title ? `<br><span style="color:var(--gray-400);">${escHtml(title)}</span>` : ''}</td>
+                <td>${why}</td>
+                <td><select style="width:100%;font-size:0.78rem;padding:0.3rem 0.5rem;border:1.5px solid #c4b5fd;border-radius:6px;background:#faf5ff;color:#6d28d9;font-weight:600;" onchange="hypoAssocSetGroup(${r.idx}, this.value)">
+                    <option value="">— No change —</option>
+                    ${st.groups.map(g => `<option value="${escHtml(g.id)}" ${r.groupId === g.id ? 'selected' : ''}>${escHtml(g.name || g.id)}</option>`).join('')}
+                </select></td>
+            </tr>`;
+        }).join('');
+    }
+
+    window.hypoAssocSelectAll = function(sel) {
+        if (!_assocState) return;
+        _assocState.rows.forEach(r => r.selected = sel);
+        renderHypoAssocPanel();
+    };
+    window.hypoAssocToggleRow = function(idx, checked) {
+        const r = _assocState?.rows[idx];
+        if (r) r.selected = checked;
+    };
+    window.hypoAssocSetGroup = function(idx, groupId) {
+        const r = _assocState?.rows[idx];
+        if (!r) return;
+        r.groupId = groupId;
+        if (groupId) { r.source = 'Chosen by you'; r.selected = true; }
+    };
+    window.hypoAssocApplyBulk = function() {
+        const st = _assocState;
+        if (!st) return;
+        const gid = document.getElementById('hypoAssocBulkSelect')?.value || '';
+        if (!gid) { alert('Pick a hypothesis group to bulk-assign first.'); return; }
+        st.rows.forEach(r => { if (r.selected) { r.groupId = gid; r.source = 'Chosen by you'; } });
+        renderHypoAssocPanel();
+    };
+
+    window.hypoAssocSaveAll = async function() {
+        const st = _assocState;
+        if (!st) return;
+        const toSave = st.rows.filter(r => r.selected && r.groupId);
+        const status = document.getElementById('hypoAssocStatus');
+        if (!toSave.length) { alert('Nothing to save — select at least one row that has a hypothesis group.'); return; }
+        const groupNames = new Map(st.groups.map(g => [g.id, g.name || g.id]));
+        if (!confirm(`Associate ${toSave.length.toLocaleString()} contact(s) with their hypothesis group?\n\nThis adds them to the group's contact list and stamps the group on their already-sent message record(s). Nothing is re-sent.`)) return;
+
+        const btn = document.getElementById('hypoAssocSaveBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving…';
+        const nowIso = new Date().toISOString();
+        const who = window.auth?.currentUser?.email || 'outcomes_group_association';
+
+        // ── 1. Group contact lists ──
+        const byGroup = new Map();
+        toSave.forEach(r => { if (!byGroup.has(r.groupId)) byGroup.set(r.groupId, []); byGroup.get(r.groupId).push(r); });
+        const failedGroups = new Set();
+        let listAdded = 0;
+        for (const [gid, gRows] of byGroup) {
+            status.textContent = `Updating the contact list of "${groupNames.get(gid)}" (${gRows.length.toLocaleString()} contact(s))…`;
+            try {
+                const snap = await getDoc(doc(emailDB, 'hypothesis_groups', gid));
+                if (!_assocSnapExists(snap)) throw new Error('group document not found');
+                const { urls, tagged } = await assocReadGroupContacts(gid, snap.data() || {});
+                const have = new Set(urls.map(u => normalizeUrl(u)).filter(Boolean));
+                const newUrls = [], newTagged = [];
+                gRows.forEach(r => {
+                    const m = r.rep;
+                    const raw = sentItemUrl(m).trim();
+                    const norm = normalizeUrl(raw);
+                    if (!norm || have.has(norm)) return;
+                    have.add(norm);
+                    newUrls.push(raw);
+                    newTagged.push({
+                        name: `${m.contactFirstName || m.contact_first_name || ''} ${m.contactLastName || m.contact_last_name || ''}`.trim() || m.prospect_name || '',
+                        linkedInUrl: raw,
+                        title: m.prospect_title || m.contactTitle || '',
+                        org: m.prospect_company || m.contactCompany || m.company_name || '',
+                        orgLinkedInUrl: ''
+                    });
+                });
+                if (newUrls.length) {
+                    const allUrls = [...urls, ...newUrls];
+                    const res = await assocWriteGroupContacts(gid, allUrls, [...tagged, ...newTagged]);
+                    listAdded += newUrls.length;
+                    // Mirror the write into the in-memory group so the re-render below counts them.
+                    const g = _outcomeGroups.find(x => x.id === gid);
+                    if (g) {
+                        g.contactLinkedInUrls = allUrls;
+                        g._chunked = res.chunked; g._chunkCount = res.chunkCount;
+                        g._totalContactCount = allUrls.length; g._chunksLoaded = true;
+                    }
+                }
+            } catch (e) {
+                failedGroups.add(gid);
+                console.error('[HypoAssoc] group list update failed:', gid, e);
+            }
+        }
+
+        // ── 2. Stamp connect_queue docs that don't already carry the group ──
+        const stampOps = [];
+        toSave.forEach(r => {
+            if (failedGroups.has(r.groupId)) return; // keep the message untouched so the row stays fixable
+            r.items.forEach(m => { if (m.hypothesisGroupId !== r.groupId) stampOps.push({ m, r }); });
+        });
+        let stamped = 0, stampFailed = 0;
+        const CHUNK = 400; // writeBatch cap safety margin (1 op/doc)
+        for (let i = 0; i < stampOps.length; i += CHUNK) {
+            const chunk = stampOps.slice(i, i + CHUNK);
+            status.textContent = `Stamping ${Math.min(i + CHUNK, stampOps.length).toLocaleString()} / ${stampOps.length.toLocaleString()} message record(s)…`;
+            const batch = writeBatch(emailDB);
+            chunk.forEach(({ m, r }) => batch.update(doc(emailDB, 'connect_queue', m.id), {
+                hypothesisGroupId: r.groupId,
+                hypothesisGroupName: groupNames.get(r.groupId),
+                hypothesisGroupPriorValue: m.hypothesisGroupId || null,
+                hypothesisGroupBackfilledAt: nowIso,
+                hypothesisGroupBackfilledBy: who,
+                hypothesisGroupBackfillSource: r.source
+            }));
+            try {
+                await batch.commit();
+                stamped += chunk.length;
+                chunk.forEach(({ m, r }) => { m.hypothesisGroupId = r.groupId; m.hypothesisGroupName = groupNames.get(r.groupId); });
+            } catch (e) {
+                stampFailed += chunk.length;
+                console.error('[HypoAssoc] stamp batch failed:', e);
+            }
+        }
+
+        // ── 3. Refresh the report + this panel ──
+        const doneRows = new Set(toSave.filter(r => !failedGroups.has(r.groupId) && r.items.every(m => m.hypothesisGroupId === r.groupId)));
+        st.rows = st.rows.filter(r => !doneRows.has(r)).map((r, i) => ({ ...r, idx: i }));
+        const failNote = (failedGroups.size || stampFailed)
+            ? ` ${failedGroups.size ? `${failedGroups.size} group list(s) could not be updated (permissions?). ` : ''}${stampFailed ? `${stampFailed} message record(s) failed to save. ` : ''}Those rows stay in the list — see the console for details.`
+            : '';
+        try { if (_hypoLastArgs) await renderHypothesisGroupBreakdown(..._hypoLastArgs); } catch (e) { console.warn('[HypoAssoc] re-render failed:', e); }
+        renderHypoAssocPanel();
+        document.getElementById('hypoAssocStatus').textContent =
+            `Done — ${doneRows.size.toLocaleString()} contact(s) associated (${listAdded.toLocaleString()} added to group lists, ${stamped.toLocaleString()} message record(s) stamped).${failNote}`;
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-save"></i> Associate Selected';
+    };
 
     // ── Hypothesis Breakdown View Switcher ─────────────────────────────────
     window.switchHypoView = function(view) {
@@ -2713,15 +3145,7 @@
 
     // Build slug+norm sets for group items and return { groupItems, urlSet, batchSet }
     function getGroupSentItems(group, allSentItems) {
-        const urlSet   = slugSet(group.contactLinkedInUrls || []);
-        const batchSet = new Set(group.sourceBatchIds || []);
-        const hasUrls  = urlSet.size > 0;
-        const hasBatches = batchSet.size > 0;
-        if (!hasUrls && !hasBatches) return [];
-        return allSentItems.filter(m => {
-            const raw = m.prospect_li_url || m.contact_linkedin_url || m.linkedin_url || '';
-            return (hasUrls && urlInSet(raw, urlSet)) || (hasBatches && batchSet.has(m.source_batch_id));
-        });
+        return allSentItems.filter(makeGroupMemberTest(group));
     }
 
     // Compute funnel metrics from a pre-filtered set of sentItems
@@ -2765,7 +3189,9 @@
             <tr style="background:#f9fafb;color:#9ca3af;font-style:italic;">
                 <td colspan="2" style="color:#9ca3af;">Not assigned to any group</td>
                 <td style="text-align:center;">${unassignedSent.toLocaleString()}</td>
-                <td colspan="4" style="text-align:center;font-size:0.8rem;">Run the hypothesis classifier to assign these contacts</td>
+                <td colspan="4" style="text-align:center;font-size:0.8rem;font-style:normal;">
+                    <button onclick="openHypoAssocRepair()" style="background:#7c3aed;color:#fff;border:none;border-radius:6px;padding:0.25rem 0.7rem;font-size:0.76rem;font-weight:700;cursor:pointer;"><i class="fas fa-link"></i> Associate with hypothesis groups</button>
+                </td>
             </tr>` : '';
 
         return `<div style="overflow-x:auto;">

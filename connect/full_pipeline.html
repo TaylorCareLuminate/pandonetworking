@@ -6421,13 +6421,63 @@
                     addLog(`   ⚠️ Could not tag ${chunk.length} contact(s) with the hypothesis group (${e.message}).`, 'warning');
                 }
             }
+            // The group's URL list is what Outcomes by Hypothesis Group (and Generate Messages'
+            // "only contacts in the group" scope) read as membership. This write used to be a
+            // single try with a console-style warning on failure, so one transient Firestore error
+            // silently left a whole org's contacts unassociated. Retry, and shout if it still fails
+            // (every contact that gets a message is re-checked by fpFlushPendingGroupContacts too).
             try {
-                const added = await fpAddKeptContactsToHypothesisGroup({ kept, groupId });
+                const added = await fpAddToGroupWithRetry({ contacts: kept, groupId });
                 if (added > 0) {
                     addLog(`   🔬 Added ${added} contact(s) to hypothesis group "${groupName || groupId}".`, 'success');
                 }
             } catch (e) {
-                addLog(`   ⚠️ Contacts were stamped with the hypothesis group, but could not be added to the group's URL list (${e.message}). Generate Messages will still find them via the stamp.`, 'warning');
+                addLog(`   ❌ Contacts were stamped with the hypothesis group, but could NOT be added to the group's URL list after 3 attempts (${e.message}). Contacts that get a message this run will be retried at the end of this organization; any others can be fixed from Outcomes → "Associate sent messages with hypothesis groups".`, 'error');
+            }
+        }
+
+        async function fpAddToGroupWithRetry({ contacts, groupId, attempts = 3 }) {
+            let lastErr = null;
+            for (let attempt = 1; attempt <= attempts; attempt++) {
+                try {
+                    return await fpAddKeptContactsToHypothesisGroup({ kept: contacts, groupId });
+                } catch (e) {
+                    lastErr = e;
+                    if (attempt < attempts) await new Promise(r => setTimeout(r, 1500 * attempt));
+                }
+            }
+            throw lastErr;
+        }
+
+        // Safety net: every contact that actually received a message in this run must be on the
+        // group's contact list, no matter how it got into the prospect list or whether the earlier
+        // "kept contacts" tagging step succeeded. `pending` is a Map(normalizedUrl → prospect)
+        // filled as messages are saved; it is drained here (after each org, and again at run end).
+        async function fpFlushPendingGroupContacts({ pending, groupId, groupName }) {
+            if (!groupId || !pending || pending.size === 0) return;
+            const prospects = [...pending.values()];
+            try {
+                const added = await fpAddToGroupWithRetry({ contacts: prospects, groupId });
+                if (added > 0) {
+                    addLog(`   🔬 Safety net: ${added} messaged contact(s) were missing from hypothesis group "${groupName || groupId}" — added.`, 'success');
+                }
+                // Also stamp the prospect_contacts doc (only when it carries no group yet — a contact
+                // can legitimately belong to more than one group, so never overwrite another stamp).
+                const toStamp = prospects.filter(p => p.id && !p.hypothesisGroupId);
+                const taggedAt = new Date().toISOString();
+                for (let i = 0; i < toStamp.length; i += 400) {
+                    const batch = writeBatch(db);
+                    toStamp.slice(i, i + 400).forEach(p => batch.update(doc(db, 'prospect_contacts', p.id), {
+                        hypothesisGroupId: groupId,
+                        hypothesisGroupName: groupName || '',
+                        hypothesisGroupTaggedAt: taggedAt
+                    }));
+                    await batch.commit().catch(e => addLog(`   ⚠️ Could not stamp ${Math.min(400, toStamp.length - i)} messaged contact(s) with the hypothesis group (${e.message}).`, 'warning'));
+                }
+                pending.clear();
+            } catch (e) {
+                // Leave `pending` intact so the end-of-run flush tries again.
+                addLog(`   ❌ Could not add ${prospects.length} messaged contact(s) to hypothesis group "${groupName || groupId}" (${e.message}). Will retry at the end of the run; if it still fails use Outcomes → "Associate sent messages with hypothesis groups".`, 'error');
             }
         }
 
@@ -7298,6 +7348,9 @@
             let lastTokenRefreshAt = Date.now();
             let orgPointer = 0;
             const fpRunCompanyKeys = new Set();
+            // Contacts that received a message this run but may not yet be confirmed on the
+            // hypothesis group's contact list — drained by fpFlushPendingGroupContacts().
+            const fpPendingGroupContacts = new Map();
             if (skipAlreadyScanned) {
                 fpGroupOrgs.forEach(o => {
                     if (fpOrgScanLabels(o).includes(scanName)) fpOrgDupeKeys(o).forEach(k => fpRunCompanyKeys.add(k));
@@ -8573,7 +8626,12 @@
                                     // Runs on every exit path (including the `continue`s above). No message
                                     // saved for this contact → give its 30-day org-limit slot back.
                                     if (orgReport.messagesGenerated === msgsBeforeThisContact) orgLimitSlot.release();
-                                    else if (org._backfill && report.totals.backfill) report.totals.backfill.messagesGenerated += orgReport.messagesGenerated - msgsBeforeThisContact;
+                                    else {
+                                        if (org._backfill && report.totals.backfill) report.totals.backfill.messagesGenerated += orgReport.messagesGenerated - msgsBeforeThisContact;
+                                        // A message was saved for this contact — make sure they end up on the group's contact list.
+                                        const pendKey = fpNormalizeUrl(prospect.linkedInUrl || prospect.li_url || prospect.linkedin_url || '');
+                                        if (pendKey && groupId) fpPendingGroupContacts.set(pendKey, prospect);
+                                    }
                                 }
 
                                 // Brief pause between prospects to avoid hammering the server
@@ -8648,6 +8706,11 @@
                         report.bdrPlan = bdrPlan.map(b => ({ bdrEmail: b.bdrEmail, target: b.target, generated: b.generated }));
                         await saveReport();
 
+                        // Hypothesis-group safety net — runs on every exit path of the org (success or
+                        // error), so every contact that got a message is on the group's contact list
+                        // before the next org starts (and before a cost shut-down can end the run).
+                        await fpFlushPendingGroupContacts({ pending: fpPendingGroupContacts, groupId, groupName });
+
                         // ── Step 6 cost guard — checked after every organization ──
                         // Stops the run when the ALL-IN average spend per generated message
                         // exceeds the target (once past the minimum-spend grace amount).
@@ -8715,6 +8778,9 @@
                     console.error('Full Pipeline error:', err);
                 }
             } finally {
+                // Final retry for any messaged contacts the per-org flush couldn't add (also covers
+                // a user Stop / thrown error that skipped the per-org flush).
+                try { await fpFlushPendingGroupContacts({ pending: fpPendingGroupContacts, groupId, groupName }); } catch (_) {}
                 report.finishedAt = new Date().toISOString();
                 report.bdrPlan = bdrPlan.map(b => ({ bdrEmail: b.bdrEmail, target: b.target, generated: b.generated }));
                 if (costLimitHit) report.costGuardResult = costLimitHit;
