@@ -3809,6 +3809,61 @@
             });
         }
 
+        // What a build would do RIGHT NOW given Step 2: for each BDR that is ticked, build at most
+        // their "Messages" number, and never more than they have waiting. This is the same cap the
+        // run itself applies (a BDR stops at plan.target), so the button's number is what you get.
+        function fpGoodToGoSelection() {
+            const last = fpGoodToGoLast;
+            if (!last) return null;
+            const rows = last.perBdr.map(b => {
+                const sel = CSS.escape(b.bdrEmail);
+                const cb = document.querySelector(`.fp-bdr-cb[data-email="${sel}"]`);
+                const input = document.querySelector(`.fp-bdr-count[data-email="${sel}"]`);
+                const checked = !!(cb && cb.checked);
+                const target = parseInt(input && input.value) || 10; // same default the run uses
+                return { ...b, checked, target, take: checked ? Math.min(b.count, target) : 0 };
+            });
+            return { rows, total: rows.reduce((s, r) => s + r.take, 0) };
+        }
+
+        // Draws the card from the last count plus the current Step 2 selections. Cheap (no server
+        // calls), so it is re-run whenever a BDR is ticked or a Messages number is edited.
+        function fpGoodToGoRenderResult() {
+            const last = fpGoodToGoLast;
+            if (!last || fpRunning) return;
+            const { eligible, orgs, tagged, groupName } = last;
+            const skipped = Math.max(0, tagged - eligible);
+            const detail = `Tagged to "${escHtml(groupName)}": ${tagged} contact(s), ${skipped} skipped (already messaged, already sent, excluded, already connected, or under the connection floor). `
+                + `The 30-day organization limit and DNC check are applied again when these are built, so a few may be skipped then.`;
+            if (eligible === 0) {
+                fpGoodToGoRender({
+                    visible: true, showRecount: true,
+                    status: `<i class="fas fa-circle-check" style="color:#059669;"></i> No good-to-go contacts are waiting. Every eligible contact tagged to this group already has a message.`,
+                    detail
+                });
+                return;
+            }
+            const sel = fpGoodToGoSelection();
+            const lines = sel.rows.filter(r => r.count > 0).map(r => {
+                const who = `<i class="fas fa-user" style="color:#059669;"></i> ${escHtml(r.name)}: <strong>${r.count}</strong> waiting`;
+                if (!r.checked) return `<div>${who} <span style="color: var(--gray-500);">· not ticked in Step 2, so none will be built</span></div>`;
+                const note = r.take < r.count
+                    ? `will build <strong>${r.take}</strong> (their Messages number in Step 2 is ${r.target}; the other ${r.count - r.take} stay waiting)`
+                    : `will build all <strong>${r.take}</strong> (under their Messages number of ${r.target})`;
+                return `<div>${who} · ${note}</div>`;
+            }).join('');
+            const hint = sel.total === 0
+                ? `<div style="color: var(--warning); margin-top: 4px;"><i class="fas fa-circle-info"></i> Tick a BDR that has waiting contacts in Step 2 and set their Messages number to build.</div>`
+                : '';
+            fpGoodToGoRender({
+                visible: true, showRecount: true,
+                sendLabel: sel.total > 0 ? `Build ${sel.total} message${sel.total === 1 ? '' : 's'}` : '',
+                status: `<strong style="font-size: 16px; color: #047857;">${eligible}</strong> good-to-go contact(s) across <strong>${orgs}</strong> organization(s) were found but have <strong>no message yet</strong>.`,
+                breakdown: lines + hint,
+                detail
+            });
+        }
+
         // Counts for the currently selected group and every BDR linked to it. Safe to call any
         // time; a newer call supersedes an older one still in flight. Runs in the background and
         // writes nothing to the run log.
@@ -3851,26 +3906,7 @@
                 const orgs = bf.totals.orgs || 0;
                 const tagged = bf.totals.tagged || 0;
                 fpGoodToGoLast = { groupId, groupName, perBdr, eligible, orgs, tagged };
-
-                const skipped = Math.max(0, tagged - eligible);
-                const detail = `Tagged to "${escHtml(groupName)}": ${tagged} contact(s), ${skipped} skipped (already messaged, already sent, excluded, already connected, or under the connection floor). `
-                    + `The 30-day organization limit and DNC check are applied again when these are built, so a few may be skipped then.`;
-                if (eligible === 0) {
-                    fpGoodToGoRender({
-                        visible: true, showRecount: true,
-                        status: `<i class="fas fa-circle-check" style="color:#059669;"></i> No good-to-go contacts are waiting. Every eligible contact tagged to this group already has a message.`,
-                        detail
-                    });
-                } else {
-                    const withContacts = perBdr.filter(b => b.count > 0);
-                    fpGoodToGoRender({
-                        visible: true, showRecount: true,
-                        sendLabel: `Build messages for all ${eligible}`,
-                        status: `<strong style="font-size: 16px; color: #047857;">${eligible}</strong> good-to-go contact(s) across <strong>${orgs}</strong> organization(s) were found but have <strong>no message yet</strong>.`,
-                        breakdown: withContacts.map(b => `<span style="margin-right:16px; white-space:nowrap;"><i class="fas fa-user" style="color:#059669;"></i> ${escHtml(b.name)}: <strong>${b.count}</strong></span>`).join(''),
-                        detail
-                    });
-                }
+                fpGoodToGoRenderResult();
             } catch (e) {
                 if (seq !== fpGoodToGoSeq) return;
                 console.warn('[good-to-go count] failed:', e);
@@ -3881,11 +3917,11 @@
             }
         };
 
-        // Builds messages for exactly the contacts the last count found, by running the existing
-        // backfill-only mode. Every BDR with waiting contacts is included, with their message
-        // target set to their waiting count so none are left behind. The run's own confirmation
-        // dialog still appears before anything starts, and the Step 2 selections are put back
-        // exactly as they were once the run has read them.
+        // Builds messages for the waiting contacts by running the existing backfill-only mode,
+        // honoring Step 2: only ticked BDRs, each capped at their "Messages" number (the number on
+        // the button). The run's own confirmation dialog still appears before anything starts.
+        // BDRs with nothing to build are left out of this one run so the confirmation and the
+        // targets it shows are accurate, and every Step 2 field is restored right afterward.
         window.fpSendGoodToGoToBuild = function() {
             const last = fpGoodToGoLast;
             if (!last || last.eligible === 0) return;
@@ -3901,14 +3937,20 @@
                 scanNameEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 return;
             }
-            const targets = new Map(last.perBdr.filter(b => b.count > 0).map(b => [b.bdrEmail, b.count]));
+            const sel = fpGoodToGoSelection();
+            if (!sel || sel.total === 0) {
+                alert('Nothing to build with the current Step 2 settings. Tick a BDR that has waiting contacts and set their Messages number.');
+                return;
+            }
+            const takeByBdr = new Map(sel.rows.filter(r => r.take > 0).map(r => [r.bdrEmail, r.take]));
             const saved = [];
             document.querySelectorAll('.fp-bdr-cb').forEach(cb => {
                 const email = cb.dataset.email;
                 const input = document.querySelector(`.fp-bdr-count[data-email="${CSS.escape(email)}"]`);
                 saved.push({ cb, input, checked: cb.checked, count: input ? input.value : null });
-                cb.checked = targets.has(email);
-                if (input && targets.has(email)) input.value = targets.get(email);
+                cb.checked = takeByBdr.has(email);
+                // Target = what will actually be built, so the confirmation and run log show the real number.
+                if (input && takeByBdr.has(email)) input.value = takeByBdr.get(email);
             });
             // fpRunPipeline reads the BDR rows and this checkbox synchronously before its first
             // await, so it is safe to set them for this one run and restore everything right after.
@@ -5417,7 +5459,11 @@
                 : fpGroupOrgs.length === 0 ? 'The selected group has no organizations — add some in Prospect Organizations Admin.'
                 : !anyBdr ? 'Check at least one BDR and set a message count.'
                 : 'Ready.');
+            // Keep the "good-to-go, not messaged" card's Build button in step with Step 2 (ticks / Messages numbers).
+            fpGoodToGoRenderResult();
         };
+        // Typing in a BDR's Messages box fires 'input' immediately; 'change' (above) only fires on blur.
+        document.getElementById('fpBdrList').addEventListener('input', () => fpGoodToGoRenderResult());
 
         // ════════════════════════════════════════════════════════════════════
         // FROM generate_messages.html — Profile Message fallback (verbatim):
