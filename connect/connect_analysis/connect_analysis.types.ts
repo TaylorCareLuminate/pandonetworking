@@ -84,6 +84,15 @@ export interface Segment {
   research?: Research;
   examples?: Examples;
   /**
+   * How this segment's audience is COMPOSED vs. the GLOBAL baseline (every other
+   * core contact across every client/hypothesis-group - NOT just this client),
+   * across 4 dimensions, plus an expected-vs-actual outcome decomposition for
+   * each. Absent/empty on the "overall" segment (no external baseline exists)
+   * and whenever sufficient_data is false. See AudienceProfile for rendering
+   * guidance.
+   */
+  audience_profile?: AudienceProfile;
+  /**
    * AI-generated, ready-to-use prompt for writing new outreach messages tuned to what works
    * for this exact segment (built from its funnel, keys, top-performing dimension levels, and
    * winning example messages). Present only when build_prompts was enabled for the run and
@@ -128,6 +137,75 @@ export type Confidence = "High" | "Medium" | "Low";
 export interface Keys {
   working: KeyItem[];
   not_working: KeyItem[];
+}
+
+/**
+ * "Does this hypothesis group / client perform differently because it's
+ * targeting a different kind of prospect?" Compares audience composition
+ * across 4 dimensions against the global baseline (everyone else, across
+ * every client), and decomposes each dimension's outcome rates into
+ * "expected from composition alone" vs. "actual".
+ *
+ * Suggested rendering: one small panel per dimension (connections, seniority,
+ * org_type, executive). Within a panel, a horizontal bar/stacked-bar comparing
+ * group_pct vs. baseline_pct per level (sort by |index - 100| descending to
+ * surface the most over/under-represented levels first), with the `index`
+ * shown as a chip/badge (e.g. "134" in green if >100, "72" in amber/red if
+ * <100). Below the bars, a one-line callout built from expected_vs_actual,
+ * e.g.: "Actual reply rate 23.1% vs. 18.4% expected from audience mix alone
+ * (+4.7pp) - this group's success isn't just who it's targeting."
+ */
+export interface AudienceProfile {
+  connections?: CompositionDimension;
+  seniority?: CompositionDimension;
+  org_type?: CompositionDimension;
+  executive?: CompositionDimension;
+}
+
+export interface CompositionDimension {
+  by_level: CompositionLevel[];
+  /** Contacts in this segment with non-null data for this dimension (denominator for group_pct). */
+  n_group: number;
+  /** Contacts in the global baseline with non-null data for this dimension (denominator for baseline_pct). */
+  n_baseline: number;
+  expected_vs_actual: ExpectedVsActual;
+}
+
+export interface CompositionLevel {
+  /** e.g. "5,000+", "C-Suite", "HealthSystem", "Executive (C-Suite/VP)". */
+  level: string;
+  /** % of this segment's (non-null) contacts at this level. */
+  group_pct: number | null;
+  /** % of the global baseline's (non-null) contacts at this level. */
+  baseline_pct: number | null;
+  /**
+   * 100 * group_pct / baseline_pct, rounded. 100 = same mix as baseline.
+   * >100 = over-represented here (150 = "50% more common than everywhere
+   * else"). <100 = under-represented. Null if baseline_pct is 0 (cannot
+   * compute a meaningful ratio against a zero baseline).
+   */
+  index: number | null;
+  group_n: number;
+  baseline_n: number;
+}
+
+export interface ExpectedVsActual {
+  /** This segment's real outcome rates, computed on the subset with non-null data for this dimension (same denominator as expected_*). */
+  actual_connect_rate: number | null;
+  actual_reply_rate: number | null;
+  actual_meeting_rate: number | null;
+  /**
+   * The global baseline's own per-level outcome rate for this dimension
+   * (restricted to levels with enough baseline n to be a stable estimate),
+   * reweighted by THIS segment's own composition mix - i.e. "what rate would
+   * we expect if this group converted exactly like everyone else does, given
+   * who it happens to be targeting?" A big actual-vs-expected gap means the
+   * segment's performance is NOT mostly explained by audience composition on
+   * this dimension.
+   */
+  expected_connect_rate: number | null;
+  expected_reply_rate: number | null;
+  expected_meeting_rate: number | null;
 }
 
 /** A tested success signal. */

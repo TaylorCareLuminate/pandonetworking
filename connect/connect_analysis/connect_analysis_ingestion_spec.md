@@ -15,13 +15,7 @@ Companion files (hand these to the web builder alongside this spec):
 - `ConnectAnalysis/runs/<YYYY-MM-DD>` → historical snapshots (for a "view past week" picker)
 - `ConnectAnalysis/index/<YYYY-MM-DD>` → `{ last_run, updated_at }` lightweight pointers for building a run picker
 
-The de-identified counterpart (used by `demos/analysis_results.html`) lives at the parallel
-`ConnectAnalysisDeidentified/latest` / `ConnectAnalysisDeidentified/runs/<date>` /
-`ConnectAnalysisDeidentified/index/<date>` paths, same database.
-
 Fetch `latest`, render, and optionally offer the run picker from the `index` node. A static file (e.g. `Connect_Analysis_<date>.json`) can be used for local development, but production should read live from Firebase so it auto-updates weekly.
-
-**Uploading a new run:** `connect/connect_analysis/upload_to_firebase.R` pushes both of the above directly from the R pipeline — no git commit needed, and no 100MB-per-file limit the way a committed JSON export has. `connect/connect_analysis/regenerate_manifest.js` only keeps the 2 newest dated exports on disk locally (for dev / same-origin fallback); older runs are only in Firebase.
 
 ## 3. Top-level structure
 
@@ -220,6 +214,57 @@ Special-shaped sub-fields:
 ```
 `opportunity` = model-scored 0–100ish opportunity. `message` is truncated to 500 chars. **Contains real prospect names and message text** — see caveats about privacy.
 
+### `audience_profile` (optional — composition vs. the global baseline)
+
+**"Does this hypothesis group / client perform differently because it's targeting a different kind of prospect?"** For every sufficient-data segment *except* `overall`, compares the segment's audience **composition** against the **global baseline** — every other core contact across *every* client and hypothesis group in the whole dataset, not just this client — across 4 dimensions, and decomposes each dimension's outcome rates into "expected from composition alone" vs. "actual."
+
+```json
+"audience_profile": {
+  "connections": {
+    "by_level": [
+      { "level": "5,000+",       "group_pct": 42.0, "baseline_pct": 28.0, "index": 150, "group_n": 84,  "baseline_n": 1120 },
+      { "level": "2,500-4,999",  "group_pct": 25.0, "baseline_pct": 24.0, "index": 104, "group_n": 50,  "baseline_n": 960 },
+      { "level": "1,000-2,499",  "group_pct": 18.0, "baseline_pct": 22.0, "index": 82,  "group_n": 36,  "baseline_n": 880 },
+      { "level": "500-999",      "group_pct": 10.0, "baseline_pct": 15.0, "index": 67,  "group_n": 20,  "baseline_n": 600 },
+      { "level": "<500",         "group_pct": 5.0,  "baseline_pct": 11.0, "index": 45,  "group_n": 10,  "baseline_n": 440 }
+    ],
+    "n_group": 200, "n_baseline": 4000,
+    "expected_vs_actual": {
+      "actual_connect_rate": 24.5, "actual_reply_rate": 23.1, "actual_meeting_rate": 2.10,
+      "expected_connect_rate": 21.0, "expected_reply_rate": 18.4, "expected_meeting_rate": 1.55
+    }
+  },
+  "seniority":  { "by_level": [ { "level": "C-Suite", ... }, { "level": "VP", ... }, ... ], "n_group": ..., "n_baseline": ..., "expected_vs_actual": { ... } },
+  "org_type":   { "by_level": [ { "level": "HealthSystem", ... }, ... ], "n_group": ..., "n_baseline": ..., "expected_vs_actual": { ... } },
+  "executive":  { "by_level": [ { "level": "Executive (C-Suite/VP)", ... }, { "level": "Non-Executive", ... } ], "n_group": ..., "n_baseline": ..., "expected_vs_actual": { ... } }
+}
+```
+
+Four dimensions, each with the same shape:
+- **`connections`** — LinkedIn connection-count bucket. Levels, in this order: `<500`, `500-999`, `1,000-2,499`, `2,500-4,999`, `5,000+`.
+- **`seniority`** — AI-classified contact seniority. Levels, in this order: `C-Suite`, `VP`, `Director`, `Manager`, `IC`, `Unknown`.
+- **`org_type`** — AI-classified type of organization the contact works at (e.g. `HealthSystem`, `Hospital`, `PhysicianGroup`, `Payer`, `VendorTech`, `Other`, `Unknown`).
+- **`executive`** — simplified 2-level rollup of seniority. Levels: `Executive (C-Suite/VP)`, `Non-Executive`.
+
+Per level, in `by_level`:
+- `group_pct` / `baseline_pct` — % of this segment's / the global baseline's contacts (with non-null data for that dimension) at this level.
+- **`index`** — `100 × group_pct / baseline_pct`, rounded. **This is the headline number.** `100` = same mix as the baseline. `>100` = over-represented here (e.g. `150` = "50% more common in this group than everywhere else"). `<100` = under-represented. `null` if `baseline_pct` is `0`.
+- `group_n` / `baseline_n` — raw counts behind the two percentages (for tooltips / "small sample" caveats).
+
+`expected_vs_actual` answers *"is this segment's performance explained by who it's targeting?"*: `expected_*` = the global baseline's own outcome rate **for this dimension** (levels with too little baseline data to be stable are excluded — see caveats), re-weighted by **this segment's own composition** — i.e. "the rate we'd expect if this group converted exactly like everyone else does, given who it happens to be targeting." `actual_*` is this segment's real rate, computed on the same subset (contacts with non-null data for that dimension) so the two numbers are directly comparable. A **large gap** (actual much above/below expected) means the segment's over/under-performance on that outcome is **not** mostly explained by its audience mix on this dimension — something else (messaging, handling, timing) is driving it. A **small gap** means composition largely explains it.
+
+Suggested rendering — one small panel per dimension (Connections, Seniority, Org Type, Executive):
+- Within a panel, a horizontal bar or paired bar chart comparing `group_pct` vs. `baseline_pct` per level. Sort by `|index − 100|` descending so the most over/under-represented levels surface first. Show `index` itself as a chip/badge next to each level — green/upward for `>100`, amber-or-red/downward for `<100`.
+- Below the bars, a one-line callout built from `expected_vs_actual`, e.g.: *"Actual reply rate 23.1% vs. 18.4% expected from audience mix alone (+4.7 pp) — this group's success isn't just who it's targeting."* Compute the delta client-side (`actual − expected`); don't assume a pre-computed delta field.
+- A compact alternative for a smaller "audience at a glance" card: just the single most over-indexed level per dimension (e.g. "68% of this group is C-Suite — 2.1x the baseline rate").
+
+Absent (empty object, or individual dimensions missing) when:
+- `sufficient_data` is `false` for the segment, or
+- the segment is `overall` ("All Clients Combined" has no external baseline to compare against — never render this panel there), or
+- none of the 4 underlying fields had usable non-null data for that segment (rare).
+
+Treat it the same as any other optional block: skip the panel gracefully rather than showing an empty/broken chart.
+
 ### `message_prompt` (optional — AI-generated message-writing prompt)
 ```json
 "message_prompt": "You are writing LinkedIn connection requests for... \n\nDO:\n- ...\n\nDON'T:\n- ...\n\n..."
@@ -246,6 +291,7 @@ A single ready-to-use prompt, generated once per run by handing the segment's fu
 4. **Keys to Success:** two columns — "What's working" (green, `keys.working`) and "What to fix" (red, `keys.not_working`), each card showing `label`, `+/‑ effect_pp pp`, and a `confidence` badge. This is the star of the page.
 5. **Research accordions:** render each `research` rate-table as a small sorted bar chart (personalization, AI feel, hook, tone, reason, personal sharing, connect phrasing, exclamation/emoji/abbreviation use, timing, audience, BDR performance, message length/readability). Each row's rate-bar **thickness** (not just its width) is scaled by that row's `n` (sqrt-scaled against the largest `n` in the table) so a reader can tell "big effect, tiny sample" apart from "big effect, real volume" at a glance — width still encodes the rate, thickness encodes confidence-via-volume.
 6. **Phrases panel:** tabs for "Phrases that work" (`top_phrases`) and "Phrases we use most" (`key_phrases`, grouped by `category`, opening vs follow-up).
+6a. **Audience profile panel** (hypothesis-group / client view only, never on `overall`): if `audience_profile` is present, a 4-up grid of small panels (Connections, Seniority, Org Type, Executive) per the rendering guidance in §4 — composition bars + `index` chips, with the expected-vs-actual callout underneath. Good placement: right after Keys to Success, since it directly answers "is this group's performance just about who it targets?"
 7. **Follow-up panel:** from `research.followup`.
 8. **Examples:** cards for `meetings_won` and `high_potential_open`.
 9. **AI message-writing prompt:** if `message_prompt` is present, show a copyable "Generate messages for this segment" block near the Keys to Success section — it's the direct, actionable output of everything else on the page.
@@ -263,3 +309,4 @@ A single ready-to-use prompt, generated once per run by handing the segment's fu
 - **Rounding/nulls:** rates are pre-rounded; any missing/undefined numeric is `null` — handle `null` gracefully.
 - **Privacy:** `examples` include real contact names and message text. Recommend each client only sees their **own** `clients.<their_slug>` subtree, and decide whether to expose named examples in client-facing reviews.
 - **`personal_sharing` may be temporarily empty:** it's a new AI-scored field — cached rows don't have it, and the incremental scoring gate won't retroactively re-score them, so `research.personal_sharing` (and its `style_examples`) can be absent/all-null until a full AI re-scan has been run. Render it the same as any other optional dimension (skip gracefully if absent) rather than treating it as an error.
+- **`audience_profile` is relative to the GLOBAL baseline, not the client's own baseline.** A hypothesis group's `index` values compare it against every other core contact across *every* client, not just its own client's other hypothesis groups — this is intentional (answers "is this group unusual overall", not "is this group unusual for this client"), but call it out in a tooltip/methodology note so it isn't misread as a same-client comparison. Never render it for the `overall` segment (no baseline exists there).
