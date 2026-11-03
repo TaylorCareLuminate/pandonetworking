@@ -709,6 +709,42 @@
                         </button>
                     </div>
 
+                    <!-- Upload a list of URLs into a group -->
+                    <div id="groupUploadPanel" style="background: var(--gray-50); border: 1px solid var(--gray-200); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+                        <h3 style="margin: 0 0 4px 0; font-size: 15px; color: var(--gray-900);">
+                            <i class="fas fa-file-upload" style="color: #15803d;"></i> Upload a list of URLs to a group
+                        </h3>
+                        <p style="color: var(--gray-600); font-size: 13px; margin: 0 0 12px 0;">
+                            Paste or upload LinkedIn profile URLs (one per line, or a .csv/.txt file). Every URL that matches one of this user's leads below is added to the group you pick. URLs that aren't in My Leads can't be grouped and are listed after the upload so you can download them.
+                        </p>
+                        <div style="display: flex; gap: 12px; margin-bottom: 12px; align-items: flex-end; flex-wrap: wrap;">
+                            <div class="filter-group" style="flex: 1; margin: 0; min-width: 220px;">
+                                <label>Assign to group</label>
+                                <select id="uploadGroupSelect" onchange="onUploadGroupSelectChange()">
+                                    <option value="">Select a group...</option>
+                                </select>
+                            </div>
+                            <div class="filter-group" id="uploadNewGroupWrap" style="flex: 1; margin: 0; min-width: 220px; display: none;">
+                                <label>New group name</label>
+                                <input type="text" id="uploadNewGroupName" placeholder="e.g. Conference Leads..." maxlength="60">
+                            </div>
+                        </div>
+                        <textarea id="uploadUrlText" rows="6" oninput="updateUploadUrlCount()" placeholder="https://www.linkedin.com/in/jane-doe&#10;https://www.linkedin.com/in/john-smith&#10;..."
+                            style="width: 100%; padding: 10px 12px; border: 1px solid var(--gray-300); border-radius: 6px; font-size: 13px; font-family: monospace; resize: vertical; box-sizing: border-box;"></textarea>
+                        <div style="display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap;">
+                            <label for="uploadUrlFile" class="btn btn-secondary" style="cursor: pointer; margin: 0;">
+                                <i class="fas fa-upload"></i> Upload .txt / .csv
+                            </label>
+                            <input type="file" id="uploadUrlFile" accept=".txt,.csv,text/plain,text/csv" style="display: none;" onchange="onUploadUrlFileSelected(event)">
+                            <span id="uploadUrlFileName" style="font-size: 12px; color: var(--gray-600);"></span>
+                            <span id="uploadUrlCount" style="font-size: 12px; color: var(--gray-600);"></span>
+                            <button class="btn btn-primary" id="uploadAssignBtn" onclick="assignUploadedUrlsToGroup()" style="margin-left: auto;">
+                                <i class="fas fa-tag"></i> Assign URLs to Group
+                            </button>
+                        </div>
+                        <div id="uploadUrlResult" style="display: none; margin-top: 12px;"></div>
+                    </div>
+
                     <!-- Existing Groups -->
                     <div id="groupsList">
                         <div style="text-align: center; padding: 20px; color: var(--gray-500);">
@@ -1159,6 +1195,8 @@
         let harvestProspectUrlToScanJob = new Map();
         let harvestPoolConfigDoc = null; // Firestore harvest_pool_configs / primary BDR email
         let harvestManualByUrl = new Map(); // normalized URL -> manual harvest_pool_manual_contacts row
+        let harvestHeyreachAcceptUrls = new Set(); // normalized URLs with a HeyReach CONNECTION_REQUEST_ACCEPTED (built-in Pando group)
+        let harvestHeyreachAcceptSource = null;    // the harvestConnectionUrlToDate Map the set above was snapshotted from
         let harvestPoolFilterState = new Map(); // poolId|'__eligible' -> 'include'|'exclude'
         const RAILWAY_HARVEST_API = 'https://railwayclemail-production.up.railway.app';
         let leadsLoadSeq = 0;                          // bumped per loadLeads(); lets stale async work bail out
@@ -1745,10 +1783,23 @@
             }
             const minDaysCfg = parseInt(harvestPoolConfigDoc && harvestPoolConfigDoc.minDaysSinceConnection, 10);
             const minD = !isNaN(minDaysCfg) && minDaysCfg > 0 ? minDaysCfg : 30;
+
+            // Snapshot URLs with a real HeyReach CONNECTION_REQUEST_ACCEPTED BEFORE manual labels are
+            // merged into the map — that is what defines the built-in "Connections Generated Through
+            // Pando" group. (The map object is replaced on every load, so identity tells us when to re-snapshot.)
+            if (harvestHeyreachAcceptSource !== harvestConnectionUrlToDate) {
+                harvestHeyreachAcceptUrls = new Set(harvestConnectionUrlToDate.keys());
+                harvestHeyreachAcceptSource = harvestConnectionUrlToDate;
+            }
             mergeManualHarvestIntoUrlDateMap(harvestConnectionUrlToDate, minD);
 
             allLeads.forEach((lead) => {
                 const norm = normalizeLinkedInUrl(lead.linkedinUrl);
+                const manualRow = harvestManualByUrl.get(norm);
+                const manualOrigin = manualRow ? manualRow.originType : null;
+                lead.isPandoConnection =
+                    manualOrigin === 'excluded' ? false
+                    : (manualOrigin === 'healthluminate' || harvestHeyreachAcceptUrls.has(norm));
                 const connAt = harvestConnectionUrlToDate.get(norm);
                 lead.harvestConnectedAt = connAt || null;
                 lead.inHarvestPool = !!connAt;
@@ -2081,6 +2132,7 @@
                     if (loadSeq !== leadsLoadSeq) return; // superseded by a newer load
                     enrichLeadsWithHarvestPools();
                     applyFilters();
+                    renderGroupsList(); // refresh the built-in Pando group count now that connection data is in
                     maybeApplyHarvestUrlParamsFromUrl();
                 });
 
@@ -2238,7 +2290,12 @@
 
                 // Custom group filter
                 if (customGroupFilter) {
-                    if (!Array.isArray(lead.customGroups) || !lead.customGroups.includes(customGroupFilter)) return false;
+                    if (customGroupFilter === PANDO_GROUP_NAME) {
+                        // Built-in group: computed membership (see enrichLeadsWithHarvestPools)
+                        if (!lead.isPandoConnection) return false;
+                    } else if (!Array.isArray(lead.customGroups) || !lead.customGroups.includes(customGroupFilter)) {
+                        return false;
+                    }
                 }
 
                 // Harvest pool include filter (OR logic across included tags)
@@ -2380,9 +2437,16 @@
                                 '<span style="color: var(--gray-400);">—</span>'}
                         </td>
                         <td>
-                            ${Array.isArray(lead.customGroups) && lead.customGroups.length > 0 
-                                ? lead.customGroups.map(g => `<span class="badge badge-group" style="margin: 2px; font-size: 11px;">${g}</span>`).join('')
-                                : '<span style="color: var(--gray-400);">—</span>'}
+                            ${(() => {
+                                const badges = [];
+                                if (lead.isPandoConnection) {
+                                    badges.push(`<span class="badge" style="margin: 2px; font-size: 11px; background:#e0e7ff;color:#3730a3;border:1px solid #a5b4fc;" title="Built-in group (automatic)">${escapeGroupText(PANDO_GROUP_NAME)}</span>`);
+                                }
+                                if (Array.isArray(lead.customGroups)) {
+                                    lead.customGroups.forEach(g => badges.push(`<span class="badge badge-group" style="margin: 2px; font-size: 11px;">${escapeGroupText(g)}</span>`));
+                                }
+                                return badges.length ? badges.join('') : '<span style="color: var(--gray-400);">—</span>';
+                            })()}
                         </td>
                         <td>${getHarvestManualLabelCell(lead)}</td>
                         <td>
@@ -3226,6 +3290,17 @@ Return ONLY a raw JSON array:
         // CUSTOM CATEGORY GROUPS FUNCTIONALITY
         // =====================================================
 
+        // Built-in group that always exists. Membership is computed (not stored on contacts):
+        // connections that came from a HeyReach connection request we sent (CONNECTION_REQUEST_ACCEPTED
+        // on the BDR's seat) or are manually labeled "Pando Executive Networking originated".
+        // generate_messages.html uses the same name for its Harvest group selectors.
+        const PANDO_GROUP_NAME = 'Connections Generated Through Pando';
+        const UPLOAD_NEW_GROUP_VALUE = '__new_group__';
+
+        function escapeGroupText(s) {
+            return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
         /**
          * Toggle custom groups manager visibility
          */
@@ -3274,15 +3349,34 @@ Return ONLY a raw JSON array:
          */
         function renderGroupsList() {
             const container = document.getElementById('groupsList');
+
+            // Built-in group — always present, can't be deleted, membership is automatic.
+            const pandoCount = allLeads.filter(l => l.isPandoConnection).length;
+            const pandoGroupHtml = `
+                <div class="group-list-item" style="background: #eef2ff; border-color: #a5b4fc;">
+                    <div>
+                        <div class="group-name"><i class="fas fa-handshake" style="color: #4338ca; margin-right: 6px;"></i>${escapeGroupText(PANDO_GROUP_NAME)}
+                            <span class="badge" style="background:#e0e7ff;color:#3730a3;border:1px solid #a5b4fc;font-size:10px;margin-left:6px;">Built-in</span>
+                        </div>
+                        <div class="group-meta">Automatically contains every connection made through a HeyReach connection request we sent (plus contacts manually labeled "Pando Executive Networking originated"). Always available in Generate Messages → Harvest.</div>
+                        <div class="group-meta">${pandoCount} contact${pandoCount !== 1 ? 's' : ''} matched <span title="Based on connections that are past the harvest pool's minimum-days wait window">(past the harvest wait window)</span></div>
+                    </div>
+                    <div class="group-actions">
+                        <button class="btn btn-secondary" onclick="viewPandoGroupLeads()" style="font-size: 12px; padding: 6px 12px;">
+                            <i class="fas fa-filter"></i> View leads
+                        </button>
+                    </div>
+                </div>`;
+
             if (allCustomGroups.length === 0) {
-                container.innerHTML = `<div style="text-align: center; padding: 20px; color: var(--gray-500);">
+                container.innerHTML = pandoGroupHtml + `<div style="text-align: center; padding: 20px; color: var(--gray-500);">
                     <i class="fas fa-tag" style="font-size: 24px; margin-bottom: 8px; display: block;"></i>
                     No custom groups yet. Create one above!
                 </div>`;
                 return;
             }
 
-            container.innerHTML = allCustomGroups.map(group => {
+            container.innerHTML = pandoGroupHtml + allCustomGroups.map(group => {
                 const contactCount = allLeads.filter(l => Array.isArray(l.customGroups) && l.customGroups.includes(group.name)).length;
                 return `
                     <div class="group-list-item">
@@ -3314,10 +3408,25 @@ Return ONLY a raw JSON array:
             const filterSelect = document.getElementById('customGroupFilter');
             const bulkSelect = document.getElementById('bulkGroupSelect');
 
-            const groupOptions = allCustomGroups.map(g => `<option value="${g.name}">${g.name}</option>`).join('');
+            const uploadSelect = document.getElementById('uploadGroupSelect');
 
-            filterSelect.innerHTML = `<option value="">All Groups</option>${groupOptions}`;
+            const groupOptions = allCustomGroups.map(g => `<option value="${escapeGroupText(g.name)}">${escapeGroupText(g.name)}</option>`).join('');
+
+            // Preserve current selections across repopulation (e.g. after creating a group)
+            const prevFilter = filterSelect.value;
+            const prevUpload = uploadSelect ? uploadSelect.value : '';
+
+            // The built-in Pando group is filterable but not assignable (its membership is automatic).
+            filterSelect.innerHTML = `<option value="">All Groups</option>` +
+                `<option value="${escapeGroupText(PANDO_GROUP_NAME)}">${escapeGroupText(PANDO_GROUP_NAME)} (built-in)</option>${groupOptions}`;
             bulkSelect.innerHTML = `<option value="">Select Group...</option>${groupOptions}`;
+            if (uploadSelect) {
+                uploadSelect.innerHTML = `<option value="">Select a group...</option>${groupOptions}` +
+                    `<option value="${UPLOAD_NEW_GROUP_VALUE}">➕ Create a new group…</option>`;
+            }
+
+            if (prevFilter && [...filterSelect.options].some(o => o.value === prevFilter)) filterSelect.value = prevFilter;
+            if (uploadSelect && prevUpload && [...uploadSelect.options].some(o => o.value === prevUpload)) uploadSelect.value = prevUpload;
         }
 
         /**
@@ -3339,42 +3448,290 @@ Return ONLY a raw JSON array:
                 return;
             }
 
-            // Check for duplicate names
+            // Check for duplicate names (the built-in Pando group is reserved)
+            if (name.toLowerCase() === PANDO_GROUP_NAME.toLowerCase()) {
+                alert(`"${PANDO_GROUP_NAME}" is a built-in group that always exists`);
+                return;
+            }
             if (allCustomGroups.some(g => g.name.toLowerCase() === name.toLowerCase())) {
                 alert(`A group named "${name}" already exists`);
                 return;
             }
 
             try {
-                const { collection, getDocs } = window.clEmailFunctions;
-                const db = window.clEmailDb;
-
-                const groupData = {
-                    name,
-                    description,
-                    bdrEmail: currentViewingEmail,
-                    createdAt: new Date().toISOString(),
-                    createdBy: currentUser?.email || currentViewingEmail
-                };
-
-                // Add the document
-                const colRef = window.clemailFirestore.collection(db, 'bdr_category_groups');
-                const docRef = await window.clemailFirestore.addDoc(colRef, groupData);
-
-                allCustomGroups.push({ id: docRef.id, ...groupData });
-                allCustomGroups.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+                await persistNewCustomGroup(name, description);
 
                 nameInput.value = '';
                 descInput.value = '';
-
-                renderGroupsList();
-                populateGroupDropdowns();
 
                 console.log(`✅ Created group "${name}"`);
             } catch (error) {
                 console.error('❌ Error creating group:', error);
                 alert('Failed to create group: ' + error.message);
             }
+        }
+
+        /**
+         * Write a new group document for the viewed BDR, add it to local state and refresh the UI.
+         * Callers are responsible for validating the name (non-empty, not a duplicate).
+         */
+        async function persistNewCustomGroup(name, description = '') {
+            const db = window.clEmailDb;
+            const groupData = {
+                name,
+                description,
+                bdrEmail: currentViewingEmail,
+                createdAt: new Date().toISOString(),
+                createdBy: currentUser?.email || currentViewingEmail
+            };
+
+            const colRef = window.clemailFirestore.collection(db, 'bdr_category_groups');
+            const docRef = await window.clemailFirestore.addDoc(colRef, groupData);
+
+            const created = { id: docRef.id, ...groupData };
+            allCustomGroups.push(created);
+            allCustomGroups.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+            renderGroupsList();
+            populateGroupDropdowns();
+            return created;
+        }
+
+        // =====================================================
+        // UPLOAD A LIST OF URLS -> CUSTOM GROUP
+        // =====================================================
+
+        let lastUploadNotFoundUrls = [];
+
+        /** Same rules as normalizeLinkedInUrl, plus regional subdomains (de.linkedin.com -> linkedin.com). */
+        function normalizeUrlForGroupMatch(url) {
+            return normalizeLinkedInUrl(url).replace(/^[a-z]{2,3}\.linkedin\.com\//, 'linkedin.com/');
+        }
+
+        /**
+         * Pull LinkedIn profile URLs out of free text / CSV content. Any cell or line containing a
+         * linkedin.com/in/... URL counts; everything else is ignored (and counted as unrecognized
+         * when the line has other content, so the user can see why a row was skipped).
+         * Returns { urls: [{ raw, norm }] (deduped), duplicates, unrecognized: [lines] }.
+         */
+        function parseLinkedInUrlsFromText(text) {
+            const urlRe = /(?:https?:\/\/)?(?:[a-z0-9-]+\.)?linkedin\.com\/in\/[^\s,;"'<>|()\[\]]+/gi;
+            const seen = new Set();
+            const urls = [];
+            const unrecognized = [];
+            let duplicates = 0;
+            String(text || '').split(/\r?\n/).forEach(line => {
+                const trimmed = line.trim();
+                if (!trimmed) return;
+                const matches = trimmed.match(urlRe);
+                if (!matches) {
+                    unrecognized.push(trimmed.length > 120 ? trimmed.slice(0, 117) + '…' : trimmed);
+                    return;
+                }
+                matches.forEach(raw => {
+                    const norm = normalizeUrlForGroupMatch(raw);
+                    if (!norm || !/linkedin\.com\/in\/[^/]+/.test(norm)) return;
+                    if (seen.has(norm)) { duplicates++; return; }
+                    seen.add(norm);
+                    urls.push({ raw, norm });
+                });
+            });
+            return { urls, duplicates, unrecognized };
+        }
+
+        function updateUploadUrlCount() {
+            const textEl = document.getElementById('uploadUrlText');
+            const countEl = document.getElementById('uploadUrlCount');
+            if (!textEl || !countEl) return;
+            const { urls } = parseLinkedInUrlsFromText(textEl.value);
+            countEl.textContent = urls.length ? `${urls.length} LinkedIn URL${urls.length !== 1 ? 's' : ''} detected` : '';
+        }
+
+        function onUploadGroupSelectChange() {
+            const isNew = document.getElementById('uploadGroupSelect').value === UPLOAD_NEW_GROUP_VALUE;
+            document.getElementById('uploadNewGroupWrap').style.display = isNew ? '' : 'none';
+            if (isNew) document.getElementById('uploadNewGroupName').focus();
+        }
+
+        function onUploadUrlFileSelected(event) {
+            const input = event.target;
+            const file = input.files && input.files[0];
+            if (!file) return;
+            document.getElementById('uploadUrlFileName').textContent = file.name;
+            const reader = new FileReader();
+            reader.onload = () => {
+                const textarea = document.getElementById('uploadUrlText');
+                const existing = textarea.value.trim();
+                const incoming = String(reader.result || '').trim();
+                textarea.value = existing ? `${existing}\n${incoming}` : incoming;
+                updateUploadUrlCount();
+                input.value = ''; // allow re-selecting the same file
+            };
+            reader.onerror = () => alert('Could not read file: ' + (reader.error?.message || 'unknown error'));
+            reader.readAsText(file);
+        }
+
+        function downloadNotFoundUploadUrls() {
+            if (!lastUploadNotFoundUrls.length) return;
+            const blob = new Blob([lastUploadNotFoundUrls.join('\n') + '\n'], { type: 'text/plain' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'urls_not_in_my_leads.txt';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        }
+
+        /**
+         * Match the uploaded URLs against this user's leads and add the chosen group to each match
+         * (heyreach_contacts.customGroups — the same field Add to Group writes).
+         */
+        async function assignUploadedUrlsToGroup() {
+            const resultEl = document.getElementById('uploadUrlResult');
+            const btn = document.getElementById('uploadAssignBtn');
+
+            if (!currentViewingEmail) { alert('No user selected'); return; }
+            if (allLeads.length === 0) {
+                alert('This user\'s leads are not loaded yet (or there are none). Wait for My Leads to finish loading, then try again.');
+                return;
+            }
+
+            // ── Resolve target group ──
+            const selected = document.getElementById('uploadGroupSelect').value;
+            let groupName = '';
+            let isNewGroup = false;
+            if (!selected) { alert('Please choose a group (or "Create a new group…")'); return; }
+            if (selected === UPLOAD_NEW_GROUP_VALUE) {
+                groupName = document.getElementById('uploadNewGroupName').value.trim();
+                if (!groupName) { alert('Please enter a name for the new group'); return; }
+                if (groupName.toLowerCase() === PANDO_GROUP_NAME.toLowerCase()) {
+                    alert(`"${PANDO_GROUP_NAME}" is a built-in group whose members are added automatically. Choose a different name.`);
+                    return;
+                }
+                const existing = allCustomGroups.find(g => g.name.toLowerCase() === groupName.toLowerCase());
+                if (existing) groupName = existing.name; // reuse the existing group instead of erroring
+                else isNewGroup = true;
+            } else {
+                groupName = selected;
+            }
+
+            // ── Parse + match ──
+            const parsed = parseLinkedInUrlsFromText(document.getElementById('uploadUrlText').value);
+            if (parsed.urls.length === 0) {
+                alert('No LinkedIn profile URLs found. URLs should look like https://www.linkedin.com/in/some-name');
+                return;
+            }
+
+            const leadsByUrl = new Map();
+            allLeads.forEach(lead => {
+                const n = normalizeUrlForGroupMatch(lead.linkedinUrl);
+                if (n && !leadsByUrl.has(n)) leadsByUrl.set(n, lead);
+            });
+
+            const toAdd = [];
+            const alreadyIn = [];
+            const notFound = [];
+            parsed.urls.forEach(({ raw, norm }) => {
+                const lead = leadsByUrl.get(norm);
+                if (!lead) { notFound.push(raw); return; }
+                const groups = Array.isArray(lead.customGroups) ? lead.customGroups : [];
+                if (groups.includes(groupName)) alreadyIn.push(lead);
+                else toAdd.push(lead);
+            });
+
+            if (toAdd.length === 0 && alreadyIn.length === 0) {
+                lastUploadNotFoundUrls = notFound;
+                renderUploadResult({ groupName, added: 0, alreadyIn: 0, failed: 0, notFound, parsed, created: false });
+                alert('None of the uploaded URLs match a lead for this user, so nothing was changed.');
+                return;
+            }
+
+            const confirmMsg =
+                `Add ${toAdd.length} contact(s) to group "${groupName}"${isNewGroup ? ' (new group will be created)' : ''}?\n\n` +
+                `• ${toAdd.length} will be added\n` +
+                `• ${alreadyIn.length} already in the group\n` +
+                `• ${notFound.length} not found in My Leads (will be skipped)`;
+            if (!confirm(confirmMsg)) return;
+
+            btn.disabled = true;
+            const setBtn = (label) => { btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${label}`; };
+            let added = 0;
+            let failed = 0;
+            let created = false;
+
+            try {
+                setBtn('Preparing…');
+                if (isNewGroup) {
+                    await persistNewCustomGroup(groupName, 'Created from a URL upload');
+                    created = true;
+                }
+
+                const { doc, updateDoc } = window.clEmailFunctions;
+                const db = window.clEmailDb;
+                const CONCURRENCY = 20;
+                for (let i = 0; i < toAdd.length; i += CONCURRENCY) {
+                    setBtn(`Adding ${Math.min(i + CONCURRENCY, toAdd.length)}/${toAdd.length}…`);
+                    const chunk = toAdd.slice(i, i + CONCURRENCY);
+                    const settled = await Promise.allSettled(chunk.map(async (lead) => {
+                        const current = Array.isArray(lead.customGroups) ? lead.customGroups : [];
+                        const next = current.includes(groupName) ? current : [...current, groupName];
+                        await updateDoc(doc(db, 'heyreach_contacts', lead.id), { customGroups: next });
+                        lead.customGroups = next;
+                    }));
+                    settled.forEach(r => {
+                        if (r.status === 'fulfilled') added++;
+                        else { failed++; console.error('❌ Failed to add lead to group:', r.reason); }
+                    });
+                }
+
+                lastUploadNotFoundUrls = notFound;
+                renderUploadResult({ groupName, added, alreadyIn: alreadyIn.length, failed, notFound, parsed, created });
+                applyFilters(); // re-renders the table with the new group badges
+                renderGroupsList();
+                console.log(`✅ Upload to group "${groupName}": ${added} added, ${alreadyIn.length} already in, ${notFound.length} not found, ${failed} failed`);
+            } catch (error) {
+                console.error('❌ Error assigning uploaded URLs to group:', error);
+                alert('Failed to assign URLs to group: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-tag"></i> Assign URLs to Group';
+            }
+        }
+
+        function renderUploadResult({ groupName, added, alreadyIn, failed, notFound, parsed, created }) {
+            const el = document.getElementById('uploadUrlResult');
+            if (!el) return;
+            const row = (color, icon, text) =>
+                `<div style="color:${color};font-size:13px;margin-bottom:4px;"><i class="fas ${icon}" style="width:16px;"></i> ${text}</div>`;
+            const notFoundPreview = notFound.slice(0, 50).map(u => escapeGroupText(u)).join('\n');
+            el.style.display = 'block';
+            el.innerHTML = `
+                <div style="background:white;border:1px solid var(--gray-200);border-radius:8px;padding:12px 16px;">
+                    <div style="font-weight:600;font-size:14px;margin-bottom:8px;">Upload result for "${escapeGroupText(groupName)}"${created ? ' <span class="badge badge-group" style="font-size:11px;">new group</span>' : ''}</div>
+                    ${row('#15803d', 'fa-check-circle', `${added} contact${added !== 1 ? 's' : ''} added to the group`)}
+                    ${alreadyIn ? row('var(--gray-600)', 'fa-equals', `${alreadyIn} already in the group`) : ''}
+                    ${failed ? row('var(--danger)', 'fa-times-circle', `${failed} failed to save (see browser console)`) : ''}
+                    ${notFound.length ? row('#b45309', 'fa-exclamation-triangle', `${notFound.length} URL${notFound.length !== 1 ? 's' : ''} not found in this user's My Leads — skipped`) : ''}
+                    ${parsed.duplicates ? row('var(--gray-600)', 'fa-clone', `${parsed.duplicates} duplicate URL${parsed.duplicates !== 1 ? 's' : ''} in the upload ignored`) : ''}
+                    ${parsed.unrecognized.length ? row('var(--gray-600)', 'fa-question-circle', `${parsed.unrecognized.length} line${parsed.unrecognized.length !== 1 ? 's' : ''} had no LinkedIn profile URL and were ignored`) : ''}
+                    ${notFound.length ? `
+                        <details style="margin-top:8px;">
+                            <summary style="cursor:pointer;font-size:13px;color:var(--gray-700);">Show URLs not found${notFound.length > 50 ? ' (first 50)' : ''}</summary>
+                            <pre style="margin:8px 0 0;padding:10px;background:var(--gray-50);border-radius:6px;font-size:12px;max-height:200px;overflow:auto;white-space:pre-wrap;">${notFoundPreview}</pre>
+                        </details>
+                        <button class="btn btn-secondary" onclick="downloadNotFoundUploadUrls()" style="margin-top:8px;font-size:12px;padding:6px 12px;">
+                            <i class="fas fa-download"></i> Download URLs not found
+                        </button>` : ''}
+                </div>`;
+        }
+
+        /** Jump the leads table to the built-in Pando group. */
+        function viewPandoGroupLeads() {
+            const sel = document.getElementById('customGroupFilter');
+            sel.value = PANDO_GROUP_NAME;
+            applyFilters();
+            document.getElementById('leadsTable')?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
         }
 
         /**

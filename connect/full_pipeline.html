@@ -794,6 +794,18 @@
             <div id="fpProgressLog"></div>
             <div id="fpReportLink" style="margin-top: 10px; font-size: 13px;"></div>
 
+            <!-- Good-to-go contacts that were found (tagged + eligible) but never got a message.
+                 Counted in the background after every run; "Send" builds messages for exactly these. -->
+            <div id="fpGoodToGoCard" class="fp-insight-box" style="display:none; margin-top: 14px; border-left: 4px solid #059669; background: #f0fdf4;">
+                <div class="fp-insight-title"><i class="fas fa-user-clock" style="color:#059669;"></i> Good-to-go contacts found but not messaged</div>
+                <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                    <span id="fpGoodToGoStatus" style="font-size: 13.5px; color: var(--gray-700); line-height: 1.5;"></span>
+                    <button class="btn btn-primary" id="fpGoodToGoSendBtn" onclick="fpSendGoodToGoToBuild()" style="display:none;"><i class="fas fa-paper-plane"></i> Send them to message build</button>
+                    <button class="btn" id="fpGoodToGoRecountBtn" onclick="fpRecountGoodToGo()" style="display:none;"><i class="fas fa-rotate"></i> Recount</button>
+                </div>
+                <div id="fpGoodToGoDetail" style="font-size: 12.5px; color: var(--gray-500); margin-top: 6px; line-height: 1.5;"></div>
+            </div>
+
             <div style="margin-top: 18px; border-top: 1px solid var(--gray-200); padding-top: 16px;">
                 <div class="section-title" style="font-size: 14.5px;"><i class="fas fa-brain" style="color:#7c3aed;"></i> Ask Opus to Review This Run</div>
                 <p class="section-help" style="margin-left: 0;">
@@ -3754,6 +3766,113 @@
             }
             return { queue, totals, token };
         }
+
+        // ════════════════════════════════════════════════════════════════════
+        // GOOD-TO-GO CONTACTS FOUND BUT NOT MESSAGED
+        // After every Full Pipeline run (completed, stopped, or errored), the page counts in the
+        // background the contacts tagged to this hypothesis group that the server treats as
+        // eligible but that still have no message: the ones a run pulled in and never built.
+        // It reuses the backfill eligibility check (fpBuildBackfillQueue → full-ai-init), so the
+        // number matches what a backfill run would actually build. "Send" runs the existing
+        // backfill-only mode on exactly those contacts. Nothing here touches HeyReach.
+        // ════════════════════════════════════════════════════════════════════
+        let fpGoodToGoSeq = 0;
+        let fpGoodToGoLast = null; // { groupId, groupName, bdrEmails, eligible, orgs, tagged }
+
+        function fpGoodToGoRender({ visible, status = '', detail = '', showSend = false, showRecount = false, busy = false }) {
+            const card = document.getElementById('fpGoodToGoCard');
+            if (!card) return;
+            card.style.display = visible ? 'block' : 'none';
+            document.getElementById('fpGoodToGoStatus').innerHTML = status;
+            document.getElementById('fpGoodToGoDetail').innerHTML = detail;
+            document.getElementById('fpGoodToGoSendBtn').style.display = showSend ? 'inline-flex' : 'none';
+            const recount = document.getElementById('fpGoodToGoRecountBtn');
+            recount.style.display = showRecount ? 'inline-flex' : 'none';
+            recount.disabled = busy;
+        }
+
+        // Runs in the background: the run does NOT await this, and it writes nothing to the run log.
+        window.fpStartGoodToGoCount = async function(groupId, groupName, bdrList) {
+            const seq = ++fpGoodToGoSeq;
+            if (!groupId || !Array.isArray(bdrList) || bdrList.length === 0) return;
+            fpGoodToGoLast = null;
+            fpGoodToGoRender({
+                visible: true, busy: true,
+                status: '<i class="fas fa-spinner fa-spin"></i> Counting good-to-go contacts that have no message yet (running in the background)…'
+            });
+            try {
+                const token = await auth.currentUser.getIdToken();
+                const connFilterOn = document.getElementById('fpConnFilterEnabled').checked;
+                const connFilterMin = parseInt(document.getElementById('fpConnFilterMin').value) || 100;
+                const bf = await fpBuildBackfillQueue({
+                    token, groupId, groupName, bdrPlan: bdrList, bdrContexts: new Map(),
+                    connFilterOn, connFilterMin, addLog: () => {}
+                });
+                if (seq !== fpGoodToGoSeq) return; // a newer count superseded this one
+                const eligible = bf.totals.eligible || 0;
+                const orgs = bf.totals.orgs || 0;
+                const tagged = bf.totals.tagged || 0;
+                fpGoodToGoLast = { groupId, groupName, bdrEmails: bdrList.map(b => b.bdrEmail), eligible, orgs, tagged };
+
+                const skipped = Math.max(0, tagged - eligible);
+                const detail = `Tagged to "${escHtml(groupName)}": ${tagged} contact(s) · ${skipped} skipped (already messaged, already sent, excluded, already connected, or under the connection floor). `
+                    + `The 30-day organization limit and DNC check are applied again when these are built, so a few may be skipped then.`;
+                if (eligible === 0) {
+                    fpGoodToGoRender({
+                        visible: true, showRecount: true,
+                        status: `<i class="fas fa-circle-check" style="color:#059669;"></i> No good-to-go contacts are waiting. Every eligible contact tagged to this group already has a message.`,
+                        detail
+                    });
+                } else {
+                    fpGoodToGoRender({
+                        visible: true, showSend: true, showRecount: true,
+                        status: `<strong style="font-size: 15px; color: #047857;">${eligible}</strong> good-to-go contact(s) across <strong>${orgs}</strong> organization(s) were found but have <strong>no message yet</strong>.`,
+                        detail
+                    });
+                }
+            } catch (e) {
+                if (seq !== fpGoodToGoSeq) return;
+                console.warn('[good-to-go count] failed:', e);
+                fpGoodToGoRender({
+                    visible: true, showRecount: true,
+                    status: `<span style="color: var(--danger);"><i class="fas fa-triangle-exclamation"></i> Could not count good-to-go contacts (${escHtml(e.message || String(e))}).</span>`
+                });
+            }
+        };
+
+        window.fpRecountGoodToGo = function() {
+            if (fpRunning) return;
+            const groupId = document.getElementById('fpGroupSelect').value;
+            const group = fpGroups.find(g => g.id === groupId);
+            const bdrList = [...document.querySelectorAll('.fp-bdr-cb')].filter(cb => cb.checked).map(cb => ({ bdrEmail: cb.dataset.email }));
+            if (!group || bdrList.length === 0) { alert('Select a hypothesis group and at least one BDR in Step 2 first.'); return; }
+            fpStartGoodToGoCount(groupId, group.name || groupId, bdrList);
+        };
+
+        // Builds messages for exactly the contacts the last count found, by running the existing
+        // backfill-only mode (no organizations scanned, no Apify scan cost). The run's own
+        // confirmation dialog still appears before anything starts.
+        window.fpSendGoodToGoToBuild = function() {
+            const last = fpGoodToGoLast;
+            if (!last || last.eligible === 0) return;
+            if (fpRunning) { alert('A Full Pipeline run is already in progress. Wait for it to finish, then send.'); return; }
+            if (document.getElementById('fpGroupSelect').value !== last.groupId) {
+                alert(`Switch the group back to "${last.groupName}" first. These contacts were counted for that group.`);
+                return;
+            }
+            const checkedNow = [...document.querySelectorAll('.fp-bdr-cb')].filter(cb => cb.checked).map(cb => cb.dataset.email).sort();
+            const counted = [...last.bdrEmails].sort();
+            if (checkedNow.join('|') !== counted.join('|')) {
+                alert('The BDRs checked in Step 2 changed since this count. Re-check the same BDRs (or click Recount) before sending.');
+                return;
+            }
+            // fpRunPipeline reads this checkbox synchronously before its first await, so it is
+            // safe to switch it on for this one run and restore the user's setting right after.
+            const bfBox = document.getElementById('fpBackfillEnabled');
+            const prev = bfBox.checked;
+            bfBox.checked = true;
+            try { fpRunPipeline(); } finally { bfBox.checked = prev; }
+        };
 
         function fpRenderGroupOrgsTable() {
             const tbody = document.getElementById('fpOrgTableBody');
@@ -7242,6 +7361,7 @@
             document.getElementById('fpProgressSection').style.display = 'block';
             document.getElementById('fpProgressLog').innerHTML = '';
             document.getElementById('fpReportLink').innerHTML = '';
+            fpGoodToGoSeq++; fpGoodToGoLast = null; fpGoodToGoRender({ visible: false }); // clear last run's count; a fresh one runs when this run ends
             fpFullLogText = [];
             document.getElementById('fpOpusReviewResult').style.display = 'none';
             document.getElementById('fpOpusReviewStatus').textContent = '';
@@ -8927,6 +9047,9 @@
                 runBtn.innerHTML = '<i class="fas fa-rocket"></i> Run Full Pipeline';
                 document.getElementById('fpStopBtn').style.display = 'none';
                 fpUpdateRunButton();
+                // Background: count good-to-go contacts this run pulled in but never messaged.
+                // Not awaited — the run is already finished from the user's point of view.
+                fpStartGoodToGoCount(groupId, groupName, bdrPlan);
             }
         };
 

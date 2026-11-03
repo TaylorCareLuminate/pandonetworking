@@ -172,6 +172,17 @@
             padding: 14px 16px; margin-bottom: 16px;
         }
         .referral-title { font-size: 14px; font-weight: 800; color: var(--primary-dark); margin-bottom: 4px; display: flex; align-items: center; gap: 7px; }
+        .qo-modal-backdrop {
+            position: fixed; inset: 0; background: rgba(15, 23, 42, 0.55); z-index: 1000;
+            display: flex; align-items: center; justify-content: center; padding: 16px;
+        }
+        .qo-modal {
+            background: white; border-radius: 14px; max-width: 480px; width: 100%;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.3); padding: 22px 24px;
+        }
+        .qo-modal h3 { margin: 0 0 10px; font-size: 18px; color: #047857; display: flex; align-items: center; gap: 8px; }
+        .qo-modal p { margin: 0 0 10px; font-size: 14px; line-height: 1.5; color: var(--gray-700, #374151); }
+        .qo-modal .qo-modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; flex-wrap: wrap; }
         .src-badge.message { background: #ecfdf5; color: #047857; border-color: #a7f3d0; }
         .src-badge.connect-kind { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
         .sticky-bar {
@@ -965,11 +976,45 @@
             }
             if (result.connected) {
                 el.className = 'conn-banner connected';
-                el.innerHTML = '<i class="fas fa-user-check"></i> Already connected to this BDR on LinkedIn. This will send as a <strong>LinkedIn message</strong>, not a connection request.';
+                el.innerHTML = '<i class="fas fa-user-check"></i> Already connected to this BDR on LinkedIn. A connection request isn\'t possible; a <strong>LinkedIn message</strong> will only be prepared if you agree.';
             } else {
                 el.className = 'conn-banner not-connected';
                 el.innerHTML = '<i class="fas fa-user-plus"></i> Not a current connection. This will send as a <strong>connection request</strong>.';
             }
+        }
+
+        // Asks the user to explicitly agree before a LinkedIn *message* (instead of a
+        // connection request) is prepared for someone the BDR is already connected to.
+        // Resolves true only if the user clicks the agree button.
+        function qoConfirmMessageToConnection({ name, bdrName }) {
+            return new Promise(resolve => {
+                const backdrop = document.createElement('div');
+                backdrop.className = 'qo-modal-backdrop';
+                backdrop.innerHTML = `
+                    <div class="qo-modal" role="dialog" aria-modal="true" aria-labelledby="qoConnModalTitle">
+                        <h3 id="qoConnModalTitle"><i class="fas fa-user-check"></i> Already a LinkedIn connection</h3>
+                        <p><strong>${escHtml(name || 'This person')}</strong> is already connected to
+                           <strong>${escHtml(bdrName || 'this BDR')}</strong> on LinkedIn, so a connection request can't be sent.</p>
+                        <p>Do you want to send them a regular <strong>LinkedIn message</strong> instead?
+                           Nothing is sent until you review the text and click Approve &amp; Send.</p>
+                        <div class="qo-modal-actions">
+                            <button type="button" class="btn btn-gray" id="qoConnModalNo"><i class="fas fa-xmark"></i> No, stop</button>
+                            <button type="button" class="btn btn-success" id="qoConnModalYes"><i class="fas fa-paper-plane"></i> Yes, send a LinkedIn message</button>
+                        </div>
+                    </div>`;
+                const finish = answer => {
+                    document.removeEventListener('keydown', onKey, true);
+                    backdrop.remove();
+                    resolve(answer);
+                };
+                const onKey = e => { if (e.key === 'Escape') { e.preventDefault(); finish(false); } };
+                document.addEventListener('keydown', onKey, true);
+                backdrop.addEventListener('click', e => { if (e.target === backdrop) finish(false); });
+                document.body.appendChild(backdrop);
+                backdrop.querySelector('#qoConnModalNo').addEventListener('click', () => finish(false));
+                backdrop.querySelector('#qoConnModalYes').addEventListener('click', () => finish(true));
+                backdrop.querySelector('#qoConnModalNo').focus();
+            });
         }
 
         async function qoLoadEmailAssociations() {
@@ -1656,8 +1701,14 @@
                 qoShowConnBanner(conn);
                 let alreadyConnected = Boolean(conn.checked && conn.connected);
                 let messageType = alreadyConnected ? 'message' : 'connect';
+                const personName = profileData.fullName || profileData.name || `${contact.firstName || ''} ${contact.lastName || ''}`.trim();
                 if (alreadyConnected) {
-                    addLog('   💬 Send type: LinkedIn message (already connected)', 'success');
+                    const agreed = await qoConfirmMessageToConnection({ name: personName, bdrName: bdr.name || bdrEmail });
+                    if (!agreed) {
+                        addLog('⛔ Stopped — this person is already connected and you chose not to send a LinkedIn message.', 'warning');
+                        return;
+                    }
+                    addLog('   💬 Send type: LinkedIn message (already connected — you agreed)', 'success');
                 } else if (conn.checked) {
                     addLog('   📨 Send type: connection request', 'info');
                 } else {
@@ -1730,10 +1781,15 @@
                     }
                     const filteredAsConnected = /already connected/i.test(reason) || reason === 'already_connected';
                     if (filteredAsConnected) {
+                        qoShowConnBanner({ connected: true, checked: true });
+                        const agreed = await qoConfirmMessageToConnection({ name: personName, bdrName: bdr.name || bdrEmail });
+                        if (!agreed) {
+                            addLog('⛔ Stopped — this person is already connected and you chose not to send a LinkedIn message.', 'warning');
+                            return;
+                        }
                         alreadyConnected = true;
                         messageType = 'message';
-                        qoShowConnBanner({ connected: true, checked: true });
-                        addLog(`   ℹ️ Full AI filtered this contact (${reason}) — generating a LinkedIn message anyway because they are already connected.`, 'info');
+                        addLog(`   ℹ️ Full AI filtered this contact (${reason}) — generating a LinkedIn message because they are already connected and you agreed.`, 'info');
                     } else {
                         addLog(`   ⚠️ The system filtered this contact out: ${reason}`, 'warning');
                         if (!confirm(`⚠️ The system filtered this contact out:\n\n"${reason}"\n\n(Common causes: they already have a message queued, or they're already connected to this BDR.)\n\nGenerate a message anyway?`)) {

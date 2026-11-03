@@ -9,6 +9,7 @@
     <title>Generate Messages - PandoConnect</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     
+    <!-- UPDATED: 2026-11-03 - Harvest Run + Harvest Fast Prospect (pool mode): optional "Custom group" selector (My Leads groups from bdr_category_groups / heyreach_contacts.customGroups) plus the always-available built-in group "Connections Generated Through Pando" (resolved server-side via onlyOurConnections) -->
     <!-- UPDATED: 2026-10-29 - Full AI Generate + Fast Prospect Messaging: new Contact Source "Our connections (Pando/HeyReach)" — message everyone the BDR is connected to because of our HeyReach connection requests (direct messages; Full AI uses the Harvest engine) -->
     <!-- UPDATED: 2026-09-16 - Harvest: option to only include contacts connected by us (exclude pre-existing connections) -->
     <!-- UPDATED: 2026-10-19 - Harvest Run: contacts now prioritized by last outreach (never-contacted first, then oldest last message → newest) so repeated runs rotate through the pool -->
@@ -3058,6 +3059,14 @@
                     </select>
                     <div class="form-help" style="margin-top: 6px;">Choose <strong>All pools</strong> to include everyone in your harvest pool, or a specific sub-pool (same rules as <a href="harvest_pool.html" style="color:var(--primary);">Harvest Pool</a>).</div>
 
+                    <label for="harvestGroupSelect" style="font-weight: 600; color: var(--gray-700); margin: 14px 0 8px; padding-top: 12px; border-top: 1px dashed #c7d7fe; display: flex; align-items: center; gap: 8px;">
+                        <i class="fas fa-tags" style="color: var(--primary);"></i> Custom group
+                    </label>
+                    <select id="harvestGroupSelect" style="width: 100%; padding: 8px 12px; border: 1px solid var(--gray-300); border-radius: 6px; font-size: 14px;">
+                        <option value="">— Select a BDR first —</option>
+                    </select>
+                    <div class="form-help" style="margin-top: 6px;">Optional. Limit this run to contacts in one of the BDR's <a href="my_leads.html" style="color:var(--primary);">My Leads</a> custom groups. <strong>Connections Generated Through Pando</strong> is always available and automatically contains every connection we made through a HeyReach connection request. Contacts must still be eligible in the harvest pool.</div>
+
                     <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; font-size: 14px; font-weight: 600; margin-top: 14px; padding-top: 12px; border-top: 1px dashed #c7d7fe;">
                         <input type="checkbox" id="harvestOnlyOurConnections"
                             style="width: 16px; height: 16px; accent-color: var(--primary); cursor: pointer; flex-shrink: 0; margin-top: 2px;">
@@ -5451,6 +5460,15 @@
                     <select id="hfpPoolSelect" style="width: 100%; padding: 8px 12px; border: 1px solid #86efac; border-radius: 6px; font-size: 14px;">
                         <option value="">— Select a BDR first —</option>
                     </select>
+                </div>
+                <div class="form-group" style="margin-bottom: 12px;">
+                    <label for="hfpGroupSelect" style="font-size: 13px; font-weight: 600; color: var(--gray-700);"><i class="fas fa-tags" style="color: #059669;"></i> Custom group <span style="font-weight: 400; color: var(--gray-500);">(optional)</span></label>
+                    <select id="hfpGroupSelect" style="width: 100%; padding: 8px 12px; border: 1px solid #86efac; border-radius: 6px; font-size: 14px;">
+                        <option value="">— Select a BDR first —</option>
+                    </select>
+                    <div class="form-help" style="margin-top: 6px; color: #065f46;">
+                        Limit to one of the BDR's <a href="my_leads.html" target="_blank" style="color:#065f46;font-weight:600;">My Leads</a> custom groups. <strong>Connections Generated Through Pando</strong> is always available (every connection we made through a HeyReach connection request).
+                    </div>
                 </div>
                 <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; color: #065f46; margin-bottom: 0; margin-top: 10px;">
                     <input type="checkbox" id="hfpOnlyOurConnections" style="width: 16px; height: 16px; accent-color: #059669; cursor: pointer;">
@@ -21967,11 +21985,21 @@
         // own inputs — used by the "Our connections (Pando/HeyReach)" Contact Source in Full AI
         // Generate and Fast Prospect Messaging. minDaysSinceConnection requires the matching
         // server param (older servers ignore it and fall back to the Harvest Pool config's min days).
+        //
+        // opts.customGroup (optional): limit to one of the BDR's My Leads custom groups.
+        //   • HARVEST_PANDO_GROUP ("Connections Generated Through Pando") is a built-in group that
+        //     is always available — it is resolved server-side via onlyOurConnections (every
+        //     connection made through a HeyReach connection request we sent).
+        //   • Any other name is matched client-side against heyreach_contacts.customGroups
+        //     (the same field My Leads writes), so no server change is required.
+        // opts.forceGroupRefresh: bypass the short-lived group-membership cache.
         async function fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections, opts = {}) {
             const h = await harvestAuthHeaders();
             const qs = new URLSearchParams();
+            const groupName = String(opts.customGroup || '').trim();
+            const isPandoGroup = groupName === HARVEST_PANDO_GROUP;
             if (poolId) qs.set('poolId', poolId);
-            if (onlyOurConnections) qs.set('onlyOurConnections', 'true');
+            if (onlyOurConnections || isPandoGroup) qs.set('onlyOurConnections', 'true');
             const excludeDays = opts.excludeRecentDays != null
                 ? parseInt(opts.excludeRecentDays, 10)
                 : parseInt(document.getElementById('harvestExcludeRecentDays')?.value, 10);
@@ -21984,7 +22012,126 @@
             const r = await heavyFetch(url, { headers: h });
             const j = await r.json();
             if (!j.success) throw new Error(j.error || 'Failed to load harvest pool contacts');
+
+            j.customGroup = groupName || null;
+            j.excludedByGroupCount = 0;
+            if (groupName && !isPandoGroup) {
+                const membership = await loadHarvestGroupMembership(bdrEmail, { force: !!opts.forceGroupRefresh });
+                const members = membership.get(groupName) || new Set();
+                const before = (j.contacts || []).length;
+                j.contacts = (j.contacts || []).filter(c => members.has(harvestGroupNormUrl(c.linkedInUrl)));
+                j.excludedByGroupCount = before - j.contacts.length;
+            }
             return j;
+        }
+
+        // ── Custom groups (created/assigned on My Leads) ─────────────────────────────────────
+        // Group definitions live in bdr_category_groups; membership lives on each contact as
+        // heyreach_contacts.customGroups (array of group names). "Connections Generated Through
+        // Pando" is a built-in group that always exists — its membership is computed (not stored).
+        const HARVEST_PANDO_GROUP = 'Connections Generated Through Pando';
+        const HARVEST_GROUP_CONTACT_FIELDS = ['linkedin_url', 'profileUrl', 'leadProfileUrl', 'linkedInUrl', 'customGroups'];
+        const HARVEST_GROUP_CACHE_MS = 120000;
+        const harvestGroupNamesCache = { bdr: null, at: 0, names: null };
+        const harvestGroupMembershipCache = { bdr: null, at: 0, map: null };
+
+        /** Same normalization My Leads uses when it matches URLs (and the Railway harvest service). */
+        function harvestGroupNormUrl(url) {
+            if (!url) return '';
+            return String(url).trim().toLowerCase().split('?')[0].split('#')[0]
+                .replace(/\/+$/, '').replace(/^https?:\/\/(www\.)?/, '');
+        }
+
+        /** Names of the BDR's custom groups from bdr_category_groups (excludes the built-in Pando group). */
+        async function loadHarvestGroupNames(bdrEmail, { force = false } = {}) {
+            const key = String(bdrEmail || '').toLowerCase();
+            if (!force && harvestGroupNamesCache.bdr === key && harvestGroupNamesCache.names &&
+                Date.now() - harvestGroupNamesCache.at < HARVEST_GROUP_CACHE_MS) {
+                return harvestGroupNamesCache.names;
+            }
+            const { collection: col, query: q, where: wh, getDocs: gd } = window.clemailFirestore;
+            const names = new Set();
+            const emails = [...new Set([bdrEmail, key].filter(Boolean))];
+            await Promise.all(emails.map(async (email) => {
+                try {
+                    const snap = await gd(q(col(db, 'bdr_category_groups'), wh('bdrEmail', '==', email)));
+                    snap.forEach(d => {
+                        const n = String((d.data() || {}).name || '').trim();
+                        if (n && n !== HARVEST_PANDO_GROUP) names.add(n);
+                    });
+                } catch (e) { console.warn('[Harvest groups] bdr_category_groups lookup failed for', email, e?.message || e); }
+            }));
+            const sorted = [...names].sort((a, b) => a.localeCompare(b));
+            harvestGroupNamesCache.bdr = key;
+            harvestGroupNamesCache.at = Date.now();
+            harvestGroupNamesCache.names = sorted;
+            return sorted;
+        }
+
+        /** Map<groupName, Set<normalizedUrl>> from heyreach_contacts.customGroups for this BDR. */
+        async function loadHarvestGroupMembership(bdrEmail, { force = false } = {}) {
+            const key = String(bdrEmail || '').toLowerCase();
+            if (!force && harvestGroupMembershipCache.bdr === key && harvestGroupMembershipCache.map &&
+                Date.now() - harvestGroupMembershipCache.at < HARVEST_GROUP_CACHE_MS) {
+                return harvestGroupMembershipCache.map;
+            }
+            await ensureLinkedInEmailMapLoaded();
+            const { collection: col, query: q, where: wh, getDocs: gd } = window.clemailFirestore;
+            const map = new Map();
+            const lookups = [];
+            for (const email of hfpEmailVariants(bdrEmail)) {
+                for (const field of ['accountEmail', 'bdrEmail', 'linkedInAccountEmail']) {
+                    lookups.push(
+                        gd(hfpSelect(q(col(db, 'heyreach_contacts'), wh(field, '==', email)), HARVEST_GROUP_CONTACT_FIELDS), { timeoutMs: 60000 })
+                            .then(snap => snap.forEach(d => {
+                                const data = d.data() || {};
+                                const groups = Array.isArray(data.customGroups) ? data.customGroups : [];
+                                if (!groups.length) return;
+                                const norm = harvestGroupNormUrl(data.profileUrl || data.linkedin_url || data.leadProfileUrl || data.linkedInUrl || '');
+                                if (!norm) return;
+                                groups.forEach(g => {
+                                    if (!map.has(g)) map.set(g, new Set());
+                                    map.get(g).add(norm);
+                                });
+                            }))
+                            .catch(e => console.warn(`[Harvest groups] heyreach_contacts ${field}=${email} lookup failed:`, e?.message || e))
+                    );
+                }
+            }
+            await Promise.all(lookups);
+            harvestGroupMembershipCache.bdr = key;
+            harvestGroupMembershipCache.at = Date.now();
+            harvestGroupMembershipCache.map = map;
+            return map;
+        }
+
+        /** Fills a "Custom group" <select>: none, the built-in Pando group, then the BDR's own groups. */
+        async function populateHarvestGroupSelect(selectEl, bdrEmail) {
+            if (!selectEl) return;
+            const prev = selectEl.value;
+            selectEl.dataset.bdr = bdrEmail || '';
+            const build = (names) => {
+                selectEl.innerHTML = '';
+                const add = (value, label) => {
+                    const o = document.createElement('option');
+                    o.value = value;
+                    o.textContent = label;
+                    selectEl.appendChild(o);
+                };
+                add('', 'No group filter (all eligible contacts)');
+                add(HARVEST_PANDO_GROUP, `${HARVEST_PANDO_GROUP} (built-in)`);
+                names.forEach(n => add(n, n));
+                if (prev && [...selectEl.options].some(o => o.value === prev)) selectEl.value = prev;
+            };
+            build([]);
+            if (!bdrEmail) return;
+            try {
+                const names = await loadHarvestGroupNames(bdrEmail, { force: true });
+                if (selectEl.dataset.bdr !== (bdrEmail || '')) return; // BDR changed while loading
+                build(names);
+            } catch (e) {
+                console.warn('[Harvest groups] could not load custom groups:', e?.message || e);
+            }
         }
 
         async function populateHarvestPoolSelect(bdrEmail) {
@@ -22033,6 +22180,7 @@
             const generateBtn = document.getElementById('harvestGenerateBtn');
             const poolId = document.getElementById('harvestPoolSelect')?.value || '';
             const onlyOurConnections = document.getElementById('harvestOnlyOurConnections')?.checked || false;
+            const customGroup = document.getElementById('harvestGroupSelect')?.value || '';
             if (!bdrEmail) {
                 if (statsEl) statsEl.style.display = 'none';
                 if (generateBtn) generateBtn.disabled = true;
@@ -22042,17 +22190,23 @@
             if (countEl) countEl.textContent = '…';
             if (generateBtn) generateBtn.disabled = true;
             try {
-                const data = await fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections);
+                const data = await fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections, { customGroup });
                 const n = (data.contacts && data.contacts.length) || 0;
                 if (countEl) countEl.textContent = n;
                 const hintEl = document.getElementById('harvestMinDaysHint');
                 if (hintEl) {
                     const baseText = hintEl.dataset.baseText || '';
                     const exclusionNote =
-                        onlyOurConnections && data.excludedPreExistingCount
+                        data.onlyOurConnections && data.excludedPreExistingCount
                             ? `${data.excludedPreExistingCount} pre-existing connection(s) excluded`
                             : '';
-                    hintEl.textContent = [baseText, exclusionNote].filter(Boolean).join(' — ');
+                    const groupNote =
+                        customGroup
+                            ? (customGroup === HARVEST_PANDO_GROUP
+                                ? `Group: ${customGroup}`
+                                : `Group "${customGroup}": ${data.excludedByGroupCount || 0} eligible contact(s) not in this group excluded`)
+                            : '';
+                    hintEl.textContent = [baseText, exclusionNote, groupNote].filter(Boolean).join(' — ');
                 }
                 // Never re-enable the Generate button mid-run (changing the BDR/pool
                 // dropdown during a run used to re-enable it, allowing a second run
@@ -22079,13 +22233,23 @@
                 document.getElementById('harvestGenerateBtn').disabled = true;
                 const ps = document.getElementById('harvestPoolSelect');
                 if (ps) ps.innerHTML = '<option value="">— Select a BDR first —</option>';
+                const gs = document.getElementById('harvestGroupSelect');
+                if (gs) { gs.dataset.bdr = ''; gs.innerHTML = '<option value="">— Select a BDR first —</option>'; }
                 return;
             }
-            await populateHarvestPoolSelect(bdrEmail);
+            // Group dropdown loads alongside the pool dropdown; the count refresh waits for both
+            // so a previously chosen group is preserved/cleared before the first fetch.
+            const harvestGroupSel = document.getElementById('harvestGroupSelect');
+            if (harvestGroupSel) harvestGroupSel.value = ''; // a different BDR starts with no group filter
+            await Promise.all([
+                populateHarvestPoolSelect(bdrEmail),
+                populateHarvestGroupSelect(harvestGroupSel, bdrEmail)
+            ]);
             await refreshHarvestEligibleCount();
         });
 
         document.getElementById('harvestPoolSelect')?.addEventListener('change', refreshHarvestEligibleCount);
+        document.getElementById('harvestGroupSelect')?.addEventListener('change', refreshHarvestEligibleCount);
         document.getElementById('harvestOnlyOurConnections')?.addEventListener('change', refreshHarvestEligibleCount);
         document.getElementById('harvestExcludeRecentDays')?.addEventListener('change', refreshHarvestEligibleCount);
 
@@ -22112,6 +22276,7 @@
             const maxContacts       = parseInt(document.getElementById('harvestMaxContacts').value)  || 20;
             const fitThreshold      = parseInt(document.getElementById('harvestFitThreshold').value)  || 6;
             const poolId            = document.getElementById('harvestPoolSelect')?.value || '';
+            const customGroup       = document.getElementById('harvestGroupSelect')?.value || '';
             const onlyOurConnections = document.getElementById('harvestOnlyOurConnections')?.checked || false;
             const llamaHistoryCheck = document.getElementById('harvestLlamaHistoryCheck')?.checked !== false;
             const messageStyle      = document.getElementById('harvestMessageStyle')?.value === 'excitement' ? 'excitement' : 'personal';
@@ -22155,6 +22320,7 @@
             addHarvestLog(`🌱 Starting Harvest Run for ${bdrEmail}…`);
             addHarvestLog(`⚙️ Settings: max ${maxContacts} contacts, ${poolId ? 'pool ' + poolId : 'all pools'}, fit threshold ${fitThreshold}/10`);
             if (onlyOurConnections) addHarvestLog('🤝 Only-our-connections ON — skipping contacts that were already connected before we created the connection.');
+            if (customGroup) addHarvestLog(`🏷️ Custom group: "${customGroup}"${customGroup === HARVEST_PANDO_GROUP ? ' (built-in — connections we made through HeyReach connection requests)' : ''}`);
             if (llamaHistoryCheck) addHarvestLog('🔒 Llama history pre-check ON — opted-out / active conversation contacts will be skipped.');
             if (orgFilterCriteria) addHarvestLog(`🔍 Org/contact filter: "${orgFilterCriteria.substring(0, 80)}${orgFilterCriteria.length > 80 ? '…' : ''}"`);
             addHarvestLog(`💬 Internet Search message style: ${messageStyle === 'excitement' ? 'Exciting News (no tie-back)' : 'Personal (ties news back to them)'}`);
@@ -22166,11 +22332,14 @@
             try {
                 // ── Step 1: Load eligible contacts from server ──────────────────────
                 addHarvestLog('🔍 Loading harvest pool contacts from server…');
-                const poolPayload = await fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections);
+                const poolPayload = await fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections, { customGroup, forceGroupRefresh: true });
                 const eligibleContacts = poolPayload.contacts || [];
-                addHarvestLog(`✅ Found ${eligibleContacts.length} eligible contact(s) in harvest pool`);
-                if (onlyOurConnections && poolPayload.excludedPreExistingCount) {
+                addHarvestLog(`✅ Found ${eligibleContacts.length} eligible contact(s) in harvest pool${customGroup ? ` and group "${customGroup}"` : ''}`);
+                if (poolPayload.onlyOurConnections && poolPayload.excludedPreExistingCount) {
                     addHarvestLog(`🤝 Excluded ${poolPayload.excludedPreExistingCount} pre-existing connection(s) not made by us.`);
+                }
+                if (customGroup && customGroup !== HARVEST_PANDO_GROUP) {
+                    addHarvestLog(`🏷️ Excluded ${poolPayload.excludedByGroupCount || 0} eligible contact(s) not in group "${customGroup}".`);
                 }
 
                 if (poolPayload.excludeMessagedWithinDays) {
@@ -27299,7 +27468,12 @@
             if (poolSection) poolSection.style.display = '';
             if (loadSection) loadSection.style.display = '';
             hfpHideDownstream();
-            await hfpLoadPools(bdrEmail);
+            const hfpGroupSel = document.getElementById('hfpGroupSelect');
+            if (hfpGroupSel) hfpGroupSel.value = ''; // a different BDR starts with no group filter
+            await Promise.all([
+                hfpLoadPools(bdrEmail),
+                populateHarvestGroupSelect(hfpGroupSel, bdrEmail)
+            ]);
         }
 
         async function hfpLoadPools(bdrEmail) {
@@ -27889,6 +28063,7 @@
             const poolId    = document.getElementById('hfpPoolSelect').value;
             const skipQueued = document.getElementById('hfpSkipQueued').checked;
             const onlyOurConnections = document.getElementById('hfpOnlyOurConnections')?.checked || false;
+            const customGroup = document.getElementById('hfpGroupSelect')?.value || '';
 
             const loadBtn      = document.getElementById('hfpLoadBtn');
             const progressWrap = document.getElementById('hfpLoadProgress');
@@ -27904,13 +28079,16 @@
             if (progressWrap) progressWrap.style.display = '';
 
             try {
-                const poolPayload = await fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections);
+                const poolPayload = await fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections, { customGroup, forceGroupRefresh: true });
                 let contacts = (poolPayload.contacts || []).map((c, i) => ({
                     ...c,
                     id: `hfp-${i}-${(c.linkedInUrl || '').replace(/[^a-z0-9]/gi, '').slice(-12)}`
                 }));
-                if (onlyOurConnections && poolPayload.excludedPreExistingCount) {
+                if (poolPayload.onlyOurConnections && poolPayload.excludedPreExistingCount) {
                     console.log(`[HFP] Excluded ${poolPayload.excludedPreExistingCount} pre-existing connection(s) not made by us.`);
+                }
+                if (customGroup && customGroup !== HARVEST_PANDO_GROUP) {
+                    console.log(`[HFP] Custom group "${customGroup}": excluded ${poolPayload.excludedByGroupCount || 0} eligible contact(s) not in the group.`);
                 }
 
                 if (progressLbl) progressLbl.textContent = `${contacts.length} harvest contacts found${skipQueued ? ' — checking connect queue…' : ''}`;
@@ -27956,11 +28134,14 @@
                 }
 
                 hfpShowContacts(contacts, skipped);
-                const preExistingNote = (onlyOurConnections && poolPayload.excludedPreExistingCount)
+                const preExistingNote = (poolPayload.onlyOurConnections && poolPayload.excludedPreExistingCount)
                     ? ` · ${poolPayload.excludedPreExistingCount} pre-existing connection(s) excluded`
                     : '';
+                const groupNote = customGroup
+                    ? ` · group "${customGroup}"${customGroup !== HARVEST_PANDO_GROUP ? ` (${poolPayload.excludedByGroupCount || 0} not in group excluded)` : ''}`
+                    : '';
                 hfpShowAlert(
-                    `✅ ${contacts.length} harvest contacts loaded${skipped > 0 ? ` · ${skipped} already queued excluded` : ''}${recentNote}${preExistingNote}`,
+                    `✅ ${contacts.length} harvest contacts loaded${skipped > 0 ? ` · ${skipped} already queued excluded` : ''}${recentNote}${preExistingNote}${groupNote}`,
                     'success'
                 );
             } catch (err) {
