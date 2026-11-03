@@ -4395,6 +4395,60 @@ Return ONLY a raw JSON array:
         }
 
         /**
+         * Hypothesis groups live in the `hypothesis_groups` collection; a contact belongs to a group
+         * when its LinkedIn URL is in the group's contactLinkedInUrls (groups too big for one
+         * Firestore doc are split into `hypothesis_group_chunks/{groupId}_{i}` — same layout the
+         * Connect Hypothesis Documentation page reads/writes).
+         * Returns Map<matchKey, Set<groupName>> where matchKey is the /in/<slug> (or, failing that,
+         * the normalized URL) — same matching approach as connect_hypothesis_documentation.html.
+         */
+        function hypothesisMatchKey(url) {
+            if (!url) return '';
+            const m = String(url).match(/linkedin\.com\/in\/([^\/\?#]+)/i);
+            if (m) return m[1].toLowerCase().trim();
+            return String(url).toLowerCase().trim().replace(/\/$/, '').replace(/^https?:\/\//i, '').replace(/^www\./i, '');
+        }
+
+        async function loadHypothesisGroupMembershipMap() {
+            const { collection, getDocs, getDoc, doc } = window.clEmailFunctions;
+            const db = window.clEmailDb;
+
+            const snap = await getDocs(collection(db, 'hypothesis_groups'));
+            const groups = [];
+            snap.forEach(d => groups.push({ id: d.id, ...d.data() }));
+
+            const map = new Map();
+            const addUrls = (urls, groupName) => {
+                (urls || []).forEach(u => {
+                    const key = hypothesisMatchKey(u);
+                    if (!key) return;
+                    if (!map.has(key)) map.set(key, new Set());
+                    map.get(key).add(groupName);
+                });
+            };
+
+            await Promise.all(groups.map(async (g) => {
+                const groupName = String(g.name || g.id).trim();
+                if (!g._chunked) {
+                    addUrls(g.contactLinkedInUrls, groupName);
+                    return;
+                }
+                const count = g._chunkCount || 0;
+                await Promise.all(Array.from({ length: count }, async (_, i) => {
+                    try {
+                        const chunk = await getDoc(doc(db, 'hypothesis_group_chunks', `${g.id}_${i}`));
+                        if (chunk.exists) addUrls(chunk.data().contactLinkedInUrls, groupName);
+                    } catch (e) {
+                        console.warn(`⚠️ Hypothesis group chunk ${g.id}_${i} failed to load:`, e.message);
+                    }
+                }));
+            }));
+
+            console.log(`✅ Loaded ${groups.length} hypothesis groups covering ${map.size} contacts for export`);
+            return map;
+        }
+
+        /**
          * Export the currently filtered lead list to a well-formatted .xlsx file.
          */
         async function exportLeadsExcel() {
@@ -4410,6 +4464,18 @@ Return ONLY a raw JSON array:
             if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Building…'; }
 
             try {
+                // Hypothesis groups per contact — a failure here must not block the export, but we tell the user.
+                let hypothesisMap = new Map();
+                let hypothesisLoadError = null;
+                if (btn) btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading hypothesis groups…';
+                try {
+                    hypothesisMap = await loadHypothesisGroupMembershipMap();
+                } catch (hgErr) {
+                    hypothesisLoadError = hgErr;
+                    console.error('❌ Could not load hypothesis groups for export:', hgErr);
+                }
+                if (btn) btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Building…';
+
                 await loadExcelJS();
 
                 const wb = new ExcelJS.Workbook();
@@ -4459,6 +4525,7 @@ Return ONLY a raw JSON array:
                     { header: 'Message Count',           key: 'messageCount',     width: 14 },
                     { header: 'AI Flagged',              key: 'aiFlagged',        width: 12 },
                     { header: 'Custom Groups',           key: 'customGroups',     width: 28 },
+                    { header: 'Hypothesis Groups',       key: 'hypothesisGroups', width: 34 },
                     { header: 'Harvest Label',           key: 'harvestLabel',     width: 20 },
                     { header: 'Harvest Pool',            key: 'harvestPool',      width: 20 },
                 ];
@@ -4538,6 +4605,10 @@ Return ONLY a raw JSON array:
                         messageCount:    lead.conversationMessageCount || 0,
                         aiFlagged:       lead.aiSearchFlag === 1 ? 'Yes' : 'No',
                         customGroups:    Array.isArray(lead.customGroups) ? lead.customGroups.join('; ') : '',
+                        hypothesisGroups: (() => {
+                            const names = hypothesisMap.get(hypothesisMatchKey(lead.linkedinUrl));
+                            return names ? [...names].sort((a, b) => a.localeCompare(b)).join('; ') : '';
+                        })(),
                         harvestLabel:    !lead.harvestManualOrigin ? ''
                                             : lead.harvestManualOrigin === 'healthluminate'
                                                 ? 'Pando Executive Networking' + (lead.harvestManualDate ? ' ' + lead.harvestManualDate : '')
@@ -4598,6 +4669,9 @@ Return ONLY a raw JSON array:
                 URL.revokeObjectURL(url);
 
                 console.log(`✅ Excel export complete: ${leads.length} rows`);
+                if (hypothesisLoadError) {
+                    alert(`⚠️ The export finished, but hypothesis groups could not be loaded, so the "Hypothesis Groups" column is empty.\n\n${hypothesisLoadError.message}`);
+                }
             } catch (err) {
                 console.error('❌ Excel export failed:', err);
                 alert('Export failed: ' + err.message);
