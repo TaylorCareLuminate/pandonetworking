@@ -2,6 +2,7 @@
 <html lang="en" class="protection-hide">
 <head>
     <meta charset="UTF-8">
+    <!-- CACHE BUSTER v1.0.1 - Restored loadProspects after a bad merge left an orphan catch that stopped the page script -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
@@ -713,6 +714,9 @@
     <script src="../js/call-filtering.js"></script>
 
     <script type="module">
+        const PAGE_VERSION = 'v1.0.1-fix-prospect-script';
+        console.log(`📄 Prospect List Page Version: ${PAGE_VERSION}`);
+
         // Wait for Firebase to be ready
         await window.firebaseReady;
         
@@ -939,25 +943,7 @@
             `;
 
             try {
-                console.log('📋 Loading outreach sets...');
-
-                const OUTREACH_FIELDS = [
-                    'email', 'phone', 'firstName', 'lastName', 'title', 'campaignId', 'prospectOrgName',
-                    'customFields.phone', 'customFields.first_name', 'customFields.last_name',
-                    'customFields.company_name', 'customFields.title'
-                ];
-                const CALL_FIELDS = ['outreachSetId', 'timestamp', 'outcome', 'userEmail', 'notes'];
-                const withFields = (ref, fields) => (typeof ref.select === 'function' ? ref.select(...fields) : ref);
-
-                const isSearchMode = typeof term !== 'undefined' && term !== null && term !== '';
-
-                if (!isSearchMode) {
-                    const [outreachSnapshot, callsSnapshot] = await Promise.all([
-                        getDocs(withFields(collection(db, 'outreach_sets'), OUTREACH_FIELDS)),
-                        getDocs(withFields(collection(db, 'campaign_call_tracking'), CALL_FIELDS))
-                    ]);
-                } else {
-                    const queries = [];
+                const queries = [];
                     if (term.includes('@')) {
                         const email = term.toLowerCase();
                         queries.push(['outreach_sets', [where('email', '==', email), limit(25)]]);
@@ -1052,7 +1038,6 @@
 
                     applyFilters();
                     showAlert(`Found ${allProspects.length} matching prospect${allProspects.length === 1 ? '' : 's'}`, 'success');
-                }
             } catch (error) {
                 console.error('❌ Callback search failed:', error);
                 container.innerHTML = `
@@ -1063,7 +1048,77 @@
                     </div>
                 `;
             }
-                
+        };
+
+        function renderCampaignPrompt() {
+            allProspects = [];
+            filteredProspects = [];
+            document.getElementById('prospectsList').innerHTML = `
+                <div class="empty-state">
+                    <i class="fas fa-bullhorn"></i>
+                    <h3>Select a Campaign</h3>
+                    <p>Prospects load one campaign at a time so the page does not download every contact at once.</p>
+                </div>
+            `;
+            document.getElementById('pagination').style.display = 'none';
+            updateStats();
+        }
+
+        // Load prospects for the selected campaign only.
+        window.loadProspects = async function() {
+            const campaignId = document.getElementById('campaignFilter').value;
+            const container = document.getElementById('prospectsList');
+            if (!campaignId) {
+                renderCampaignPrompt();
+                return;
+            }
+
+            const loadId = ++prospectLoadId;
+            const campaignName = campaignsMap.get(campaignId) || 'this campaign';
+            container.innerHTML = `
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    <p>Loading ${escapeHtml(campaignName)}...</p>
+                </div>
+            `;
+
+            try {
+                console.log(`📋 Loading prospects for campaign ${campaignId}...`);
+                const isPhoneCampaign = campaignTypesMap.get(campaignId) === 'phone_only';
+                const sourceQuery = query(
+                    collection(db, isPhoneCampaign ? 'phone_activities' : 'outreach_sets'),
+                    where('campaignId', '==', campaignId)
+                );
+                const outreachSnapshot = await getDocs(sourceQuery, campaignQueryOptions);
+                if (loadId !== prospectLoadId) return;
+
+                let callsSnapshot = { docs: [] };
+                let callHistoryWarning = '';
+                try {
+                    const callsQuery = query(
+                        collection(db, 'campaign_call_tracking'),
+                        where('campaignId', '==', campaignId)
+                    );
+                    callsSnapshot = await getDocs(callsQuery, campaignQueryOptions);
+                } catch (callError) {
+                    console.warn('⚠️ Call history did not load:', callError);
+                    callHistoryWarning = 'Contacts loaded, but call history timed out. Refresh to try that again.';
+                }
+                if (loadId !== prospectLoadId) return;
+
+                try {
+                    const blockQuery = query(
+                        collection(db, 'campaign_call_organization_blocks'),
+                        where('campaignId', '==', campaignId)
+                    );
+                    const blockSnapshot = await getDocs(blockQuery, { pageSize: 200, timeoutMs: 20000, maxRetries: 1 });
+                    campaignOrganizationBlocks = blockSnapshot.docs.map(blockDoc => ({ id: blockDoc.id, ...blockDoc.data() }));
+                } catch (blockError) {
+                    console.warn('⚠️ Organization blocks did not load:', blockError);
+                    campaignOrganizationBlocks = [];
+                }
+                if (loadId !== prospectLoadId) return;
+
                 // Create a map of outreach sets with their call history
                 const prospectsMap = new Map();
                 
