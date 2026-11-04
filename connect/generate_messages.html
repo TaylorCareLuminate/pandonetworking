@@ -9,6 +9,7 @@
     <title>Generate Messages - PandoConnect</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     
+    <!-- UPDATED: 2026-11-04 - Harvest Run + Harvest Fast Prospect: Group dropdown now also lists Hypothesis groups (heyreach_contacts.hypothesisFit, imported on My Leads from the ChatGPT categorization JSON), each split into "generated through Pando" (hyp:gen:<id>) and "executive was already connected" (hyp:pre:<id>) -->
     <!-- UPDATED: 2026-11-03 - Harvest Run + Harvest Fast Prospect (pool mode): optional "Custom group" selector (My Leads groups from bdr_category_groups / heyreach_contacts.customGroups) plus the always-available built-in group "Connections Generated Through Pando" (resolved server-side via onlyOurConnections) -->
     <!-- UPDATED: 2026-10-29 - Full AI Generate + Fast Prospect Messaging: new Contact Source "Our connections (Pando/HeyReach)" — message everyone the BDR is connected to because of our HeyReach connection requests (direct messages; Full AI uses the Harvest engine) -->
     <!-- UPDATED: 2026-09-16 - Harvest: option to only include contacts connected by us (exclude pre-existing connections) -->
@@ -3065,7 +3066,8 @@
                     <select id="harvestGroupSelect" style="width: 100%; padding: 8px 12px; border: 1px solid var(--gray-300); border-radius: 6px; font-size: 14px;">
                         <option value="">— Select a BDR first —</option>
                     </select>
-                    <div class="form-help" style="margin-top: 6px;">Optional. Limit this run to contacts in one of the BDR's <a href="my_leads.html" style="color:var(--primary);">My Leads</a> custom groups. <strong>Connections Generated Through Pando</strong> is always available and automatically contains every connection we made through a HeyReach connection request. Contacts must still be eligible in the harvest pool.</div>
+                    <div class="form-help" style="margin-top: 6px;">Optional. Limit this run to contacts in one of the BDR's <a href="my_leads.html" style="color:var(--primary);">My Leads</a> custom groups. <strong>Connections Generated Through Pando</strong> is always available and automatically contains every connection we made through a HeyReach connection request. Contacts must still be eligible in the harvest pool.<br>
+                        <strong>🧬 Hypothesis groups</strong> (after you import the ChatGPT categorization on My Leads) appear in two sections: <em>generated through Pando</em> (connections our outreach created) and <em>executive was already connected</em> (pre-existing connections). The "only include contacts connected by Pando" checkbox is ignored when you pick an "already connected" hypothesis pool.</div>
 
                     <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; font-size: 14px; font-weight: 600; margin-top: 14px; padding-top: 12px; border-top: 1px dashed #c7d7fe;">
                         <input type="checkbox" id="harvestOnlyOurConnections"
@@ -5467,7 +5469,7 @@
                         <option value="">— Select a BDR first —</option>
                     </select>
                     <div class="form-help" style="margin-top: 6px; color: #065f46;">
-                        Limit to one of the BDR's <a href="my_leads.html" target="_blank" style="color:#065f46;font-weight:600;">My Leads</a> custom groups. <strong>Connections Generated Through Pando</strong> is always available (every connection we made through a HeyReach connection request).
+                        Limit to one of the BDR's <a href="my_leads.html" target="_blank" style="color:#065f46;font-weight:600;">My Leads</a> custom groups. <strong>Connections Generated Through Pando</strong> is always available (every connection we made through a HeyReach connection request). <strong>🧬 Hypothesis groups</strong> imported from the ChatGPT categorization on My Leads are split into <em>generated through Pando</em> and <em>executive was already connected</em> (the "only connected by Pando" checkbox is ignored for the latter).
                     </div>
                 </div>
                 <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; color: #065f46; margin-bottom: 0; margin-top: 10px;">
@@ -22001,8 +22003,11 @@
             const qs = new URLSearchParams();
             const groupName = String(opts.customGroup || '').trim();
             const isPandoGroup = groupName === HARVEST_PANDO_GROUP;
+            const hypPool = parseHarvestHypothesisValue(groupName);
             if (poolId) qs.set('poolId', poolId);
-            if (onlyOurConnections || isPandoGroup) qs.set('onlyOurConnections', 'true');
+            // "Already connected" hypothesis pools need the pre-existing connections the server would
+            // otherwise drop, so the only-our-connections checkbox is deliberately ignored for them.
+            if (hypPool ? hypPool.mode === 'gen' : (onlyOurConnections || isPandoGroup)) qs.set('onlyOurConnections', 'true');
             const excludeDays = opts.excludeRecentDays != null
                 ? parseInt(opts.excludeRecentDays, 10)
                 : parseInt(document.getElementById('harvestExcludeRecentDays')?.value, 10);
@@ -22018,7 +22023,19 @@
 
             j.customGroup = groupName || null;
             j.excludedByGroupCount = 0;
-            if (groupName && !isPandoGroup) {
+            if (hypPool) {
+                // Hypothesis best-fit pool, split by who generated the connection:
+                //   gen → server already limited to connections made through us (onlyOurConnections)
+                //   pre → keep only pre-existing connections the executive had before Pando
+                const membership = await loadHarvestGroupMembership(bdrEmail, { force: !!opts.forceGroupRefresh });
+                const members = membership.get(HARVEST_HYP_KEY_PREFIX + hypPool.groupId) || new Set();
+                const before = (j.contacts || []).length;
+                j.contacts = (j.contacts || []).filter(c =>
+                    members.has(harvestGroupNormUrl(c.linkedInUrl)) &&
+                    (hypPool.mode === 'gen' || c.connectionOrigin === 'pre_existing'));
+                j.excludedByGroupCount = before - j.contacts.length;
+                j.hypothesisPool = hypPool;
+            } else if (groupName && !isPandoGroup) {
                 const membership = await loadHarvestGroupMembership(bdrEmail, { force: !!opts.forceGroupRefresh });
                 const members = membership.get(groupName) || new Set();
                 const before = (j.contacts || []).length;
@@ -22033,7 +22050,30 @@
         // heyreach_contacts.customGroups (array of group names). "Connections Generated Through
         // Pando" is a built-in group that always exists — its membership is computed (not stored).
         const HARVEST_PANDO_GROUP = 'Connections Generated Through Pando';
-        const HARVEST_GROUP_CONTACT_FIELDS = ['linkedin_url', 'profileUrl', 'leadProfileUrl', 'linkedInUrl', 'customGroups'];
+        const HARVEST_GROUP_CONTACT_FIELDS = ['linkedin_url', 'profileUrl', 'leadProfileUrl', 'linkedInUrl', 'customGroups', 'hypothesisFit'];
+
+        // ── Hypothesis-group pools (best-fit groups imported on My Leads from the ChatGPT JSON) ──
+        // Stored on each contact as heyreach_contacts.hypothesisFit = { groupId, groupName, score, ... }.
+        // They appear in the same "Custom group" dropdown as two entries per group:
+        //   hyp:gen:<groupId> → contacts we generated (connection made through a Pando/HeyReach request)
+        //   hyp:pre:<groupId> → contacts the executive was already connected to (pre-existing)
+        // Membership is kept in the shared membership map under the key HARVEST_HYP_KEY_PREFIX + groupId.
+        const HARVEST_HYP_KEY_PREFIX = '\u0000hyp:';
+        const harvestHypNames = new Map(); // groupId -> groupName (filled whenever membership loads)
+
+        /** 'hyp:gen:<id>' | 'hyp:pre:<id>' → { mode: 'gen'|'pre', groupId } (null for anything else). */
+        function parseHarvestHypothesisValue(value) {
+            const m = /^hyp:(gen|pre):(.+)$/.exec(String(value || ''));
+            return m ? { mode: m[1], groupId: m[2] } : null;
+        }
+
+        /** Human-readable label for a Group-dropdown value (used in logs / stats text). */
+        function harvestGroupDisplayName(value) {
+            const hyp = parseHarvestHypothesisValue(value);
+            if (!hyp) return value;
+            const name = harvestHypNames.get(hyp.groupId) || hyp.groupId;
+            return `Hypothesis "${name}" — ${hyp.mode === 'gen' ? 'generated through Pando' : 'already connected'}`;
+        }
         const HARVEST_GROUP_CACHE_MS = 120000;
         const harvestGroupNamesCache = { bdr: null, at: 0, names: null };
         const harvestGroupMembershipCache = { bdr: null, at: 0, map: null };
@@ -22089,13 +22129,21 @@
                             .then(snap => snap.forEach(d => {
                                 const data = d.data() || {};
                                 const groups = Array.isArray(data.customGroups) ? data.customGroups : [];
-                                if (!groups.length) return;
+                                const fit = data.hypothesisFit && typeof data.hypothesisFit === 'object' && data.hypothesisFit.groupId
+                                    ? data.hypothesisFit : null;
+                                if (!groups.length && !fit) return;
                                 const norm = harvestGroupNormUrl(data.profileUrl || data.linkedin_url || data.leadProfileUrl || data.linkedInUrl || '');
                                 if (!norm) return;
                                 groups.forEach(g => {
                                     if (!map.has(g)) map.set(g, new Set());
                                     map.get(g).add(norm);
                                 });
+                                if (fit) {
+                                    const hypKey = HARVEST_HYP_KEY_PREFIX + fit.groupId;
+                                    if (!map.has(hypKey)) map.set(hypKey, new Set());
+                                    map.get(hypKey).add(norm);
+                                    if (fit.groupName) harvestHypNames.set(fit.groupId, fit.groupName);
+                                }
                             }))
                             .catch(e => console.warn(`[Harvest groups] heyreach_contacts ${field}=${email} lookup failed:`, e?.message || e))
                     );
@@ -22113,18 +22161,40 @@
             if (!selectEl) return;
             const prev = selectEl.value;
             selectEl.dataset.bdr = bdrEmail || '';
-            const build = (names) => {
+            let currentNames = [];
+            const build = (names, hypPools) => {
+                currentNames = names;
+                const keep = selectEl.value || prev;
                 selectEl.innerHTML = '';
-                const add = (value, label) => {
+                const add = (value, label, parent) => {
                     const o = document.createElement('option');
                     o.value = value;
                     o.textContent = label;
-                    selectEl.appendChild(o);
+                    (parent || selectEl).appendChild(o);
                 };
                 add('', 'No group filter (all eligible contacts)');
                 add(HARVEST_PANDO_GROUP, `${HARVEST_PANDO_GROUP} (built-in)`);
                 names.forEach(n => add(n, n));
-                if (prev && [...selectEl.options].some(o => o.value === prev)) selectEl.value = prev;
+
+                // Hypothesis-group pools (best-fit groups imported on My Leads), split into the
+                // connections we generated vs. ones the executive already had.
+                if (hypPools && hypPools.length) {
+                    const countKnown = hypPools.some(p => p.gen != null);
+                    const addSplit = (mode, groupLabel, countKey) => {
+                        const items = hypPools.filter(p => !countKnown || p[countKey] > 0);
+                        if (!items.length) return;
+                        const og = document.createElement('optgroup');
+                        og.label = groupLabel;
+                        items.forEach(p => {
+                            const count = countKnown ? `${p[countKey]} connected` : `${p.total} categorized`;
+                            add(`hyp:${mode}:${p.groupId}`, `${p.name} (${count})`, og);
+                        });
+                        selectEl.appendChild(og);
+                    };
+                    addSplit('gen', '🧬 Hypothesis groups — generated through Pando (our connections)', 'gen');
+                    addSplit('pre', '🧬 Hypothesis groups — executive was already connected (pre-existing)', 'pre');
+                }
+                if (keep && [...selectEl.options].some(o => o.value === keep)) selectEl.value = keep;
             };
             build([]);
             if (!bdrEmail) return;
@@ -22135,6 +22205,40 @@
             } catch (e) {
                 console.warn('[Harvest groups] could not load custom groups:', e?.message || e);
             }
+            // Hypothesis pools take an extra membership + connection-origin lookup, so load them in the
+            // background and add them to the dropdown when ready (never blocks the BDR change handler).
+            loadHarvestHypothesisPools(bdrEmail).then(pools => {
+                if (selectEl.dataset.bdr !== (bdrEmail || '')) return; // BDR changed while loading
+                if (pools.length) build(currentNames, pools);
+            }).catch(e => console.warn('[Harvest groups] could not load hypothesis pools:', e?.message || e));
+        }
+
+        /**
+         * Hypothesis groups that have contacts categorized (My Leads → Import Hypothesis Fit JSON) for this BDR.
+         * Returns [{ groupId, name, total, gen, pre }] where gen = connections we generated through Pando,
+         * pre = connections the executive already had; gen/pre are null if connection origins couldn't be loaded.
+         */
+        async function loadHarvestHypothesisPools(bdrEmail) {
+            const membership = await loadHarvestGroupMembership(bdrEmail);
+            const groups = [];
+            membership.forEach((members, key) => {
+                if (key.startsWith(HARVEST_HYP_KEY_PREFIX)) groups.push({ groupId: key.slice(HARVEST_HYP_KEY_PREFIX.length), members });
+            });
+            if (!groups.length) return [];
+            const originMap = await loadHarvestConnectionOriginMap(bdrEmail); // null when the lookup failed
+            return groups.map(({ groupId, members }) => {
+                let gen = null, pre = null;
+                if (originMap) {
+                    gen = 0; pre = 0;
+                    members.forEach(url => {
+                        const info = originMap.get(url);
+                        if (!info) return;
+                        if (info.origin === 'pre_existing') pre++;
+                        else if (!isNotOurConnectionOrigin(info.origin)) gen++;
+                    });
+                }
+                return { groupId, name: harvestHypNames.get(groupId) || groupId, total: members.size, gen, pre };
+            }).sort((a, b) => a.name.localeCompare(b.name));
         }
 
         // ── "Not our connection" flag ────────────────────────────────────────────────────────────
@@ -22266,7 +22370,7 @@
                         customGroup
                             ? (customGroup === HARVEST_PANDO_GROUP
                                 ? `Group: ${customGroup}`
-                                : `Group "${customGroup}": ${data.excludedByGroupCount || 0} eligible contact(s) not in this group excluded`)
+                                : `Group "${harvestGroupDisplayName(customGroup)}": ${data.excludedByGroupCount || 0} eligible contact(s) not in this group excluded`)
                             : '';
                     hintEl.textContent = [baseText, exclusionNote, groupNote].filter(Boolean).join(' — ');
                 }
@@ -22382,7 +22486,7 @@
             addHarvestLog(`🌱 Starting Harvest Run for ${bdrEmail}…`);
             addHarvestLog(`⚙️ Settings: max ${maxContacts} contacts, ${poolId ? 'pool ' + poolId : 'all pools'}, fit threshold ${fitThreshold}/10`);
             if (onlyOurConnections) addHarvestLog('🤝 Only-our-connections ON — skipping contacts that were already connected before we created the connection.');
-            if (customGroup) addHarvestLog(`🏷️ Custom group: "${customGroup}"${customGroup === HARVEST_PANDO_GROUP ? ' (built-in — connections we made through HeyReach connection requests)' : ''}`);
+            if (customGroup) addHarvestLog(`🏷️ Custom group: "${harvestGroupDisplayName(customGroup)}"${customGroup === HARVEST_PANDO_GROUP ? ' (built-in — connections we made through HeyReach connection requests)' : ''}`);
             if (llamaHistoryCheck) addHarvestLog('🔒 Llama history pre-check ON — opted-out / active conversation contacts will be skipped.');
             if (orgFilterCriteria) addHarvestLog(`🔍 Org/contact filter: "${orgFilterCriteria.substring(0, 80)}${orgFilterCriteria.length > 80 ? '…' : ''}"`);
             addHarvestLog(`💬 Internet Search message style: ${messageStyle === 'excitement' ? 'Exciting News (no tie-back)' : 'Personal (ties news back to them)'}`);
@@ -22396,12 +22500,12 @@
                 addHarvestLog('🔍 Loading harvest pool contacts from server…');
                 const poolPayload = await fetchHarvestEligibleFromServer(bdrEmail, poolId, onlyOurConnections, { customGroup, forceGroupRefresh: true });
                 const eligibleContacts = poolPayload.contacts || [];
-                addHarvestLog(`✅ Found ${eligibleContacts.length} eligible contact(s) in harvest pool${customGroup ? ` and group "${customGroup}"` : ''}`);
+                addHarvestLog(`✅ Found ${eligibleContacts.length} eligible contact(s) in harvest pool${customGroup ? ` and group "${harvestGroupDisplayName(customGroup)}"` : ''}`);
                 if (poolPayload.onlyOurConnections && poolPayload.excludedPreExistingCount) {
                     addHarvestLog(`🤝 Excluded ${poolPayload.excludedPreExistingCount} pre-existing connection(s) not made by us.`);
                 }
                 if (customGroup && customGroup !== HARVEST_PANDO_GROUP) {
-                    addHarvestLog(`🏷️ Excluded ${poolPayload.excludedByGroupCount || 0} eligible contact(s) not in group "${customGroup}".`);
+                    addHarvestLog(`🏷️ Excluded ${poolPayload.excludedByGroupCount || 0} eligible contact(s) not in group "${harvestGroupDisplayName(customGroup)}".`);
                 }
 
                 if (poolPayload.excludeMessagedWithinDays) {
@@ -28165,7 +28269,7 @@
                     console.log(`[HFP] Excluded ${poolPayload.excludedPreExistingCount} pre-existing connection(s) not made by us.`);
                 }
                 if (customGroup && customGroup !== HARVEST_PANDO_GROUP) {
-                    console.log(`[HFP] Custom group "${customGroup}": excluded ${poolPayload.excludedByGroupCount || 0} eligible contact(s) not in the group.`);
+                    console.log(`[HFP] Custom group "${harvestGroupDisplayName(customGroup)}": excluded ${poolPayload.excludedByGroupCount || 0} eligible contact(s) not in the group.`);
                 }
 
                 if (progressLbl) progressLbl.textContent = `${contacts.length} harvest contacts found${skipQueued ? ' — checking connect queue…' : ''}`;
@@ -28215,7 +28319,7 @@
                     ? ` · ${poolPayload.excludedPreExistingCount} pre-existing connection(s) excluded`
                     : '';
                 const groupNote = customGroup
-                    ? ` · group "${customGroup}"${customGroup !== HARVEST_PANDO_GROUP ? ` (${poolPayload.excludedByGroupCount || 0} not in group excluded)` : ''}`
+                    ? ` · group "${harvestGroupDisplayName(customGroup)}"${customGroup !== HARVEST_PANDO_GROUP ? ` (${poolPayload.excludedByGroupCount || 0} not in group excluded)` : ''}`
                     : '';
                 hfpShowAlert(
                     `✅ ${contacts.length} harvest contacts loaded${skipped > 0 ? ` · ${skipped} already queued excluded` : ''}${recentNote}${preExistingNote}${groupNote}`,

@@ -1065,6 +1065,19 @@
                             onmouseout="this.style.boxShadow='0 2px 6px rgba(33,115,70,0.3)'; this.style.transform='';">
                         <i class="fas fa-file-excel"></i> Export Excel
                     </button>
+                    <!-- Hypothesis-group categorization workflow: Export Excel → ChatGPT → JSON → Import -->
+                    <button type="button" id="copyHypothesisPromptBtn" onclick="copyHypothesisFitPrompt()"
+                            title="Copy the instructions to paste into ChatGPT together with the exported Excel file"
+                            style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; background: #f5f3ff; color: #5b21b6; border: 1px solid #c4b5fd; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer;">
+                        <i class="fas fa-clipboard"></i> Copy ChatGPT Prompt
+                    </button>
+                    <button type="button" id="importHypothesisFitBtn" onclick="document.getElementById('hypothesisFitFileInput').click()"
+                            title="Import the JSON ChatGPT returned. Each contact's best-fit hypothesis group is saved and becomes selectable in Generate Messages (Harvest Run / Harvest Fast Prospect)."
+                            style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; background: linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%); color: white; border: none; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 6px rgba(91,33,182,0.3);">
+                        <i class="fas fa-file-import"></i> Import Hypothesis Fit JSON
+                    </button>
+                    <input type="file" id="hypothesisFitFileInput" accept=".json,application/json" multiple style="display: none;"
+                           onchange="onHypothesisFitFilesSelected(event)">
                     <!-- Admin-only export button -->
                     <button id="exportLeadsCSVBtn" onclick="exportLeadsCSV()" 
                             style="display: none; align-items: center; gap: 6px; padding: 8px 16px; background: linear-gradient(135deg, #0d9488 0%, #0f766e 100%); color: white; border: none; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 6px rgba(13,148,136,0.3); transition: all 0.2s;"
@@ -2185,7 +2198,11 @@
                     conversationLastMessageAt: null,
                     aiSearchFlag: data.aiSearchFlag || 0,
                     aiSearchCriteria: data.aiSearchCriteria || null,
-                    customGroups: Array.isArray(data.customGroups) ? data.customGroups : []
+                    customGroups: Array.isArray(data.customGroups) ? data.customGroups : [],
+                    // Best-fit hypothesis group imported from the ChatGPT categorization JSON
+                    // ({ groupId, groupName, score, confidence, reason, alsoFitsGroupIds, importedAt })
+                    hypothesisFit: (data.hypothesisFit && typeof data.hypothesisFit === 'object' && data.hypothesisFit.groupId)
+                        ? data.hypothesisFit : null
                 });
             });
             
@@ -4399,8 +4416,10 @@ Return ONLY a raw JSON array:
          * when its LinkedIn URL is in the group's contactLinkedInUrls (groups too big for one
          * Firestore doc are split into `hypothesis_group_chunks/{groupId}_{i}` — same layout the
          * Connect Hypothesis Documentation page reads/writes).
-         * Returns Map<matchKey, Set<groupName>> where matchKey is the /in/<slug> (or, failing that,
-         * the normalized URL) — same matching approach as connect_hypothesis_documentation.html.
+         * Returns { map, groups }:
+         *   map    — Map<matchKey, Map<groupId, groupName>> where matchKey is the /in/<slug> (or, failing
+         *            that, the normalized URL) — same matching approach as connect_hypothesis_documentation.html
+         *   groups — Map<groupId, { id, name, ...group doc fields, _memberCount }> (every group)
          */
         function hypothesisMatchKey(url) {
             if (!url) return '';
@@ -4418,26 +4437,33 @@ Return ONLY a raw JSON array:
             snap.forEach(d => groups.push({ id: d.id, ...d.data() }));
 
             const map = new Map();
-            const addUrls = (urls, groupName) => {
+            const groupsById = new Map();
+            groups.forEach(g => { g._memberCount = 0; groupsById.set(g.id, g); });
+
+            const addUrls = (urls, g) => {
+                const groupName = String(g.name || g.id).trim();
                 (urls || []).forEach(u => {
                     const key = hypothesisMatchKey(u);
                     if (!key) return;
-                    if (!map.has(key)) map.set(key, new Set());
-                    map.get(key).add(groupName);
+                    if (!map.has(key)) map.set(key, new Map());
+                    const members = map.get(key);
+                    if (!members.has(g.id)) {
+                        members.set(g.id, groupName);
+                        g._memberCount++;
+                    }
                 });
             };
 
             await Promise.all(groups.map(async (g) => {
-                const groupName = String(g.name || g.id).trim();
                 if (!g._chunked) {
-                    addUrls(g.contactLinkedInUrls, groupName);
+                    addUrls(g.contactLinkedInUrls, g);
                     return;
                 }
                 const count = g._chunkCount || 0;
                 await Promise.all(Array.from({ length: count }, async (_, i) => {
                     try {
                         const chunk = await getDoc(doc(db, 'hypothesis_group_chunks', `${g.id}_${i}`));
-                        if (chunk.exists) addUrls(chunk.data().contactLinkedInUrls, groupName);
+                        if (chunk.exists) addUrls(chunk.data().contactLinkedInUrls, g);
                     } catch (e) {
                         console.warn(`⚠️ Hypothesis group chunk ${g.id}_${i} failed to load:`, e.message);
                     }
@@ -4445,7 +4471,47 @@ Return ONLY a raw JSON array:
             }));
 
             console.log(`✅ Loaded ${groups.length} hypothesis groups covering ${map.size} contacts for export`);
-            return map;
+            return { map, groups: groupsById };
+        }
+
+        /** Excel cells max out at 32,767 characters. */
+        function xlText(value, max = 32000) {
+            const s = value == null ? '' : String(value);
+            return s.length > max ? s.slice(0, max - 1) + '…' : s;
+        }
+
+        /** Column number (1-based) → Excel letters (1→A, 26→Z, 27→AA). */
+        function excelColLetter(n) {
+            let s = '';
+            while (n > 0) {
+                const r = (n - 1) % 26;
+                s = String.fromCharCode(65 + r) + s;
+                n = Math.floor((n - 1) / 26);
+            }
+            return s;
+        }
+
+        /** Flatten the free-form pieces of a hypothesis group doc into readable text for the Excel tab. */
+        function describeHypothesisVariations(g) {
+            const vars = Array.isArray(g.messageVariations) ? g.messageVariations : [];
+            return vars
+                .filter(v => v && (v.label || v.prompt || v.aiCriteria))
+                .map((v, i) => {
+                    const parts = [`${i + 1}. ${v.label || 'Variation ' + (i + 1)}`];
+                    if (v.aiCriteria) parts.push(`Applies when: ${v.aiCriteria}`);
+                    if (v.prompt) parts.push(`Prompt: ${String(v.prompt).slice(0, 400)}`);
+                    return parts.join(' | ');
+                })
+                .join('\n');
+        }
+
+        function describeHypothesisSourcePrompts(g) {
+            const sp = Array.isArray(g.sourcePrompts) ? g.sourcePrompts : [];
+            return sp.map(p => {
+                if (typeof p === 'string') return p;
+                if (p && typeof p === 'object') return p.prompt || p.text || p.description || JSON.stringify(p);
+                return '';
+            }).filter(Boolean).join('\n');
         }
 
         /**
@@ -4465,11 +4531,14 @@ Return ONLY a raw JSON array:
 
             try {
                 // Hypothesis groups per contact — a failure here must not block the export, but we tell the user.
-                let hypothesisMap = new Map();
+                let hypothesisMap = new Map();      // matchKey -> Map<groupId, groupName>
+                let hypothesisGroups = new Map();   // groupId -> group doc
                 let hypothesisLoadError = null;
                 if (btn) btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading hypothesis groups…';
                 try {
-                    hypothesisMap = await loadHypothesisGroupMembershipMap();
+                    const loaded = await loadHypothesisGroupMembershipMap();
+                    hypothesisMap = loaded.map;
+                    hypothesisGroups = loaded.groups;
                 } catch (hgErr) {
                     hypothesisLoadError = hgErr;
                     console.error('❌ Could not load hypothesis groups for export:', hgErr);
@@ -4526,13 +4595,16 @@ Return ONLY a raw JSON array:
                     { header: 'AI Flagged',              key: 'aiFlagged',        width: 12 },
                     { header: 'Custom Groups',           key: 'customGroups',     width: 28 },
                     { header: 'Hypothesis Groups',       key: 'hypothesisGroups', width: 34 },
+                    { header: 'Hypothesis Group IDs',    key: 'hypothesisGroupIds', width: 30 },
+                    { header: 'Best-Fit Hypothesis Group', key: 'hypothesisBestFit', width: 30 },
                     { header: 'Harvest Label',           key: 'harvestLabel',     width: 20 },
                     { header: 'Harvest Pool',            key: 'harvestPool',      width: 20 },
+                    // Plain-text URL: the "LinkedIn" column above is a clickable "Open ↗" link, so its cell
+                    // value is not the URL. This column is the stable key used by the categorization JSON.
+                    { header: 'LinkedIn URL (text)',     key: 'linkedinUrlText',  width: 44 },
                 ];
 
-                // Column letter helper (works up to Z)
-                const colLetter = n => String.fromCharCode(64 + n);
-                const lastCol = colLetter(columns.length);
+                const lastCol = excelColLetter(columns.length);
 
                 const ws = wb.addWorksheet('Leads');
                 ws.views = [{ state: 'frozen', ySplit: 2 }];
@@ -4606,9 +4678,15 @@ Return ONLY a raw JSON array:
                         aiFlagged:       lead.aiSearchFlag === 1 ? 'Yes' : 'No',
                         customGroups:    Array.isArray(lead.customGroups) ? lead.customGroups.join('; ') : '',
                         hypothesisGroups: (() => {
-                            const names = hypothesisMap.get(hypothesisMatchKey(lead.linkedinUrl));
-                            return names ? [...names].sort((a, b) => a.localeCompare(b)).join('; ') : '';
+                            const members = hypothesisMap.get(hypothesisMatchKey(lead.linkedinUrl));
+                            return members ? [...members.values()].sort((a, b) => a.localeCompare(b)).join('; ') : '';
                         })(),
+                        hypothesisGroupIds: (() => {
+                            const members = hypothesisMap.get(hypothesisMatchKey(lead.linkedinUrl));
+                            return members ? [...members.keys()].sort().join('; ') : '';
+                        })(),
+                        hypothesisBestFit: lead.hypothesisFit ? (lead.hypothesisFit.groupName || lead.hypothesisFit.groupId) : '',
+                        linkedinUrlText: lead.linkedinUrl || '',
                         harvestLabel:    !lead.harvestManualOrigin ? ''
                                             : lead.harvestManualOrigin === 'healthluminate'
                                                 ? 'Pando Executive Networking' + (lead.harvestManualDate ? ' ' + lead.harvestManualDate : '')
@@ -4652,6 +4730,88 @@ Return ONLY a raw JSON array:
                     }
                 });
 
+                // ── Sheet 2: Hypothesis Groups ────────────────────────────────
+                // One row per hypothesis group that at least one exported contact belongs to. The
+                // Leads sheet's "Hypothesis Group IDs" column points here, so a reader (e.g. ChatGPT)
+                // can look up what each group is about and decide which one best fits each contact.
+                const exportedCountByGroup = new Map();
+                leads.forEach(lead => {
+                    const members = hypothesisMap.get(hypothesisMatchKey(lead.linkedinUrl));
+                    if (members) members.forEach((_, gid) => exportedCountByGroup.set(gid, (exportedCountByGroup.get(gid) || 0) + 1));
+                });
+
+                const bdrNameByEmail = new Map();
+                (bdrLeaders || []).forEach(b => {
+                    [b.primaryEmail, b.email, b.id].filter(Boolean).forEach(e => bdrNameByEmail.set(String(e).toLowerCase(), b.name || e));
+                });
+
+                const hgSheet = wb.addWorksheet('Hypothesis Groups');
+                const hgColumns = [
+                    { header: 'Group ID',                      key: 'id',            width: 24 },
+                    { header: 'Group Name',                    key: 'name',          width: 32 },
+                    { header: 'Description',                   key: 'description',   width: 60 },
+                    { header: 'Target Contact Instructions',   key: 'targetInstr',   width: 60 },
+                    { header: 'Message Review Instructions',   key: 'reviewInstr',   width: 50 },
+                    { header: 'Message Variations',            key: 'variations',    width: 60 },
+                    { header: 'Source Prompts',                key: 'sourcePrompts', width: 50 },
+                    { header: 'Contact Source',                key: 'contactSource', width: 26 },
+                    { header: 'Workspace',                     key: 'workspace',     width: 22 },
+                    { header: 'BDRs',                          key: 'bdrs',          width: 30 },
+                    { header: 'Contacts In This Export',       key: 'exportCount',   width: 14 },
+                    { header: 'Total Contacts In Group',       key: 'totalCount',    width: 14 },
+                ];
+                hgSheet.columns = hgColumns.map(c => ({ key: c.key, width: c.width }));
+                hgSheet.views = [{ state: 'frozen', ySplit: 1 }];
+                const hgHeaderVals = {};
+                hgColumns.forEach(c => { hgHeaderVals[c.key] = c.header; });
+                hgSheet.addRow(hgHeaderVals);
+                const hgHeaderRow = hgSheet.getRow(1);
+                hgHeaderRow.height = 30;
+                hgHeaderRow.eachCell({ includeEmpty: true }, cell => {
+                    cell.font = { ...baseFont, bold: true, color: { argb: 'FFFFFFFF' } };
+                    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.headerBg } };
+                    cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+                    cell.border = { bottom: { style: 'medium', color: { argb: 'FF' + C.borderCol } } };
+                });
+                hgSheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: hgColumns.length } };
+
+                const exportedGroups = [...exportedCountByGroup.keys()]
+                    .map(gid => hypothesisGroups.get(gid))
+                    .filter(Boolean)
+                    .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+
+                exportedGroups.forEach((g, idx) => {
+                    const bdrEmails = Array.isArray(g.bdrEmails) && g.bdrEmails.length ? g.bdrEmails : (g.bdrEmail ? [g.bdrEmail] : []);
+                    const row = hgSheet.addRow({
+                        id:            g.id,
+                        name:          xlText(g.name || g.id),
+                        description:   xlText(g.description || g.notes || ''),
+                        targetInstr:   xlText(g.targetContactInstructions || ''),
+                        reviewInstr:   xlText(g.messageReviewInstructions || ''),
+                        variations:    xlText(describeHypothesisVariations(g)),
+                        sourcePrompts: xlText(describeHypothesisSourcePrompts(g)),
+                        contactSource: xlText(g.contactSource || ''),
+                        workspace:     xlText(g.workspaceName || ''),
+                        bdrs:          xlText(bdrEmails.map(e => bdrNameByEmail.get(String(e).toLowerCase()) || e).join('; ')),
+                        exportCount:   exportedCountByGroup.get(g.id) || 0,
+                        totalCount:    g._chunked && g._totalContactCount ? g._totalContactCount : g._memberCount,
+                    });
+                    row.eachCell({ includeEmpty: true }, cell => {
+                        cell.font = { ...baseFont };
+                        cell.alignment = { vertical: 'top', wrapText: true };
+                        if (idx % 2 === 1) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + C.altRowBg } };
+                    });
+                    ['exportCount', 'totalCount'].forEach(k => {
+                        const cell = row.getCell(hgColumns.findIndex(c => c.key === k) + 1);
+                        cell.alignment = { vertical: 'top', horizontal: 'center' };
+                    });
+                });
+                if (exportedGroups.length === 0) {
+                    hgSheet.addRow({ name: hypothesisLoadError
+                        ? 'Hypothesis groups could not be loaded for this export.'
+                        : 'None of the exported contacts belong to a hypothesis group.' });
+                }
+
                 // ── Download ──────────────────────────────────────────────────
                 const buffer = await wb.xlsx.writeBuffer();
                 const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
@@ -4680,7 +4840,265 @@ Return ONLY a raw JSON array:
             }
         }
 
+        // ═════════════════════════════════════════════════════════════════════════
+        // HYPOTHESIS FIT — ChatGPT categorization round trip
+        //   1. Export Excel   → "Leads" + "Hypothesis Groups" sheets
+        //   2. ChatGPT        → returns a JSON file (prompt below)
+        //   3. Import JSON    → each contact's best-fit group is saved on its heyreach_contacts doc as
+        //                       `hypothesisFit`; Generate Messages (Harvest Run / Harvest Fast Prospect)
+        //                       reads that field to offer per-group pools, split into connections
+        //                       generated through Pando vs. connections the executive already had.
+        // ═════════════════════════════════════════════════════════════════════════
+
+        const HYPOTHESIS_FIT_PROMPT = `You are helping me sort my LinkedIn contacts into "hypothesis groups". I have attached an Excel workbook exported from our CRM. Please read it with Python and follow the instructions below exactly.
+
+WORKBOOK LAYOUT
+- Sheet "Leads": one row per contact. Row 1 is a banner, so the real column headers are in ROW 2 (use pandas header=1). Useful columns: Name, Company, Position, Location, Company Type, Business Model, Healthcare Co., Direct Care Provider, Hospital / Health Sys., Lead Category, Hypothesis Groups, Hypothesis Group IDs, Best-Fit Hypothesis Group, and "LinkedIn URL (text)".
+- Sheet "Hypothesis Groups": one row per hypothesis group (headers in row 1). Columns: Group ID, Group Name, Description, Target Contact Instructions, Message Review Instructions, Message Variations, Source Prompts, Contact Source, Workspace, BDRs.
+
+YOUR TASK
+For EVERY contact in the "Leads" sheet that has a value in "LinkedIn URL (text)", decide which ONE hypothesis group fits that contact best.
+
+HOW TO DECIDE
+1. Candidate groups = the Group IDs listed in that contact's "Hypothesis Group IDs" cell (semicolon-separated). Compare the contact's Position, Company, Company Type, Business Model, healthcare flags and Location against each candidate group's Description, Target Contact Instructions, the "Applies when" text inside Message Variations, and Source Prompts.
+2. If the contact has NO Hypothesis Group IDs, you may still pick from ANY group on the "Hypothesis Groups" sheet, but only when the fit is clear (fitScore 60 or higher). Otherwise set bestFitGroupId to null.
+3. If none of the candidates fit reasonably (fitScore below 40), set bestFitGroupId to null.
+4. Use your own judgment on each contact's role and organization. Do not rely only on simple keyword matching.
+5. Use Group IDs EXACTLY as written in the "Group ID" column. Never invent, shorten or rename IDs.
+6. Copy each LinkedIn URL EXACTLY as it appears in "LinkedIn URL (text)". Include each contact once.
+
+OUTPUT
+Produce ONE downloadable file named hypothesis_fit.json (valid JSON, no comments, no text outside the JSON) shaped exactly like this:
+
+{
+  "schemaVersion": 1,
+  "assignments": [
+    {
+      "linkedinUrl": "https://www.linkedin.com/in/jane-doe",
+      "bestFitGroupId": "GROUP_ID_FROM_SHEET",
+      "bestFitGroupName": "Group Name From Sheet",
+      "fitScore": 85,
+      "confidence": "high",
+      "alsoFitsGroupIds": ["OTHER_GROUP_ID"],
+      "reason": "VP Operations at a regional health system matches the group's target buyer."
+    },
+    {
+      "linkedinUrl": "https://www.linkedin.com/in/john-smith",
+      "bestFitGroupId": null,
+      "bestFitGroupName": null,
+      "fitScore": 0,
+      "confidence": "low",
+      "alsoFitsGroupIds": [],
+      "reason": "No candidate group matches this role."
+    }
+  ]
+}
+
+Field rules:
+- fitScore: integer 0-100 (how well the contact matches the chosen group).
+- confidence: "high" (score 75+), "medium" (50-74) or "low" (below 50).
+- alsoFitsGroupIds: other groups that fit with score 50+ (at most 3). Use [] if none.
+- reason: one short sentence (25 words or fewer).
+
+PROCESS RULES
+- Process ALL rows. Work in batches (about 50 contacts at a time) and keep going until every row is done. Never sample or skip rows.
+- If you cannot finish in one response, STOP and tell me exactly which row numbers you completed, and give me the partial JSON file so far. I will send "continue" and you should pick up from the next row. I can import several partial JSON files, so each file only needs its own contacts.
+- When finished, verify: (a) the JSON parses, (b) every bestFitGroupId is either null or exists in the "Group ID" column, (c) no LinkedIn URL appears twice. Then tell me the total contacts processed and how many were assigned to each group (and how many null), and give me the download link.`;
+
+        async function copyHypothesisFitPrompt() {
+            try {
+                await navigator.clipboard.writeText(HYPOTHESIS_FIT_PROMPT);
+                alert('✅ ChatGPT prompt copied.\n\nPaste it into ChatGPT together with the Excel file from "Export Excel" (it has the Leads and Hypothesis Groups tabs), then bring the JSON file it returns back here with "Import Hypothesis Fit JSON".');
+            } catch (err) {
+                // Clipboard blocked (e.g. insecure context) — fall back to downloading the prompt as text.
+                const blob = new Blob([HYPOTHESIS_FIT_PROMPT], { type: 'text/plain' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'chatgpt_hypothesis_fit_prompt.txt';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                alert('Could not access the clipboard, so the prompt was downloaded as chatgpt_hypothesis_fit_prompt.txt. Paste its contents into ChatGPT with the Excel file.');
+            }
+        }
+
+        function onHypothesisFitFilesSelected(ev) {
+            const files = Array.from((ev.target && ev.target.files) || []);
+            ev.target.value = ''; // allow re-selecting the same file later
+            if (files.length) importHypothesisFitFiles(files);
+        }
+
+        /** hypothesis_groups id → { id, name } (metadata docs only; chunks are not needed for names). */
+        async function loadHypothesisGroupIndex() {
+            const { collection, getDocs } = window.clEmailFunctions;
+            const snap = await getDocs(collection(window.clEmailDb, 'hypothesis_groups'));
+            const byId = new Map();
+            snap.forEach(d => byId.set(d.id, { id: d.id, name: String((d.data() || {}).name || d.id).trim() }));
+            return byId;
+        }
+
+        async function importHypothesisFitFiles(files) {
+            await harvestReadyPromise;
+            if (!allLeads.length) {
+                alert('⚠️ No leads are loaded yet. Select the BDR whose contacts were exported, wait for the leads to load, then import.');
+                return;
+            }
+            const btn = document.getElementById('importHypothesisFitBtn');
+            const origHtml = btn ? btn.innerHTML : '';
+            const setBusy = (text) => { if (btn) { btn.disabled = true; btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${text}`; } };
+
+            try {
+                setBusy('Reading…');
+
+                // ── 1. Parse every file ─────────────────────────────────────────
+                const rawEntries = [];
+                for (const file of files) {
+                    let parsed;
+                    try {
+                        parsed = JSON.parse(await file.text());
+                    } catch (e) {
+                        throw new Error(`"${file.name}" is not valid JSON (${e.message}). Ask ChatGPT to re-output the file as valid JSON.`);
+                    }
+                    const list = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.assignments) ? parsed.assignments : null);
+                    if (!list) throw new Error(`"${file.name}" has no "assignments" array.`);
+                    list.forEach(e => { if (e && typeof e === 'object') rawEntries.push(e); });
+                }
+                if (!rawEntries.length) throw new Error('The file(s) contained no assignments.');
+
+                setBusy('Loading groups…');
+                const groupsById = await loadHypothesisGroupIndex();
+                const groupIdByLowerName = new Map();
+                groupsById.forEach(g => groupIdByLowerName.set(g.name.toLowerCase(), g.id));
+                const resolveGroupId = (id, name) => {
+                    if (id && groupsById.has(String(id).trim())) return String(id).trim();
+                    const byName = groupIdByLowerName.get(String(name || id || '').trim().toLowerCase());
+                    return byName || null;
+                };
+
+                // ── 2. Match to leads and resolve groups ────────────────────────
+                const leadsByKey = new Map();
+                allLeads.forEach(l => {
+                    const k = hypothesisMatchKey(l.linkedinUrl);
+                    if (!k) return;
+                    if (!leadsByKey.has(k)) leadsByKey.set(k, []);
+                    leadsByKey.get(k).push(l);
+                });
+
+                const planByKey = new Map(); // matchKey -> { fit|null, leads[] }  (last entry for a contact wins)
+                const unmatchedUrls = [];
+                const unknownGroups = new Set();
+                let duplicateCount = 0;
+                let noUrlCount = 0;
+
+                rawEntries.forEach(e => {
+                    const url = e.linkedinUrl || e.linkedInUrl || e.linkedin_url || e.url || '';
+                    const key = hypothesisMatchKey(url);
+                    if (!key) { noUrlCount++; return; }
+                    const matched = leadsByKey.get(key);
+                    if (!matched) { unmatchedUrls.push(String(url)); return; }
+
+                    const rawBest = e.bestFitGroupId != null && e.bestFitGroupId !== '' ? e.bestFitGroupId : null;
+                    const rawBestName = e.bestFitGroupName != null && e.bestFitGroupName !== '' ? e.bestFitGroupName : null;
+                    let fit = null;
+                    if (rawBest != null || rawBestName != null) {
+                        const gid = resolveGroupId(rawBest, rawBestName);
+                        if (!gid) { unknownGroups.add(String(rawBest != null ? rawBest : rawBestName)); return; }
+                        const score = Math.max(0, Math.min(100, Math.round(Number(e.fitScore) || 0)));
+                        const conf = String(e.confidence || '').toLowerCase();
+                        const also = (Array.isArray(e.alsoFitsGroupIds) ? e.alsoFitsGroupIds : [])
+                            .map(x => resolveGroupId(x, x)).filter(x => x && x !== gid);
+                        fit = {
+                            groupId: gid,
+                            groupName: groupsById.get(gid).name,
+                            score,
+                            confidence: ['high', 'medium', 'low'].includes(conf) ? conf : '',
+                            reason: String(e.reason || '').slice(0, 300),
+                            alsoFitsGroupIds: [...new Set(also)].slice(0, 5),
+                            importedAt: new Date().toISOString()
+                        };
+                    }
+                    if (planByKey.has(key)) duplicateCount++;
+                    planByKey.set(key, { fit, leads: matched });
+                });
+
+                // Only touch docs that change: a null result clears an existing fit, and is a no-op otherwise.
+                const writes = [];
+                const perGroup = new Map();
+                let clearCount = 0;
+                planByKey.forEach(({ fit, leads }) => {
+                    leads.forEach(lead => {
+                        if (fit) {
+                            writes.push({ lead, fit });
+                            perGroup.set(fit.groupName, (perGroup.get(fit.groupName) || 0) + 1);
+                        } else if (lead.hypothesisFit) {
+                            writes.push({ lead, fit: null });
+                            clearCount++;
+                        }
+                    });
+                });
+
+                const noFitCount = [...planByKey.values()].filter(p => !p.fit).length;
+                const lines = [
+                    `File(s): ${files.length}   |   Entries read: ${rawEntries.length}`,
+                    `Contacts matched to this BDR's leads: ${planByKey.size}`,
+                    `Best-fit group assigned: ${planByKey.size - noFitCount}   |   No fit (null): ${noFitCount}`,
+                    clearCount ? `Existing fits that will be cleared: ${clearCount}` : '',
+                    unmatchedUrls.length ? `⚠️ Not found in this BDR's leads (skipped): ${unmatchedUrls.length} — e.g. ${unmatchedUrls.slice(0, 3).join(', ')}` : '',
+                    unknownGroups.size ? `⚠️ Unknown group IDs/names (skipped): ${[...unknownGroups].slice(0, 5).join(', ')}${unknownGroups.size > 5 ? '…' : ''}` : '',
+                    duplicateCount ? `Duplicate contacts (last one used): ${duplicateCount}` : '',
+                    noUrlCount ? `Entries without a LinkedIn URL (skipped): ${noUrlCount}` : '',
+                ].filter(Boolean);
+                lines.push('', 'Contacts per best-fit group:',
+                    ...[...perGroup.entries()].sort((a, b) => b[1] - a[1]).map(([n, c]) => `  • ${n}: ${c}`));
+
+                if (!writes.length) {
+                    alert('Nothing to import.\n\n' + lines.join('\n'));
+                    return;
+                }
+                if (!confirm(`Import hypothesis fit for ${currentViewingEmail || 'this BDR'}?\n\n${lines.join('\n')}\n\nThis saves a "hypothesisFit" field on ${writes.length} contact record(s). Continue?`)) return;
+
+                // ── 3. Write (limited concurrency) ──────────────────────────────
+                const { updateDoc, doc } = window.clEmailFunctions;
+                const dbRef = window.clEmailDb;
+                let done = 0, failed = 0, firstError = null;
+                const CONCURRENCY = 15;
+                let cursor = 0;
+                const worker = async () => {
+                    while (cursor < writes.length) {
+                        const { lead, fit } = writes[cursor++];
+                        try {
+                            await updateDoc(doc(dbRef, 'heyreach_contacts', lead.id), { hypothesisFit: fit });
+                            lead.hypothesisFit = fit;
+                        } catch (err) {
+                            failed++;
+                            if (!firstError) firstError = err;
+                            console.error('❌ hypothesisFit write failed for', lead.id, err);
+                        }
+                        done++;
+                        if (done % 10 === 0 || done === writes.length) setBusy(`Saving ${done}/${writes.length}…`);
+                    }
+                };
+                setBusy(`Saving 0/${writes.length}…`);
+                await Promise.all(Array.from({ length: Math.min(CONCURRENCY, writes.length) }, worker));
+
+                if (failed) {
+                    alert(`⚠️ Imported ${writes.length - failed} of ${writes.length} contact(s). ${failed} failed.\n\nFirst error: ${firstError && firstError.message}\n\nRe-run the import to retry (already-saved contacts are simply overwritten).`);
+                } else {
+                    alert(`✅ Saved best-fit hypothesis groups for ${writes.length} contact(s).\n\nThey are now available in Generate Messages → Harvest Run / Harvest Fast Prospect → Group dropdown (split into "generated through Pando" and "already connected").`);
+                }
+            } catch (err) {
+                console.error('❌ Hypothesis fit import failed:', err);
+                alert('Import failed: ' + err.message);
+            } finally {
+                if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+            }
+        }
+
         // Make functions globally available
+        window.copyHypothesisFitPrompt = copyHypothesisFitPrompt;
+        window.onHypothesisFitFilesSelected = onHypothesisFitFilesSelected;
         window.exportLeadsCSV = exportLeadsCSV;
         window.exportLeadsExcel = exportLeadsExcel;
         window.applyFilters = applyFilters;
