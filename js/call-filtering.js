@@ -38,19 +38,60 @@
     return String(record?.outcome || '').trim();
   }
 
+  function phoneKeyRank(key) {
+    const k = String(key || '').toLowerCase().replace(/[\s_-]/g, '');
+    if (!k) return 0;
+    // Timestamp / metadata fields contain "phone" but are not a dialable number.
+    if (/lastcalled|areacode|slot|dates|datatype|extension|phonetype|score|status|flag|count|campaign/.test(k)) return 0;
+    if (/^(phone|phonenumber|workphone|mobile|cell|telephone|tel|phone1|phone2|phone3|contactphone|contactphone1|contactphone2|companyphone1|companyphone2|directphone|directdial|officephone|officeline|mainphone|mainline)$/.test(k)) return 3;
+    if (/phone|mobile|cellphone|telephone/.test(k)) return 2;
+    return 0;
+  }
+
+  function isDialablePhoneValue(val) {
+    if (val == null || typeof val === 'object') return false;
+    const text = String(val).trim();
+    if (!text || text.length > 80) return false;
+    if (/^\d{4}-\d{2}-\d{2}/.test(text)) return false;
+    return normalizePhone10(text).length === 10;
+  }
+
+  function phoneFromBag(bag) {
+    if (!bag || typeof bag !== 'object' || Array.isArray(bag)) return '';
+    const ranked = Object.entries(bag)
+      .map(([key, val]) => ({ val, rank: phoneKeyRank(key) }))
+      .filter((entry) => entry.rank > 0 && isDialablePhoneValue(entry.val))
+      .sort((a, b) => b.rank - a.rank);
+    return ranked.length ? ranked[0].val : '';
+  }
+
+  // Last resort for imports that stored the number under a column name that
+  // does not contain "phone" (for example a custom "Main Line" field). Only
+  // formatted values count, so a bare 10-digit NPI or id is left alone.
+  function formattedPhoneFromBag(bag) {
+    if (!bag || typeof bag !== 'object' || Array.isArray(bag)) return '';
+    for (const [key, val] of Object.entries(bag)) {
+      const k = String(key || '').toLowerCase();
+      if (/note|script|npi|zip|email|url|address|personalization|name|title|city|state|date|id/.test(k)) continue;
+      if (val == null || typeof val === 'object') continue;
+      const text = String(val).trim();
+      if (text.length < 10 || text.length > 40) continue;
+      if (!/[()\-.\s]/.test(text)) continue;
+      if (normalizePhone10(text).length === 10) return val;
+    }
+    return '';
+  }
+
   function getPhoneRaw(record) {
+    if (!record || typeof record !== 'object') return '';
     return (
-      record?.phoneNumber ||
-      record?.phone ||
-      record?.contactPhone ||
-      // Phone-calls uses contactData.workphone heavily; include it so we don't falsely treat calls as "no phone".
-      record?.workphone ||
-      record?.workPhone ||
-      record?.contactData?.workphone ||
-      record?.contactData?.workPhone ||
-      record?.contactData?.phoneNumber ||
-      record?.contactData?.phone ||
-      record?.phone1 ||
+      phoneFromBag(record) ||
+      phoneFromBag(record.customFields) ||
+      phoneFromBag(record.contactData) ||
+      phoneFromBag(record.additionalData) ||
+      formattedPhoneFromBag(record.customFields) ||
+      formattedPhoneFromBag(record.contactData) ||
+      formattedPhoneFromBag(record.additionalData) ||
       ''
     );
   }
