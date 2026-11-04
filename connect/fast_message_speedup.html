@@ -228,7 +228,8 @@
                 </div>
             </div>
             <div class="warn-box">
-                Keep this tab open while it runs. For each message: the lead is re-checked in HeyReach, the conversation is re-confirmed, the lead is stopped and purged from
+                Keep this tab open while it runs. For each message: the lead is re-checked in HeyReach, the conversation is re-confirmed, the contact&rsquo;s history is checked to
+                make sure this message was never sent to them before (conversation, activity log and HeyReach&rsquo;s sent-message events &mdash; if that history can&rsquo;t be read, nothing is sent), the lead is stopped and purged from
                 the Quick Message campaign, removal is verified against HeyReach&rsquo;s live data, and only then is the message sent. Anything that looks wrong before the
                 removal is skipped. If something goes wrong after the removal, the run halts and the message text is shown above so nothing is lost.
                 The first message goes out as soon as you press Start.
@@ -269,7 +270,7 @@
         await window.firebaseReady;
         const auth = window.auth;
         const BACKEND = 'https://railwayclemail-production.up.railway.app';
-        const { collection, getDocs, getDoc, doc: fsDoc, addDoc } = window.clemailFirestore;
+        const { collection, getDocs, getDoc, doc: fsDoc, addDoc, query: fsQuery, where: fsWhere, limit: fsLimit } = window.clemailFirestore;
         const emailDB = window.clemailDb;
 
         // ── Constants ──────────────────────────────────────────────────────
@@ -668,9 +669,37 @@
                 const rawUrl = extractUrl(l);
                 const key = canon(rawUrl);
                 if (!key) continue;
-                map.set(key, { rawUrl, content: extractContent(l) });
+                const prof = l.linkedInUserProfile || l.leadProfile || l.lead || {};
+                map.set(key, {
+                    rawUrl, content: extractContent(l),
+                    firstName: prof.firstName || prof.first_name || l.firstName || '',
+                    lastName: prof.lastName || prof.last_name || l.lastName || '',
+                    company: prof.companyName || prof.company || l.companyName || l.company || '',
+                    position: prof.position || prof.headline || l.position || ''
+                });
             }
             return { map, truncated };
+        }
+
+        // HeyReach's lead-listing API (leads/getall) does NOT return leads the campaign has accepted but not
+        // started yet (its "Not started yet" pool) — the same gap services/in_process_leads_service.js works around.
+        // Those leads ARE in the campaign's lead list, so list leads that getall never returned are that pool.
+        // The campaign's own count of them (progressStats.totalUsersPending) is read for cross-checking.
+        async function fetchCampaignPendingCount(apiKey, campaignId) {
+            try {
+                for (let page = 0; page < 20; page++) {
+                    const r = await hrFetch(apiKey, '/proxy/heyreach/campaigns/getall', { offset: page * 100, limit: 100, keyword: '', status: 'all' });
+                    if (!r.ok) return null;
+                    const arr = (r.data && (r.data.items || r.data.campaigns || r.data.data)) || (Array.isArray(r.data) ? r.data : []);
+                    const hit = arr.find(c => String(c.id || c._id || c.campaign_id) === String(campaignId));
+                    if (hit) {
+                        const n = hit.progressStats && Number(hit.progressStats.totalUsersPending);
+                        return Number.isFinite(n) ? n : null;
+                    }
+                    if (arr.length < 100) return null;
+                }
+            } catch (_) { /* informational only */ }
+            return null;
         }
 
         async function lookupListIdFromHeyReach(apiKey, campaignId) {
@@ -742,6 +771,62 @@
             });
         }
 
+        // ── "Was this message already sent to this contact?" ───────────────
+        function textMatches(a, b) {
+            const na = normMsg(a), nb = normMsg(b);
+            if (!na || !nb) return false;
+            if (na === nb) return true;
+            return Math.min(na.length, nb.length) > 40 && (na.includes(nb) || nb.includes(na));
+        }
+        // Firestore only matches stored URLs exactly, so look for the common spellings of the profile URL.
+        function urlVariants(rawUrl) {
+            const out = new Set();
+            const raw = String(rawUrl || '').trim();
+            if (!raw) return [];
+            const noSlash = raw.replace(/\/+$/, '');
+            out.add(raw); out.add(noSlash); out.add(noSlash.toLowerCase()); out.add(noSlash.toLowerCase() + '/');
+            const m = noSlash.match(/linkedin\.com\/in\/([^/?#]+)/i);
+            if (m) {
+                for (const s of new Set([m[1], m[1].toLowerCase()])) {
+                    out.add(`https://www.linkedin.com/in/${s}`);
+                    out.add(`https://www.linkedin.com/in/${s}/`);
+                    out.add(`https://linkedin.com/in/${s}`);
+                }
+            }
+            return Array.from(out).slice(0, 10);   // Firestore "in" allows 10 values
+        }
+        // Looks everywhere we have a record of what went to this contact. Returns
+        //   { sent: true, reason }   — the message (or an identical one) already went out: do NOT send
+        //   { sent: false, error }   — the history could not be read: do NOT send (cannot verify)
+        //   { sent: false }          — nothing found: safe to continue
+        async function checkPriorSend(item, message, conv) {
+            if (isHandled(item.key, message)) return { sent: true, reason: 'this page already handled this exact message for this contact in the last 3 days' };
+            if (messageInThread(conv && conv.messages, message)) return { sent: true, reason: 'this exact message is already in the conversation' };
+            const variants = urlVariants(item.rawUrl);
+            if (!variants.length) return { sent: false, error: 'no LinkedIn URL to look the contact up by' };
+            try {
+                // Messages previously sent from our tools (this page's own audit trail included)
+                const trk = await getDocs(fsQuery(collection(emailDB, 'activity_tracking'),
+                    fsWhere('contact_linkedin_url', 'in', variants), fsLimit(300)));
+                let hit = null;
+                trk.forEach(d => { const x = d.data(); if (!hit && textMatches(x.message, message)) hit = x; });
+                if (hit) return { sent: true, reason: `the activity log already shows this message sent to this contact (${hit.activity_type || 'activity'})` };
+
+                // Messages HeyReach itself reported sending (campaign messages, other quick sends, etc.)
+                const act = await getDocs(fsQuery(collection(emailDB, 'heyreach_activity'),
+                    fsWhere('leadProfileUrl', 'in', variants), fsLimit(500)));
+                act.forEach(d => {
+                    const x = d.data();
+                    const et = String(x.eventType || '').toUpperCase();
+                    if (!hit && /^(MESSAGE|INMAIL)_SENT$/.test(et) && textMatches(x.messageText || x.message_text || x.message, message)) hit = x;
+                });
+                if (hit) return { sent: true, reason: 'HeyReach already reported sending this exact message to this contact' };
+            } catch (e) {
+                return { sent: false, error: e.message || String(e) };
+            }
+            return { sent: false };
+        }
+
         // ── Removing a lead from the Quick Message campaign ────────────────
         async function removeFromQuickMessage(item, listEntry) {
             const job = item.job;
@@ -794,6 +879,9 @@
                 // A lead HeyReach itself flagged Failed (never attempted) can keep showing that status after
                 // it has been removed from the list; it counts as "queued" for scanning but cannot send once
                 // it is out of the list, so list membership alone decides whether it is removed.
+                // Leads from HeyReach's "not started" pool are not returned by getall at all (row is undefined),
+                // so for them list membership is the proof. Deleting a not-started lead from its list makes the
+                // campaign fail it as LeadDeletedFromList instead of sending it.
                 const stillQueued = !!(row && row.state === 'queued' && !row.internalFail);
                 if (!stillInList && !stillQueued) {
                     note(`Verified: lead is gone from the campaign list and no longer queued${row ? ` (HeyReach shows: ${row.label})` : ''}`);
@@ -982,7 +1070,7 @@
             const warnings = [];
             const stats = {
                 campaigns: 0, queuedTotal: 0, eligible: 0, noConversation: 0, otherAccount: 0, checkErrors: 0,
-                blank: 0, tooLong: 0, handled: 0, noListMatch: 0,
+                blank: 0, tooLong: 0, handled: 0, noListMatch: 0, pool: 0, hrPendingReported: 0, alreadyInThread: 0,
                 sent: 0, paused: 0, finished: 0, failed: 0,
                 notQueued: new Map()     // "label — status detail" -> count, for the "why left out" list
             };
@@ -1047,13 +1135,14 @@
                     });
                     stats.queuedTotal += queued.length;
                     console.log(`[fast-msg] ${job.bdr.name} / ${job.campaignName}: ${campRes.map.size} leads read from HeyReach, ${queued.length} queued`);
-                    if (!queued.length) continue;
 
-                    // Message-text fallback + presence in the campaign list
-                    let listMap = null;
+                    // Message-text fallback + presence in the campaign list. The list is always read, because
+                    // it is also the only place HeyReach's "not started yet" leads can be seen (see below).
+                    let listMap = null, listTruncated = false;
                     try {
                         const lr = await fetchListRows(job);
                         listMap = lr.map;
+                        listTruncated = lr.truncated;
                         console.log(`[fast-msg] ${job.bdr.name}: lead list ${job.listIdInt} read — ${lr.map.size} leads${lr.truncated ? ' (TRUNCATED)' : ''}`);
                         if (lr.truncated) warnings.push(`${job.bdr.name} / ${job.campaignName}: lead list is larger than this page reads; some leads may be treated as missing from the list.`);
                     } catch (e) {
@@ -1061,6 +1150,36 @@
                         stats.noListMatch += queued.length;
                         continue;
                     }
+
+                    // Not-started pool: leads in the campaign's list that the campaign read never returned.
+                    const pool = [];
+                    if (campRes.truncated || listTruncated) {
+                        warnings.push(`${job.bdr.name} / ${job.campaignName}: campaign or list is larger than this page reads, so leads HeyReach has not started yet cannot be identified safely — they were skipped.`);
+                    } else {
+                        listMap.forEach((entry, key) => { if (!campRes.map.has(key)) pool.push({ key, entry }); });
+                    }
+                    const hrPending = await fetchCampaignPendingCount(job.apiKey, job.campaignId);
+                    stats.pool += pool.length;
+                    stats.queuedTotal += pool.length;
+                    if (hrPending != null) stats.hrPendingReported += hrPending;
+                    console.log(`[fast-msg] ${job.bdr.name} / ${job.campaignName}: ${pool.length} list leads not returned by the campaign read (HeyReach "not started" count: ${hrPending == null ? 'unavailable' : hrPending})`);
+                    if (hrPending != null && pool.length > hrPending) {
+                        warnings.push(`${job.bdr.name} / ${job.campaignName}: ${pool.length} leads are in the campaign's list but not returned by HeyReach's lead read, while HeyReach reports ${hrPending} not started. The extra ${pool.length - hrPending} may have been dropped by HeyReach — each one is still checked for an open conversation and for any earlier send before anything goes out.`);
+                    }
+                    for (const { key, entry } of pool) {
+                        const message = (entry.content || '').trim();
+                        if (!message) { stats.blank++; continue; }
+                        if (message.length > MESSAGE_CHAR_LIMIT) { stats.tooLong++; continue; }
+                        if (isHandled(key, message)) { stats.handled++; continue; }
+                        candidates.push({
+                            job, key, rawUrl: entry.rawUrl,
+                            firstName: entry.firstName, lastName: entry.lastName,
+                            name: [entry.firstName, entry.lastName].filter(Boolean).join(' ') || '(no name)',
+                            company: entry.company, position: entry.position,
+                            message, conv: null, status: 'pending', note: '', fromPendingPool: true
+                        });
+                    }
+
                     for (const row of queued) {
                         const entry = listMap.get(row.key);
                         if (!entry) { stats.noListMatch++; continue; }
@@ -1088,7 +1207,11 @@
                         let res = await resolveConversation(item);
                         if (res.status === 'error') { await sleep(1500); res = await resolveConversation(item); }   // one quick retry
                         if (cancelled()) return;
-                        if (res.status === 'found') { item.conv = res; eligible.push(item); }
+                        if (res.status === 'found') {
+                            // The contact's conversation already holds this exact message: it was sent before.
+                            if (messageInThread(res.messages, item.message)) { stats.alreadyInThread++; markHandled(item.key, item.message); }
+                            else { item.conv = res; eligible.push(item); }
+                        }
                         else if (res.status === 'none' || res.status === 'mismatch') stats.noConversation++;
                         else if (res.status === 'other_account') stats.otherAccount++;
                         else {
@@ -1138,7 +1261,10 @@
                 droppedBlankMessage: stats.blank,
                 droppedTooLong: stats.tooLong,
                 droppedAlreadyHandled: stats.handled,
-                checkedForConversation: stats.eligible + stats.noConversation + stats.otherAccount + stats.checkErrors,
+                notStartedPoolFromList: stats.pool,
+                heyreachReportsNotStarted: stats.hrPendingReported,
+                droppedMessageAlreadyInConversation: stats.alreadyInThread,
+                checkedForConversation: stats.eligible + stats.noConversation + stats.otherAccount + stats.checkErrors + stats.alreadyInThread,
                 noOpenConversation: stats.noConversation,
                 conversationOnOtherAccount: stats.otherAccount,
                 checkErrors: stats.checkErrors,
@@ -1154,6 +1280,7 @@
             const cards = [
                 { cls: 'good', n: stats.eligible, l: 'Can use a conversation' },
                 { cls: '', n: stats.queuedTotal, l: 'Queued in Quick Message' },
+                { cls: '', n: stats.pool, l: 'Of those, not started yet' },
                 { cls: '', n: stats.noConversation, l: 'No open conversation' },
                 { cls: '', n: stats.campaigns, l: 'Campaigns read' }
             ];
@@ -1165,6 +1292,7 @@
             if (stats.blank) reasons.push(`${stats.blank} have no message text in HeyReach (blank messages are never sent).`);
             if (stats.tooLong) reasons.push(`${stats.tooLong} are longer than ${MESSAGE_CHAR_LIMIT} characters.`);
             if (stats.noListMatch) reasons.push(`${stats.noListMatch} are not in the campaign's lead list, so removal could not be verified.`);
+            if (stats.alreadyInThread) reasons.push(`${stats.alreadyInThread} already have this exact message in their conversation, so they were left out.`);
             if (stats.handled) reasons.push(`${stats.handled} were already handled by this page in the last 3 days.`);
             const other = stats.sent + stats.paused + stats.finished + stats.failed;
             if (other) {
@@ -1307,11 +1435,18 @@
             try { [campRes, listRes] = await Promise.all([fetchCampaignRows(job), fetchListRows(job)]); }
             catch (e) { return skipItem(item, `Could not read HeyReach (${e.message}). Nothing was changed.`); }
             const row = campRes.map.get(item.key);
-            if (!row) return skipItem(item, 'Lead is no longer in the campaign. Nothing was changed.');
-            if (row.state !== 'queued') return skipItem(item, `Lead is no longer queued (HeyReach shows: ${row.label}). Nothing was changed.`, { handled: row.messageSent });
             const listEntry = listRes.map.get(item.key);
+            if (!row) {
+                // Only a lead from HeyReach's "not started" pool may be absent from the campaign read, and only
+                // when that read was complete and the lead is still in the campaign's list.
+                if (!item.fromPendingPool) return skipItem(item, 'Lead is no longer in the campaign. Nothing was changed.');
+                if (campRes.truncated || listRes.truncated) return skipItem(item, 'The campaign is too large to confirm this lead is still waiting to start. Nothing was changed.');
+                if (!listEntry) return skipItem(item, 'Lead is no longer in the campaign list. Nothing was changed.');
+            } else if (row.state !== 'queued') {
+                return skipItem(item, `Lead is no longer queued (HeyReach shows: ${row.label}). Nothing was changed.`, { handled: row.messageSent });
+            }
             if (!listEntry) return skipItem(item, 'Lead is not in the campaign list, so removal could not be verified. Nothing was changed.');
-            const message = (row.content || listEntry.content || '').trim();
+            const message = ((row && row.content) || listEntry.content || '').trim();
             if (!message) return skipItem(item, 'No message text in HeyReach any more. Nothing was changed.');
             if (message.length > MESSAGE_CHAR_LIMIT) return skipItem(item, `Message is over ${MESSAGE_CHAR_LIMIT} characters. Nothing was changed.`);
             if (normMsg(message) !== normMsg(item.message)) log('info', 'Message text changed in HeyReach since the scan — using the current text', item);
@@ -1322,7 +1457,12 @@
             const conv = await resolveConversation(item);
             if (conv.status === 'none' || conv.status === 'mismatch') return skipItem(item, 'No open conversation any more. Nothing was changed.');
             if (conv.status !== 'found') return skipItem(item, `Could not confirm the conversation (${conv.error}). Nothing was changed.`);
-            if (messageInThread(conv.messages, message)) return skipItem(item, 'This exact message is already in the conversation — not sent again. The lead is still queued, so review it in HeyReach.');
+            // Never send a message this contact has already received: conversation thread, this page's own memory,
+            // our activity log and HeyReach's sent-message events. If the history can't be read, don't send.
+            step('Checking this message was not already sent to this contact', 'Checking history…');
+            const prior = await checkPriorSend(item, message, conv);
+            if (prior.sent) return skipItem(item, `Not sent: ${prior.reason}. The lead was NOT removed from Quick Message — review it in HeyReach.`, { handled: true });
+            if (prior.error) return skipItem(item, `Could not verify this message was not already sent (${prior.error}). Nothing was changed.`);
             item.conv = conv;
 
             if (_run.stop) { setRowStatus(item, 'pending', ''); return { outcome: 'stopped' }; }
