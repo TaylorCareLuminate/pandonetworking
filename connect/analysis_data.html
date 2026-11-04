@@ -1181,10 +1181,19 @@
             renderResults();
             updateEnrichmentBanner(enrichResult);
 
+            const rc = window._scheduledReconcile;
+            const rcMsg = rc
+                ? `Scheduled meetings: ${rc.pairs} unique prospect+BDR pairs found (${rc.withRow} in dataset` +
+                  (rc.outOfScope ? `, ${rc.outOfScope} belong to BDRs outside the selected scope` : '') +
+                  (rc.noRowOther ? `, ${rc.noRowOther} could not be matched to a row — see console "[Scheduled Reconcile]"` : '') +
+                  (rc.unattributedUrls ? `; ${rc.unattributedUrls} prospect URLs had no determinable BDR` : '') + `).`
+                : '';
             if (loadIssues.length) {
                 showAlert(`<strong>Dataset may be INCOMPLETE</strong> — ${loadIssues.length} load problem(s):<br>` +
                     loadIssues.map(m => '• ' + m).join('<br>') +
-                    `<br>Click Build Dataset again to retry.`, 'warning');
+                    `<br>Click Build Dataset again to retry.` + (rcMsg ? `<br>${rcMsg}` : ''), 'warning');
+            } else if (rcMsg) {
+                showAlert(rcMsg, 'info');
             }
 
         } catch(err) {
@@ -1608,7 +1617,14 @@
                 const title   = data.leadPosition || data.leadTitle || correspondent.position || correspondent.headline || '';
                 const company = data.companyName  || data.leadCompany || correspondent.companyName || correspondent.company || '';
                 const liUrl   = normalizeUrl(data.leadProfileUrl || correspondent.profileUrl || '');
-                const rawBdrEmail = (data.accountEmail || data.bdrEmail || data.linkedInAccountEmail || '').toLowerCase();
+                // Pick the first email field that maps to a KNOWN BDR identity (this is how the
+                // doc was matched by the queries above — it may have matched on uploadedByEmail,
+                // or have a stale/blank accountEmail). Falling back to "first non-empty" alone
+                // could pick an unknown address and leave the BDR blank, which drops the
+                // conversation's scheduled status (it is now keyed by prospect + BDR).
+                const candidateEmails = [data.accountEmail, data.bdrEmail, data.linkedInAccountEmail, data.uploadedByEmail]
+                    .map(e => (e || '').toLowerCase()).filter(Boolean);
+                const rawBdrEmail = candidateEmails.find(e => emailToCanonical.has(e)) || candidateEmails[0] || '';
                 // Canonicalize to the BDR's primary email so work-email and LinkedIn-seat-email
                 // records for the same real BDR key to the same "liUrl||bdrEmail" bucket.
                 const bdrEmail = emailToCanonical.get(rawBdrEmail) || rawBdrEmail;
@@ -1884,7 +1900,8 @@
         for (let i = 0; i < emailArr.length; i += 30) chunks.push(emailArr.slice(i, i + 30));
 
         // Source 1: activity_tracking (bdr_email + contact_linkedin_url)
-        let src1Count = 0;
+        let src1Count = 0, src1Dropped = 0;
+        const orphanMeta = new Map();   // pairKey → {liUrl, bdrEmail, name, title, company}
         for (const chunk of chunks) {
             if (!chunk.length) continue;
             const q = query(
@@ -1897,20 +1914,37 @@
                 const data = d.data();
                 const url = normalizeUrl(data.contact_linkedin_url || '');
                 const bdr = (data.bdr_email || '').toLowerCase();
-                if (url && bdr) { pairs.add(pairKey(url, bdr)); src1Count++; }
+                if (url && bdr) {
+                    pairs.add(pairKey(url, bdr)); src1Count++;
+                    // Remember what activity_tracking knows about the contact so a row can still
+                    // be created if this pair has no connect_queue / inbox record at all.
+                    const k = pairKey(url, bdr);
+                    if (!orphanMeta.has(k)) orphanMeta.set(k, {
+                        liUrl: url, bdrEmail: canon(bdr),
+                        name:    data.contact_name || data.contact_full_name || data.lead_name || '',
+                        title:   data.contact_title || data.contact_position || '',
+                        company: data.contact_company || ''
+                    });
+                } else {
+                    src1Dropped++;
+                }
             });
         }
-        console.log(`[Scheduled] Source 1 (activity_tracking): ${src1Count} (URL, BDR) pairs`);
+        console.log(`[Scheduled] Source 1 (activity_tracking): ${src1Count} (URL, BDR) pairs (${src1Dropped} dropped: missing URL or BDR)`);
 
         // Source 2: inbox responseCategory = 'Scheduled'
-        // Use entry.liUrl / entry.bdrEmail (not the map key, which is the composite "liUrl||bdrEmail")
-        let src2Count = 0;
-        inboxByUrl.forEach(entry => {
-            if (entry.responseCategory === 'Scheduled' && entry.liUrl && entry.bdrEmail) {
-                pairs.add(pairKey(entry.liUrl, entry.bdrEmail)); src2Count++;
-            }
+        // Iterate ALL inbox docs (inboxByBdr), NOT the inboxByUrl map: that map holds only one
+        // doc per (URL, BDR), so when a pair has several conversation threads a later,
+        // non-Scheduled thread overwrote an earlier Scheduled one and the meeting was lost.
+        // (Conversation count here is comparable to demo_review_replies.html's per-doc count.)
+        let src2Count = 0, src2Convs = 0, src2Dropped = 0;
+        (inboxByBdr || []).forEach(entry => {
+            if (entry.responseCategory !== 'Scheduled') return;
+            src2Convs++;
+            if (entry.liUrl && entry.bdrEmail) { pairs.add(pairKey(entry.liUrl, entry.bdrEmail)); src2Count++; }
+            else src2Dropped++;
         });
-        console.log(`[Scheduled] Source 2 (inbox responseCategory): ${src2Count} (URL, BDR) pairs`);
+        console.log(`[Scheduled] Source 2 (inbox responseCategory): ${src2Convs} Scheduled conversations → ${src2Count} usable (URL, BDR) hits (${src2Dropped} dropped: missing URL or BDR)`);
 
         // Source 3: conversation_category_overrides (manual categorization overrides)
         // Query once for all Scheduled overrides, then look up by conversationId → liUrl
@@ -2001,6 +2035,33 @@
             } catch(e) { console.warn('conversation_category_overrides scheduled failed:', e); }
         }
         console.log(`[Scheduled] Source 3 (conversation_category_overrides): ${src3Count} (URL, BDR) pairs, ${src3Unattributed} with no determinable BDR`);
+
+        // Source 4: heyreach_activity docs with responseCategory = 'Scheduled'.
+        // demo_review_replies.html counts these as scheduled conversations; this page ignored them.
+        let src4Docs = 0, src4Count = 0, src4Unattributed = 0, src4NoUrl = 0;
+        try {
+            const actSnap = await fetchAllWithRetry(query(
+                collection(emailDB, 'heyreach_activity'),
+                where('responseCategory', '==', 'Scheduled')
+            ), 'heyreach_activity (Scheduled)');
+            if (actSnap) {
+                const convToEntry = new Map();
+                allInbox.forEach(e => { if (e.conversationId) convToEntry.set(e.conversationId, e); });
+                actSnap.forEach(d => {
+                    src4Docs++;
+                    const data = d.data() || {};
+                    const inboxMatch = convToEntry.get(data.conversationId) || convToEntry.get(d.id);
+                    const url = extractActivityUrl(data) || inboxMatch?.liUrl || '';
+                    if (!url) { src4NoUrl++; return; }
+                    const cands = [data.accountEmail, data.bdrEmail, data.linkedInAccountEmail, data.uploadedByEmail]
+                        .map(e => (e || '').toLowerCase()).filter(Boolean);
+                    const bdr = cands.find(e => emailToCanonical.has(e)) || inboxMatch?.bdrEmail || '';
+                    if (bdr) { pairs.add(pairKey(url, bdr)); src4Count++; }
+                    else { unattributedUrls.add(url); src4Unattributed++; }
+                });
+            }
+        } catch (e) { console.warn('heyreach_activity scheduled failed:', e); }
+        console.log(`[Scheduled] Source 4 (heyreach_activity): ${src4Docs} Scheduled docs → ${src4Count} (URL, BDR) pairs, ${src4Unattributed} no determinable BDR, ${src4NoUrl} no URL`);
         console.log(`[Scheduled] Total unique scheduled (URL, BDR) pairs: ${pairs.size}; unattributed URLs: ${unattributedUrls.size}`);
 
         // Debug: log sample known-missing URLs to check if they're in the set
@@ -2021,7 +2082,7 @@
             }
         });
 
-        return { pairs, unattributedUrls };
+        return { pairs, unattributedUrls, orphanMeta };
     }
 
     // ── Build rows ────────────────────────────────────────────────────────────
@@ -2295,6 +2356,54 @@
             });
         });
         console.log(`[buildRows] Inbox-only scheduled contacts added: ${inboxOnlyScheduled}`);
+
+        // ── Orphan scheduled pairs: a meeting_scheduled activity exists for (prospect, BDR) but
+        // there is no connect_queue record and no inbox doc in scope, so neither loop above
+        // could produce a row — the meeting was silently dropped. Emit a minimal row so it counts.
+        let orphanRows = 0;
+        const orphanSkippedUnknownBdr = [];
+        (scheduledInfo.orphanMeta || new Map()).forEach((m, key) => {
+            if (seen.has(key)) return;
+            if (!bdrEmailToName.has(m.bdrEmail)) { orphanSkippedUnknownBdr.push(key); return; }
+            seen.add(key);
+            orphanRows++;
+            const connDate = connectionDateMap.get(m.liUrl) || null;
+            const currentlyConnected = (connDate || currentConnectionUrls.has(m.liUrl)) ? 1 : 0;
+            const hypGroup = urlToGroupMap.get(m.liUrl);
+            rows.push({
+                contact_name: m.name, contact_linkedin_url: m.liUrl, contact_title: m.title, contact_company: m.company,
+                bdr_name: bdrEmailToName.get(m.bdrEmail) || m.bdrEmail, bdr_email: m.bdrEmail,
+                client_company: bdrEmailToCompany.get(m.bdrEmail) || '',
+                hypothesis_group: hypGroup?.name || bdrEmailToCompany.get(m.bdrEmail) || '',
+                hypothesis_group_id: hypGroup?.id || '',
+                hypothesis_variation_id: '', hypothesis_variation_label: '',
+                connected: connDate ? 1 : 0,
+                connected_by_healthluminate: (connDate || (sentRequestUrlSet.has(m.liUrl) && currentlyConnected)) ? 1 : 0,
+                currently_connected_on_linkedin: currentlyConnected,
+                connection_date: connDate ? connDate.toISOString().slice(0, 10) : '',
+                first_outreach_date: '', first_outreach_sent_at: '', last_message_date: '',
+                message_type: 'other',
+                replied: 1,   // a meeting can only be booked after the contact engaged
+                scheduled: 1,
+                total_messages: 0, bdr_messages: 0, contact_messages: 0,
+                conversation_history: []
+            });
+        });
+        console.log(`[buildRows] Orphan scheduled pairs (activity_tracking only) added: ${orphanRows}; skipped (BDR not in selected scope): ${orphanSkippedUnknownBdr.length}`);
+
+        // ── Reconciliation: every scheduled (prospect, BDR) pair should now have a row.
+        const rowKeys = new Set(rows.map(r => `${r.contact_linkedin_url}||${r.bdr_email}`));
+        const pairsWithoutRow = [...scheduledInfo.pairs].filter(k => !rowKeys.has(k));
+        const pairsOutOfScope = pairsWithoutRow.filter(k => !bdrEmailToName.has(k.split('||')[1]));
+        console.log(`[Scheduled Reconcile] ${scheduledInfo.pairs.size} scheduled (prospect, BDR) pairs → ${scheduledInfo.pairs.size - pairsWithoutRow.length} have a dataset row; ${pairsWithoutRow.length} do not (${pairsOutOfScope.length} belong to a BDR outside the selected scope).`);
+        if (pairsWithoutRow.length) console.log('[Scheduled Reconcile] pairs with no row:', pairsWithoutRow);
+        window._scheduledReconcile = {
+            pairs: scheduledInfo.pairs.size,
+            withRow: scheduledInfo.pairs.size - pairsWithoutRow.length,
+            outOfScope: pairsOutOfScope.length,
+            noRowOther: pairsWithoutRow.length - pairsOutOfScope.length,
+            unattributedUrls: scheduledInfo.unattributedUrls.size
+        };
 
         // Debug: check if the known-missing contacts appear in connect_queue rows vs. inbox-only
         const debugUrls = [
