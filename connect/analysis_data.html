@@ -1152,8 +1152,8 @@
 
             // ── Step 4: Load scheduled meetings ──
             const s4 = addStep('Loading scheduled meeting records…');
-            const scheduledUrlSet = await loadScheduledMeetings(allEmailsArr, inboxByUrl, inboxByBdr);
-            doneStep(s4, `${scheduledUrlSet.size} contacts scheduled a meeting`);
+            const scheduledInfo = await loadScheduledMeetings(allEmailsArr, inboxByUrl, inboxByBdr, emailToCanonical);
+            doneStep(s4, `${scheduledInfo.pairs.size} prospect+BDR pairs scheduled a meeting`);
 
             // ── Step 5: Load current LinkedIn connections (any source) ──
             const s4b = addStep('Loading current LinkedIn connections…');
@@ -1167,7 +1167,7 @@
 
             // ── Step 7: Build rows ──
             const s5 = addStep('Assembling dataset rows (connect_queue outreach only)…');
-            dataset = buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet, bdrEmailToName, urlToGroupMap, bdrEmailToCompany, currentConnectionUrls, emailToCanonical);
+            dataset = buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledInfo, bdrEmailToName, urlToGroupMap, bdrEmailToCompany, currentConnectionUrls, emailToCanonical);
             doneStep(s5, `${dataset.length} rows built (outreach-initiated, with job title)`);
 
             // ── Step 8: Load profile enrichment from prospect_contacts ──
@@ -1868,8 +1868,18 @@
     }
 
     // ── Load scheduled meetings ───────────────────────────────────────────────
-    async function loadScheduledMeetings(emailArr, inboxByUrl, inboxByBdr) {
-        const scheduledSet = new Set();
+    // Returns { pairs, unattributedUrls }.
+    //   pairs: Set of "liUrl||canonicalBdrEmail" — a meeting is scheduled for the
+    //          COMBINATION of prospect + sending BDR, never the prospect alone. The same
+    //          prospect can be in two BDRs' outreach (different clients/campaigns); a
+    //          meeting booked via one BDR must not mark the other BDR's row as scheduled.
+    //   unattributedUrls: URLs from override docs where the BDR could not be determined.
+    //          isScheduled() only honours these when exactly one BDR has outreach to the URL.
+    async function loadScheduledMeetings(emailArr, inboxByUrl, inboxByBdr, emailToCanonical = new Map()) {
+        const pairs = new Set();
+        const unattributedUrls = new Set();
+        const canon = (e) => { const l = (e || '').toLowerCase(); return emailToCanonical.get(l) || l; };
+        const pairKey = (url, bdr) => `${url}||${canon(bdr)}`;
         const chunks = [];
         for (let i = 0; i < emailArr.length; i += 30) chunks.push(emailArr.slice(i, i + 30));
 
@@ -1884,29 +1894,54 @@
             );
             const snap = await fetchAllWithRetry(q, 'activity_tracking (meeting_scheduled)');
             if (snap) snap.forEach(d => {
-                const url = normalizeUrl(d.data().contact_linkedin_url || '');
-                if (url) { scheduledSet.add(url); src1Count++; }
+                const data = d.data();
+                const url = normalizeUrl(data.contact_linkedin_url || '');
+                const bdr = (data.bdr_email || '').toLowerCase();
+                if (url && bdr) { pairs.add(pairKey(url, bdr)); src1Count++; }
             });
         }
-        console.log(`[Scheduled] Source 1 (activity_tracking): ${src1Count} URLs`);
+        console.log(`[Scheduled] Source 1 (activity_tracking): ${src1Count} (URL, BDR) pairs`);
 
         // Source 2: inbox responseCategory = 'Scheduled'
-        // Use entry.liUrl (not the map key, which is now the composite "liUrl||bdrEmail")
+        // Use entry.liUrl / entry.bdrEmail (not the map key, which is the composite "liUrl||bdrEmail")
         let src2Count = 0;
         inboxByUrl.forEach(entry => {
-            if (entry.responseCategory === 'Scheduled' && entry.liUrl) { scheduledSet.add(entry.liUrl); src2Count++; }
+            if (entry.responseCategory === 'Scheduled' && entry.liUrl && entry.bdrEmail) {
+                pairs.add(pairKey(entry.liUrl, entry.bdrEmail)); src2Count++;
+            }
         });
-        console.log(`[Scheduled] Source 2 (inbox responseCategory): ${src2Count} URLs`);
+        console.log(`[Scheduled] Source 2 (inbox responseCategory): ${src2Count} (URL, BDR) pairs`);
 
         // Source 3: conversation_category_overrides (manual categorization overrides)
         // Query once for all Scheduled overrides, then look up by conversationId → liUrl
-        let src3Count = 0;
+        let src3Count = 0, src3Unattributed = 0;
         const allInbox = inboxByBdr || [];
         if (allInbox.length > 0) {
+            // conversationId → inbox entry (carries both the prospect URL and the BDR whose
+            // conversation it is — needed to attribute the override to a (URL, BDR) pair).
             const convIdToUrl = new Map();
+            const convIdToBdr = new Map();
             allInbox.forEach(entry => {
-                if (entry.conversationId && entry.liUrl) convIdToUrl.set(entry.conversationId, entry.liUrl);
+                if (entry.conversationId && entry.liUrl) {
+                    convIdToUrl.set(entry.conversationId, entry.liUrl);
+                    if (entry.bdrEmail) convIdToBdr.set(entry.conversationId, entry.bdrEmail);
+                }
             });
+            // sanitized email (non-alphanumerics → "_", as used in override doc IDs) → canonical email
+            const sanitizedToCanonical = new Map();
+            emailToCanonical.forEach((primary, email) => {
+                sanitizedToCanonical.set(email.replace(/[^a-zA-Z0-9]/g, '_'), primary);
+            });
+            const bdrFromDocId = (id) => {
+                if (!id) return '';
+                for (const [san, primary] of sanitizedToCanonical) {
+                    if (id.endsWith('_' + san)) return primary;
+                }
+                // webhook_<slug>_<rawBdrEmail>
+                const lu = id.lastIndexOf('_');
+                if (lu > -1 && id.slice(lu + 1).includes('@')) return canon(id.slice(lu + 1));
+                return '';
+            };
             console.log(`[Scheduled] Source 3: ${convIdToUrl.size} conversations with IDs mapped`);
             try {
                 const snap = await fetchAllWithRetry(query(
@@ -1939,24 +1974,34 @@
                         const data = d.data() || {};
                         let url = convIdToUrl.get(d.id)
                             || (data.conversationId && convIdToUrl.get(data.conversationId));
+                        let matchedConvId = convIdToUrl.has(d.id) ? d.id
+                            : (data.conversationId && convIdToUrl.has(data.conversationId) ? data.conversationId : '');
                         if (!url) {
                             for (const cid of embeddedConvIds(d.id)) {
                                 url = convIdToUrl.get(cid);
-                                if (url) break;
+                                if (url) { matchedConvId = cid; break; }
                             }
                         }
                         if (!url) {
                             const slug = slugFromWebhookId(d.id) || slugFromWebhookId(data.conversationId);
                             if (slug) url = normalizeUrl(`https://www.linkedin.com/in/${slug}`);
                         }
-                        if (url) { scheduledSet.add(url); src3Count++; }
-                        else console.log(`[Scheduled] Source 3: override doc ${d.id} still unresolved`);
+                        if (!url) { console.log(`[Scheduled] Source 3: override doc ${d.id} still unresolved`); return; }
+
+                        // Attribute to a BDR: explicit bdrEmail field → doc-ID suffix → the
+                        // BDR on the matched inbox conversation.
+                        const bdr = (data.bdrEmail || '').toLowerCase()
+                            || bdrFromDocId(d.id)
+                            || (matchedConvId && convIdToBdr.get(matchedConvId))
+                            || '';
+                        if (bdr) { pairs.add(pairKey(url, bdr)); src3Count++; }
+                        else { unattributedUrls.add(url); src3Unattributed++; }
                     });
                 }
             } catch(e) { console.warn('conversation_category_overrides scheduled failed:', e); }
         }
-        console.log(`[Scheduled] Source 3 (conversation_category_overrides): ${src3Count} URLs`);
-        console.log(`[Scheduled] Total unique scheduled URLs: ${scheduledSet.size}`);
+        console.log(`[Scheduled] Source 3 (conversation_category_overrides): ${src3Count} (URL, BDR) pairs, ${src3Unattributed} with no determinable BDR`);
+        console.log(`[Scheduled] Total unique scheduled (URL, BDR) pairs: ${pairs.size}; unattributed URLs: ${unattributedUrls.size}`);
 
         // Debug: log sample known-missing URLs to check if they're in the set
         const debugUrls = [
@@ -1965,7 +2010,8 @@
             'linkedin.com/in/acoaaacblhcbzzxtjmfejkoim9mikojpwysan0k'
         ];
         debugUrls.forEach(u => {
-            console.log(`[Scheduled Debug] "${u}" in scheduledSet: ${scheduledSet.has(u)}`);
+            const bdrsForUrl = [...pairs].filter(k => k.startsWith(u + '||')).map(k => k.split('||')[1]);
+            console.log(`[Scheduled Debug] "${u}" scheduled for BDRs: [${bdrsForUrl.join(', ')}] unattributed: ${unattributedUrls.has(u)}`);
         });
 
         // Debug: log which inbox entries have these URLs
@@ -1975,14 +2021,42 @@
             }
         });
 
-        return scheduledSet;
+        return { pairs, unattributedUrls };
     }
 
     // ── Build rows ────────────────────────────────────────────────────────────
-    function buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet, bdrEmailToName, urlToGroupMap = new Map(), bdrEmailToCompany = new Map(), currentConnectionUrls = new Set(), emailToCanonical = new Map()) {
+    function buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledInfo, bdrEmailToName, urlToGroupMap = new Map(), bdrEmailToCompany = new Map(), currentConnectionUrls = new Set(), emailToCanonical = new Map()) {
         const rows = [];
         // Track which (normalizedUrl, bdrEmail) pairs have been added
         const seen = new Set();
+
+        // Which BDRs have outreach to each prospect URL (connect_queue + inbox). Used only to
+        // decide whether an override doc with no determinable BDR can be safely attributed.
+        const urlToBdrSet = new Map();
+        const noteUrlBdr = (u, b) => {
+            if (!u || !b) return;
+            if (!urlToBdrSet.has(u)) urlToBdrSet.set(u, new Set());
+            urlToBdrSet.get(u).add(b);
+        };
+        sentItems.forEach(item => {
+            const u = normalizeUrl(item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || item.linkedInUrl || '');
+            const raw = (item.account_email || '').toLowerCase();
+            noteUrlBdr(u, emailToCanonical.get(raw) || raw);
+        });
+        inboxByBdr.forEach(e => noteUrlBdr(e.liUrl, e.bdrEmail));
+
+        // Scheduled is a property of the (prospect, BDR) pair — NOT the prospect alone.
+        // Exception: override docs whose BDR couldn't be determined are honoured only when
+        // exactly one BDR has outreach to that prospect (so attribution is unambiguous).
+        const isScheduled = (liUrl, bdrEmail) => {
+            if (!liUrl || !bdrEmail) return false;
+            if (scheduledInfo.pairs.has(`${liUrl}||${bdrEmail}`)) return true;
+            if (scheduledInfo.unattributedUrls.has(liUrl)) {
+                const bdrs = urlToBdrSet.get(liUrl);
+                return !!bdrs && bdrs.size === 1 && bdrs.has(bdrEmail);
+            }
+            return false;
+        };
 
         // Every normalized URL that has an approved + pushed connect_queue record
         // (i.e. Pando Executive Networking definitely sent this contact a connection request),
@@ -2101,7 +2175,7 @@
             const msgType        = classifyMessageType(item);
             const rawMessages    = inbox?.rawMessages || [];
             const replied        = inbox?.hasLeadReply ? 1 : 0;
-            const scheduled      = (liUrl && scheduledUrlSet.has(liUrl)) ? 1 : 0;
+            const scheduled      = isScheduled(liUrl, bdrEmail) ? 1 : 0;
             // connDate comes from heyreach_activity's CONNECTION_REQUEST_ACCEPTED events,
             // which HeyReach only fires for invites the BDR's own account sent — i.e. this
             // is always a Pando Executive Networking-initiated connection.
@@ -2169,7 +2243,7 @@
         inboxByBdr.forEach(inbox => {
             const liUrl    = inbox.liUrl;
             const bdrEmail = inbox.bdrEmail;
-            if (!liUrl || !scheduledUrlSet.has(liUrl)) return;
+            if (!liUrl || !isScheduled(liUrl, bdrEmail)) return;
             const key = `${liUrl}||${bdrEmail}`;
             if (seen.has(key)) return;
             seen.add(key);
