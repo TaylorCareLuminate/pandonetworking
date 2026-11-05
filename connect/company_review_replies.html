@@ -2085,6 +2085,14 @@
                     <i class="fas fa-list-check"></i>
                     Draft Follow-Up Sequences
                 </button>
+                <button id="otherFollowUpScanBtn" onclick="scanForOtherFollowUpOpportunities()" style="background: linear-gradient(135deg, #f59e0b 0%, #b45309 100%); box-shadow: 0 4px 12px rgba(245,158,11,0.35); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 10px; font-weight: 600; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem;" title="Low-cost AI scan (DeepSeek V4.1 Flash) of every OTHER loaded conversation — ones with no follow-up drafted or due. The AI is told today's date and the date of every message, and flags threads that look like they need a follow-up. It never writes the follow-up; flagged cards show an amber banner and appear under 'AI-Flagged Needs Follow-Up'.">
+                    <i class="fas fa-bell"></i>
+                    Scan for Other Follow-Up Opportunities
+                </button>
+                <button id="weeklyRunNowBtn" onclick="triggerWeeklyFollowUpRunNow()" style="background: linear-gradient(135deg, #b45309 0%, #92400e 100%); box-shadow: 0 4px 12px rgba(180,83,9,0.35); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 10px; font-weight: 600; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem;" title="Runs the automated Wednesday-night job on the server RIGHT NOW for every active BDR across every company: AI 'Scan for Number of Follow-Ups' (raise-only), then 'Draft Follow-Up Sequences'. Nothing is sent — drafts land on the cards under 'Follow-Ups Ready'. You can close this page; it keeps running on Railway.">
+                    <i class="fas fa-calendar-check"></i>
+                    Run Weekly Follow-Up Job Now (All BDRs)
+                </button>
             </div>
             
             <div id="rescanProgress" style="margin-top: 1rem; display: none;"></div>
@@ -2327,8 +2335,14 @@
                 <button id="showFollowUpDraftsBtn" class="flag-filter-btn" onclick="toggleShowOnlyFollowUpDrafts()" style="background: linear-gradient(135deg, #f0fdfa 0%, #99f6e4 100%); color: #115e59; border: 2px solid #0d9488;">
                     <i class="fas fa-paper-plane"></i> Follow-Ups Ready (<span id="followUpDraftCount">0</span>)
                 </button>
+                <button id="showAiFollowUpFlagsBtn" class="flag-filter-btn" onclick="toggleShowOnlyAiFollowUpFlags()" style="background: linear-gradient(135deg, #fffbeb 0%, #fde68a 100%); color: #78350f; border: 2px solid #f59e0b;" title="Conversations the 'Scan for Other Follow-Up Opportunities' AI scan flagged as probably needing a follow-up. Flag only — no message is drafted.">
+                    <i class="fas fa-bell"></i> AI-Flagged Needs Follow-Up (<span id="aiFollowUpFlagCount">0</span>)
+                </button>
                 <button id="followUpsOnlyModeBtn" class="flag-filter-btn" onclick="toggleFollowUpsOnlyMode()" title="Fast single-window view: loads ONLY the conversations that have a follow-up drafted and waiting for review, instead of every conversation. Admins get every BDR in one window.">
                     <i class="fas fa-bolt"></i> <span id="followUpsOnlyModeBtnLabel">Load Only Follow-Ups</span>
+                </button>
+                <button id="followUpsDueModeBtn" class="flag-filter-btn" onclick="toggleFollowUpsDueMode()" style="background: linear-gradient(135deg, #fef3c7 0%, #fcd34d 100%); color: #78350f; border: 2px solid #d97706;" title="Fast single-window view: loads ONLY the conversations whose next follow-up is DUE right now (same rules as the 'due now' circle: 1-2 invites sent and enough days since the last one), plus any that already have a draft waiting. Admins get every BDR in one window.">
+                    <i class="fas fa-calendar-check"></i> <span id="followUpsDueModeBtnLabel">Load Only Follow-Ups Due</span>
                 </button>
             </div>
             <div id="flagFilterInfo" style="margin-top: 0.75rem; font-size: 0.85rem; color: #78350f; font-weight: 600;">
@@ -3044,7 +3058,13 @@
         // conversations that have a drafted follow-up waiting (followUpSequence.status ==
         // 'pending_review' — the drafts the Wednesday-night run and "Draft Follow-Up Sequences"
         // write). For admins this opens All BDRs in a single window. Turn it off to load everything.
-        let followUpsOnlyMode = companyReportParams.get('followUps') === '1';
+        // "Follow-ups DUE" sub-mode (?followUpsDue=1, or the "Load Only Follow-Ups Due" button):
+        // same fast, all-BDRs single-window load, but instead of the drafted threads it loads the
+        // threads whose next follow-up is DUE per the same dates/counts rules as the "due now"
+        // circle (computeFollowUpsDueNow) — plus anything already drafted. It always implies
+        // followUpsOnlyMode, so every loader's follow-ups-only branch is reused.
+        let followUpsDueMode = companyReportParams.get('followUpsDue') === '1';
+        let followUpsOnlyMode = companyReportParams.get('followUps') === '1' || followUpsDueMode;
 
         let currentUser = null;
         let currentUserEmail = null;
@@ -3062,6 +3082,7 @@
         let showOnlySuggested = false; // Default: Show all conversations (not just AI-suggested changes)
         let showOnlyFollowUpDrafts = false; // Default: Show all conversations (not just pending follow-up drafts)
         let showNeedsReply = false; // Default: Show all conversations
+        let showOnlyAiFollowUpFlags = false; // Default: Show all conversations (not just ones the AI flagged as needing a follow-up)
         let showHiddenConversations = false; // Default: Hide ignored conversations
         let showNotPandoOriginated = false;  // Default: Hide conversations not originated by Pando (the gray "Not Pando Outreach"/"Inbound" cards)
         let hideWrongContacts = false; // Default: Show wrong contacts
@@ -4083,6 +4104,17 @@
         // Every doc in `collName` whose follow-up draft is waiting for review. A plain equality
         // filter on one field, so Firestore needs no composite index.
         async function queryFollowUpDraftDocs(collName, timeoutMs = 90000) {
+            if (followUpsDueMode) {
+                // Due mode: a follow-up can only ever be due after 1 or 2 invitations have gone
+                // out (0 = first follow-up is human-written; 3 = sequence complete). Another single
+                // field filter — no composite index. The precise due check (category, spacing,
+                // paused/scheduled) runs client-side once categories are loaded, see
+                // filterToFollowUpsDue().
+                return getDocs(
+                    query(collection(emailDB, collName), where('followUpInvitesSent', 'in', [1, 2]), limit(5000)),
+                    { timeoutMs }
+                );
+            }
             return getDocs(
                 query(collection(emailDB, collName), where('followUpSequence.status', '==', 'pending_review'), limit(5000)),
                 { timeoutMs }
@@ -4472,6 +4504,45 @@
             return !!(c.followUpSequence && c.followUpSequence.status === 'pending_review' && c.followUpSequence.draftMessage);
         }
 
+        // ── "Other follow-up opportunities" AI flags ─────────────────────────────────────────
+        // Written by scanForOtherFollowUpOpportunities() onto the conversation's
+        // conversation_category_overrides doc as `aiFollowUpFlag`. A flag only says "this thread
+        // looks like it needs a follow-up" — no message is drafted. It goes quiet by itself as soon
+        // as the thread has new messages (the situation the AI judged is stale), or when dismissed.
+        function convHasActiveAiFollowUpFlag(c) {
+            const f = c.aiFollowUpFlag;
+            if (!f || !f.needsFollowUp || f.dismissed) return false;
+            const rc = c.responseCategory || 'Response';
+            if (rc === 'Scheduled' || rc === 'Declined to Meet') return false;
+            if ((c.followUpCategory || 'No Follow Up') === 'Qualified Wrong Contact') return false;
+            const msgCount = (c.messages || c.rawData?.messages || []).length;
+            return msgCount <= (f.messageCount || 0);
+        }
+
+        function updateAiFollowUpFlagCount() {
+            const count = allConversations.filter(convHasActiveAiFollowUpFlag).length;
+            const countElement = document.getElementById('aiFollowUpFlagCount');
+            if (countElement) countElement.textContent = count;
+        }
+
+        window.toggleShowOnlyAiFollowUpFlags = function() {
+            showOnlyAiFollowUpFlags = !showOnlyAiFollowUpFlags;
+            const button = document.getElementById('showAiFollowUpFlagsBtn');
+            const count = allConversations.filter(convHasActiveAiFollowUpFlag).length;
+            if (showOnlyAiFollowUpFlags) {
+                button.style.background = 'linear-gradient(135deg, #f59e0b 0%, #b45309 100%)';
+                button.style.color = 'white';
+                button.style.border = '2px solid #92400e';
+                button.innerHTML = `<i class="fas fa-bell"></i> Showing Only AI-Flagged (${count})`;
+            } else {
+                button.style.background = 'linear-gradient(135deg, #fffbeb 0%, #fde68a 100%)';
+                button.style.color = '#78350f';
+                button.style.border = '2px solid #f59e0b';
+                button.innerHTML = `<i class="fas fa-bell"></i> AI-Flagged Needs Follow-Up (<span id="aiFollowUpFlagCount">${count}</span>)`;
+            }
+            applyAllFilters();
+        };
+
         function updateFollowUpDraftCount() {
             const count = allConversations.filter(conversationHasFollowUpDraft).length;
             const countElement = document.getElementById('followUpDraftCount');
@@ -4505,7 +4576,45 @@
             const btn = document.getElementById('followUpsOnlyModeBtn');
             const label = document.getElementById('followUpsOnlyModeBtnLabel');
             const banner = document.getElementById('followUpsOnlyBanner');
+            const dueBtn = document.getElementById('followUpsDueModeBtn');
+            const dueLabel = document.getElementById('followUpsDueModeBtnLabel');
             if (!btn || !label || !banner) return;
+
+            // The "Due" button mirrors the "Only" button's look: solid amber when active.
+            if (dueBtn && dueLabel) {
+                if (followUpsDueMode) {
+                    dueBtn.style.background = 'linear-gradient(135deg, #d97706 0%, #b45309 100%)';
+                    dueBtn.style.color = 'white';
+                    dueBtn.style.border = '2px solid #92400e';
+                    dueLabel.textContent = 'Follow-Ups Due: ON (click to load everything)';
+                } else {
+                    dueBtn.style.background = 'linear-gradient(135deg, #fef3c7 0%, #fcd34d 100%)';
+                    dueBtn.style.color = '#78350f';
+                    dueBtn.style.border = '2px solid #d97706';
+                    dueLabel.textContent = isAdmin ? 'Load Only Follow-Ups Due (All BDRs)' : 'Load Only Follow-Ups Due';
+                }
+            }
+
+            if (followUpsDueMode) {
+                // Due mode owns the banner; the drafts button goes back to its idle look.
+                btn.style.background = 'linear-gradient(135deg, #ccfbf1 0%, #5eead4 100%)';
+                btn.style.color = '#115e59';
+                btn.style.border = '2px solid #0d9488';
+                label.textContent = isAdmin ? 'Load Only Follow-Ups (All BDRs)' : 'Load Only Follow-Ups';
+                const { due, blocked } = computeFollowUpsDueNow(allConversations);
+                const drafted = allConversations.filter(conversationHasFollowUpDraft);
+                const bdrCount = new Set(allConversations.map(c => (c.bdrEmail || '').toLowerCase()).filter(Boolean)).size;
+                banner.style.display = 'block';
+                banner.style.color = '#78350f';
+                banner.style.background = '#fffbeb';
+                banner.style.borderColor = '#fcd34d';
+                banner.innerHTML = `<i class="fas fa-calendar-check"></i> Follow-ups-due view: loaded ${allConversations.length} conversation${allConversations.length === 1 ? '' : 's'}${bdrCount ? ` across ${bdrCount} BDR${bdrCount === 1 ? '' : 's'}` : ''} — ${due.length} due now${blocked.length ? `, ${blocked.length} due but blocked (BDR missing EA outreach settings)` : ''}${drafted.length ? `, ${drafted.length} already drafted and waiting for review` : ''}. Nothing else was loaded, so the grid counts and filters below cover only these.`;
+                return;
+            }
+            banner.style.color = '#115e59';
+            banner.style.background = '#f0fdfa';
+            banner.style.borderColor = '#99f6e4';
+
             if (followUpsOnlyMode) {
                 btn.style.background = 'linear-gradient(135deg, #0d9488 0%, #0f766e 100%)';
                 btn.style.color = 'white';
@@ -4527,15 +4636,29 @@
         // Switches between the fast follow-ups-only load and the normal full load. For admins with
         // no company chosen yet, turning it on opens "All BDRs (All Companies)" so every BDR's
         // drafts land in this one window.
-        window.toggleFollowUpsOnlyMode = async function() {
-            const turningOn = !followUpsOnlyMode;
+        window.toggleFollowUpsOnlyMode = function() {
+            // Clicking "Only" while the "Due" view is on switches to the drafts view, not off.
+            return switchFollowUpsLoadMode(followUpsOnlyMode && !followUpsDueMode ? 'off' : 'drafts');
+        };
+
+        // Same fast all-BDRs load, but for conversations whose next follow-up is DUE.
+        window.toggleFollowUpsDueMode = function() {
+            return switchFollowUpsLoadMode(followUpsDueMode ? 'off' : 'due');
+        };
+
+        // newMode: 'off' (normal full load) | 'drafts' (drafted follow-ups only) | 'due' (follow-ups due only)
+        async function switchFollowUpsLoadMode(newMode) {
+            const turningOn = newMode !== 'off';
             const selector = document.getElementById('bdrSelect');
             const adminScope = isAdmin && selector ? selector.value : null; // null = not an admin view
             if (!turningOn && adminScope === '__ALL_BDRS__') {
                 if (!confirm('Load EVERY conversation for ALL BDRs?\n\nThat is the slow, full load and can take a minute or more. (Cancel keeps the fast follow-ups-only view.)')) return;
             }
             followUpsOnlyMode = turningOn;
-            if (!turningOn && showOnlyFollowUpDrafts) window.toggleShowOnlyFollowUpDrafts();
+            followUpsDueMode = newMode === 'due';
+            // The "Follow-Ups Ready" filter only makes sense in the drafts view (it would hide the
+            // due-but-not-yet-drafted threads in the due view, and is pointless in a full load).
+            if (newMode !== 'drafts' && showOnlyFollowUpDrafts) window.toggleShowOnlyFollowUpDrafts();
             updateFollowUpsOnlyModeUi();
 
             if (isAdmin && !adminScope) {
@@ -4548,10 +4671,19 @@
             document.getElementById('repliesContainer').innerHTML = `
                 <div class="empty-state">
                     <i class="fas fa-spinner fa-spin"></i>
-                    <h3>${turningOn ? 'Loading follow-ups…' : 'Loading all conversations…'}</h3>
+                    <h3>${newMode === 'due' ? 'Loading follow-ups that are due…' : turningOn ? 'Loading follow-ups…' : 'Loading all conversations…'}</h3>
                 </div>`;
             await loadConversations();
-        };
+        }
+
+        // Follow-ups-DUE mode: keep a thread if its next follow-up is due now (or due but blocked by
+        // missing BDR setup — still worth seeing), or it already has a drafted follow-up waiting.
+        // Uses computeFollowUpsDueNow(), the exact rules behind the "due now" circle.
+        function filterToFollowUpsDue(conversations) {
+            const { due, blocked } = computeFollowUpsDueNow(conversations);
+            const keep = new Set([...due, ...blocked].map(item => item.id));
+            return conversations.filter(c => keep.has(c.id) || conversationHasFollowUpDraft(c));
+        }
 
         // Toggle a filter that shows ONLY conversations with a pending AI-suggested category change —
         // makes it easy to review/triage suggestions (which live in a banner buried inside each card)
@@ -4750,6 +4882,12 @@
             if (showOnlyFollowUpDrafts) {
                 filtered = filtered.filter(conversationHasFollowUpDraft);
                 console.log(`📨 Follow-up drafts filter: ${filtered.length} conversations with a draft ready to send`);
+            }
+
+            // Apply AI-flagged-needs-follow-up filter
+            if (showOnlyAiFollowUpFlags) {
+                filtered = filtered.filter(convHasActiveAiFollowUpFlag);
+                console.log(`🔔 AI-flagged filter: ${filtered.length} conversations flagged as needing a follow-up`);
             }
 
             // Apply wrong contacts filter
@@ -5146,6 +5284,92 @@
                 button.disabled = false;
                 button.innerHTML = '<i class="fas fa-list-check"></i> Draft Follow-Up Sequences';
             }
+        }
+
+        // Manually fires the same server-side job that Railway runs automatically every Wednesday
+        // at 9:00 PM Mountain (startWeeklyFollowUpSequenceScan in server.js): AI follow-up count for
+        // every active BDR, then draft follow-up sequences. It runs entirely on the server, so the
+        // page only starts it and shows progress — closing the tab does not stop it.
+        let weeklyRunPollTimer = null;
+        let weeklyRunPollFailures = 0;
+        window.triggerWeeklyFollowUpRunNow = async function() {
+            if (!confirm('Run the weekly follow-up job now for ALL active BDRs across ALL companies?\n\n1. AI "Scan for Number of Follow-Ups" (raise-only — counts are never lowered)\n2. "Draft Follow-Up Sequences"\n\nExisting un-sent follow-up drafts are replaced. Nothing is sent automatically. This runs on the server, so you can close this page.')) return;
+
+            const button = document.getElementById('weeklyRunNowBtn');
+            const progress = document.getElementById('sequenceScanProgress');
+            const originalHtml = button.innerHTML;
+            button.disabled = true;
+            button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starting…';
+            progress.style.display = 'block';
+            progress.innerHTML = '<p style="color: #92400e; font-weight: 600; background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">⏳ Starting weekly follow-up job…</p>';
+
+            try {
+                const token = await window.auth.currentUser.getIdToken();
+                const resp = await fetch(`${RAILWAY_URL}/api/connect/scan-followup-sequence-weekly-now`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                    body: '{}'
+                });
+                const result = await resp.json();
+                if (!result.success || !result.jobId) throw new Error(result.error || 'Failed to start weekly run');
+                weeklyRunPollFailures = 0;
+                button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Running…';
+                pollWeeklyFollowUpRun(result.jobId, result.bdrCount, originalHtml);
+            } catch (error) {
+                console.error('❌ Weekly follow-up run error:', error);
+                progress.innerHTML = `<p style="color: #dc2626; font-weight: 600; background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">❌ Error: ${escapeHtml(error.message)}</p>`;
+                button.disabled = false;
+                button.innerHTML = originalHtml;
+            }
+        };
+
+        function pollWeeklyFollowUpRun(jobId, bdrCount, originalHtml) {
+            clearTimeout(weeklyRunPollTimer);
+            weeklyRunPollTimer = setTimeout(async () => {
+                const button = document.getElementById('weeklyRunNowBtn');
+                const progress = document.getElementById('sequenceScanProgress');
+                const finish = () => { button.disabled = false; button.innerHTML = originalHtml; };
+                try {
+                    const token = await window.auth.currentUser.getIdToken();
+                    const resp = await fetch(`${RAILWAY_URL}/api/connect/generation-job/${jobId}`, { headers: { 'Authorization': `Bearer ${token}` } });
+                    const data = await resp.json();
+                    weeklyRunPollFailures = 0;
+                    const job = data.job || data;
+                    const pct = job.progress?.percentage || 0;
+                    const msg = job.progress?.message || job.status || '…';
+                    const box = (color, html) => `<div style="color:${color}; font-weight:600; background:white; padding:1rem; border-radius:8px; margin-top:1rem; line-height:1.6;">${html}</div>`;
+
+                    if (job.status === 'completed' && job.results) {
+                        const r = job.results;
+                        progress.innerHTML = box('#10b981', `✅ Weekly follow-up job complete (${bdrCount} BDRs)<div style="color:#4a5568; font-weight:400; font-size:0.9rem;">Follow-up counts: checked ${r.countsChecked || 0}, raised ${r.countsRaised || 0}, unchanged threads skipped ${r.countsUnchangedThread || 0}, errors ${r.countErrors || 0}<br>Scanned: ${r.scanned} | Drafts ready: ${r.drafted} | Sequence complete: ${r.complete} | Too soon: ${r.tooSoon || 0} | Needs human reply: ${r.needsHumanReply || 0} | Errors: ${r.errors}<br>📨 Reload and use the <strong>"Follow-Ups Ready"</strong> filter to review the drafts.</div>`);
+                        finish();
+                        setTimeout(() => { loadConversations(); }, 2000);
+                    } else if (job.status === 'failed') {
+                        progress.innerHTML = box('#dc2626', `❌ Weekly run failed: ${escapeHtml(job.error || 'Job failed')}<div style="color:#4a5568; font-weight:400; font-size:0.9rem;">Anything already drafted is saved. Click the button again to resume.</div>`);
+                        finish();
+                    } else if (job.status === 'interrupted') {
+                        progress.innerHTML = box('#b45309', '⚠️ The weekly run stopped reporting progress (the server likely restarted mid-run). Drafts and counts already saved are kept — click the button again to resume.');
+                        finish();
+                    } else {
+                        progress.innerHTML = `
+                            <div style="background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">
+                                <p style="color: #92400e; font-weight: 600; margin: 0 0 0.5rem;"><i class="fas fa-spinner fa-spin"></i> Weekly job (${bdrCount} BDRs): ${escapeHtml(msg)}</p>
+                                <div style="background:#e2e8f0; border-radius:999px; height:6px; overflow:hidden;">
+                                    <div style="height:100%; width:${pct}%; background:linear-gradient(90deg,#b45309,#f59e0b); border-radius:999px; transition:width 0.4s;"></div>
+                                </div>
+                                <p style="color:#6b7280; font-size:0.8rem; margin:0.5rem 0 0;">Running on the server — it's safe to close this page. Job ID: ${escapeHtml(jobId)}</p>
+                            </div>`;
+                        pollWeeklyFollowUpRun(jobId, bdrCount, originalHtml);
+                    }
+                } catch (error) {
+                    console.error('❌ Weekly run poll error:', error);
+                    weeklyRunPollFailures++;
+                    if (weeklyRunPollFailures >= 5) {
+                        progress.innerHTML = `<p style="color: #b45309; font-weight: 600; background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">⚠️ Having trouble reaching the server (${weeklyRunPollFailures} failed checks in a row) — still retrying. The job keeps running on Railway regardless. Job ID: ${escapeHtml(jobId)}</p>`;
+                    }
+                    pollWeeklyFollowUpRun(jobId, bdrCount, originalHtml);
+                }
+            }, 5000);
         }
 
         // Merge drafts published on the job doc (draftsLive) into the already-loaded conversation
@@ -6636,6 +6860,14 @@
                 
                 // Load CRM notes, category overrides, and harvest pool tags in parallel
                 await Promise.all([loadCRMNotes(), loadCategoryOverrides(), loadHarvestDataForFilter()]);
+
+                // Follow-ups-DUE mode: the loaders fetched every thread with 1-2 invites sent; now that
+                // category overrides are applied, narrow to the ones whose next follow-up is due.
+                if (followUpsDueMode) {
+                    const beforeCount = allConversations.length;
+                    allConversations = filterToFollowUpsDue(allConversations);
+                    console.log(`📅 Follow-ups-due: kept ${allConversations.length}/${beforeCount} threads`);
+                }
                 
                 // Debug: Check if Layne is in the final list
                 const layneConv = allConversations.find(c => {
@@ -6678,12 +6910,14 @@
                 updateNotPandoCount();
                 updateSuggestedCount();
                 updateFollowUpDraftCount();
+                updateAiFollowUpFlagCount();
 
                 // Update follow-up date counts from localStorage
                 if (typeof updateFollowUpDateCounts === 'function') updateFollowUpDateCounts();
 
                 // Follow-ups-only mode: land directly on the drafts (the "Follow-Ups Ready" filter)
-                if (followUpsOnlyMode && !showOnlyFollowUpDrafts) {
+                // (Due mode shows every loaded thread instead — they are all due or already drafted.)
+                if (followUpsOnlyMode && !followUpsDueMode && !showOnlyFollowUpDrafts) {
                     window.toggleShowOnlyFollowUpDrafts(); // also calls applyAllFilters()
                 }
                 updateFollowUpsOnlyModeUi();
@@ -6792,7 +7026,12 @@
                     const data = doc.data();
                     const conversation = allConversations.find(c => c.id === data.conversationId);
                     if (conversation) {
-                        conversation.manualCategoryOverride = data.manualCategoryOverride;
+                        // Only overwrite when the doc actually carries the field — flag-only docs
+                        // (client-review flag, AI follow-up flag) don't, and must not wipe a lock
+                        // that came from the conversation's own document.
+                        if (data.manualCategoryOverride !== undefined) conversation.manualCategoryOverride = data.manualCategoryOverride;
+                        // AI "needs a follow-up" flag from the Other Follow-Up Opportunities scan
+                        if (data.aiFollowUpFlag) conversation.aiFollowUpFlag = data.aiFollowUpFlag;
                         // IMPORTANT: only apply the stored responseCategory/followUpCategory when this
                         // override doc represents a real human lock (manualCategoryOverride === true).
                         // Actions like ignoreConversation()/toggleClientReviewFlag() also write to this
@@ -8785,6 +9024,23 @@
                         </div>
                     ` : ''}
 
+                    ${convHasActiveAiFollowUpFlag(conv) ? `
+                        <div class="ai-followup-flag-banner" style="padding: 0.9rem 2rem; background: #fffbeb; border-top: 2px solid #fcd34d; border-bottom: 2px solid #fcd34d;">
+                            <div style="display:flex; align-items:flex-start; gap:0.6rem;">
+                                <i class="fas fa-bell" style="color:#d97706; margin-top:3px;"></i>
+                                <div style="flex:1;">
+                                    <div style="font-weight:600; color:#78350f;">
+                                        AI flagged: this conversation looks like it needs a follow-up
+                                        <span style="font-weight:700; font-size:0.75rem; padding:0.1rem 0.5rem; border-radius:999px; margin-left:0.35rem; background:${conv.aiFollowUpFlag.urgency === 'high' ? '#fee2e2' : conv.aiFollowUpFlag.urgency === 'low' ? '#f3f4f6' : '#fef3c7'}; color:${conv.aiFollowUpFlag.urgency === 'high' ? '#991b1b' : conv.aiFollowUpFlag.urgency === 'low' ? '#4b5563' : '#92400e'};">${escapeHtml(conv.aiFollowUpFlag.urgency || 'medium')} priority</span>
+                                    </div>
+                                    ${conv.aiFollowUpFlag.reason ? `<div style="font-size:0.85rem; color:#92400e; margin-top:0.3rem; font-style:italic;">"${escapeHtml(conv.aiFollowUpFlag.reason)}"</div>` : ''}
+                                    <div style="font-size:0.75rem; color:#a16207; margin-top:0.3rem;">No follow-up drafted — flag only${conv.aiFollowUpFlag.flaggedOn ? ` · flagged ${escapeHtml(conv.aiFollowUpFlag.flaggedOn)}` : ''}. Goes away on its own once the thread has a new message.</div>
+                                </div>
+                                <button class="btn btn-secondary" onclick="dismissAiFollowUpFlag('${conv.id}')"><i class="fas fa-times"></i> Dismiss</button>
+                            </div>
+                        </div>
+                    ` : ''}
+
                     ${buildDelayedReplyBannerHtml(conv.id)}
 
                     <!-- Conversation Section -->
@@ -9910,6 +10166,11 @@
             return allConversations.filter(conv => {
                 if ((conv.responseCategory || '') === 'Scheduled') return false;
                 if ((conv.followUpCategory || 'No Follow Up') === 'Qualified Wrong Contact') return false;
+                // Never count conversations that didn't originate from us — the prospect messaged
+                // first, or the contact isn't in our connect queue. Same definition as the gray
+                // "Not Pando Outreach" / "Inbound" cards, and the server-side scans'
+                // conversationStartedByUs() check, so the count never gets written to those.
+                if (isNotPandoOriginated(conv)) return false;
                 const msgs = conv.messages || conv.rawData?.messages || [];
                 if (!msgs.length) return false;
                 return msgs.some(m => m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound');
@@ -9980,7 +10241,7 @@
 
             const eligible = getEligibleFollowUpCountConversations();
             if (eligible.length === 0) {
-                alert('No eligible conversations to scan (everything is Scheduled, marked Wrong Contact, or has no BDR messages).');
+                alert('No eligible conversations to scan (everything is Scheduled, marked Wrong Contact, not started by us, or has no BDR messages).');
                 return;
             }
 
@@ -10044,7 +10305,7 @@
             const eligible = getEligibleFollowUpCountConversations();
 
             if (eligible.length === 0) {
-                alert('No eligible conversations to scan (everything is Scheduled, marked Wrong Contact, or has no BDR messages).');
+                alert('No eligible conversations to scan (everything is Scheduled, marked Wrong Contact, not started by us, or has no BDR messages).');
                 return;
             }
 
@@ -10235,6 +10496,325 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer �
                     </div>
                     <div style="padding: 0.9rem 1.25rem; border-top: 1px solid #e5e7eb; text-align: right;">
                         <button onclick="document.getElementById('fuCountScanResultsModal').remove()" style="background: ${accent}; color: white; border: none; padding: 0.55rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer;">Close</button>
+                    </div>
+                </div>`;
+            modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+            document.body.appendChild(modal);
+        }
+
+        // ══════════════════════════════════════════════════════════════════════════════════════
+        // "Scan for Other Follow-Up Opportunities"
+        // A cheap AI pass over every loaded conversation that ISN'T already covered by a drafted or
+        // due follow-up, asking one question: does this thread look like it needs a follow-up now?
+        // Positives get an `aiFollowUpFlag` (amber banner + "AI-Flagged Needs Follow-Up" filter).
+        // The AI never writes the follow-up — it only flags. Every message is sent with its date,
+        // along with today's date, so "reach back out in January" or "went quiet 5 weeks ago" can be
+        // judged against the calendar.
+        // ══════════════════════════════════════════════════════════════════════════════════════
+        const OTHER_FOLLOWUP_SCAN_MODEL = 'deepseek/deepseek-v4.1-flash';
+        const OTHER_FOLLOWUP_SCAN_CONCURRENCY = 5;
+        const OTHER_FOLLOWUP_DISMISS_QUIET_DAYS = 14; // a dismissed flag isn't re-raised for this long (unless the thread changes)
+        const OTHER_FOLLOWUP_MAX_MESSAGES = 30;        // most recent messages sent to the AI
+        const OTHER_FOLLOWUP_MAX_CHARS_PER_MESSAGE = 700;
+
+        // Which loaded conversations the scan looks at: two-way threads WE started that have no
+        // drafted/due follow-up of their own and don't already show up as "needs our reply".
+        function getOtherFollowUpScanCandidates() {
+            const { due, blocked } = computeFollowUpsDueNow(allConversations);
+            const dueIds = new Set([...due, ...blocked].map(item => item.id));
+            const now = Date.now();
+            const n = new Date();
+            const todayStr = `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
+
+            return allConversations.filter(conv => {
+                if (conv.ignored || conv.isCurrentlyIgnored) return false;
+                const rc = conv.responseCategory || 'Response';
+                if (rc === 'Scheduled' || rc === 'Declined to Meet') return false;
+                if ((conv.followUpCategory || 'No Follow Up') === 'Qualified Wrong Contact') return false;
+                if (isNotPandoOriginated(conv)) return false;
+
+                const msgs = conv.messages || conv.rawData?.messages || [];
+                const hasBdr = msgs.some(m => m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound');
+                const hasProspect = msgs.some(m => m.sender === 'CORRESPONDENT' || m.sender === 'lead' || m.direction === 'inbound');
+                if (!hasBdr || !hasProspect) return false;
+
+                if (conversationHasFollowUpDraft(conv)) return false;   // already has a drafted follow-up
+                if (dueIds.has(conv.id)) return false;                  // follow-up already due via the sequence
+                if (conversationNeedsReply(conv)) return false;         // prospect spoke last — "Needs Our Reply" already covers it
+                if (conv.followUpWaitingSinceMessageCount != null && conv.followUpWaitingSinceMessageCount >= msgs.length) return false; // deliberately paused
+
+                // A future Follow-Up Scheduler date means the user already deferred this one.
+                const scheduled = typeof getFollowUpForConv === 'function' ? getFollowUpForConv(conv.id) : null;
+                if (scheduled && scheduled.date && scheduled.date > todayStr) return false;
+
+                // Dismissed by a human and nothing has changed since — leave it alone for a while.
+                const f = conv.aiFollowUpFlag;
+                if (f && f.dismissed && msgs.length <= (f.messageCount || 0)) {
+                    const dismissedAt = safeToDate(f.dismissedAt);
+                    if (dismissedAt && (now - dismissedAt.getTime()) < OTHER_FOLLOWUP_DISMISS_QUIET_DAYS * 86400000) return false;
+                }
+                return true;
+            });
+        }
+
+        function buildOtherFollowUpScanPrompt(conv) {
+            const msgs = conv.messages || conv.rawData?.messages || [];
+            const now = new Date();
+            const dayMs = 86400000;
+            const fmtDate = (d) => d.toLocaleDateString('en-CA'); // YYYY-MM-DD
+            const todayLabel = `${now.toLocaleDateString('en-US', { weekday: 'long' })}, ${fmtDate(now)}`;
+
+            const leadName = (conv.leadFirstName && conv.leadLastName)
+                ? `${conv.leadFirstName} ${conv.leadLastName}`
+                : (conv.lead_name || conv.leadName || conv.leadFirstName || 'the prospect');
+            const bdrLabel = conv.bdrEmail || 'our BDR';
+
+            const items = msgs.map(m => ({
+                isBdr: m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound',
+                date: safeToDate(m.createdAt || m.timestamp || m.date),
+                body: String(m.body || m.text || m.message || '').replace(/\s+/g, ' ').trim()
+            }));
+            const validDates = (arr) => arr.map(i => i.date).filter(d => d && !isNaN(d));
+            const lastOf = (arr) => { const ds = validDates(arr); return ds.length ? new Date(Math.max(...ds.map(d => d.getTime()))) : null; };
+            const firstOf = (arr) => { const ds = validDates(arr); return ds.length ? new Date(Math.min(...ds.map(d => d.getTime()))) : null; };
+            const daysAgo = (d) => d ? Math.floor((now.getTime() - d.getTime()) / dayMs) : null;
+            const describe = (d) => d ? `${fmtDate(d)} (${daysAgo(d)} days ago)` : 'unknown';
+
+            const lastBdr = lastOf(items.filter(i => i.isBdr));
+            const lastProspect = lastOf(items.filter(i => !i.isBdr));
+            const firstMsg = firstOf(items);
+
+            const shown = items.slice(-OTHER_FOLLOWUP_MAX_MESSAGES);
+            const omitted = items.length - shown.length;
+            const transcript = shown.map((i, idx) => {
+                const body = i.body.length > OTHER_FOLLOWUP_MAX_CHARS_PER_MESSAGE ? i.body.slice(0, OTHER_FOLLOWUP_MAX_CHARS_PER_MESSAGE) + '…' : i.body;
+                const when = i.date && !isNaN(i.date) ? `${fmtDate(i.date)}, ${daysAgo(i.date)} days ago` : 'date unknown';
+                return `[${omitted + idx + 1}] (${when}) ${i.isBdr ? 'BDR' : 'PROSPECT'}: ${body}`;
+            }).join('\n');
+
+            const rc = conv.responseCategory || 'Response';
+            return `TODAY'S DATE: ${todayLabel}
+
+You are helping a BDR team decide which LinkedIn conversations deserve a follow-up. Below is a conversation between our BDR (${bdrLabel}) and the prospect ${leadName}. Every message is labeled with the date it was sent and how many days ago that was, counted from today's date above.
+
+CONVERSATION FACTS
+- First message: ${describe(firstMsg)}
+- Last message from the BDR: ${describe(lastBdr)}
+- Last message from the prospect: ${describe(lastProspect)}
+- Total messages: ${items.length}${omitted > 0 ? ` (only the most recent ${shown.length} are shown below)` : ''}
+- Our current category for this contact: ${rc}
+- Meeting invitations the BDR has already sent: ${conv.followUpInvitesSent || 0}
+
+CONVERSATION
+${transcript}
+
+TASK
+Decide whether this conversation NEEDS A FOLLOW-UP from the BDR right now. Do NOT write the follow-up message — only flag whether one is needed.
+
+Flag it (needsFollowUp = true) when, judged against TODAY'S DATE:
+- The prospect showed interest or engagement, and the conversation stalled after the BDR's last message with no response for a meaningful stretch of time.
+- The prospect said to reach back out later (e.g. "next quarter", "after the holidays", "in January") and that time has now arrived or is close.
+- The prospect said they would check with someone, look into it, or get back to us, and has gone quiet since.
+- A meeting or call was discussed but never actually got scheduled, or seems to have fallen through.
+
+Do NOT flag it (needsFollowUp = false) when:
+- The prospect declined, said they are not interested, asked us to stop, or is clearly the wrong contact / left the company.
+- A meeting is already scheduled or has already taken place.
+- The last messages are very recent and there is no reason to nudge yet.
+- The thread ended naturally (thank-yous, polite closings) with no open loop.
+- The prospect asked for a time that has not arrived yet.
+
+Respond ONLY with valid JSON (no markdown, no code fences):
+{"needsFollowUp": true or false, "urgency": "high" | "medium" | "low", "reason": "one or two sentences citing the specific message dates that led to your decision"}`;
+        }
+
+        async function askAiIfConversationNeedsFollowUp(conv) {
+            const prompt = buildOtherFollowUpScanPrompt(conv);
+            let lastError = null;
+            for (let attempt = 1; attempt <= 2; attempt++) {
+                try {
+                    const aiData = await fetchJsonWithTimeout(`${RAILWAY_URL}/api/ai-profile-eval`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            provider: 'openrouter',
+                            model: OTHER_FOLLOWUP_SCAN_MODEL,
+                            prompt,
+                            temperature: 0.1,
+                            max_tokens: 1000,
+                            lowReasoning: true
+                        })
+                    }, 120000);
+                    if (aiData.success === false) throw new Error(aiData.error || 'AI call failed');
+                    const raw = (aiData.message || aiData.response || '').trim();
+                    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+                    const match = cleaned.match(/\{[\s\S]*\}/);
+                    if (!match) throw new Error('AI did not return JSON');
+                    const parsed = JSON.parse(match[0]);
+                    if (typeof parsed.needsFollowUp !== 'boolean') throw new Error('AI did not return needsFollowUp true/false');
+                    const urgency = ['high', 'medium', 'low'].includes(parsed.urgency) ? parsed.urgency : 'medium';
+                    return { needsFollowUp: parsed.needsFollowUp, urgency, reason: String(parsed.reason || '').trim().slice(0, 500) };
+                } catch (e) {
+                    lastError = e;
+                    if (attempt < 2) await new Promise(r => setTimeout(r, 2000));
+                }
+            }
+            throw lastError || new Error('AI call failed');
+        }
+
+        // Stored on the conversation's conversation_category_overrides doc (same place the
+        // client-review flag and ignore state live), keyed by the conversation's own BDR.
+        async function saveAiFollowUpFlag(conv, flag) {
+            const { doc, setDoc } = window.clemailFirestore;
+            const bdr = (conv.bdrEmail || accountEmail || '').toLowerCase();
+            const overrideRef = doc(emailDB, 'conversation_category_overrides', `${conv.id}_${bdr.replace(/[^a-zA-Z0-9]/g, '_')}`);
+            await setDoc(overrideRef, {
+                conversationId: conv.id,
+                bdrEmail: bdr,
+                aiFollowUpFlag: flag,
+                aiFollowUpFlagUpdatedAt: new Date()
+            }, { merge: true });
+        }
+
+        window.dismissAiFollowUpFlag = async function(convId) {
+            const conv = allConversations.find(c => c.id === convId);
+            if (!conv || !conv.aiFollowUpFlag) return;
+            try {
+                const updated = { ...conv.aiFollowUpFlag, dismissed: true, dismissedAt: new Date(), dismissedBy: currentUserEmail };
+                await saveAiFollowUpFlag(conv, updated);
+                conv.aiFollowUpFlag = updated;
+                updateAiFollowUpFlagCount();
+                applyAllFilters();
+            } catch (error) {
+                console.error('❌ Failed to dismiss AI follow-up flag:', error);
+                alert('❌ Could not dismiss the flag: ' + error.message);
+            }
+        };
+
+        window.scanForOtherFollowUpOpportunities = async function() {
+            if (followUpsOnlyMode) {
+                alert('This scan looks at the OTHER conversations, which the follow-ups-only views don\'t load.\n\nTurn off "Load Only Follow-Ups" / "Load Only Follow-Ups Due" first so everything is loaded, then run it again.');
+                return;
+            }
+            const candidates = getOtherFollowUpScanCandidates();
+            if (candidates.length === 0) {
+                alert('Nothing to scan — every loaded conversation either already has a follow-up drafted/due, is waiting on our reply, is scheduled/declined/wrong contact, or didn\'t start with us.');
+                return;
+            }
+            if (!confirm(`Scan ${candidates.length} other conversation${candidates.length === 1 ? '' : 's'} for ones that need a follow-up?\n\nThe AI (${OTHER_FOLLOWUP_SCAN_MODEL}, low cost) reads each thread with today's date and every message date, and FLAGS the ones that look like they need a follow-up. It does not write any follow-ups, and nothing is sent.`)) return;
+
+            const button = document.getElementById('otherFollowUpScanBtn');
+            const originalHtml = button.innerHTML;
+            button.disabled = true;
+
+            const resolveName = (conv) => (conv.leadFirstName && conv.leadLastName) ? `${conv.leadFirstName} ${conv.leadLastName}` : (conv.lead_name || conv.leadName || conv.leadFirstName || 'Unknown');
+            const todayLabel = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+            const results = [];
+            let nextIdx = 0;
+            let done = 0;
+
+            const worker = async () => {
+                while (nextIdx < candidates.length) {
+                    const conv = candidates[nextIdx++];
+                    const label = { id: conv.id, name: resolveName(conv), company: conv.companyName || conv.leadCompany || conv.company || '', bdr: conv.bdrEmail || '' };
+                    try {
+                        const verdict = await askAiIfConversationNeedsFollowUp(conv);
+                        const msgCount = (conv.messages || conv.rawData?.messages || []).length;
+                        if (verdict.needsFollowUp) {
+                            const flag = {
+                                needsFollowUp: true,
+                                urgency: verdict.urgency,
+                                reason: verdict.reason,
+                                messageCount: msgCount,
+                                flaggedAt: new Date(),
+                                flaggedOn: todayLabel,
+                                model: OTHER_FOLLOWUP_SCAN_MODEL,
+                                dismissed: false
+                            };
+                            await saveAiFollowUpFlag(conv, flag);
+                            conv.aiFollowUpFlag = flag;
+                            results.push({ ...label, ok: true, flagged: true, urgency: verdict.urgency, reason: verdict.reason });
+                        } else {
+                            // A flag from an earlier scan that no longer holds is cleared.
+                            let cleared = false;
+                            if (conv.aiFollowUpFlag && conv.aiFollowUpFlag.needsFollowUp) {
+                                await saveAiFollowUpFlag(conv, null);
+                                conv.aiFollowUpFlag = null;
+                                cleared = true;
+                            }
+                            results.push({ ...label, ok: true, flagged: false, cleared, reason: verdict.reason });
+                        }
+                    } catch (error) {
+                        console.error(`❌ Other-follow-up scan failed for ${conv.id}:`, error);
+                        results.push({ ...label, ok: false, error: error.message });
+                    } finally {
+                        done++;
+                        button.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Scanning ${done}/${candidates.length}…`;
+                    }
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(OTHER_FOLLOWUP_SCAN_CONCURRENCY, candidates.length) }, worker));
+
+            button.disabled = false;
+            button.innerHTML = originalHtml;
+            updateAiFollowUpFlagCount();
+            applyAllFilters();
+            showOtherFollowUpScanResults(results, candidates.length);
+        };
+
+        function showOtherFollowUpScanResults(results, scannedTotal) {
+            const existing = document.getElementById('otherFollowUpScanResultsModal');
+            if (existing) existing.remove();
+
+            const flagged = results.filter(r => r.ok && r.flagged);
+            const notFlagged = results.filter(r => r.ok && !r.flagged);
+            const cleared = notFlagged.filter(r => r.cleared).length;
+            const failed = results.filter(r => !r.ok);
+            const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const urgencyRank = { high: 0, medium: 1, low: 2 };
+            flagged.sort((a, b) => (urgencyRank[a.urgency] ?? 1) - (urgencyRank[b.urgency] ?? 1));
+
+            const urgencyColors = { high: ['#fee2e2', '#991b1b'], medium: ['#fef3c7', '#92400e'], low: ['#f3f4f6', '#4b5563'] };
+            const flaggedRows = flagged.map(r => {
+                const [bg, fg] = urgencyColors[r.urgency] || urgencyColors.medium;
+                return `<div style="padding: 0.75rem 1rem; border-bottom: 1px solid #f3f4f6;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;">
+                        <div style="font-weight: 600; color: #111827;">${esc(r.name)}${r.company ? ` — ${esc(r.company)}` : ''}</div>
+                        <span style="background: ${bg}; color: ${fg}; font-weight: 700; padding: 0.1rem 0.55rem; border-radius: 999px; font-size: 0.78rem; white-space: nowrap;">${esc(r.urgency)} priority</span>
+                    </div>
+                    ${r.bdr ? `<div style="font-size: 0.78rem; color: #6b7280;">BDR: ${esc(r.bdr)}</div>` : ''}
+                    <div style="font-size: 0.83rem; color: #4b5563; margin-top: 0.25rem;">🔔 ${esc(r.reason)}</div>
+                </div>`;
+            }).join('') || '<div style="padding: 1.25rem; text-align: center; color: #6b7280;">No conversations were flagged as needing a follow-up.</div>';
+
+            const failedHtml = failed.length ? `
+                <div style="margin-top: 1rem;">
+                    <div style="font-size: 0.85rem; font-weight: 700; color: #b91c1c; margin-bottom: 0.5rem;">❌ ${failed.length} failed</div>
+                    <div style="border: 1px solid #fecaca; border-radius: 10px; overflow: hidden;">
+                        ${failed.map(r => `<div style="padding: 0.6rem 1rem; border-bottom: 1px solid #fee2e2; background: #fef2f2; font-size: 0.83rem;"><strong>${esc(r.name)}</strong> — ${esc(r.error)}</div>`).join('')}
+                    </div>
+                </div>` : '';
+
+            const modal = document.createElement('div');
+            modal.id = 'otherFollowUpScanResultsModal';
+            modal.style.cssText = 'position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 10000; display: flex; align-items: center; justify-content: center; padding: 1.5rem;';
+            modal.innerHTML = `
+                <div style="background: white; border-radius: 14px; max-width: 680px; width: 100%; max-height: 85vh; display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(0,0,0,0.3);">
+                    <div style="padding: 1.1rem 1.25rem; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center;">
+                        <h3 style="margin: 0; font-size: 1.05rem; color: #111827;"><i class="fas fa-bell" style="color: #d97706;"></i> Other Follow-Up Opportunities</h3>
+                        <button onclick="document.getElementById('otherFollowUpScanResultsModal').remove()" style="background: none; border: none; font-size: 1.3rem; color: #6b7280; cursor: pointer; line-height: 1;">&times;</button>
+                    </div>
+                    <div style="padding: 1rem 1.25rem; overflow-y: auto;">
+                        <div style="font-size: 0.88rem; color: #374151; margin-bottom: 0.75rem;">
+                            Scanned ${scannedTotal} · 🔔 ${flagged.length} flagged as needing a follow-up · ${notFlagged.length} look fine${cleared ? ` (${cleared} earlier flag${cleared === 1 ? '' : 's'} cleared)` : ''}${failed.length ? ` · ❌ ${failed.length} failed` : ''}
+                            <div style="font-size: 0.78rem; color: #6b7280; margin-top: 0.2rem;">No follow-ups were written — flagged cards show an amber banner and appear under "AI-Flagged Needs Follow-Up".</div>
+                        </div>
+                        <div style="border: 1px solid #e5e7eb; border-radius: 10px; overflow: hidden;">${flaggedRows}</div>
+                        ${failedHtml}
+                    </div>
+                    <div style="padding: 0.9rem 1.25rem; border-top: 1px solid #e5e7eb; display: flex; justify-content: flex-end; gap: 0.6rem;">
+                        ${flagged.length ? `<button onclick="document.getElementById('otherFollowUpScanResultsModal').remove(); if (!showOnlyAiFollowUpFlags) toggleShowOnlyAiFollowUpFlags();" style="background: #fffbeb; color: #92400e; border: 1px solid #fcd34d; padding: 0.55rem 1.2rem; border-radius: 8px; font-weight: 600; cursor: pointer;"><i class="fas fa-bell"></i> Show flagged only</button>` : ''}
+                        <button onclick="document.getElementById('otherFollowUpScanResultsModal').remove()" style="background: #d97706; color: white; border: none; padding: 0.55rem 1.4rem; border-radius: 8px; font-weight: 600; cursor: pointer;">Close</button>
                     </div>
                 </div>`;
             modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
@@ -11500,8 +12080,8 @@ Respond ONLY with valid JSON (no markdown, no code fences): {"count": <integer �
                     
                     updateFollowUpsOnlyModeUi();
                     if (followUpsOnlyMode) {
-                        // ?followUps=1 — open every BDR's drafted follow-ups in this one window
-                        console.log('⚡ Follow-ups-only mode — opening All BDRs');
+                        // ?followUps=1 / ?followUpsDue=1 — open every BDR's follow-ups in this one window
+                        console.log(`⚡ Follow-ups-${followUpsDueMode ? 'due' : 'only'} mode — opening All BDRs`);
                         const companySelector = document.getElementById('bdrSelect');
                         companySelector.value = '__ALL_BDRS__';
                         companySelector.dispatchEvent(new Event('change'));
