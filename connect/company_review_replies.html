@@ -2089,6 +2089,10 @@
                     <i class="fas fa-bell"></i>
                     Scan for Other Follow-Up Opportunities
                 </button>
+                <button id="otherFollowUpFlagJobBtn" onclick="triggerOtherFollowUpFlagJobNow()" style="background: linear-gradient(135deg, #ca8a04 0%, #854d0e 100%); box-shadow: 0 4px 12px rgba(202,138,4,0.35); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 10px; font-weight: 600; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem;" title="Runs the automated 'other follow-up opportunities' flag job on the server RIGHT NOW for every active BDR across every company (it also runs automatically every Wednesday night, right after the weekly count + draft job). A low-cost AI flags conversations that look like they need a follow-up — it never writes follow-ups, changes counts, or touches drafts. Flagged cards appear under 'AI-Flagged Needs Follow-Up'. You can close this page; it keeps running on Railway.">
+                    <i class="fas fa-bell"></i>
+                    Run Other Follow-Up Flag Job Now (All BDRs)
+                </button>
                 <button id="weeklyRunNowBtn" onclick="triggerWeeklyFollowUpRunNow()" style="background: linear-gradient(135deg, #b45309 0%, #92400e 100%); box-shadow: 0 4px 12px rgba(180,83,9,0.35); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 10px; font-weight: 600; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem;" title="Runs the automated Wednesday-night job on the server RIGHT NOW for every active BDR across every company: AI 'Scan for Number of Follow-Ups' (raise-only), then 'Draft Follow-Up Sequences'. Nothing is sent — drafts land on the cards under 'Follow-Ups Ready'. You can close this page; it keeps running on Railway.">
                     <i class="fas fa-calendar-check"></i>
                     Run Weekly Follow-Up Job Now (All BDRs)
@@ -4515,6 +4519,14 @@
             const rc = c.responseCategory || 'Response';
             if (rc === 'Scheduled' || rc === 'Declined to Meet') return false;
             if ((c.followUpCategory || 'No Follow Up') === 'Qualified Wrong Contact') return false;
+            // Stale once the thread has a message newer than the one the AI judged. Compared by date
+            // when the flag recorded it (the server job and this page can see slightly different
+            // message counts for the same thread, so a count alone could hide a fresh flag).
+            const flaggedLast = safeToDate(f.lastMessageAt);
+            const convLast = getConvLastMessageDate(c);
+            if (flaggedLast && !isNaN(flaggedLast) && convLast) {
+                return convLast.getTime() <= flaggedLast.getTime() + 60 * 1000;
+            }
             const msgCount = (c.messages || c.rawData?.messages || []).length;
             return msgCount <= (f.messageCount || 0);
         }
@@ -5292,41 +5304,64 @@
         // page only starts it and shows progress — closing the tab does not stop it.
         let weeklyRunPollTimer = null;
         let weeklyRunPollFailures = 0;
-        window.triggerWeeklyFollowUpRunNow = async function() {
-            if (!confirm('Run the weekly follow-up job now for ALL active BDRs across ALL companies?\n\n1. AI "Scan for Number of Follow-Ups" (raise-only — counts are never lowered)\n2. "Draft Follow-Up Sequences"\n\nExisting un-sent follow-up drafts are replaced. Nothing is sent automatically. This runs on the server, so you can close this page.')) return;
+        // Two server jobs share this start/poll code (both run on Railway's Wednesday-night cron, in
+        // this order): 'weekly' = count follow-ups + draft sequences, 'flags' = the flag-only
+        // "other follow-up opportunities" pass.
+        const SERVER_FOLLOWUP_JOBS = {
+            weekly: {
+                buttonId: 'weeklyRunNowBtn',
+                endpoint: '/api/connect/scan-followup-sequence-weekly-now',
+                label: 'Weekly follow-up job',
+                confirmText: 'Run the weekly follow-up job now for ALL active BDRs across ALL companies?\n\n1. AI "Scan for Number of Follow-Ups" (raise-only — counts are never lowered)\n2. "Draft Follow-Up Sequences"\n\nExisting un-sent follow-up drafts are replaced. Nothing is sent automatically. This runs on the server, so you can close this page.'
+            },
+            flags: {
+                buttonId: 'otherFollowUpFlagJobBtn',
+                endpoint: '/api/connect/scan-other-followups-now',
+                label: 'Other follow-up flag job',
+                confirmText: 'Run the "other follow-up opportunities" flag job now for ALL active BDRs across ALL companies?\n\nA low-cost AI reads every conversation that has no follow-up drafted or due (with today\'s date and every message date) and FLAGS the ones that look like they need a follow-up.\n\nIt does NOT write follow-ups, change counts, or touch existing drafts. Nothing is sent. This runs on the server, so you can close this page.'
+            }
+        };
 
-            const button = document.getElementById('weeklyRunNowBtn');
+        window.triggerWeeklyFollowUpRunNow = () => startServerFollowUpJob('weekly');
+        window.triggerOtherFollowUpFlagJobNow = () => startServerFollowUpJob('flags');
+
+        async function startServerFollowUpJob(kind) {
+            const cfg = SERVER_FOLLOWUP_JOBS[kind];
+            if (!confirm(cfg.confirmText)) return;
+
+            const button = document.getElementById(cfg.buttonId);
             const progress = document.getElementById('sequenceScanProgress');
             const originalHtml = button.innerHTML;
             button.disabled = true;
             button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starting…';
             progress.style.display = 'block';
-            progress.innerHTML = '<p style="color: #92400e; font-weight: 600; background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">⏳ Starting weekly follow-up job…</p>';
+            progress.innerHTML = `<p style="color: #92400e; font-weight: 600; background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">⏳ Starting ${cfg.label.toLowerCase()}…</p>`;
 
             try {
                 const token = await window.auth.currentUser.getIdToken();
-                const resp = await fetch(`${RAILWAY_URL}/api/connect/scan-followup-sequence-weekly-now`, {
+                const resp = await fetch(`${RAILWAY_URL}${cfg.endpoint}`, {
                     method: 'POST',
                     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
                     body: '{}'
                 });
                 const result = await resp.json();
-                if (!result.success || !result.jobId) throw new Error(result.error || 'Failed to start weekly run');
+                if (!result.success || !result.jobId) throw new Error(result.error || `Failed to start ${cfg.label.toLowerCase()}`);
                 weeklyRunPollFailures = 0;
                 button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Running…';
-                pollWeeklyFollowUpRun(result.jobId, result.bdrCount, originalHtml);
+                pollWeeklyFollowUpRun(result.jobId, result.bdrCount, originalHtml, kind);
             } catch (error) {
                 console.error('❌ Weekly follow-up run error:', error);
                 progress.innerHTML = `<p style="color: #dc2626; font-weight: 600; background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">❌ Error: ${escapeHtml(error.message)}</p>`;
                 button.disabled = false;
                 button.innerHTML = originalHtml;
             }
-        };
+        }
 
-        function pollWeeklyFollowUpRun(jobId, bdrCount, originalHtml) {
+        function pollWeeklyFollowUpRun(jobId, bdrCount, originalHtml, kind = 'weekly') {
+            const cfg = SERVER_FOLLOWUP_JOBS[kind];
             clearTimeout(weeklyRunPollTimer);
             weeklyRunPollTimer = setTimeout(async () => {
-                const button = document.getElementById('weeklyRunNowBtn');
+                const button = document.getElementById(cfg.buttonId);
                 const progress = document.getElementById('sequenceScanProgress');
                 const finish = () => { button.disabled = false; button.innerHTML = originalHtml; };
                 try {
@@ -5341,25 +5376,30 @@
 
                     if (job.status === 'completed' && job.results) {
                         const r = job.results;
-                        progress.innerHTML = box('#10b981', `✅ Weekly follow-up job complete (${bdrCount} BDRs)<div style="color:#4a5568; font-weight:400; font-size:0.9rem;">Follow-up counts: checked ${r.countsChecked || 0}, raised ${r.countsRaised || 0}, unchanged threads skipped ${r.countsUnchangedThread || 0}, errors ${r.countErrors || 0}<br>Scanned: ${r.scanned} | Drafts ready: ${r.drafted} | Sequence complete: ${r.complete} | Too soon: ${r.tooSoon || 0} | Needs human reply: ${r.needsHumanReply || 0} | Errors: ${r.errors}<br>📨 Reload and use the <strong>"Follow-Ups Ready"</strong> filter to review the drafts.</div>`);
+                        if (kind === 'flags') {
+                            const flaggedPreview = (r.flaggedList || []).slice(0, 10).map(f => `<li><strong>${escapeHtml(f.contactName)}</strong>${f.company ? ` — ${escapeHtml(f.company)}` : ''} <span style="color:#92400e;">(${escapeHtml(f.urgency)})</span>: ${escapeHtml(f.reason)}</li>`).join('');
+                            progress.innerHTML = box('#10b981', `✅ ${cfg.label} complete (${bdrCount} BDRs)<div style="color:#4a5568; font-weight:400; font-size:0.9rem;">Checked: ${r.flagsChecked || 0} | 🔔 Flagged as needing a follow-up: ${r.flagsRaised || 0} | Earlier flags cleared: ${r.flagsCleared || 0} | Looked fine: ${r.flagsUnchanged || 0} | Skipped (already covered / waiting on our reply): ${r.flagsSkippedCovered || 0} | Skipped (dismissed): ${r.flagsSkippedDismissed || 0} | Errors: ${r.flagErrors || 0}${flaggedPreview ? `<ul style="margin:0.5rem 0 0 1.1rem; padding:0;">${flaggedPreview}</ul>${(r.flaggedList || []).length > 10 ? `<div>…and ${(r.flaggedList || []).length - 10} more.</div>` : ''}` : ''}<br>🔔 Reload and use the <strong>"AI-Flagged Needs Follow-Up"</strong> filter to review them. No follow-ups were written.</div>`);
+                        } else {
+                            progress.innerHTML = box('#10b981', `✅ Weekly follow-up job complete (${bdrCount} BDRs)<div style="color:#4a5568; font-weight:400; font-size:0.9rem;">Follow-up counts: checked ${r.countsChecked || 0}, raised ${r.countsRaised || 0}, unchanged threads skipped ${r.countsUnchangedThread || 0}, errors ${r.countErrors || 0}<br>Scanned: ${r.scanned} | Drafts ready: ${r.drafted} | Sequence complete: ${r.complete} | Too soon: ${r.tooSoon || 0} | Needs human reply: ${r.needsHumanReply || 0} | Errors: ${r.errors}<br>📨 Reload and use the <strong>"Follow-Ups Ready"</strong> filter to review the drafts.</div>`);
+                        }
                         finish();
                         setTimeout(() => { loadConversations(); }, 2000);
                     } else if (job.status === 'failed') {
-                        progress.innerHTML = box('#dc2626', `❌ Weekly run failed: ${escapeHtml(job.error || 'Job failed')}<div style="color:#4a5568; font-weight:400; font-size:0.9rem;">Anything already drafted is saved. Click the button again to resume.</div>`);
+                        progress.innerHTML = box('#dc2626', `❌ ${cfg.label} failed: ${escapeHtml(job.error || 'Job failed')}<div style="color:#4a5568; font-weight:400; font-size:0.9rem;">Anything already saved is kept. Click the button again to resume.</div>`);
                         finish();
                     } else if (job.status === 'interrupted') {
-                        progress.innerHTML = box('#b45309', '⚠️ The weekly run stopped reporting progress (the server likely restarted mid-run). Drafts and counts already saved are kept — click the button again to resume.');
+                        progress.innerHTML = box('#b45309', `⚠️ The ${cfg.label.toLowerCase()} stopped reporting progress (the server likely restarted mid-run). Anything already saved is kept — click the button again to resume.`);
                         finish();
                     } else {
                         progress.innerHTML = `
                             <div style="background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">
-                                <p style="color: #92400e; font-weight: 600; margin: 0 0 0.5rem;"><i class="fas fa-spinner fa-spin"></i> Weekly job (${bdrCount} BDRs): ${escapeHtml(msg)}</p>
+                                <p style="color: #92400e; font-weight: 600; margin: 0 0 0.5rem;"><i class="fas fa-spinner fa-spin"></i> ${cfg.label} (${bdrCount} BDRs): ${escapeHtml(msg)}</p>
                                 <div style="background:#e2e8f0; border-radius:999px; height:6px; overflow:hidden;">
                                     <div style="height:100%; width:${pct}%; background:linear-gradient(90deg,#b45309,#f59e0b); border-radius:999px; transition:width 0.4s;"></div>
                                 </div>
                                 <p style="color:#6b7280; font-size:0.8rem; margin:0.5rem 0 0;">Running on the server — it's safe to close this page. Job ID: ${escapeHtml(jobId)}</p>
                             </div>`;
-                        pollWeeklyFollowUpRun(jobId, bdrCount, originalHtml);
+                        pollWeeklyFollowUpRun(jobId, bdrCount, originalHtml, kind);
                     }
                 } catch (error) {
                     console.error('❌ Weekly run poll error:', error);
@@ -5367,7 +5407,7 @@
                     if (weeklyRunPollFailures >= 5) {
                         progress.innerHTML = `<p style="color: #b45309; font-weight: 600; background: white; padding: 1rem; border-radius: 8px; margin-top: 1rem;">⚠️ Having trouble reaching the server (${weeklyRunPollFailures} failed checks in a row) — still retrying. The job keeps running on Railway regardless. Job ID: ${escapeHtml(jobId)}</p>`;
                     }
-                    pollWeeklyFollowUpRun(jobId, bdrCount, originalHtml);
+                    pollWeeklyFollowUpRun(jobId, bdrCount, originalHtml, kind);
                 }
             }, 5000);
         }
@@ -7031,7 +7071,16 @@
                         // that came from the conversation's own document.
                         if (data.manualCategoryOverride !== undefined) conversation.manualCategoryOverride = data.manualCategoryOverride;
                         // AI "needs a follow-up" flag from the Other Follow-Up Opportunities scan
-                        if (data.aiFollowUpFlag) conversation.aiFollowUpFlag = data.aiFollowUpFlag;
+                        // The server job and this page can each write their own override doc for the
+                        // same conversation, so when several carry a flag the most recently written
+                        // one wins (a cleared flag is stored as null, which must also be able to win).
+                        if ('aiFollowUpFlag' in data) {
+                            const flagStamp = safeToDate(data.aiFollowUpFlagUpdatedAt)?.getTime() || 0;
+                            if (flagStamp >= (conversation._aiFlagStamp || 0)) {
+                                conversation.aiFollowUpFlag = data.aiFollowUpFlag || null;
+                                conversation._aiFlagStamp = flagStamp;
+                            }
+                        }
                         // IMPORTANT: only apply the stored responseCategory/followUpCategory when this
                         // override doc represents a real human lock (manualCategoryOverride === true).
                         // Actions like ignoreConversation()/toggleClientReviewFlag() also write to this
@@ -10726,6 +10775,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
                                 urgency: verdict.urgency,
                                 reason: verdict.reason,
                                 messageCount: msgCount,
+                                lastMessageAt: (getConvLastMessageDate(conv) || null)?.toISOString() || null,
                                 flaggedAt: new Date(),
                                 flaggedOn: todayLabel,
                                 model: OTHER_FOLLOWUP_SCAN_MODEL,
