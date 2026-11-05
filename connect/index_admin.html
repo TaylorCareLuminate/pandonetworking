@@ -5156,15 +5156,22 @@
             if (_bdrAssignmentMapPromise && !force) return _bdrAssignmentMapPromise;
             _bdrAssignmentMapPromise = (async () => {
                 try {
-                    const { collection, getDocs } = window.clemailFirestore;
-                    const emailDB = window.clemailDb;
-                    const snap = await getDocs(collection(emailDB, 'bdr_leaders'));
+                    // Key EVERY known email for a BDR (primary, LinkedIn login, aliases),
+                    // not just primaryEmail. Reply alerts are stored under the LinkedIn
+                    // seat's login, which often isn't primaryEmail — looking up only the
+                    // primary hid those replies until "Show all BDRs" was turned on.
+                    await _liGetAliasToCanonicalEmailMap();
                     const map = {};
-                    snap.forEach(d => {
-                        const data = d.data();
-                        const email = (data.primaryEmail || '').toLowerCase().trim();
-                        if (email) map[email] = data.assignedTo || '';
-                    });
+                    if (_liAliasToCanonicalEmail && _liPrimaryToAssignedTo) {
+                        _liAliasToCanonicalEmail.forEach((primary, email) => {
+                            const key = String(email || '').toLowerCase().trim();
+                            if (!key) return;
+                            map[key] = _liPrimaryToAssignedTo.get(primary) || '';
+                        });
+                        _liPrimaryToAssignedTo.forEach((assigned, primary) => {
+                            if (primary) map[primary] = assigned || '';
+                        });
+                    }
                     _bdrAssignmentMap = map;
                     return map;
                 } catch (err) {
@@ -5180,6 +5187,14 @@
 
         function invalidateBdrAssignmentMap() {
             _bdrAssignmentMap = null;
+            // Assignment lives on the same bdr_leaders docs as the email/account
+            // identity maps. Drop those too so the next scope pass doesn't keep
+            // matching replies against a BDR who was just reassigned.
+            _liIdentityGeneration++;
+            _liAliasToCanonicalEmail = null;
+            _liAccountIdToCanonicalEmail = null;
+            _liCanonicalEmailToName = null;
+            _liPrimaryToAssignedTo = null;
         }
 
         // Updates the small "Viewing as: X" badges shown in the reply-alerts and
@@ -5269,34 +5284,90 @@
         // caused "I only see a few of my messages, then a few minutes later I see all of
         // them" even after fixing the separate firebaseReady race.
         let _liAliasToCanonicalEmailPromise = null;
-        // Lazily-loaded map of HeyReach linkedInAccountId (string) -> canonical BDR email,
-        // sourced from linkedin_accounts (heyreachAccountId -> bdrEmail). This is the SAME
-        // account-ownership record the rest of this dashboard already treats as authoritative
-        // (see loadHeyreachAccountIdMap below). It's a more reliable resolution path than the
-        // email-alias map above: linkedin_reply_alerts.bdrEmail is written by the Railway
-        // scanner as the *LinkedIn account's own login email* (heyreach_inbox_service.js sets
-        // bdrEmail = linkedInAccount.emailAddress), which frequently differs from the BDR's
-        // canonical/work email used by about_me.html and company_review_replies.html — and
-        // that LinkedIn login email doesn't always have a matching linkedin_email_associations
-        // doc. linkedInAccountId, however, is always tied 1:1 to a linkedin_accounts doc whose
-        // bdrEmail field IS the canonical email, so it resolves cases the alias map misses.
+        // Bumped by invalidateBdrAssignmentMap(). A build that started before the bump
+        // must not publish — otherwise a save that lands mid-fetch would put the
+        // pre-save identity maps back.
+        let _liIdentityGeneration = 0;
+        // Lazily-loaded map of HeyReach linkedInAccountId (string) -> canonical primary email.
+        // Values are always a bdr_leaders.primaryEmail when we can tell who owns the seat.
+        // linkedin_accounts.bdrEmail is often the LinkedIn login, NOT the primary email the
+        // filter dropdown and team-scope assignment map are keyed by — storing that login
+        // here was why picking one BDR hid replies that "Show all BDRs" still listed.
         let _liAccountIdToCanonicalEmail = null;
         // Lazily-loaded map of canonical primary email (lowercased) -> BDR display name,
         // sourced from bdr_leaders. Used so the alert cards and filter dropdown always
         // refer to the same person the same way, instead of the card showing whatever
         // raw (often alias) email happened to be on that particular alert.
         let _liCanonicalEmailToName = null;
-        async function _liGetAliasToCanonicalEmailMap() {
+        // canonical primary email -> assignedTo team-member id ('' when unassigned).
+        // Filled alongside the alias map so team scope and the BDR dropdown agree.
+        let _liPrimaryToAssignedTo = null;
+
+        function _liAsEmail(value) {
+            const v = String(value || '').toLowerCase().trim();
+            return v.includes('@') ? v : '';
+        }
+
+        function _liCollectBdrDocEmails(data) {
+            const emails = [];
+            const push = (value) => {
+                const email = _liAsEmail(value);
+                if (email) emails.push(email);
+            };
+            push(data.primaryEmail);
+            push(data.linkedInEmail);
+            push(data.email);
+            push(data.authEmail);
+            (data.emailAccountIds || []).forEach(push);
+            (data.linkedInAccounts || []).forEach(acct => {
+                if (!acct) return;
+                if (typeof acct === 'string') push(acct);
+                else {
+                    push(acct.email);
+                    push(acct.bdrEmail);
+                    push(acct.accountEmail);
+                    push(acct.linkedInEmail);
+                }
+            });
+            return emails;
+        }
+
+        function _liCollectBdrDocAccountIds(data) {
+            const explicit = new Set();
+            const extra = new Set();
+            const add = (set, id) => {
+                if (id === undefined || id === null) return;
+                const v = String(id).trim();
+                if (v) set.add(v);
+            };
+            add(explicit, data.heyreachAccountId);
+            (data.heyreachCampaigns || []).forEach(c => {
+                if (!c) return;
+                add(extra, c.accountId);
+                add(extra, c.heyreachAccountId);
+            });
+            (data.linkedInAccounts || []).forEach(acct => {
+                if (acct && typeof acct === 'object') add(extra, acct.heyreachAccountId || acct.accountId);
+            });
+            explicit.forEach(id => extra.delete(id));
+            return { explicit, extra };
+        }
+
+        async function _liGetAliasToCanonicalEmailMap(attempt) {
             if (_liAliasToCanonicalEmail) return _liAliasToCanonicalEmail;
             if (_liAliasToCanonicalEmailPromise) return _liAliasToCanonicalEmailPromise;
-            _liAliasToCanonicalEmailPromise = (async () => {
-                const aliasMap = new Map();
-                const accountIdMap = new Map();
+            const gen = _liIdentityGeneration;
+            const pending = (async () => {
+                const aliasMap = new Map(); // any known email -> bdr_leaders.primaryEmail
+                const accountIdMap = new Map(); // heyreach account id -> primaryEmail
                 const nameMap = new Map();
+                const assignedMap = new Map();
                 if (!window.clemailFirestore || !window.clemailDb) {
+                    if (gen !== _liIdentityGeneration) return null;
                     _liAliasToCanonicalEmail = aliasMap;
                     _liAccountIdToCanonicalEmail = accountIdMap;
                     _liCanonicalEmailToName = nameMap;
+                    _liPrimaryToAssignedTo = assignedMap;
                     return aliasMap;
                 }
                 try {
@@ -5307,81 +5378,180 @@
                         getDocs(collection(emailDB, 'linkedin_email_associations')),
                         getDocs(collection(emailDB, 'linkedin_accounts'))
                     ]);
+
+                    const active = [];
+                    const inactive = [];
                     bdrSnap.forEach(d => {
                         const data = d.data();
-                        const primary = (data.primaryEmail || '').toLowerCase();
+                        const primary = _liAsEmail(data.primaryEmail);
                         if (!primary) return;
-                        if (data.linkedInEmail) {
-                            aliasMap.set(data.linkedInEmail.toLowerCase(), primary);
-                        }
-                        nameMap.set(primary, data.name || primary);
+                        const ids = _liCollectBdrDocAccountIds(data);
+                        const rec = {
+                            primary,
+                            name: data.name || primary,
+                            assignedTo: data.assignedTo || '',
+                            emails: _liCollectBdrDocEmails(data),
+                            explicitAccountIds: ids.explicit,
+                            extraAccountIds: ids.extra
+                        };
+                        if (data.status === 'inactive') inactive.push(rec);
+                        else active.push(rec);
                     });
+
+                    // Active BDRs win when two records share an email or a name slot.
+                    const claimEmail = (email, primary, force) => {
+                        const v = _liAsEmail(email);
+                        if (!v) return;
+                        if (force || !aliasMap.has(v)) aliasMap.set(v, primary);
+                    };
+                    inactive.forEach(b => claimEmail(b.primary, b.primary, true));
+                    active.forEach(b => claimEmail(b.primary, b.primary, true));
+                    active.forEach(b => b.emails.forEach(e => claimEmail(e, b.primary, false)));
+                    inactive.forEach(b => b.emails.forEach(e => claimEmail(e, b.primary, false)));
+                    inactive.forEach(b => {
+                        nameMap.set(b.primary, b.name);
+                        assignedMap.set(b.primary, b.assignedTo);
+                    });
+                    active.forEach(b => {
+                        nameMap.set(b.primary, b.name);
+                        assignedMap.set(b.primary, b.assignedTo);
+                    });
+
+                    // Associations link a LinkedIn login to a work email. Only attach the
+                    // unknown side onto a BDR we already know — the old code wrote
+                    // linkedInEmail -> authEmail even when authEmail wasn't the primary,
+                    // which overwrote the primary link and made the dropdown miss the reply.
                     assocSnap.forEach(d => {
                         const data = d.data();
-                        const authEmail = (data.authEmail || d.id || '').toLowerCase();
-                        if (authEmail && data.linkedInEmail) {
-                            aliasMap.set(data.linkedInEmail.toLowerCase(), authEmail);
-                        }
+                        const auth = _liAsEmail(data.authEmail || data.primaryEmail || d.id);
+                        const linked = _liAsEmail(data.linkedInEmail);
+                        const authPrimary = auth ? aliasMap.get(auth) : '';
+                        const linkedPrimary = linked ? aliasMap.get(linked) : '';
+                        if (authPrimary && linked && !aliasMap.has(linked)) aliasMap.set(linked, authPrimary);
+                        else if (linkedPrimary && auth && !aliasMap.has(auth)) aliasMap.set(auth, linkedPrimary);
                     });
+
+                    // The heyreachAccountId field on bdr_leaders is the manually curated
+                    // seat owner. It beats linkedin_accounts, which often stores the
+                    // LinkedIn login rather than primaryEmail (and can be stale after a
+                    // seat is reassigned). An active BDR beats an inactive one.
+                    const explicitOwner = new Map(); // id -> { primary, priority }
+                    const claimAccount = (id, primary, priority) => {
+                        const cur = explicitOwner.get(id);
+                        if (!cur || priority > cur.priority) explicitOwner.set(id, { primary, priority });
+                    };
+                    active.forEach(b => b.explicitAccountIds.forEach(id => claimAccount(id, b.primary, 2)));
+                    inactive.forEach(b => b.explicitAccountIds.forEach(id => claimAccount(id, b.primary, 1)));
+
                     accountsSnap.forEach(d => {
                         const data = d.data();
-                        if (data.heyreachAccountId && data.bdrEmail) {
-                            accountIdMap.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
+                        const id = data.heyreachAccountId ? String(data.heyreachAccountId).trim() : '';
+                        const emails = [data.bdrEmail, data.accountEmail, data.email, data.linkedInEmail]
+                            .map(_liAsEmail).filter(Boolean);
+                        const explicit = id && explicitOwner.get(id);
+                        if (explicit) {
+                            // Don't import this doc's emails onto the explicit owner —
+                            // a reassigned seat may still list the previous BDR's login.
+                            accountIdMap.set(id, explicit.primary);
+                            return;
+                        }
+                        const ownerPrimary = emails.map(e => aliasMap.get(e)).find(Boolean) || '';
+                        if (ownerPrimary) {
+                            if (id) accountIdMap.set(id, ownerPrimary);
+                            // Same seat, other addresses. An alert stored under the login
+                            // email then still matches the BDR's primary in the dropdown.
+                            emails.forEach(e => { if (!aliasMap.has(e)) aliasMap.set(e, ownerPrimary); });
+                        } else if (id && emails.length) {
+                            accountIdMap.set(id, emails[0]);
                         }
                     });
-                    // bdr_leaders.heyreachAccountId (when set) is the definitive,
-                    // manually-curated account-ownership record — maintained in Manage
-                    // BDRs — so it OVERRIDES whatever linkedin_accounts derived above.
-                    // linkedin_accounts entries can be stale or shared across more than
-                    // one BDR (e.g. a reassigned LinkedIn seat), which silently resolved
-                    // an alert to the WRONG canonical email — the same
-                    // cross-BDR-contamination problem the HR Queue Report works around
-                    // with its identical "bdrLeaderAccountId" override. That wrong
-                    // resolution is why the BDR filter dropdown (built from
-                    // bdr_leaders.primaryEmail) wouldn't match some alerts, and why
-                    // per-team-member scoping hid or leaked alerts inconsistently.
-                    bdrSnap.forEach(d => {
-                        const data = d.data();
-                        const primary = (data.primaryEmail || '').toLowerCase();
-                        if (primary && data.heyreachAccountId) {
-                            accountIdMap.set(String(data.heyreachAccountId), primary);
-                        }
+                    // Campaign / nested account ids only fill seats nobody else claimed.
+                    const fillAccount = (id, primary) => {
+                        if (!accountIdMap.has(id)) accountIdMap.set(id, primary);
+                    };
+                    active.forEach(b => b.extraAccountIds.forEach(id => fillAccount(id, b.primary)));
+                    inactive.forEach(b => b.extraAccountIds.forEach(id => fillAccount(id, b.primary)));
+                    explicitOwner.forEach((info, id) => accountIdMap.set(id, info.primary));
+                    accountIdMap.forEach((email, id) => {
+                        if (explicitOwner.has(id)) return;
+                        const primary = aliasMap.get(_liAsEmail(email));
+                        if (primary) accountIdMap.set(id, primary);
                     });
                 } catch (err) {
                     console.warn('[LiAlerts] Could not load alias->canonical email map:', err.message);
                 }
-                // Only publish to the module-level caches once fully populated, so a
-                // concurrent caller that arrives after this point gets the complete map
-                // via the fast `if (_liAliasToCanonicalEmail) return ...` path above,
-                // instead of racing the fetch again.
+                // Only publish once fully populated, and only if assignments weren't
+                // invalidated while this fetch was in flight.
+                if (gen !== _liIdentityGeneration) return null;
                 _liAliasToCanonicalEmail = aliasMap;
                 _liAccountIdToCanonicalEmail = accountIdMap;
                 _liCanonicalEmailToName = nameMap;
+                _liPrimaryToAssignedTo = assignedMap;
                 return aliasMap;
             })();
+            _liAliasToCanonicalEmailPromise = pending;
             try {
-                return await _liAliasToCanonicalEmailPromise;
+                const result = await pending;
+                if (result) return result;
             } finally {
-                _liAliasToCanonicalEmailPromise = null;
+                if (_liAliasToCanonicalEmailPromise === pending) _liAliasToCanonicalEmailPromise = null;
             }
+            if (_liAliasToCanonicalEmail) return _liAliasToCanonicalEmail;
+            // The build was discarded by an invalidate that landed mid-fetch.
+            if ((attempt || 0) >= 2) return new Map();
+            return _liGetAliasToCanonicalEmailMap((attempt || 0) + 1);
+        }
+        function _liNormalizeToPrimary(email) {
+            const lower = String(email || '').toLowerCase().trim();
+            if (!lower) return '';
+            const mapped = _liAliasToCanonicalEmail && _liAliasToCanonicalEmail.get(lower);
+            return (mapped || lower).toLowerCase();
+        }
+        // True when `email` resolves to a real bdr_leaders primary (not an unrecognized login).
+        function _liKnownBdrPrimary(email) {
+            const norm = _liNormalizeToPrimary(email);
+            if (!norm || !_liPrimaryToAssignedTo || !_liPrimaryToAssignedTo.has(norm)) return '';
+            return norm;
+        }
+        // The BDR the alert belongs to, as bdr_leaders.primaryEmail.
+        // A HeyReach seat id wins when it maps to a known BDR. An account id that only
+        // maps to an unrecognized login must not shadow the alert's own bdrEmail —
+        // that shadowing is what hid a BDR's replies from their own filter.
+        function _liAlertOwnerPrimary(alert) {
+            if (!alert) return '';
+            const acctId = alert.linkedInAccountId ? String(alert.linkedInAccountId) : '';
+            if (acctId && _liAccountIdToCanonicalEmail && _liAccountIdToCanonicalEmail.has(acctId)) {
+                const fromAcct = _liKnownBdrPrimary(_liAccountIdToCanonicalEmail.get(acctId));
+                if (fromAcct) return fromAcct;
+            }
+            const fromCanonical = _liKnownBdrPrimary(_liAlertCanonicalEmail.get(alert.id) || '');
+            if (fromCanonical) return fromCanonical;
+            const fromRaw = _liKnownBdrPrimary(alert.bdrEmail || '');
+            if (fromRaw) return fromRaw;
+            return _liNormalizeToPrimary(_liAlertCanonicalEmail.get(alert.id) || alert.bdrEmail || '');
         }
         async function _liResolveCanonicalBdrEmail(email) {
             if (!email) return email;
             const lower = email.toLowerCase();
             const aliasMap = await _liGetAliasToCanonicalEmailMap();
-            return aliasMap.get(lower) || email;
+            return (aliasMap && aliasMap.get(lower)) || email;
         }
-        // Alert-aware resolver: prefers the linkedInAccountId -> linkedin_accounts.bdrEmail
-        // mapping (authoritative account ownership) and only falls back to the email-alias
-        // map (or the raw bdrEmail as-is) when no account ID or no matching account is found.
+        // Alert-aware resolver: prefers the linkedInAccountId -> owning BDR's primary
+        // email, then folds whatever address we found (account login, alias, or raw
+        // bdrEmail) onto that same primary. The reply filter and team scope both
+        // compare against primaryEmail, so leaving the login address in place made
+        // a specific BDR's filter drop replies that "Show all BDRs" still showed.
         async function _liResolveCanonicalBdrEmailForAlert(alert) {
             const rawEmail = (alert && alert.bdrEmail) || '';
-            await _liGetAliasToCanonicalEmailMap(); // ensures _liAccountIdToCanonicalEmail is populated too
+            await _liGetAliasToCanonicalEmailMap();
             const acctId = alert && alert.linkedInAccountId ? String(alert.linkedInAccountId) : '';
+            let resolved = '';
             if (acctId && _liAccountIdToCanonicalEmail && _liAccountIdToCanonicalEmail.has(acctId)) {
-                return _liAccountIdToCanonicalEmail.get(acctId);
+                resolved = _liAccountIdToCanonicalEmail.get(acctId);
+            } else {
+                resolved = await _liResolveCanonicalBdrEmail(rawEmail);
             }
-            return _liResolveCanonicalBdrEmail(rawEmail);
+            return _liNormalizeToPrimary(resolved) || resolved || rawEmail;
         }
 
         function _liEscHtml(str) {
@@ -7386,8 +7556,11 @@ Rules:
             if (!getViewerTeamMemberId()) return alerts;
             const assignMap = await getBdrAssignmentMap();
             return alerts.filter(a => {
-                const email = (_liAlertCanonicalEmail.get(a.id) || a.bdrEmail || '').toLowerCase().trim();
-                const assignedTo = email ? (assignMap[email] || '') : '';
+                const owner = _liAlertOwnerPrimary(a);
+                const rawNorm = _liNormalizeToPrimary(a.bdrEmail || '');
+                const raw = (a.bdrEmail || '').toLowerCase().trim();
+                const key = [owner, rawNorm, raw].find(k => k && Object.prototype.hasOwnProperty.call(assignMap, k)) || '';
+                const assignedTo = key ? (assignMap[key] || '') : '';
                 return isBdrAssignmentVisibleToViewer(assignedTo);
             });
         }
@@ -8034,9 +8207,19 @@ Rules:
 
         function _liAlertMatchesBdrFilter(alert, bdrEmailLower) {
             if (!bdrEmailLower) return true;
-            const canonical = (_liAlertCanonicalEmail.get(alert.id) || '').toLowerCase();
-            const raw = (alert.bdrEmail || '').toLowerCase();
-            return canonical === bdrEmailLower || raw === bdrEmailLower;
+            const wanted = _liNormalizeToPrimary(bdrEmailLower);
+            if (!wanted) return true;
+            // Match on any identity we have for this card. Alerts are often stored
+            // under the LinkedIn login, so comparing that raw string to the dropdown
+            // (always primaryEmail) dropped replies that "All BDRs" still showed.
+            const candidates = [
+                _liAlertOwnerPrimary(alert),
+                _liAlertCanonicalEmail.get(alert.id),
+                alert.bdrEmail,
+                alert.accountEmail,
+                alert.linkedInAccountEmail
+            ];
+            return candidates.some(email => email && _liNormalizeToPrimary(email) === wanted);
         }
 
         function _liAlertMatchesSearchFilter(alert, q) {
@@ -8055,7 +8238,7 @@ Rules:
             const emptyEl = document.getElementById('liFilterEmptyState');
             if (!bdrSel || !searchInput) return;
 
-            const bdrEmail = bdrSel.value.toLowerCase();
+            const bdrEmail = bdrSel.value.trim().toLowerCase();
             const q = searchInput.value.trim().toLowerCase();
             const hasFilter = !!(bdrEmail || q);
 
