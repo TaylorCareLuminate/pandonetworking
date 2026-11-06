@@ -160,7 +160,7 @@
         <h1><i class="fas fa-magnifying-glass-chart"></i> Message Audit Trail</h1>
         <p>
             Pick a BDR, paste the LinkedIn URLs in question, and get the full life of every message sent to each person:
-            which page generated it, the research it was built from, who reviewed and approved it and when, when it was
+            which BDR workspace(s) the contact sits in, which page generated it, the research it was built from, who reviewed and approved it and when, when it was
             pushed to HeyReach and into which campaign (<b>Connect</b>, <b>Message</b> or <b>Quick Message</b>), and when HeyReach
             actually sent it. Read-only &mdash; nothing on this page changes any data.
         </p>
@@ -676,6 +676,36 @@ function buildTimeline(c, ctx) {
     return rows;
 }
 
+// ── Workspace BDR(s): which BDR workspace(s) this contact sits in, based on every queue record found for the URL ──
+function buildWorkspaces(docs, ctx) {
+    const out = new Map();
+    const idx = ctx.workspaceIndex;
+    (docs || []).forEach(d => {
+        const x = d.data || {};
+        const own = ownedBy(x, ctx);
+        let bdrs = [];
+        if (own === 'direct') bdrs = [ctx.bdr];
+        else if (idx) {
+            for (const f of ['account_email', 'bdr_auth_email', 'bdr_primary_email', 'bdr_email']) {
+                const v = lc(x[f]); if (!v) continue;
+                const p = idx.byPrimary.get(v); if (p) { bdrs = [p]; break; }
+                const vs = idx.byVariant.get(v); if (vs && vs.length) { bdrs = vs; break; }
+            }
+            if (!bdrs.length && own === 'override') bdrs = [ctx.bdr];
+        }
+        const rawEmail = x.account_email || x.bdr_auth_email || x.bdr_primary_email || x.bdr_email || '';
+        const entries = bdrs.length
+            ? bdrs.map(b => ({ key: 'bdr:' + lc(b.primaryEmail), name: b.name || b.primaryEmail, email: b.primaryEmail, customer: ctx.customerNameOf ? ctx.customerNameOf(b) : '', isSelected: b === ctx.bdr, ambiguous: bdrs.length > 1 }))
+            : [{ key: 'raw:' + (lc(rawEmail) || lc(x.bdr_name) || 'unknown'), name: x.bdr_name || rawEmail || 'Unknown workspace', email: rawEmail, customer: '', isSelected: false, unresolved: true }];
+        entries.forEach(e => {
+            if (!out.has(e.key)) out.set(e.key, { ...e, records: 0, pushed: 0, ids: [] });
+            const w = out.get(e.key);
+            w.records++; if (x.pushed_to_heyreach) w.pushed++; w.ids.push(d.id);
+        });
+    });
+    return Array.from(out.values()).sort((a, b) => (b.isSelected - a.isSelected) || String(a.name).localeCompare(String(b.name)));
+}
+
 // ── Case assembly ──
 function assembleCase(input, ctx) {
     const mine = [], others = [];
@@ -716,6 +746,7 @@ function assembleCase(input, ctx) {
         inputUrl: input.inputUrl, key: slugKey(input.inputUrl), foundVia: input.foundVia || 'direct lookup',
         contactName: '', contactTitle: '', contactCompany: '',
         records, otherBdrDocs: input.otherBdrFlag === false ? [] : others, events, otherActivity, inboxMessages,
+        workspaces: buildWorkspaces(input.queueDocs, ctx),
         tracking: input.tracking, lookupErrors: input.lookupErrors || [], flags: [], timeline: []
     };
     const pick = f => { for (const r of records) { const v = f(r.q); if (v) return v; } return ''; };
@@ -756,7 +787,7 @@ root.AuditLogic = {
     TEAM, SEND_TYPES, CAMPAIGN_TYPE_LABEL, EVENT_LABEL, STAGE_LABEL,
     lc, esc, toDate, firstDate, fmtDT, fmtDay, dtHtml, fmtDur, normText, plain,
     slugKey, urlVariants, parseUrlList, personLabel, ownedBy, eventOwner, classifyGeneration, resolveCampaign,
-    wordDiffHtml, normalizeEvent, analyzeRecord, attachDelivery, buildFlags, buildTimeline, assembleCase, summarize, narrative
+    wordDiffHtml, normalizeEvent, buildWorkspaces, analyzeRecord, attachDelivery, buildFlags, buildTimeline, assembleCase, summarize, narrative
 };
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
@@ -984,7 +1015,16 @@ async function runAudit() {
     const variantsRaw = bdrVariants(bdr);
     const campaignsById = new Map();
     (bdr.heyreachCampaigns || []).forEach(c => { const id = String(c.id || c.campaignId || ''); if (id) campaignsById.set(id, { id, name: c.name || '', type: lc(c.type) }); });
-    const ctx = { bdr, variantsRaw, variantsLower: new Set(Array.from(variantsRaw).map(lc)), campaignsById, accountIdToEmail, bdrNameByEmail };
+    // Email -> BDR index so each queue record can be attributed to the BDR workspace it sits in
+    const workspaceIndex = { byPrimary: new Map(), byVariant: new Map() };
+    allBdrs.forEach(b => workspaceIndex.byPrimary.set(lc(b.primaryEmail), b));
+    allBdrs.forEach(b => Array.from(bdrVariants(b)).map(lc).forEach(e => {
+        if (!e) return;
+        if (!workspaceIndex.byVariant.has(e)) workspaceIndex.byVariant.set(e, []);
+        const arr = workspaceIndex.byVariant.get(e); if (!arr.includes(b)) arr.push(b);
+    }));
+    const ctx = { bdr, variantsRaw, variantsLower: new Set(Array.from(variantsRaw).map(lc)), campaignsById, accountIdToEmail, bdrNameByEmail, workspaceIndex,
+        customerNameOf: b => (b && b.customerId && customerMap.get(b.customerId)) || '' };
     lastCtx = ctx;
 
     $('runBtn').disabled = true; $('csvBtn').disabled = true; $('jsonBtn').disabled = true;
@@ -1002,7 +1042,7 @@ async function runAudit() {
                 const input = await fetchForUrl(u, ctx, opts);
                 results[i] = L.assembleCase(input, ctx);
                 const c = results[i];
-                log(`${c.contactName || L.slugKey(u)}: ${c.records.length} queue record(s), ${c.events.length} HeyReach event(s), ${c.flags.filter(f => f.sev === 'high').length} high / ${c.flags.filter(f => f.sev === 'med').length} medium finding(s).`, c.flags.some(f => f.sev === 'high') ? 'l-warn' : 'l-ok');
+                log(`${c.contactName || L.slugKey(u)}: workspace BDR(s): ${c.workspaces.map(w => w.name).join(', ') || 'none found'}; ${c.records.length} queue record(s), ${c.events.length} HeyReach event(s), ${c.flags.filter(f => f.sev === 'high').length} high / ${c.flags.filter(f => f.sev === 'med').length} medium finding(s).`, c.flags.some(f => f.sev === 'high') ? 'l-warn' : 'l-ok');
             } catch (e) {
                 console.error(e); log(`❌ ${u}: ${e.message}`, 'l-danger');
                 results[i] = L.assembleCase({ inputUrl: u, queueDocs: [], activity: [], hrEvents: [], inbox: [], slots: [], qmLeads: [], edits: [], tracking: [], contexts: {}, lookupErrors: ['audit failed: ' + e.message] }, ctx);
@@ -1039,6 +1079,7 @@ function render() {
         const approvers = p ? p.approvals.filter(a => a.stage !== 'Rejected').map(a => `${esc(personLabel(a.by, lastCtx))}<div class="tiny">${a.at ? esc(fmtDT(a.at)) : 'date not recorded'}</div>`).join('') : '';
         return `<tr class="clickable" data-case="${i}">
             <td><b>${esc(c.contactName || '(name unknown)')}</b><div class="tiny">${esc(c.contactTitle)}${c.contactCompany ? ' · ' + esc(c.contactCompany) : ''}</div><div class="tiny">${esc(c.key)}</div></td>
+            <td>${workspaceChips(c)}</td>
             <td class="nowrap">${s.records}${s.pushed ? ` <span class="tiny">(${s.pushed} pushed)</span>` : ''}</td>
             <td>${p ? esc(p.generation.label) + `<div class="tiny">${p.generatedAt ? esc(fmtDT(p.generatedAt)) : 'date not recorded'}</div>` : '—'}</td>
             <td>${approvers || (p ? '<span class="tiny">none recorded</span>' : '—')}</td>
@@ -1048,7 +1089,7 @@ function render() {
             <td class="nowrap">${s.high ? badge('b-red', s.high + ' high') + ' ' : ''}${s.med ? badge('b-gold', s.med + ' med') : ''}${!s.high && !s.med ? badge('b-sage', 'no issues') : ''}</td>
         </tr>`;
     }).join('');
-    $('summaryTable').innerHTML = `<thead><tr><th>Contact</th><th>Queue records</th><th>Generated by</th><th>Approved by</th><th>Pushed to HeyReach</th><th>Campaign</th><th>HeyReach sent</th><th>Findings</th></tr></thead><tbody>${rows}</tbody>`;
+    $('summaryTable').innerHTML = `<thead><tr><th>Contact</th><th>Workspace BDR(s)</th><th>Queue records</th><th>Generated by</th><th>Approved by</th><th>Pushed to HeyReach</th><th>Campaign</th><th>HeyReach sent</th><th>Findings</th></tr></thead><tbody>${rows}</tbody>`;
     $('summaryTable').querySelectorAll('tr.clickable').forEach(tr => tr.addEventListener('click', () => {
         const el = $('case-' + tr.dataset.case); if (!el) return; el.open = true; el.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }));
@@ -1076,6 +1117,7 @@ function renderCase(c, i) {
             </span>
         </summary>
         <div class="case-body">
+            <div class="sec-title"><i class="fas fa-users"></i> Workspace BDR(s) this contact is in (${c.workspaces.length})</div>${renderWorkspaces(c)}
             <div class="sec-title"><i class="fas fa-flag"></i> Findings</div>${flags}
             <div class="sec-title"><i class="fas fa-route"></i> What happened (plain English)</div>${narr}
             <div class="sec-title"><i class="fas fa-layer-group"></i> Queue records (${c.records.length})</div>
@@ -1088,6 +1130,15 @@ function renderCase(c, i) {
     </details>`;
 }
 
+function workspaceChips(c) {
+    if (!c.workspaces.length) return '<span class="tiny">none found</span>';
+    return c.workspaces.map(w => `<div style="margin-bottom:.25rem;"><b>${esc(w.name)}</b>${w.isSelected ? ' ' + badge('b-navy', 'selected') : ''}${w.unresolved ? ' ' + badge('b-gray', 'not in BDR list') : ''}${w.ambiguous ? ' ' + badge('b-gold', 'shared account', 'This account email is shared by more than one BDR, so the exact workspace is ambiguous') : ''}${w.customer ? `<div class="tiny">${esc(w.customer)}</div>` : ''}</div>`).join('');
+}
+function renderWorkspaces(c) {
+    if (!c.workspaces.length) return '<div class="note-box">This contact was not found in any BDR workspace (no connect_queue record for this URL under any BDR).</div>';
+    const rows = c.workspaces.map(w => `<tr><td><b>${esc(w.name)}</b>${w.isSelected ? ' ' + badge('b-navy', 'selected BDR') : ''}${w.unresolved ? ' ' + badge('b-gray', 'not in BDR list') : ''}${w.ambiguous ? ' ' + badge('b-gold', 'shared account', 'This account email is shared by more than one BDR, so the exact workspace is ambiguous') : ''}</td><td>${esc(w.email || '')}</td><td>${esc(w.customer || '')}</td><td>${w.records}</td><td>${w.pushed}</td></tr>`).join('');
+    return `<div style="overflow:auto;"><table class="grid"><thead><tr><th>BDR workspace</th><th>Account email</th><th>Client</th><th>Queue records</th><th>Pushed to HeyReach</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
 function renderOtherBdr(c) {
     if (!c.otherBdrDocs.length) return '';
     const rows = c.otherBdrDocs.map(d => {
@@ -1238,7 +1289,8 @@ function rawJson(obj) {
 // ═══════════════ Copy / exports ═══════════════
 function plainText(s) { return String(s).replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"'); }
 function caseText(c) {
-    const lines = [`AUDIT — ${c.contactName || '(name unknown)'} · ${c.inputUrl}`, `BDR: ${lastCtx.bdr.name || lastCtx.bdr.primaryEmail}`, ''];
+    const lines = [`AUDIT — ${c.contactName || '(name unknown)'} · ${c.inputUrl}`, `BDR searched: ${lastCtx.bdr.name || lastCtx.bdr.primaryEmail}`,
+        `Workspace BDR(s): ${c.workspaces.length ? c.workspaces.map(w => `${w.name}${w.customer ? ' [' + w.customer + ']' : ''} (${w.records} record${w.records === 1 ? '' : 's'})`).join('; ') : 'none found'}`, ''];
     if (!c.records.length) lines.push('No queue record found for this BDR.');
     c.records.forEach((r, i) => lines.push(`Record ${i + 1} (${r.id}): ${plainText(L.narrative(r, lastCtx))}`));
     if (c.flags.length) { lines.push('', 'Findings:'); c.flags.forEach(f => lines.push(` - [${f.sev.toUpperCase()}] ${f.text}`)); }
@@ -1257,14 +1309,14 @@ $('csvBtn').addEventListener('click', () => {
     // Quote every cell; neutralise leading = + - @ so Excel never treats message text as a formula
     const q = v => { let s = String(v == null ? '' : v); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return '"' + s.replace(/"/g, '""') + '"'; };
     const iso = d => d ? d.toISOString() : '';
-    const head = ['bdr', 'input_url', 'contact_name', 'queue_record_id', 'message_type', 'generated_at', 'generated_by_page', 'generated_by_file', 'page_confidence', 'message_source', 'pipeline_run_id', 'hypothesis_group',
+    const head = ['bdr', 'input_url', 'contact_name', 'workspace_bdrs', 'queue_record_id', 'message_type', 'generated_at', 'generated_by_page', 'generated_by_file', 'page_confidence', 'message_source', 'pipeline_run_id', 'hypothesis_group',
         'queue_stage', 'admin_approved_by', 'admin_approved_at', 'customer_approved_by', 'customer_approved_at', 'approval_method', 'auto_approved_before_review', 'submitted_at', 'submitted_by',
         'pushed_to_heyreach_at', 'push_mode', 'push_status', 'campaign_type', 'campaign_name', 'campaign_id', 'heyreach_first_sent_at', 'heyreach_first_sent_event', 'heyreach_send_events', 'push_to_send_lag_minutes',
         'message_in_queue', 'message_at_push', 'message_heyreach_reported', 'edits_count', 'high_findings', 'medium_findings', 'findings'];
     const rows = [head.map(q).join(',')];
     lastCases.forEach(c => {
         const flagTxt = c.flags.filter(f => f.sev !== 'info').map(f => `[${f.sev}] ${f.text}`).join(' | ');
-        const base = [lastCtx.bdr.name || lastCtx.bdr.primaryEmail, c.inputUrl, c.contactName];
+        const base = [lastCtx.bdr.name || lastCtx.bdr.primaryEmail, c.inputUrl, c.contactName, c.workspaces.map(w => w.name + (w.customer ? ' [' + w.customer + ']' : '')).join('; ')];
         const tail = [c.summary.high, c.summary.med, flagTxt];
         if (!c.records.length) { rows.push([...base, '(no queue record)', ...new Array(head.length - base.length - 1 - tail.length).fill(''), ...tail].map(q).join(',')); return; }
         c.records.forEach(r => {
@@ -1281,7 +1333,7 @@ $('csvBtn').addEventListener('click', () => {
 $('jsonBtn').addEventListener('click', () => {
     const out = { generatedAt: new Date().toISOString(), generatedBy: currentUser && currentUser.email, bdr: { name: lastCtx.bdr.name, email: lastCtx.bdr.primaryEmail, accountEmails: Array.from(lastCtx.variantsLower) },
         cases: lastCases.map(c => ({
-            inputUrl: c.inputUrl, contact: { name: c.contactName, title: c.contactTitle, company: c.contactCompany }, foundVia: c.foundVia, findings: c.flags,
+            inputUrl: c.inputUrl, contact: { name: c.contactName, title: c.contactTitle, company: c.contactCompany }, foundVia: c.foundVia, workspaceBdrs: c.workspaces, findings: c.flags,
             records: c.records.map(r => ({ id: r.id, generation: r.generation, campaign: r.campaign, approvals: r.approvals, push: r.push, delivery: { firstSend: r.delivery.firstSend && { type: r.delivery.firstSend.type, ts: r.delivery.firstSend.ts }, sends: r.delivery.sends.length }, versions: r.versions, edits: r.edits, queueDocument: r.q, pushRecord: r.activity, aiContext: r.aiContext, archive: r.archive })),
             otherBdrRecords: c.otherBdrDocs, heyreachEvents: c.events.map(e => ({ ...e, raw: undefined })), threadMessages: c.inboxMessages, timeline: c.timeline.map(t => ({ ...t, ts: t.ts ? t.ts.toISOString() : null }))
         })) };
