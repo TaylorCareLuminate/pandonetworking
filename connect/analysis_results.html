@@ -22,6 +22,9 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <!-- PptxGenJS for the "Export PowerPoint" feature (browser bundle — exposes window.PptxGenJS) -->
 <script src="https://cdn.jsdelivr.net/npm/pptxgenjs@4.0.1/dist/pptxgen.bundle.js"></script>
+<!-- jsPDF + AutoTable for the "Export PDF report" feature (same libraries the other Connect PDF reports use) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 
 <style>
 :root {
@@ -203,6 +206,10 @@ body {
 .pptx-export-btn:hover { background: #fdf0ec; border-color: #b7472a; }
 .pptx-export-btn:disabled { opacity: 0.6; cursor: wait; }
 .pptx-export-btn .fa-spinner { margin-right: 0.1rem; }
+.pdf-export-btn { color: #0F2D4D; }
+.pdf-export-btn:hover { background: #eef2f7; border-color: #0F2D4D; }
+.pdf-export-btn:disabled { opacity: 0.6; cursor: wait; }
+.pdf-export-btn .fa-spinner { margin-right: 0.1rem; }
 
 /* ── Glossary drawer ── */
 .glossary-drawer {
@@ -916,6 +923,7 @@ body {
             </div>
             <button class="glossary-btn" id="glossaryBtn" type="button"><i class="fas fa-circle-question"></i> How to read this page</button>
             <button class="glossary-btn pptx-export-btn" id="exportPptxBtn" type="button"><i class="fas fa-file-powerpoint"></i> Export PowerPoint</button>
+            <button class="glossary-btn pdf-export-btn" id="exportPdfBtn" type="button" title="Full printable report for this selection — everything on this tab plus everything the Lagging Hypothesis Groups tab knows about the same group"><i class="fas fa-file-pdf"></i> Export PDF report</button>
         </div>
 
         <div class="glossary-drawer" id="glossaryDrawer" style="display:none;"></div>
@@ -3957,6 +3965,1425 @@ async function exportSegmentToPowerpoint() {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+   PDF REPORT EXPORT
+   One printable, self-contained report for the selected segment (client × hypothesis
+   group). It covers everything the Success Analysis tab shows for that segment —
+   funnel, trend, keys, audience makeup, best send time, every Deep-Dive Research
+   breakdown (with the strongest real example per breakdown), phrases, follow-up
+   behavior, real examples, the AI prompt and the Message 2 / Message 3+ stage models —
+   PLUS everything the Lagging Hypothesis Groups tab knows about the same group (flag
+   reason, AI-suggested review instructions, hypothesis search, weekly performance and
+   downturn checks, baseline) and, for admins, the instructions/variations currently
+   saved on the hypothesis-group record. Built client-side with jsPDF + AutoTable; charts
+   are rendered off-screen with Chart.js and embedded as images. The same data-gating
+   rules the page uses (sufficient_data, TREND_MIN_N, RATE_LOW_N, …) apply, so the
+   report never claims more than the page would.
+   ══════════════════════════════════════════════════════════════════ */
+
+const PDF_C = {
+    navy: [15, 23, 42], primary: [15, 45, 77], gold: [201, 151, 61],
+    success: [16, 185, 129], successDark: [4, 120, 87], successBg: [231, 248, 240],
+    danger: [239, 68, 68], dangerDark: [185, 28, 28], dangerBg: [253, 236, 236],
+    warning: [245, 158, 11], warningDark: [146, 64, 14], warningBg: [254, 243, 199],
+    infoBg: [239, 246, 255],
+    text: [31, 41, 55], textSoft: [75, 85, 99], muted: [107, 114, 128], light: [156, 163, 175],
+    line: [229, 231, 235], cardBg: [248, 250, 252], zebra: [250, 250, 248], track: [241, 245, 249], white: [255, 255, 255],
+    connect: [56, 189, 248], reply: [167, 139, 250], meeting: [52, 211, 153]
+};
+const PDF_METRIC = {
+    connect_rate: { label: 'Connect', color: PDF_C.connect, decimals: 1 },
+    reply_rate: { label: 'Reply', color: PDF_C.reply, decimals: 1 },
+    meeting_rate: { label: 'Meeting', color: PDF_C.meeting, decimals: 2 }
+};
+const PDF_DIM_GROUP_SUB = {
+    'Message Craft': 'Tone, hooks, phrasing and formatting choices — what to say.',
+    'Timing & Volume': 'Day, time of day, and how outreach / thread volume relate to outcomes — when to send.',
+    'Audience': 'Seniority and organization type — who responds best.',
+    'Team': 'How each BDR\'s sends in this segment perform.'
+};
+
+// Characters jsPDF's built-in (WinAnsi) fonts can't draw, mapped to readable ASCII
+// equivalents instead of being silently dropped. Anything else outside Latin-1 is removed.
+const PDF_CHAR_MAP = {
+    '\u2014': '-', '\u2013': '-', '\u2212': '-', '\u2018': "'", '\u2019': "'", '\u201A': "'", '\u201C': '"', '\u201D': '"', '\u201E': '"',
+    '\u2026': '...', '\u2022': '-', '\u2192': '->', '\u2190': '<-', '\u2191': 'up', '\u2193': 'down', '\u2265': '>=', '\u2264': '<=', '\u2260': '!=',
+    '\u00A0': ' ', '\u2009': ' ', '\u202F': ' ', '\u2715': 'x', '\u2713': 'yes', '\u2714': 'yes', '\u2605': '*', '\u25B2': 'up', '\u25BC': 'down',
+    '\u203A': '>', '\u2039': '<', '\u2122': '(TM)', '\u2192\uFE0F': '->'
+};
+function pdfText(v) {
+    if (v == null) return '';
+    let s = String(v);
+    if (/<\/?[a-z][^>]*>/i.test(s)) s = s.replace(/<\/?[a-z][^>]*>/gi, '');
+    if (/&[a-z#0-9]+;/i.test(s)) { const ta = document.createElement('textarea'); ta.innerHTML = s; s = ta.value; }
+    s = s.replace(/[\u2014\u2013\u2212\u2018\u2019\u201A\u201C\u201D\u201E\u2026\u2022\u2192\u2190\u2191\u2193\u2265\u2264\u2260\u00A0\u2009\u202F\u2715\u2713\u2714\u2605\u25B2\u25BC\u203A\u2039\u2122]/g, c => PDF_CHAR_MAP[c] || '');
+    s = s.replace(/[\u{1F000}-\u{1FFFF}]/gu, '').replace(/[\u{2600}-\u{27BF}]/gu, '').replace(/[\u{FE00}-\u{FE0F}]/gu, '');
+    return s.replace(/[^\x09\x0A\x20-\x7E\xA0-\xFF]/g, '').replace(/[ \t]+\n/g, '\n').replace(/[ \t]{2,}/g, ' ');
+}
+function pdfBlend(rgb, alpha) { return rgb.map(c => Math.round(255 - (255 - c) * alpha)); }
+
+async function pdfLoadLogo() {
+    try {
+        const resp = await fetch('../images/pando_logo_transparent.png');
+        if (!resp.ok) return null;
+        const blob = await resp.blob();
+        return await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    } catch (e) { console.warn('Could not load logo for PDF report:', e); return null; }
+}
+
+// Renders a Chart.js config on a detached canvas and returns a PNG data URL. Animation
+// is disabled so drawing is synchronous; font sizes in the config are sized for the
+// large pixel canvas (it is later scaled down to page width).
+function pdfChartImage(config, pxW, pxH) {
+    if (typeof Chart === 'undefined') return null;
+    const canvas = document.createElement('canvas');
+    canvas.width = pxW; canvas.height = pxH;
+    let chart = null;
+    try {
+        config.options = Object.assign({}, config.options, { responsive: false, animation: false, devicePixelRatio: 1 });
+        chart = new Chart(canvas.getContext('2d'), config);
+        // Flatten onto white and emit JPEG: jsPDF stores PNGs as raw pixels, so a few
+        // 1800px charts would otherwise push the file past 10 MB.
+        const flat = document.createElement('canvas');
+        flat.width = pxW; flat.height = pxH;
+        const fctx = flat.getContext('2d');
+        fctx.fillStyle = '#ffffff'; fctx.fillRect(0, 0, pxW, pxH);
+        fctx.drawImage(canvas, 0, 0);
+        return flat.toDataURL('image/jpeg', 0.92);
+    } catch (e) {
+        console.warn('PDF chart render failed:', e);
+        return null;
+    } finally {
+        if (chart) { try { chart.destroy(); } catch (e) { /* ignore */ } }
+    }
+}
+const PDF_CHART_FONT = size => ({ size, family: 'Helvetica, Arial, sans-serif' });
+
+function pdfTrendChartImage(trend) {
+    const labels = trend.map(t => {
+        const [y, m] = String(t.month).split('-');
+        return (y && m) ? new Date(Number(y), Number(m) - 1, 1).toLocaleDateString('en-US', { month: 'short', year: '2-digit' }) : String(t.month);
+    });
+    const line = (label, key, color) => ({ type: 'line', label, data: trend.map(t => isNum(t[key]) ? t[key] : null), borderColor: color, backgroundColor: color, tension: 0.3, yAxisID: 'yRate', order: 1, borderWidth: 4, pointRadius: 6, spanGaps: true });
+    return pdfChartImage({
+        data: {
+            labels,
+            datasets: [
+                { type: 'bar', label: 'Contacts reached', data: trend.map(t => t.n), backgroundColor: 'rgba(148,163,184,0.3)', yAxisID: 'yCount', order: 3, borderRadius: 4 },
+                line('Connect rate', 'connect_rate', '#38bdf8'), line('Reply rate', 'reply_rate', '#C9973D'), line('Meeting rate', 'meeting_rate', '#10b981')
+            ]
+        },
+        options: {
+            layout: { padding: 18 },
+            plugins: { legend: { position: 'bottom', labels: { boxWidth: 28, padding: 26, font: PDF_CHART_FONT(22), color: '#374151' } } },
+            scales: {
+                yRate: { position: 'left', beginAtZero: true, title: { display: true, text: 'Rate (%)', font: PDF_CHART_FONT(22), color: '#4B5563' }, ticks: { font: PDF_CHART_FONT(20), color: '#4B5563' }, grid: { color: '#f1f5f9' } },
+                yCount: { position: 'right', beginAtZero: true, title: { display: true, text: 'Contacts', font: PDF_CHART_FONT(22), color: '#4B5563' }, ticks: { font: PDF_CHART_FONT(20), color: '#4B5563' }, grid: { display: false } },
+                x: { grid: { display: false }, ticks: { font: PDF_CHART_FONT(20), color: '#4B5563' } }
+            }
+        }
+    }, 1800, 720);
+}
+
+function pdfWeeklyChartImage(ts) {
+    const weekly = lgArr(ts.weekly).slice().sort((a, b) => String(a.week).localeCompare(String(b.week)));
+    if (!weekly.length) return null;
+    const recent = new Set(lgArr(ts.recent_weeks));
+    const labels = weekly.map(w => new Date(w.week + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
+    const mk = (label, key, color, axis) => ({
+        label, data: weekly.map(w => isNum(w[key]) ? w[key] : null), borderColor: color, backgroundColor: color, yAxisID: axis, tension: 0.25, spanGaps: true, borderWidth: 4,
+        pointRadius: weekly.map(w => recent.has(w.week) ? 11 : 6),
+        pointBorderColor: weekly.map(w => recent.has(w.week) ? '#ef4444' : color),
+        pointBorderWidth: weekly.map(w => recent.has(w.week) ? 4 : 2),
+        pointBackgroundColor: color
+    });
+    return pdfChartImage({
+        type: 'line',
+        data: { labels, datasets: [mk('Connect rate', 'connect_rate', '#0F2D4D', 'y'), mk('Reply rate', 'reply_rate', '#8b5cf6', 'y'), mk('Meeting rate', 'meeting_rate', '#10b981', 'y1')] },
+        options: {
+            layout: { padding: 18 },
+            plugins: { legend: { position: 'bottom', labels: { boxWidth: 28, padding: 26, font: PDF_CHART_FONT(22), color: '#374151' } } },
+            scales: {
+                y: { beginAtZero: true, title: { display: true, text: 'Connect / reply rate (%)', font: PDF_CHART_FONT(22), color: '#4B5563' }, ticks: { font: PDF_CHART_FONT(20), color: '#4B5563', callback: v => v + '%' }, grid: { color: '#f1f5f9' } },
+                y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Meeting rate (%)', font: PDF_CHART_FONT(22), color: '#4B5563' }, ticks: { font: PDF_CHART_FONT(20), color: '#4B5563', callback: v => v + '%' } },
+                x: { grid: { display: false }, ticks: { font: PDF_CHART_FONT(20), color: '#4B5563' } }
+            }
+        }
+    }, 1800, 720);
+}
+
+/* ── Page builder: layout primitives shared by every section ── */
+function pdfCreateBuilder(doc) {
+    const pageW = doc.internal.pageSize.getWidth(), pageH = doc.internal.pageSize.getHeight();
+    const M = 14, W = pageW - 2 * M, TOP = 20, BOTTOM = pageH - 17;
+    const PT = 0.352778; // mm per pt
+    const lineH = size => size * PT * 1.28;
+    const st = { y: TOP, toc: [], sectionNo: 0 };
+    const font = (size, style, color) => { doc.setFont('helvetica', style || 'normal'); doc.setFontSize(size); doc.setTextColor(...(color || PDF_C.text)); };
+    const B = { doc, M, W, TOP, BOTTOM, pageW, pageH, font, lineH };
+    Object.defineProperty(B, 'y', { get: () => st.y, set: v => { st.y = v; } });
+
+    B.page = () => { doc.addPage(); st.y = TOP; };
+    B.remaining = () => BOTTOM - st.y;
+    B.ensure = h => { if (st.y + h > BOTTOM) { B.page(); return true; } return false; };
+    B.space = h => { st.y = Math.min(st.y + h, BOTTOM); };
+    B.rule = () => { B.ensure(4); doc.setDrawColor(...PDF_C.line); doc.setLineWidth(0.3); doc.line(M, st.y + 1, M + W, st.y + 1); st.y += 4; };
+    B.pageNo = () => doc.internal.getCurrentPageInfo().pageNumber;
+
+    // Major section: numbered, listed in the table of contents. Starts a fresh page unless
+    // the current one is still mostly empty (avoids a near-blank page after a short spill).
+    B.h1 = (title, o) => {
+        o = o || {};
+        if (st.y > TOP) {
+            if (B.remaining() < (BOTTOM - TOP) * 0.62) B.page();
+            else st.y += 6;
+        }
+        const no = ++st.sectionNo;
+        const label = `${no}. ${pdfText(title)}`;
+        st.toc.push({ level: 1, title: label, page: B.pageNo() });
+        if (o.kicker) { font(7, 'bold', PDF_C.gold); doc.text(pdfText(o.kicker).toUpperCase(), M, st.y + 2.5, { charSpace: 0.4 }); st.y += 5; }
+        const bandH = 11;
+        doc.setFillColor(...(o.color || PDF_C.primary)); doc.rect(M, st.y, W, bandH, 'F');
+        doc.setFillColor(...PDF_C.gold); doc.rect(M, st.y + bandH, W, 0.9, 'F');
+        font(13, 'bold', PDF_C.white);
+        doc.text(doc.splitTextToSize(label, W - 8)[0], M + 4, st.y + 7.4);
+        st.y += bandH + 5.5;
+        if (o.subtitle) B.p(o.subtitle, { size: 8.5, style: 'italic', color: PDF_C.muted, gap: 3 });
+        return no;
+    };
+    B.h2 = (title, o) => {
+        o = o || {};
+        // Keep-with-next: a heading needs room for its intro line plus a table head and a few rows.
+        if (B.remaining() < (o.keep || 52)) B.page(); else if (st.y > TOP) st.y += 2.5;
+        if (!o.noToc) st.toc.push({ level: 2, title: pdfText(title), page: B.pageNo() });
+        font(11.5, 'bold', PDF_C.primary);
+        doc.splitTextToSize(pdfText(title), W).forEach(l => { doc.text(l, M, st.y + 4); st.y += lineH(11.5); });
+        doc.setFillColor(...PDF_C.gold); doc.rect(M, st.y + 1, 22, 0.7, 'F');
+        st.y += 5;
+        if (o.subtitle) B.p(o.subtitle, { size: 8.3, style: 'italic', color: PDF_C.muted });
+    };
+    B.h3 = (title, o) => {
+        o = o || {};
+        if (B.remaining() < (o.keep || 46)) B.page(); else if (st.y > TOP) st.y += 1.5;
+        font(10, 'bold', PDF_C.text);
+        doc.splitTextToSize(pdfText(title), W).forEach(l => { doc.text(l, M, st.y + 3.6); st.y += lineH(10); });
+        st.y += 1.5;
+        if (o.subtitle) B.p(o.subtitle, { size: 8.3, style: 'italic', color: PDF_C.muted });
+    };
+    B.p = (text, o) => {
+        o = o || {};
+        const size = o.size || 9, indent = o.indent || 0;
+        const clean = pdfText(text);
+        if (!clean) return;
+        font(size, o.style, o.color);
+        const lines = doc.splitTextToSize(clean, W - indent);
+        const lh = lineH(size);
+        lines.forEach(l => {
+            if (st.y + lh > BOTTOM) { B.page(); font(size, o.style, o.color); }
+            doc.text(l, M + indent, st.y + lh * 0.78);
+            st.y += lh;
+        });
+        st.y += o.gap != null ? o.gap : 2;
+    };
+    B.bullet = (text, o) => {
+        o = o || {};
+        const size = o.size || 9, indent = (o.indent || 0) * 5, x = M + indent;
+        const clean = pdfText(text);
+        if (!clean) return;
+        font(size, 'bold', o.markerColor || PDF_C.primary);
+        const markerW = o.marker ? Math.max(5, doc.getTextWidth(pdfText(o.marker)) + 2) : 4;
+        font(size, o.style, o.color);
+        const lines = doc.splitTextToSize(clean, W - indent - markerW);
+        const lh = lineH(size);
+        B.ensure(lh);
+        if (o.marker) { font(size, 'bold', o.markerColor || PDF_C.primary); doc.text(pdfText(o.marker), x, st.y + lh * 0.78); font(size, o.style, o.color); }
+        else { doc.setFillColor(...(o.markerColor || PDF_C.gold)); doc.circle(x + 1.1, st.y + lh * 0.5, 0.75, 'F'); }
+        lines.forEach(l => {
+            if (st.y + lh > BOTTOM) { B.page(); font(size, o.style, o.color); }
+            doc.text(l, x + markerW, st.y + lh * 0.78);
+            st.y += lh;
+        });
+        st.y += o.gap != null ? o.gap : 1.2;
+    };
+    // Call-out box with a colored accent stripe. kind: info | warn | danger | success | plain
+    B.note = (text, kind, o) => {
+        o = o || {};
+        const theme = {
+            info: [PDF_C.infoBg, PDF_C.primary, PDF_C.text], warn: [PDF_C.warningBg, PDF_C.warning, PDF_C.warningDark],
+            danger: [PDF_C.dangerBg, PDF_C.danger, PDF_C.dangerDark], success: [PDF_C.successBg, PDF_C.success, PDF_C.successDark],
+            plain: [PDF_C.cardBg, PDF_C.light, PDF_C.textSoft]
+        }[kind || 'info'];
+        const size = o.size || 8.5, pad = 3;
+        const title = o.title ? pdfText(o.title) : '';
+        font(size, 'normal', theme[2]);
+        const lines = doc.splitTextToSize(pdfText(text), W - pad * 2 - 3);
+        const lh = lineH(size);
+        const h = pad * 2 + lines.length * lh + (title ? lh + 0.5 : 0);
+        if (h > BOTTOM - TOP) { if (title) B.p(title, { style: 'bold', size, color: theme[2] }); B.p(text, { size, color: theme[2] }); return; }
+        B.ensure(h + 2);
+        doc.setFillColor(...theme[0]); doc.setDrawColor(...theme[1]); doc.setLineWidth(0.2);
+        doc.roundedRect(M, st.y, W, h, 1.2, 1.2, 'FD');
+        doc.setFillColor(...theme[1]); doc.rect(M, st.y, 1.4, h, 'F');
+        let yy = st.y + pad + lh * 0.78;
+        if (title) { font(size, 'bold', theme[2]); doc.text(title, M + pad + 2, yy); yy += lh + 0.5; font(size, 'normal', theme[2]); }
+        lines.forEach(l => { doc.text(l, M + pad + 2, yy); yy += lh; });
+        st.y += h + 3;
+    };
+    // Row of stat boxes: [{ value, label, sub?, color?, subColor? }]
+    B.stats = (items, o) => {
+        o = o || {};
+        if (!items.length) return;
+        const h = o.h || 20, gap = 3, bw = (W - gap * (items.length - 1)) / items.length;
+        B.ensure(h + 3);
+        items.forEach((it, i) => {
+            const x = M + i * (bw + gap);
+            doc.setFillColor(...PDF_C.cardBg); doc.setDrawColor(...PDF_C.line); doc.setLineWidth(0.25);
+            doc.roundedRect(x, st.y, bw, h, 1.5, 1.5, 'FD');
+            const val = pdfText(String(it.value));
+            let vs = it.valueSize || 14;
+            font(vs, 'bold', it.color || PDF_C.primary);
+            while (doc.getTextWidth(val) > bw - 4 && vs > 8) { vs -= 1; font(vs, 'bold', it.color || PDF_C.primary); }
+            doc.text(val, x + bw / 2, st.y + 8.8, { align: 'center' });
+            font(6.3, 'bold', PDF_C.muted);
+            doc.text(doc.splitTextToSize(pdfText(it.label).toUpperCase(), bw - 3)[0], x + bw / 2, st.y + 13.2, { align: 'center' });
+            if (it.sub) { font(6.5, 'normal', it.subColor || PDF_C.textSoft); doc.text(doc.splitTextToSize(pdfText(it.sub), bw - 3)[0], x + bw / 2, st.y + 17.3, { align: 'center' }); }
+        });
+        st.y += h + 4;
+    };
+    // AutoTable wrapper with the report's house style. Cells may be strings or AutoTable cell objects.
+    B.table = cfg => {
+        const body = (cfg.body || []).map(r => r.map(c => (c && typeof c === 'object' && !Array.isArray(c)) ? { ...c, content: pdfText(c.content) } : pdfText(c)));
+        if (!body.length) { B.p(cfg.empty || 'No data available.', { style: 'italic', color: PDF_C.muted, size: 8.5 }); return; }
+        const fs = cfg.fontSize || 8;
+        const numeric = cfg.numericCols || [];
+        B.ensure(cfg.minHeight || 30);
+        doc.autoTable({
+            startY: st.y,
+            margin: { left: M, right: M, top: TOP, bottom: pageH - BOTTOM },
+            head: cfg.head ? [cfg.head.map(pdfText)] : undefined,
+            body,
+            theme: 'grid',
+            tableWidth: W,
+            styles: { font: 'helvetica', fontSize: fs, cellPadding: { top: 1.5, bottom: 1.5, left: 1.8, right: 1.8 }, textColor: PDF_C.text, lineColor: PDF_C.line, lineWidth: 0.2, overflow: 'linebreak', valign: 'middle' },
+            headStyles: { fillColor: cfg.headFill || PDF_C.primary, textColor: PDF_C.white, fontStyle: 'bold', fontSize: Math.max(6.8, fs - 0.5), halign: 'left', valign: 'middle' },
+            alternateRowStyles: { fillColor: PDF_C.zebra },
+            columnStyles: cfg.columnStyles || {},
+            rowPageBreak: 'avoid',
+            showHead: 'everyPage',
+            didParseCell: d => {
+                if (numeric.includes(d.column.index)) d.cell.styles.halign = 'right';
+                if (cfg.didParseCell) cfg.didParseCell(d);
+            },
+            didDrawCell: d => { if (cfg.didDrawCell) cfg.didDrawCell(d); }
+        });
+        st.y = doc.lastAutoTable.finalY + (cfg.gap != null ? cfg.gap : 4);
+        (cfg.footnotes || []).forEach(f => B.p(f, { size: 7.3, style: 'italic', color: PDF_C.muted, gap: 0.8 }));
+        if (cfg.footnotes && cfg.footnotes.length) st.y += 1.5;
+    };
+    // Rate breakdown table (the PDF equivalent of the page's rate rows): every level with
+    // n, connect/reply/meeting rates and a bar for the sort metric (bar length = rate
+    // relative to the best reliable row, bar thickness = sample size), best row highlighted, low-n
+    // rows faded — the same conventions as the site.
+    B.rateTable = (rows, o) => {
+        o = o || {};
+        if (!rows || !rows.length) { B.p(o.empty || 'No breakdown available.', { style: 'italic', color: PDF_C.muted, size: 8.5 }); return; }
+        const meetingOnly = !!o.meetingOnly;
+        const metric = o.metric || (meetingOnly ? 'meeting_rate' : 'reply_rate');
+        const mInfo = PDF_METRIC[metric];
+        const list = o.ordinal ? rows.slice() : rows.slice().sort((a, b) => (b[metric] || 0) - (a[metric] || 0));
+        // Scale bars against the best *reliable* row so a tiny-n 100% doesn't flatten everything else.
+        const reliable = list.filter(r => (r.n || 0) >= RATE_LOW_N);
+        const maxVal = Math.max(...(reliable.length ? reliable : list).map(r => r[metric] || 0), 0.001);
+        const maxN = Math.max(...list.map(r => r.n || 0), 1);
+        const best = o.highlightBest ? pptxBestRow(list, metric) : null;
+        const anyLow = list.some(r => (r.n || 0) < RATE_LOW_N);
+        const labelOf = o.labelOf || levelLabel;
+        const head = meetingOnly
+            ? [o.levelHeader || 'Level', 'n', 'Meeting rate', 'Meeting rate (bar)']
+            : [o.levelHeader || 'Level', 'n', 'Connect', 'Reply', 'Meeting', `${mInfo.label} rate (bar)`];
+        const barCol = head.length - 1;
+        const body = list.map(r => {
+            const lowN = (r.n || 0) < RATE_LOW_N;
+            const label = labelOf(r) + (lowN ? ' *' : '');
+            return meetingOnly
+                ? [label, fmtNum(r.n), fmtPct(r.meeting_rate, 2), '']
+                : [label, fmtNum(r.n), fmtPct(r.connect_rate), fmtPct(r.reply_rate), fmtPct(r.meeting_rate, 2), ''];
+        });
+        const numeric = head.map((_, i) => i).filter(i => i > 0 && i < barCol);
+        const columnStyles = { 0: { fontStyle: 'bold' }, [barCol]: { cellWidth: meetingOnly ? 60 : 40 } };
+        numeric.forEach(i => { columnStyles[i] = { cellWidth: meetingOnly ? 26 : 18 }; });
+        const footnotes = [];
+        if (o.footnotes !== false) {
+            footnotes.push(best
+                ? `Highlighted row = ${o.bestLabel || 'best-performing level'} (highest ${mInfo.label.toLowerCase()} rate among levels with at least ${RATE_LOW_N} sends). Bar length = ${mInfo.label.toLowerCase()} rate relative to the best reliable row; bar thickness = sample size.`
+                : `Bar length = ${mInfo.label.toLowerCase()} rate relative to the best reliable row; bar thickness = sample size (n).`);
+            if (anyLow) footnotes.push(`* Fewer than ${RATE_LOW_N} sends - too small a sample to draw strong conclusions from.`);
+        }
+        B.table({
+            head, body, columnStyles, numericCols: numeric, fontSize: o.fontSize || 8, footnotes,
+            didParseCell: d => {
+                if (d.section !== 'body') return;
+                const r = list[d.row.index];
+                if (!r) return;
+                if (r === best) { d.cell.styles.fillColor = PDF_C.successBg; d.cell.styles.textColor = PDF_C.successDark; d.cell.styles.fontStyle = 'bold'; }
+                else if ((r.n || 0) < RATE_LOW_N) d.cell.styles.textColor = PDF_C.light;
+            },
+            didDrawCell: d => {
+                if (d.section !== 'body' || d.column.index !== barCol) return;
+                const r = list[d.row.index];
+                if (!r) return;
+                const v = isNum(r[metric]) ? r[metric] : 0, lowN = (r.n || 0) < RATE_LOW_N;
+                const t = 1.1 + 2.4 * Math.sqrt(Math.min(1, (r.n || 0) / maxN));
+                const x = d.cell.x + 2, w = d.cell.width - 4, yy = d.cell.y + d.cell.height / 2 - t / 2;
+                doc.setFillColor(...PDF_C.track); doc.roundedRect(x, yy, w, t, t / 2, t / 2, 'F');
+                const fw = Math.max(v > 0 ? 0.8 : 0, w * Math.min(1, v / maxVal));
+                if (fw > 0) { doc.setFillColor(...(lowN ? PDF_C.light : (r === best ? PDF_C.success : mInfo.color))); doc.roundedRect(x, yy, fw, t, t / 2, t / 2, 'F'); }
+            }
+        });
+    };
+    // Day × time-of-day heatmap table, shaded by the given metric (same 7×6 grid as the site).
+    B.heatmap = (rows, metric) => {
+        const mInfo = PDF_METRIC[metric];
+        const byCell = {};
+        rows.forEach(r => { const p = parseDayTimeLevel(r.level); if (p) byCell[`${p.day}||${p.part}`] = r; });
+        const reliable = rows.filter(r => (r.n || 0) >= RATE_LOW_N).map(r => r[metric]).filter(isNum);
+        const max = Math.max(...reliable, 0.001);
+        const head = ['', ...DAY_TIME_PART_ORDER];
+        const body = DAY_TIME_DAY_ORDER.map(day => [day.slice(0, 3), ...DAY_TIME_PART_ORDER.map(part => {
+            const r = byCell[`${day}||${part}`];
+            return r ? `${fmtPct(r[metric], mInfo.decimals)}\nn=${fmtNum(r.n)}` : '-';
+        })]);
+        B.table({
+            head, body, fontSize: 7.6, columnStyles: { 0: { cellWidth: 14 } }, minHeight: 78,   // keep the 7x6 grid on one page
+            footnotes: [`${mInfo.label} rate by day x time window (US Central). Darker = higher rate relative to the best reliable cell. Cells with fewer than ${RATE_LOW_N} sends are shown in gray and are too small to draw conclusions from.`],
+            didParseCell: d => {
+                d.cell.styles.halign = 'center';
+                if (d.section === 'head') { d.cell.styles.fontSize = 7; return; }
+                if (d.column.index === 0) { d.cell.styles.fillColor = PDF_C.cardBg; d.cell.styles.textColor = PDF_C.textSoft; d.cell.styles.fontStyle = 'bold'; return; }
+                const r = byCell[`${DAY_TIME_DAY_ORDER[d.row.index]}||${DAY_TIME_PART_ORDER[d.column.index - 1]}`];
+                if (!r) { d.cell.styles.fillColor = PDF_C.white; d.cell.styles.textColor = PDF_C.light; return; }
+                const t = isNum(r[metric]) ? Math.max(0, Math.min(1, r[metric] / max)) : 0;
+                const lowN = (r.n || 0) < RATE_LOW_N;
+                d.cell.styles.fillColor = pdfBlend(mInfo.color, 0.1 + t * 0.8);
+                d.cell.styles.textColor = lowN ? PDF_C.muted : PDF_C.text;
+                d.cell.styles.fontStyle = lowN ? 'normal' : 'bold';
+            }
+        });
+    };
+    B.image = (dataUrl, h, o) => {
+        if (!dataUrl) return;
+        o = o || {};
+        const w = o.w || W;
+        B.ensure(h + 2);
+        const fmt = /^data:image\/jpe?g/i.test(dataUrl) ? 'JPEG' : 'PNG';
+        try { doc.addImage(dataUrl, fmt, M + (W - w) / 2, st.y, w, h, undefined, 'FAST'); } catch (e) { console.warn('PDF image failed:', e); return; }
+        st.y += h + (o.gap != null ? o.gap : 4);
+    };
+    // Monospace block (for the AI prompt) that paginates cleanly.
+    B.code = (text, o) => {
+        o = o || {};
+        const size = o.size || 7.6, pad = 3;
+        doc.setFont('courier', 'normal'); doc.setFontSize(size);
+        const lines = doc.splitTextToSize(pdfText(text), W - pad * 2);
+        const lh = lineH(size) * 1.05;
+        let i = 0;
+        while (i < lines.length) {
+            if (B.remaining() < lh * 3 + pad * 2) B.page();
+            const fit = Math.max(1, Math.floor((B.remaining() - pad * 2) / lh));
+            const chunk = lines.slice(i, i + fit);
+            const h = chunk.length * lh + pad * 2;
+            doc.setFillColor(...PDF_C.cardBg); doc.setDrawColor(...PDF_C.line); doc.setLineWidth(0.25);
+            doc.roundedRect(M, st.y, W, h, 1.2, 1.2, 'FD');
+            doc.setFont('courier', 'normal'); doc.setFontSize(size); doc.setTextColor(...PDF_C.text);
+            chunk.forEach((l, k) => doc.text(l, M + pad, st.y + pad + lh * (k + 0.78)));
+            st.y += h + 2;
+            i += fit;
+            if (i < lines.length) { font(6.8, 'italic', PDF_C.muted); doc.text('(continued on next page)', M + W, st.y + 1, { align: 'right' }); B.page(); }
+        }
+        st.y += 2;
+    };
+    // Small Markdown renderer (headings, bullets, numbered lists, quotes, rules, inline
+    // bold/italic/code stripped to plain text) for the AI-written instruction blocks.
+    B.markdown = md => {
+        const inline = s => s.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/__([^_]+)__/g, '$1').replace(/`([^`]+)`/g, '$1')
+            .replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\*)/g, '$1$2').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+        let para = [];
+        let lastBullet = null;
+        const flush = () => { if (para.length) { B.p(inline(para.join(' ')), { size: 8.8 }); para = []; } };
+        String(md || '').replace(/\r/g, '').split('\n').forEach(line => {
+            if (!line.trim()) { flush(); lastBullet = null; return; }
+            let m = line.match(/^(#{1,6})\s+(.*)$/);
+            if (m) {
+                flush(); lastBullet = null;
+                const text = inline(m[2].replace(/\s*#+\s*$/, ''));
+                if (m[1].length <= 2) B.h3(text); else B.p(text, { style: 'bold', size: 9.2, color: PDF_C.primary, gap: 1.2 });
+                return;
+            }
+            if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); lastBullet = null; B.rule(); return; }
+            m = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+            if (m) {
+                flush();
+                const indent = Math.min(3, Math.floor(m[1].replace(/\t/g, '    ').length / 2));
+                lastBullet = { indent };
+                B.bullet(inline(m[3]), { indent, size: 8.8, marker: /\d/.test(m[2]) ? m[2] : null });
+                return;
+            }
+            m = line.match(/^>\s?(.*)$/);
+            if (m) { flush(); lastBullet = null; B.p(inline(m[1]), { style: 'italic', color: PDF_C.textSoft, indent: 4, size: 8.8 }); return; }
+            if (lastBullet && /^\s+\S/.test(line)) { B.p(inline(line.trim()), { indent: lastBullet.indent * 5 + 4, size: 8.8, gap: 1 }); return; }
+            lastBullet = null;
+            para.push(line.trim());
+        });
+        flush();
+    };
+    // Real-example card (contact, role, outcome/opportunity, message text).
+    B.exampleCard = (ex, o) => {
+        o = o || {};
+        const pad = 3, innerW = W - pad * 2 - 2;
+        const msgSize = o.compact ? 8.2 : 8.8;
+        font(msgSize, 'italic');
+        let msgLines = doc.splitTextToSize(pdfText(ex.message || 'No message text available.'), innerW);
+        const lh = lineH(msgSize);
+        const chips = [ex.message_type ? humanizeLevel(ex.message_type) : '', ex.outcome ? `Outcome: ${ex.outcome}` : ''].filter(Boolean).join('  ·  ');
+        const headH = 9.5 + (chips ? 4.2 : 0);
+        const maxLines = Math.floor((BOTTOM - TOP - headH - pad * 2 - 2) / lh);
+        if (msgLines.length > maxLines) msgLines = msgLines.slice(0, maxLines - 1).concat(['...']);
+        const h = pad * 2 + headH + msgLines.length * lh;
+        // Optional caption drawn directly above the card and kept on the same page as it.
+        const capLh = o.caption ? lineH(7.8) + 1 : 0;
+        B.ensure(h + capLh + 2);
+        if (o.caption) { font(7.8, 'bold', PDF_C.textSoft); doc.text(doc.splitTextToSize(pdfText(o.caption), W)[0], M, st.y + lineH(7.8) * 0.78); st.y += capLh; }
+        doc.setFillColor(...PDF_C.cardBg); doc.setDrawColor(...PDF_C.line); doc.setLineWidth(0.25);
+        doc.roundedRect(M, st.y, W, h, 1.5, 1.5, 'FD');
+        doc.setFillColor(...(o.accent || PDF_C.gold)); doc.rect(M, st.y, 1.3, h, 'F');
+        let yy = st.y + pad + 3.4;
+        font(9.5, 'bold', PDF_C.text);
+        doc.text(doc.splitTextToSize(pdfText(ex.contact || 'Unknown contact'), innerW - 34)[0], M + pad + 2, yy);
+        if (isNum(ex.opportunity)) { font(7.4, 'bold', PDF_C.warningDark); doc.text(`Opportunity ${Math.round(ex.opportunity)}`, M + W - pad, yy, { align: 'right' }); }
+        yy += 4.3;
+        font(7.8, 'normal', PDF_C.muted);
+        doc.text(doc.splitTextToSize(pdfText(`${ex.title || '-'}${ex.company ? ' @ ' + ex.company : ''}`), innerW)[0], M + pad + 2, yy);
+        if (chips) { yy += 4.2; font(7.2, 'bold', PDF_C.textSoft); doc.text(pdfText(chips), M + pad + 2, yy); }
+        yy += 2.2;
+        font(msgSize, 'italic', PDF_C.textSoft);
+        msgLines.forEach(l => { yy += lh; doc.text(l, M + pad + 2, yy); });
+        st.y += h + 3;
+    };
+    B.cover = o => {
+        const bandH = 98;
+        doc.setFillColor(...PDF_C.navy); doc.rect(0, 0, pageW, bandH, 'F');
+        doc.setFillColor(...PDF_C.gold); doc.rect(0, bandH, pageW, 2, 'F');
+        if (o.logo) { try { doc.addImage(o.logo, 'PNG', pageW - M - 38, 8, 38, 12.85); } catch (e) { /* ignore */ } }
+        font(9.5, 'bold', PDF_C.gold); doc.text('CONNECT SUCCESS ANALYSIS', M, 30, { charSpace: 0.8 });
+        font(8.5, 'normal', [148, 163, 184]); doc.text('Hypothesis Group Report', M, 36);
+        font(24, 'bold', PDF_C.white);
+        let yy = 50;
+        doc.splitTextToSize(pdfText(o.title), W - 10).slice(0, 3).forEach(l => { doc.text(l, M, yy); yy += 11; });
+        font(11, 'normal', [203, 213, 225]); doc.text(doc.splitTextToSize(pdfText(o.subtitle), W - 10)[0], M, yy + 1); yy += 8;
+        font(9.5, 'italic', [148, 163, 184]); doc.text(doc.splitTextToSize(pdfText(o.tagline), W - 10)[0], M, yy + 2);
+        st.y = bandH + 14;
+        const colW = W / 2;
+        (o.meta || []).forEach((row, i) => {
+            const x = M + (i % 2) * colW, yRow = st.y + Math.floor(i / 2) * 11;
+            font(6.5, 'bold', PDF_C.muted); doc.text(pdfText(row[0]).toUpperCase(), x, yRow);
+            font(9.2, 'normal', PDF_C.text); doc.text(doc.splitTextToSize(pdfText(row[1]), colW - 6)[0], x, yRow + 4.6);
+        });
+        st.y += Math.ceil((o.meta || []).length / 2) * 11 + 4;
+        if (o.stats && o.stats.length) B.stats(o.stats, { h: 22 });
+        if (o.summary && o.summary.length) {
+            st.y += 2;
+            font(8, 'bold', PDF_C.primary); doc.text('WHAT THIS REPORT CONTAINS', M, st.y + 3, { charSpace: 0.5 }); st.y += 7;
+            o.summary.slice(0, 9).forEach(s => B.bullet(s, { size: 8.6, color: PDF_C.textSoft }));
+        }
+        doc.setDrawColor(...PDF_C.line); doc.setLineWidth(0.3); doc.line(M, pageH - 22, M + W, pageH - 22);
+        font(7.2, 'italic', PDF_C.muted);
+        doc.text(doc.splitTextToSize(pdfText(o.confidential), W), M, pageH - 18);
+        doc.addPage(); // page 2 is reserved for the table of contents, filled in by finish()
+        doc.addPage(); st.y = TOP;
+    };
+    // Table of contents (page 2) + running header/footer on every page after the cover.
+    B.finish = o => {
+        const total = doc.internal.getNumberOfPages();
+        doc.setPage(2);
+        let yy = TOP + 4;
+        font(16, 'bold', PDF_C.primary); doc.text('Contents', M, yy + 5); yy += 9;
+        doc.setFillColor(...PDF_C.gold); doc.rect(M, yy, 22, 0.8, 'F'); yy += 7;
+        let entries = st.toc.slice();
+        const cap = Math.floor((BOTTOM - yy) / 6.2);
+        if (entries.length > cap) entries = entries.filter(e => e.level === 1);
+        if (entries.length > cap) entries = entries.slice(0, cap);
+        entries.forEach(e => {
+            const isTop = e.level === 1, x = M + (isTop ? 0 : 6);
+            font(isTop ? 9.8 : 8.6, isTop ? 'bold' : 'normal', isTop ? PDF_C.text : PDF_C.textSoft);
+            const pageStr = String(e.page), pw = doc.getTextWidth(pageStr);
+            const title = doc.splitTextToSize(e.title, W - (x - M) - pw - 10)[0];
+            doc.text(title, x, yy);
+            const tw = doc.getTextWidth(title);
+            doc.setDrawColor(...PDF_C.light); doc.setLineWidth(0.25); doc.setLineDashPattern([0.5, 1.2], 0);
+            doc.line(x + tw + 2, yy - 0.8, M + W - pw - 3, yy - 0.8);
+            doc.setLineDashPattern([], 0);
+            doc.text(pageStr, M + W, yy, { align: 'right' });
+            yy += isTop ? 6.6 : 5.6;
+        });
+        for (let i = 2; i <= total; i++) {
+            doc.setPage(i);
+            font(7.3, 'normal', PDF_C.muted);
+            doc.text(doc.splitTextToSize(pdfText(o.headerLeft), W * 0.68)[0], M, 11);
+            doc.text(pdfText(o.headerRight), M + W, 11, { align: 'right' });
+            doc.setDrawColor(...PDF_C.line); doc.setLineWidth(0.3);
+            doc.line(M, 13.5, M + W, 13.5);
+            doc.line(M, pageH - 11.5, M + W, pageH - 11.5);
+            doc.text(doc.splitTextToSize(pdfText(o.footerLeft), W * 0.75)[0], M, pageH - 7.5);
+            doc.text(`Page ${i} of ${total}`, M + W, pageH - 7.5, { align: 'right' });
+        }
+    };
+    return B;
+}
+
+/* ── Section writers: Success Analysis tab ── */
+
+function pdfResolveSegment(clientSlug, groupSlug) {
+    if (!PAYLOAD) return { segment: null, crumbs: [], kind: 'missing' };
+    if (!clientSlug) return { segment: PAYLOAD.overall, crumbs: ['Overall - All Clients'], kind: 'overall' };
+    const client = PAYLOAD.clients[clientSlug];
+    if (!client) return { segment: null, crumbs: [], kind: 'missing' };
+    if (!groupSlug) return { segment: client, crumbs: [client.name], kind: 'client' };
+    const group = (client.hypothesis_groups || {})[groupSlug];
+    if (!group) return { segment: null, crumbs: [client.name], kind: 'missing' };
+    return { segment: group, crumbs: [client.name, group.name], kind: 'group' };
+}
+
+function pdfGlanceBullets(ctx) {
+    const { segment, kind, lgRow } = ctx;
+    const f = segment.funnel || {}, out = [];
+    let deltaTxt = '';
+    if (kind !== 'overall' && isNum(f.blended_score) && PAYLOAD.overall.funnel && isNum(PAYLOAD.overall.funnel.blended_score)) {
+        const d = f.blended_score - PAYLOAD.overall.funnel.blended_score;
+        deltaTxt = ` (${d >= 0 ? '+' : ''}${d.toFixed(2)} vs. the overall ${fmtScore(PAYLOAD.overall.funnel.blended_score)})`;
+    }
+    out.push(`${fmtNum(f.n)} contacts reached: ${fmtPct(f.connect_rate)} connected, ${fmtPct(f.reply_rate)} replied and ${fmtPct(f.meeting_rate, 2)} booked a meeting (${fmtNum(f.scheduled)} meetings). Blended success score ${fmtScore(f.blended_score)}${deltaTxt}.`);
+    if (segment.sufficient_data) {
+        const w = (segment.keys && segment.keys.working) || [], nw = (segment.keys && segment.keys.not_working) || [];
+        if (w.length) out.push(`Strongest positive signal: "${w[0].label}" - ${fmtPP(w[0].effect_pp)} on ${OUTCOME_LABEL[w[0].outcome] || 'the outcome'} (${w[0].confidence || 'Low'} confidence; ${fmtPct(w[0].rate_with)} with vs ${fmtPct(w[0].rate_without)} without).`);
+        if (nw.length) out.push(`Biggest drag: "${nw[0].label}" - ${fmtPP(nw[0].effect_pp)} on ${OUTCOME_LABEL[nw[0].outcome] || 'the outcome'} (${nw[0].confidence || 'Low'} confidence; ${fmtPct(nw[0].rate_with)} with vs ${fmtPct(nw[0].rate_without)} without).`);
+        const r = segment.research || {};
+        const realSend = !!((r.request_day_of_week && r.request_day_of_week.length) || (r.request_time_of_day && r.request_time_of_day.length));
+        const bestDay = pptxBestRow(realSend ? r.request_day_of_week : r.day_of_week, 'connect_rate');
+        const bestTime = pptxBestRow(realSend ? r.request_time_of_day : r.time_of_day, 'connect_rate');
+        if (bestDay || bestTime) {
+            const parts = [bestDay ? levelLabel(bestDay) : '', bestTime ? humanizeLevel(bestTime.level) : ''].filter(Boolean).join(', ');
+            out.push(`Best time to send the connection request: ${parts} (${fmtPct((bestTime || bestDay).connect_rate)} connect rate${realSend ? '' : '; based on first-message dates, true send-time data is not available yet'}).`);
+        }
+        const mv = r.message_variation;
+        if (Array.isArray(mv) && mv.length > 1) {
+            const top = pptxBestRow(mv, 'reply_rate');
+            if (top && (top.n || 0) >= RATE_LOW_N && (top.reply_rate || 0) > 0) out.push(`Leading A/B message angle: "${top.level}" at ${fmtPct(top.reply_rate)} reply rate (n=${fmtNum(top.n)}) across ${mv.length} angles tested.`);
+        }
+        const tp = r.top_phrases;
+        if (tp && tp.working && tp.working.length) out.push(`Phrase most associated with replies: "${tp.working[0].phrase}" (${fmtPP(tp.working[0].effect_pp)} reply rate, n=${fmtNum(tp.working[0].n)}).`);
+        const prof = segment.audience_profile;
+        if (kind !== 'overall' && audDims(prof).length) {
+            const verdicts = audDims(prof).map(d => audVerdict(prof[d.key].expected_vs_actual)).filter(Boolean);
+            if (verdicts.length) {
+                const pos = verdicts.filter(v => v.cls === 'pos').length, neg = verdicts.filter(v => v.cls === 'neg').length;
+                const read = pos > neg ? 'messaging, timing or handling is adding lift beyond who is being targeted' : neg > pos ? 'results are weaker than the audience mix alone would predict' : 'audience mix largely explains the results';
+                out.push(`Audience check: beating audience-based expectations on ${pos} of ${verdicts.length} dimensions and below on ${neg} - ${read}.`);
+            }
+        }
+        const fu = r.followup;
+        if (fu && isNum(fu.n_replied)) {
+            const bestA = (fu.by_approach || []).filter(a => (a.n || 0) >= 3).sort((a, b) => (b.meeting_rate || 0) - (a.meeting_rate || 0))[0];
+            out.push(`Follow-up: ${fmtNum(fu.n_replied)} prospects replied (average reply warmth ${fmtScore(fu.avg_reply_enthusiasm, 1)} / 5)${bestA ? `; the "${humanizeLevel(bestA.approach)}" follow-up approach converts best at ${fmtPct(bestA.meeting_rate)} (n=${fmtNum(bestA.n)})` : ''}.`);
+        }
+        const later = [];
+        if (contentBlockUsable(segment.message_2)) later.push(`${fmtNum(segment.message_2.n_eligible_rows)} contacts reached message 2`);
+        if (contentBlockUsable(segment.message_3plus)) later.push(`${fmtNum(segment.message_3plus.n_eligible_rows)} reached message 3+`);
+        if (later.length) out.push(`Later-stage models are included: ${later.join('; ')} (meeting rate only).`);
+    } else {
+        out.push('Deep-dive sections (keys, research, phrases, examples) are omitted: this segment has not yet reached the 40 driver-eligible contacts needed for reliable patterns.');
+    }
+    if (lgRow) {
+        const g = lgRow.group, fl = g.flag || {};
+        const runDate = (LG.payload && LG.payload.meta && LG.payload.meta.run_date) || '';
+        out.push(`Flagged by the Connect Hypothesis Optimizer${runDate ? ` (run ${runDate})` : ''}: ${fl.reason || 'active but under-performing.'}${lgIsDownturn(g) ? ' A statistically meaningful recent downturn was detected.' : ''}${lgConfirmedCount(g) ? ` ${lgConfirmedCount(g)} new hypothesis${lgConfirmedCount(g) === 1 ? ' was' : 'es were'} confirmed.` : ''}`);
+    } else if (LG.payload && kind === 'group') {
+        out.push(`Not flagged by the Connect Hypothesis Optimizer (run ${(LG.payload.meta && LG.payload.meta.run_date) || '-'}) - this group is performing within range.`);
+    }
+    if (segment.message_prompt) out.push('A ready-to-use AI message-writing prompt tuned to this segment is included near the end of this report.');
+    return out;
+}
+
+function pdfKeysTable(B, items, working) {
+    if (!items.length) {
+        B.p(working ? 'No strong positive signals were found for this segment yet.' : 'No strong negative signals were found for this segment yet.', { style: 'italic', color: PDF_C.muted, size: 8.5 });
+        return;
+    }
+    const accent = working ? PDF_C.successDark : PDF_C.dangerDark;
+    const body = items.map(k => {
+        const info = signalInfoOf(k.id), flip = hasUnstableSignFlip(k);
+        let label = k.label || '';
+        if (info) label += `\n${info.family.shortTitle}: ${info.position.where.toLowerCase()}`;
+        if (flip) label += `\nCaution: the raw rates point the other way; with p=${k.p_value.toFixed(3)} and Low confidence this adjusted estimate is unstable.`;
+        return [label, k.category || 'General', OUTCOME_LABEL[k.outcome] || k.outcome || '-', fmtPP(k.effect_pp) + (k.connection_controlled ? ' (ctrl.)' : ''),
+            `${fmtPct(k.rate_with)}\nn=${fmtNum(k.n_with)}`, `${fmtPct(k.rate_without)}\nn=${fmtNum(k.n_without)}`, isNum(k.p_value) ? k.p_value.toFixed(3) : '-', k.confidence || 'Low'];
+    });
+    B.table({
+        head: ['Signal', 'Category', 'Affects', 'Effect', 'With', 'Without', 'p', 'Conf.'], body, headFill: accent, fontSize: 7.6,
+        numericCols: [3, 4, 5, 6],
+        columnStyles: { 1: { cellWidth: 22 }, 2: { cellWidth: 22 }, 3: { cellWidth: 19, fontStyle: 'bold' }, 4: { cellWidth: 17 }, 5: { cellWidth: 17 }, 6: { cellWidth: 12 }, 7: { cellWidth: 14 } },
+        didParseCell: d => {
+            if (d.section !== 'body') return;
+            if (d.column.index === 3) d.cell.styles.textColor = accent;
+            if (d.column.index === 7) {
+                const c = (items[d.row.index] || {}).confidence;
+                d.cell.styles.textColor = c === 'High' ? PDF_C.successDark : c === 'Medium' ? PDF_C.warningDark : PDF_C.muted;
+                d.cell.styles.fontStyle = 'bold';
+            }
+        },
+        footnotes: ['Effect = percentage-point change in the outcome when the signal is present (shrunk toward the average for small samples). (ctrl.) = controlled for the prospect\'s LinkedIn connection count. Confidence: High = p<0.05 with a solid sample; Medium = p<0.10; Low = weak signal, treat as a hint.']
+    });
+}
+
+function pdfAddKeys(B, keys) {
+    const working = (keys && keys.working) || [], notWorking = (keys && keys.not_working) || [];
+    B.h3(`What's working (${working.length})`);
+    pdfKeysTable(B, working, true);
+    B.h3(`What to fix (${notWorking.length})`);
+    pdfKeysTable(B, notWorking, false);
+}
+
+function pdfTopPhrasesTable(B, list, positive) {
+    if (!list.length) { B.p('No standout phrases found.', { style: 'italic', color: PDF_C.muted, size: 8.5 }); return; }
+    const accent = positive ? PDF_C.successDark : PDF_C.dangerDark;
+    const body = list.map(p => [`"${p.phrase}"`, fmtNum(p.n), fmtPct(p.reply_rate_with), fmtPct(p.reply_rate_without), fmtPP(p.effect_pp) + (p.connection_controlled ? ' (ctrl.)' : ''), isNum(p.p_value) ? p.p_value.toFixed(3) : '-']);
+    B.table({
+        head: ['Phrase', 'n', 'Reply rate with', 'Reply rate without', 'Effect', 'p'], body, headFill: accent, fontSize: 7.8, numericCols: [1, 2, 3, 4, 5],
+        columnStyles: { 0: { fontStyle: 'bold' }, 1: { cellWidth: 16 }, 2: { cellWidth: 26 }, 3: { cellWidth: 28 }, 4: { cellWidth: 24, fontStyle: 'bold' }, 5: { cellWidth: 14 } },
+        didParseCell: d => { if (d.section === 'body' && d.column.index === 4) d.cell.styles.textColor = accent; }
+    });
+}
+
+function pdfKeyPhrasesTable(B, list) {
+    if (!list.length) { B.p('No recurring phrases found.', { style: 'italic', color: PDF_C.muted, size: 8.5 }); return; }
+    const sorted = list.slice().sort((a, b) => (b.pct_of_messages || 0) - (a.pct_of_messages || 0));
+    const body = sorted.map(p => [`"${p.phrase}"`, p.category || 'Other', fmtPct(p.pct_of_messages), isNum(p.count) ? fmtNum(p.count) : '-', isNum(p.lift_pp) ? `${fmtPP(p.lift_pp)} ${p.lift_outcome || ''}${p.connection_controlled ? ' (ctrl.)' : ''}`.trim() : '-']);
+    B.table({
+        head: ['Phrase', 'Category', '% of messages', 'Uses', 'Lift'], body, fontSize: 7.8, numericCols: [2, 3],
+        columnStyles: { 0: { fontStyle: 'bold' }, 1: { cellWidth: 34 }, 2: { cellWidth: 24 }, 3: { cellWidth: 16 }, 4: { cellWidth: 34 } },
+        didParseCell: d => {
+            if (d.section !== 'body' || d.column.index !== 4) return;
+            const p = sorted[d.row.index];
+            if (p && isNum(p.lift_pp)) { d.cell.styles.textColor = p.lift_pp >= 0 ? PDF_C.successDark : PDF_C.dangerDark; d.cell.styles.fontStyle = 'bold'; }
+        },
+        footnotes: ['Lift = percentage-point change in the named outcome for messages that use the phrase vs. those that do not.']
+    });
+}
+
+function pdfAddPhrases(B, research, stage) {
+    const tp = (research && research.top_phrases) || {};
+    B.h3('Phrases that move reply rate - boost');
+    pdfTopPhrasesTable(B, tp.working || [], true);
+    B.h3('Phrases that move reply rate - hurt');
+    pdfTopPhrasesTable(B, tp.not_working || [], false);
+    const kp = research && research.key_phrases;
+    const groups = Array.isArray(kp)
+        ? [{ title: stage === 'message_2' ? 'Phrases we use most - in message 2' : stage === 'message_3plus' ? 'Phrases we use most - in message 3+' : 'Phrases we use most - in the opening message', list: kp }]
+        : [{ title: 'Phrases we use most - in the opening message', list: (kp && kp.opening) || [] }, { title: 'Phrases we use most - in follow-ups', list: (kp && kp.followup) || [] }];
+    groups.forEach(g => { B.h3(g.title); pdfKeyPhrasesTable(B, g.list); });
+}
+
+function pdfAddAudience(B, segment) {
+    const profile = segment.audience_profile, dims = audDims(profile);
+    B.h1('Audience Makeup & Expected vs. Realized', { subtitle: 'Who this group is actually targeting - and whether its results are explained by that audience. Composition is compared against every other contact across all clients and hypothesis groups (not just this client).' });
+    const tiles = dims.map(d => {
+        const dim = profile[d.key];
+        const lvl = d.key === 'executive' ? (dim.by_level.find(l => /^executive/i.test(l.level)) || audTopLevel(dim)) : audTopLevel(dim);
+        if (!lvl) return null;
+        return { value: fmtPct(lvl.group_pct, 0), label: d.tile, sub: `${d.key === 'executive' ? 'executives (C-Suite / VP)' : humanizeLevel(lvl.level)} · baseline ${fmtPct(lvl.baseline_pct, 0)} · index ${isNum(lvl.index) ? lvl.index : 'n/a'}` };
+    }).filter(Boolean);
+    if (tiles.length) B.stats(tiles);
+    const evaDims = dims.filter(d => profile[d.key].expected_vs_actual);
+    if (evaDims.length) {
+        B.h3('Expected vs. realized outcomes', { subtitle: 'Realized = what this group actually achieved. Expected = what we would predict if it converted like the global baseline does, given its audience mix on that dimension. Gaps of 10% or more above / below expectation are flagged.' });
+        const body = evaDims.map(d => {
+            const dim = profile[d.key], eva = dim.expected_vs_actual, v = audVerdict(eva);
+            return [`${d.label}\nn=${fmtNum(dim.n_group)}${dim.n_group < AUD_SMALL_N ? ' (small sample)' : ''}`,
+                ...AUD_OUTCOMES.map(o => {
+                    const a = eva[`actual_${o.id}_rate`], e = eva[`expected_${o.id}_rate`];
+                    if (!isNum(a) && !isNum(e)) return '-';
+                    return `${fmtPct(a, o.decimals)} realized\n${fmtPct(e, o.decimals)} expected\n${audDelta(a, e, o.decimals) || ''}`;
+                }), v ? v.text : '-'];
+        });
+        const cls = c => c === 'pos' ? PDF_C.successDark : c === 'neg' ? PDF_C.dangerDark : PDF_C.muted;
+        B.table({
+            head: ['Audience dimension', 'Connect rate', 'Reply rate', 'Meeting rate', 'Read'], body, fontSize: 7.8,
+            columnStyles: { 0: { fontStyle: 'bold' }, 1: { cellWidth: 30 }, 2: { cellWidth: 30 }, 3: { cellWidth: 30 }, 4: { cellWidth: 38, fontStyle: 'bold' } },
+            didParseCell: d => {
+                if (d.section !== 'body') return;
+                const dim = profile[evaDims[d.row.index].key], eva = dim.expected_vs_actual;
+                if (d.column.index >= 1 && d.column.index <= 3) {
+                    const o = AUD_OUTCOMES[d.column.index - 1];
+                    d.cell.styles.textColor = cls(audDeltaClass(eva[`actual_${o.id}_rate`], eva[`expected_${o.id}_rate`]));
+                }
+                if (d.column.index === 4) { const v = audVerdict(eva); if (v) d.cell.styles.textColor = cls(v.cls); }
+            }
+        });
+    }
+    B.h3('Audience composition by dimension');
+    dims.forEach(d => {
+        const dim = profile[d.key], levels = audOrderLevels(d.key, dim.by_level);
+        B.p(`${d.label} - n=${fmtNum(dim.n_group)} here · ${fmtNum(dim.n_baseline)} baseline`, { style: 'bold', size: 9.2, gap: 1.5 });
+        const body = levels.map(l => [humanizeLevel(l.level), fmtPct(l.group_pct), fmtNum(l.group_n), fmtPct(l.baseline_pct), isNum(l.index) ? String(l.index) : 'n/a',
+            isNum(l.index) ? (l.index >= 110 ? `${l.index - 100}% more common here` : l.index <= 90 ? `${100 - l.index}% less common here` : 'Same mix as baseline') : 'No baseline for this level']);
+        B.table({
+            head: ['Level', 'This group', 'n', 'Baseline', 'Index', 'Read'], body, fontSize: 7.8, numericCols: [1, 2, 3, 4],
+            columnStyles: { 1: { cellWidth: 22 }, 2: { cellWidth: 16 }, 3: { cellWidth: 22 }, 4: { cellWidth: 16, fontStyle: 'bold' }, 5: { cellWidth: 46 } },
+            didParseCell: dd => {
+                if (dd.section !== 'body') return;
+                const l = levels[dd.row.index];
+                if (!l) return;
+                if (isNum(l.group_n) && l.group_n < RATE_LOW_N) dd.cell.styles.textColor = PDF_C.light;
+                if (dd.column.index === 4 && isNum(l.index)) dd.cell.styles.textColor = l.index >= 110 ? PDF_C.successDark : l.index <= 90 ? PDF_C.dangerDark : PDF_C.muted;
+            }
+        });
+        if (dim.expected_vs_actual) {
+            const txt = pdfText(renderAudienceCallout(d, dim));
+            const v = audVerdict(dim.expected_vs_actual);
+            if (txt) B.note(txt, v ? (v.cls === 'pos' ? 'success' : v.cls === 'neg' ? 'danger' : 'plain') : 'plain', { size: 8 });
+        }
+    });
+    B.p('Index = 100 x (share of this group at a level / share of the global baseline at that level). 100 = same mix as everyone else; 150 = 50% more common here; 67 = a third less common. Levels with fewer than 20 contacts here are shown in gray.', { size: 7.5, style: 'italic', color: PDF_C.muted });
+}
+
+function pdfAddBestSendTime(B, research) {
+    const dayRows = research.request_day_of_week, timeRows = research.request_time_of_day, heatRows = research.request_day_time;
+    const hasSendTime = !!((dayRows && dayRows.length) || (timeRows && timeRows.length) || (heatRows && heatRows.length));
+    const fbDay = research.day_of_week, fbTime = research.time_of_day;
+    const usingFallback = !hasSendTime && !!((fbDay && fbDay.length) || (fbTime && fbTime.length));
+    if (!hasSendTime && !usingFallback) return;
+    B.h1('Best Time to Send the Connection Request', { subtitle: 'Based on when the connection request was actually sent (US Central) - not when it was accepted or replied to. Ranked by connect (acceptance) rate, the outcome send-time actually influences.' });
+    if (usingFallback) B.note("True send-time data isn't available yet for this segment - showing first-message dates instead, which mostly track when contacts accepted or replied rather than when the request was sent. This switches to real send-time data automatically once it is available.", 'warn');
+    B.h3('Day of week');
+    B.rateTable(usingFallback ? fbDay : dayRows, { metric: 'connect_rate', highlightBest: true, bestLabel: 'recommended day' });
+    B.h3('Time of day (Central)');
+    B.rateTable(usingFallback ? fbTime : timeRows, { metric: 'connect_rate', highlightBest: true, bestLabel: 'recommended time window' });
+    if (!usingFallback && heatRows && heatRows.length) {
+        B.h3('Day x time window');
+        B.heatmap(heatRows, 'connect_rate');
+        const reliable = heatRows.filter(r => (r.n || 0) >= RATE_LOW_N).sort((a, b) => (b.connect_rate || 0) - (a.connect_rate || 0));
+        if (reliable.length) {
+            B.h3(`Top day x time windows (at least ${RATE_LOW_N} sends)`);
+            B.rateTable(reliable.slice(0, 10), { metric: 'connect_rate', highlightBest: true, bestLabel: 'best window' });
+        }
+    }
+}
+
+function pdfAddSignalFamily(B, fam, timingRows, keys) {
+    B.p(`${pdfText(fam.intro)} Each contact is counted once, in the earliest spot it first happens (or "Never").`, { size: 8.3, color: PDF_C.textSoft });
+    const sorted = sortSignalTiming(timingRows);
+    if (sorted.length) B.rateTable(sorted, { ordinal: true, levelHeader: 'When it first happens' });
+    else B.p('No timing breakdown available for this segment.', { style: 'italic', color: PDF_C.muted, size: 8.5 });
+    const overallKeys = PAYLOAD && PAYLOAD.overall && PAYLOAD.overall.keys;
+    const isOverall = !!overallKeys && keys === overallKeys;
+    const cellTxt = (hit, bench) => {
+        if (hit) { const k = hit.item; return `${fmtPP(k.effect_pp)} (${k.confidence || 'Low'})\n${fmtPct(k.rate_with)} with vs ${fmtPct(k.rate_without)} without · n=${fmtNum(k.n_with)} used it`; }
+        if (isNum(bench)) return `${fmtPP(bench)}\nbenchmark effect only`;
+        return 'Not enough data yet';
+    };
+    let found = 0;
+    const body = SIGNAL_POSITIONS.map(p => {
+        const id = `${fam.prefix}_${p.suffix}`;
+        const seg = isOverall ? null : findSignalKey(keys, id);
+        const ov = findSignalKey(overallKeys, id);
+        if (seg) found++;
+        const benchmark = seg && seg.item ? seg.item.overall_effect_pp : null;
+        const outcome = (seg && seg.item && seg.item.outcome) || (ov && ov.item && ov.item.outcome) || null;
+        return [p.short + (outcome ? `\neffect on ${OUTCOME_LABEL[outcome] || outcome}` : ''), ...(isOverall ? [] : [cellTxt(seg)]), cellTxt(ov, ov ? null : benchmark)];
+    });
+    B.p(`Effect of using it at each position (with vs. without), controlled for network size where the page marks it.${found || isOverall ? '' : ' None of the positions have enough data for this segment yet - that means "not enough data", not "doesn\'t work".'}`, { size: 8.3, color: PDF_C.textSoft });
+    const colorCell = d => {
+        if (d.section !== 'body' || d.column.index === 0) return;
+        const txt = String(d.cell.raw || '');
+        if (/^\+/.test(txt)) d.cell.styles.textColor = PDF_C.successDark;
+        else if (/^-\d/.test(txt)) d.cell.styles.textColor = PDF_C.dangerDark;
+        else d.cell.styles.textColor = PDF_C.muted;
+    };
+    B.table({ head: ["Where it's used", ...(isOverall ? [] : ['This segment']), 'Overall (all data)'], body, fontSize: 7.8, columnStyles: { 0: { cellWidth: 48, fontStyle: 'bold' } }, didParseCell: colorCell });
+}
+
+function pdfAddPriorInterest(B, rows, dim) {
+    if (!Array.isArray(rows) || !rows.length) return;
+    const field = dim.crossTab.seriesField;
+    const series = (dim.crossTab.seriesOrder || []).filter(s => rows.some(r => r[field] === s));
+    rows.forEach(r => { if (r[field] != null && !series.includes(r[field])) series.push(r[field]); });
+    const tiers = [];
+    rows.forEach(r => { if (!tiers.includes(r.interest_tier)) tiers.push(r.interest_tier); });
+    tiers.sort((a, b) => interestTierRank(a) - interestTierRank(b));
+    B.p("By how warm their first reply was - meeting rate for each option, split by how enthusiastic the contact's first reply was (Cold -> Warm). Warm replies convert more no matter what, so compare within a tier.", { size: 8.3, color: PDF_C.textSoft });
+    const body = tiers.map(t => [String(t), ...series.map(s => {
+        const r = rows.find(x => x.interest_tier === t && x[field] === s);
+        return r ? `${fmtPct(r.meeting_rate, 1)}\nn=${fmtNum(r.n)}${(r.n || 0) < RATE_LOW_N ? ' *' : ''}` : '-';
+    })]);
+    B.table({ head: ['First-reply warmth', ...series.map(humanizeLevel)], body, fontSize: 7.8, columnStyles: { 0: { cellWidth: 40, fontStyle: 'bold' } }, footnotes: [`* Fewer than ${RATE_LOW_N} contacts - too small a sample to draw strong conclusions from.`] });
+}
+
+function pdfAddBestExample(B, research, dimKey, rows, metric) {
+    const best = pptxBestRow(rows, metric);
+    if (!best) return;
+    const lvl = pptxGetStyleExample(research, dimKey, pptxRowMatchKey(best));
+    if (!lvl) return;
+    const ex = lvl.examples[0];
+    if (!ex || !ex.message) return;
+    B.exampleCard(ex, { accent: PDF_C.success, compact: true, caption: `Strongest real example - ${levelLabel(best)} (${lvl.examples.length} example${lvl.examples.length === 1 ? '' : 's'} on the site):` });
+}
+
+// Every research breakdown for one stage, grouped the way the site groups them.
+function pdfAddResearch(B, research, stage, segment, keys, o) {
+    o = o || {};
+    const meetingOnly = stage !== 'opening', metric = meetingOnly ? 'meeting_rate' : 'reply_rate';
+    const dims = stage === 'opening' ? RESEARCH_DIMENSIONS : RESEARCH_DIMENSIONS.filter(d => CONTENT_BLOCK_DIM_KEYS.has(d.key));
+    const groups = {};
+    dims.forEach(d => { (groups[d.group] = groups[d.group] || []).push(d); });
+    let any = false;
+    Object.entries(groups).forEach(([groupName, groupDims]) => {
+        const usable = groupDims.filter(dim => {
+            const data = research[dim.key];
+            if (dim.hideWhenEmpty && !(Array.isArray(data) && data.length)) return false;
+            if (stage !== 'opening' && !contentDimHasData(research, dim.key)) return false;
+            if (dim.special === 'signal_timing') return stage === 'opening';
+            return !!pptxResolveDimensionRows(research, dim);
+        });
+        if (!usable.length) return;
+        any = true;
+        if (!o.flat) B.h2(groupName, { subtitle: PDF_DIM_GROUP_SUB[groupName] || '' });
+        usable.forEach(dim => {
+            const data = research[dim.key];
+            B.h3(dim.title);
+            if (['day_of_week', 'time_of_day', 'day_time'].includes(dim.key)) {
+                B.p('Based on first-message dates, which largely track when the contact accepted or replied - see "Best Time to Send the Connection Request" for the true send-time signal.', { size: 7.8, style: 'italic', color: PDF_C.muted });
+            }
+            if (dim.special === 'signal_timing') { pdfAddSignalFamily(B, SIGNAL_FAMILIES[dim.family], data, keys); return; }
+            const resolved = pptxResolveDimensionRows(research, dim);
+            if (!resolved) return;
+            if (resolved.statLine) B.p(resolved.statLine, { style: 'bold', size: 9, color: PDF_C.primary });
+            if (resolved.heatmapRows) {
+                B.heatmap(resolved.heatmapRows, metric);
+                const reliable = resolved.heatmapRows.filter(r => (r.n || 0) >= RATE_LOW_N);
+                if (reliable.length) {
+                    B.p(`Combinations with at least ${RATE_LOW_N} sends, best first:`, { size: 8, color: PDF_C.textSoft, gap: 1 });
+                    B.rateTable(reliable, { metric, meetingOnly, highlightBest: true, bestLabel: 'best window' });
+                }
+                return;
+            }
+            let rows = resolved.rows;
+            let opts = { ordinal: !!dim.ordinal, meetingOnly, metric };
+            if (dim.key === 'message_variation') {
+                const top = pptxBestRow(rows, 'reply_rate');
+                const hasLeader = rows.length > 1 && !!top && (top.reply_rate || 0) > 0 && (top.n || 0) >= RATE_LOW_N;
+                B.p(`Each row is one A/B message angle being tested, ranked by reply rate - i.e. which angle is winning. Messages not tagged with an angle are left out. Angles with fewer than ${RATE_LOW_N} sends are too early to call.`, { size: 8.3, color: PDF_C.textSoft });
+                opts = { ordinal: false, meetingOnly, metric: meetingOnly ? 'meeting_rate' : 'reply_rate', highlightBest: hasLeader, bestLabel: 'leading angle' };
+            }
+            if (dim.special === 'company_vs_prospect') B.p(`${meetingOnly ? 'Meeting rate' : 'Reply / meeting rate'} grouped by how much of the message was about the prospect (not about us) - "76-100% about them" means messages almost entirely about the prospect.`, { size: 8.3, color: PDF_C.textSoft });
+            if (dim.special === 'ai_feel') B.p(`${meetingOnly ? 'Meeting rate' : 'Reply / meeting rate'} by AI-feel score (1 = clearly human, 5 = obviously AI).`, { size: 8.3, color: PDF_C.textSoft });
+            B.rateTable(rows, opts);
+            if (dim.key === 'message_type' && stage === 'opening' && Array.isArray(segment.message_type_overview) && segment.message_type_overview.length) {
+                B.p('All message types, including surround connections. The table above leaves out surround_connections (they require a teammate who is already connected, so they cannot be compared fairly); they are included here, sorted by volume.', { size: 8, color: PDF_C.textSoft, gap: 1 });
+                B.rateTable(segment.message_type_overview.slice().sort((a, b) => (b.n || 0) - (a.n || 0)), { ordinal: true, metric: 'reply_rate', footnotes: false });
+            }
+            if (dim.crossTab && stage === 'message_2') pdfAddPriorInterest(B, research[dim.crossTab.key], dim);
+            pdfAddBestExample(B, research, dim.key, rows, opts.metric);
+        });
+    });
+    if (!any) B.p('No research breakdown available for this stage.', { style: 'italic', color: PDF_C.muted });
+}
+
+function pdfAddFollowup(B, fu) {
+    B.h1('Follow-Up Behavior', { subtitle: 'Once a prospect replies, what happens next matters just as much as the opener. Opening-message contacts only.' });
+    const warmth = isNum(fu.avg_reply_enthusiasm) ? (fu.avg_reply_enthusiasm >= 3.5 ? 'warm replies on average' : fu.avg_reply_enthusiasm >= 2.5 ? 'neutral replies on average' : 'cool replies on average') : '';
+    B.stats([{ value: fmtNum(fu.n_replied), label: 'Prospects who replied' }, { value: `${fmtScore(fu.avg_reply_enthusiasm, 1)} / 5`, label: 'Average warmth of their reply', sub: warmth }]);
+    const approach = (fu.by_approach || []).map(a => ({ level: humanizeLevel(a.approach), rawLevel: true, n: a.n, meeting_rate: a.meeting_rate }));
+    const speed = (fu.by_speed || []).slice().sort((a, b) => SPEED_ORDER.indexOf(a.speed) - SPEED_ORDER.indexOf(b.speed)).map(s => ({ level: s.speed, rawLevel: true, n: s.n, meeting_rate: s.meeting_rate }));
+    B.h3('Our follow-up approach -> meeting rate');
+    B.rateTable(approach, { meetingOnly: true, metric: 'meeting_rate', highlightBest: true, bestLabel: 'best-converting approach', levelHeader: 'Follow-up approach' });
+    B.h3('Our follow-up speed -> meeting rate');
+    B.rateTable(speed, { meetingOnly: true, metric: 'meeting_rate', ordinal: true, levelHeader: 'Time to our follow-up' });
+    B.h3('Length of their reply -> meeting rate');
+    // Everyone here has already connected and replied, so only the meeting rate is informative.
+    B.rateTable(fu.by_reply_length, { meetingOnly: true, metric: 'meeting_rate', ordinal: true, levelHeader: 'Reply length' });
+}
+
+function pdfAddExamples(B, examples) {
+    const won = (examples && examples.meetings_won) || [], open = (examples && examples.high_potential_open) || [];
+    B.h1('Real Examples', { subtitle: 'The actual opening messages behind the outcomes in this report.' });
+    B.note('These show real prospect names and message excerpts - for internal review only.', 'warn');
+    B.h3(`Meetings won (${won.length})`);
+    if (won.length) won.forEach(ex => B.exampleCard(ex, { accent: PDF_C.gold }));
+    else B.p('No won meetings recorded for this segment yet.', { style: 'italic', color: PDF_C.muted });
+    B.h3(`High-potential - connected, not yet scheduled (${open.length})`);
+    if (open.length) open.forEach(ex => B.exampleCard(ex, { accent: PDF_C.danger }));
+    else B.p('No high-potential open conversations flagged for this segment yet.', { style: 'italic', color: PDF_C.muted });
+}
+
+function pdfAddContentStage(B, block, stageId, segment) {
+    if (!contentBlockUsable(block)) return;
+    const title = stageId === 'message_2' ? 'Message 2 - Before the Second Reply' : 'Message 3+ - After the Second Reply';
+    const copy = STAGE_COPY[stageId];
+    B.h1(title, { kicker: 'Later-stage message model', subtitle: `${stageBlurb(stageId, segment, block)} Connect and reply are left out of every table below because everyone at this stage has already done both.` });
+    B.h2('Keys to success', { subtitle: copy.keys });
+    pdfAddKeys(B, block.keys);
+    B.h2('Deep-dive research - message craft', { subtitle: copy.research });
+    pdfAddResearch(B, block, stageId, segment, block.keys, { flat: true });
+    B.h2('Phrases', { subtitle: copy.phrases });
+    pdfAddPhrases(B, block, stageId);
+}
+
+function pdfAddSuccessPart(B, ctx) {
+    const { segment, kind } = ctx;
+    if (!segment) {
+        B.h1('Success Analysis', { kicker: 'Success Analysis tab' });
+        B.note(`This client / hypothesis group is not in the loaded Connect Success Analysis run${ctx.runLabel ? ` (${ctx.runLabel})` : ''}, so there is no funnel, keys, research or examples to report. It may be too new to have been analysed, or it may only appear in the optimizer run below.`, 'warn', { title: 'Not in the Success Analysis run' });
+        return;
+    }
+    const f = segment.funnel || {}, n = f.n || 0;
+    const isOverall = kind === 'overall', suff = !!segment.sufficient_data;
+    const research = segment.research || {};
+
+    // Executive summary
+    B.h1('Executive Summary', { kicker: 'Success Analysis tab', subtitle: 'Headline numbers for this segment and the findings that matter most. Everything in this part is drawn from the same weekly Connect Success Analysis run shown on the site.' });
+    let deltaSub = '', deltaColor = null;
+    if (!isOverall && isNum(f.blended_score) && PAYLOAD.overall.funnel && isNum(PAYLOAD.overall.funnel.blended_score)) {
+        const d = f.blended_score - PAYLOAD.overall.funnel.blended_score;
+        deltaSub = `${d >= 0 ? '+' : ''}${d.toFixed(2)} vs. overall (${fmtScore(PAYLOAD.overall.funnel.blended_score)})`;
+        deltaColor = d >= 0 ? PDF_C.successDark : PDF_C.dangerDark;
+    }
+    B.stats([
+        { value: fmtNum(n), label: 'Contacts' },
+        { value: fmtScore(f.blended_score), label: 'Blended score', sub: deltaSub, subColor: deltaColor },
+        { value: fmtPct(f.connect_rate), label: 'Connect rate', sub: `${fmtNum(f.connected)} connected` },
+        { value: fmtPct(f.reply_rate), label: 'Reply rate', sub: `${fmtNum(f.replied)} replied` },
+        { value: fmtPct(f.meeting_rate, 2), label: 'Meeting rate', sub: `${fmtNum(f.scheduled)} meetings` }
+    ]);
+    B.p('Blended score = 15% connect rate + 35% reply rate + 50% meeting rate - weighted toward meetings booked, the outcome that matters most.', { size: 7.6, style: 'italic', color: PDF_C.muted });
+    B.h3('Outreach funnel');
+    const stages = [
+        { label: 'Contacted', count: n, pct: 100, conv: '-', color: PDF_C.light },
+        { label: 'Connected', count: f.connected, pct: f.connect_rate, conv: `${fmtPct(f.connect_rate)} of contacted`, color: PDF_C.connect },
+        { label: 'Replied', count: f.replied, pct: f.reply_rate, conv: isNum(f.cond_reply_rate) ? `${fmtPct(f.cond_reply_rate)} of those connected` : '-', color: PDF_C.reply },
+        { label: 'Scheduled a meeting', count: f.scheduled, pct: f.meeting_rate, conv: isNum(f.cond_meeting_rate) ? `${fmtPct(f.cond_meeting_rate)} of those who replied` : '-', color: PDF_C.meeting }
+    ];
+    B.table({
+        head: ['Stage', 'Contacts', '% of contacted', 'Conversion from previous stage', 'Share of contacted'],
+        body: stages.map(s => [s.label, fmtNum(s.count), isNum(s.pct) ? fmtPct(s.pct, s.pct < 1 ? 2 : 1) : '-', s.conv, '']),
+        numericCols: [1, 2], columnStyles: { 0: { fontStyle: 'bold' }, 1: { cellWidth: 24 }, 2: { cellWidth: 26 }, 3: { cellWidth: 52 }, 4: { cellWidth: 40 } },
+        didDrawCell: d => {
+            if (d.section !== 'body' || d.column.index !== 4) return;
+            const s = stages[d.row.index];
+            const x = d.cell.x + 2, w = d.cell.width - 4, t = 3.2, yy = d.cell.y + d.cell.height / 2 - t / 2;
+            B.doc.setFillColor(...PDF_C.track); B.doc.roundedRect(x, yy, w, t, 1.6, 1.6, 'F');
+            const fw = Math.max(s.count ? 0.9 : 0, w * Math.min(1, (isNum(s.pct) ? s.pct : 0) / 100));
+            if (fw > 0) { B.doc.setFillColor(...s.color); B.doc.roundedRect(x, yy, fw, t, 1.6, 1.6, 'F'); }
+        }
+    });
+    if (!suff) {
+        B.note(`${segment.note || 'This segment has too few contacts for statistically reliable "keys to success," research, or examples.'} The funnel and trend are still accurate - just be cautious about reading too much into a small sample. Sections that need more data are left out of this report, exactly as they are hidden on the site.`, 'warn', { title: 'Not enough data yet for a reliable deep-dive' });
+    }
+    B.h3('At a glance');
+    pdfGlanceBullets(ctx).forEach(b => B.bullet(b, { size: 8.8 }));
+    B.h3('Data coverage');
+    const trendAll = segment.trend || [];
+    let trend = trendAll.filter(t => isNum(t.n) && t.n >= TREND_MONTH_MIN_N);
+    if (isOverall) trend = trend.slice(-TREND_RECENT_MONTHS);
+    const showTrend = isNum(n) && n >= TREND_MIN_N;
+    const stageTxt = (block, label) => contentBlockUsable(block) ? `Included - ${fmtNum(block.n_eligible_rows)} contacts reached this point` : `Not enough contacts reached this point for a ${label} model`;
+    const user = window.auth && window.auth.currentUser;
+    const cov = [
+        ['Analysis run', ctx.runLabel || '-'],
+        ['Data source', CURRENT_SOURCE === 'firebase' ? 'Live Firebase data' : 'Local analysis snapshot'],
+        ['Contacts in this segment', fmtNum(n)],
+        ['Driver-eligible contacts', isNum(segment.n_driver_rows) ? `${fmtNum(segment.n_driver_rows)} (surround connections excluded - they need a teammate who is already connected)` : '-'],
+        ['Sufficient data for deep-dive', suff ? 'Yes - keys, research, phrases, examples included' : 'No - only funnel and trend are reliable (needs at least 40 driver-eligible contacts)'],
+        ['Trend over time', showTrend ? `${trend.length} month${trend.length === 1 ? '' : 's'} charted (months under ${TREND_MONTH_MIN_N} outreaches excluded${isOverall ? `; last ${TREND_RECENT_MONTHS} months only` : ''})` : `Not shown - fewer than ${TREND_MIN_N} contacts in the segment`],
+        ['Message 2 stage', stageTxt(segment.message_2, 'Message 2')],
+        ['Message 3+ stage', stageTxt(segment.message_3plus, 'Message 3+')],
+        ['AI message-writing prompt', segment.message_prompt ? 'Included' : 'Not generated for this segment'],
+        ['Optimizer (lagging groups) run', LG.payload ? `${(LG.payload.meta && LG.payload.meta.run_date) || '-'} - ${ctx.lgRow ? 'this group IS flagged' : (kind === 'group' ? 'this group is not flagged' : 'see the optimizer section')}` : 'No optimizer data was available'],
+        ['Report generated', `${ctx.genLabel}${user && user.email ? ` by ${user.email}` : ''}`]
+    ];
+    B.table({ head: ['Item', 'Value'], body: cov, columnStyles: { 0: { cellWidth: 58, fontStyle: 'bold' } }, fontSize: 7.8 });
+
+    // Trend
+    if (showTrend) {
+        B.h1('Trend Over Time', { subtitle: `Monthly connect / reply / meeting rates with the number of contacts reached each month. Months with fewer than ${TREND_MONTH_MIN_N} outreaches are excluded - too noisy to chart reliably.${isOverall ? ` For the overall segment only the last ${TREND_RECENT_MONTHS} months are shown.` : ''}` });
+        if (!trendAll.length) B.note('No monthly trend data available for this segment.', 'plain');
+        else if (!trend.length) B.note(`No individual month had at least ${TREND_MONTH_MIN_N} outreaches - too noisy to chart reliably.`, 'plain');
+        else {
+            B.image(pdfTrendChartImage(trend), B.W * 0.4);
+            const body = trend.map((t, i) => {
+                const prev = trend[i - 1];
+                const delta = (k, dec) => prev && isNum(t[k]) && isNum(prev[k]) ? ` (${t[k] - prev[k] >= 0 ? '+' : ''}${(t[k] - prev[k]).toFixed(dec)})` : '';
+                return [t.month, fmtNum(t.n), fmtPct(t.connect_rate) + delta('connect_rate', 1), fmtPct(t.reply_rate) + delta('reply_rate', 1), fmtPct(t.meeting_rate, 2) + delta('meeting_rate', 2)];
+            });
+            B.table({ head: ['Month', 'Contacts reached', 'Connect rate', 'Reply rate', 'Meeting rate'], body, numericCols: [1, 2, 3, 4], columnStyles: { 0: { fontStyle: 'bold' } }, footnotes: ['Values in parentheses = change vs. the previous charted month, in percentage points.', trendAll.length > trend.length ? `${trendAll.length - trend.length} month(s) with fewer than ${TREND_MONTH_MIN_N} outreaches are not listed.` : ''].filter(Boolean) });
+        }
+    }
+
+    if (suff) {
+        B.h1('Keys to Success - Opening Message', { subtitle: STAGE_COPY.opening.keys });
+        pdfAddKeys(B, segment.keys);
+        if (!isOverall && audDims(segment.audience_profile).length) pdfAddAudience(B, segment);
+        pdfAddBestSendTime(B, research);
+        B.h1('Deep-Dive Research - Opening Message', { subtitle: `${STAGE_COPY.opening.research.replace(' Click any section to expand.', '')} Every breakdown the site shows is listed here, grouped the same way, with the strongest real example behind the best-performing level where one exists.` });
+        pdfAddResearch(B, research, 'opening', segment, segment.keys);
+        B.h1('Phrases - Opening Message', { subtitle: `The exact wording behind the numbers. ${STAGE_COPY.opening.phrases}` });
+        pdfAddPhrases(B, research, 'opening');
+        if (research.followup) pdfAddFollowup(B, research.followup);
+        pdfAddExamples(B, segment.examples);
+        pdfAddContentStage(B, segment.message_2, 'message_2', segment);
+        pdfAddContentStage(B, segment.message_3plus, 'message_3plus', segment);
+    }
+    if (typeof segment.message_prompt === 'string' && segment.message_prompt.trim()) {
+        B.h1('AI Message-Writing Prompt', { subtitle: 'A ready-to-use prompt - built from everything above - for writing new messages tuned to what actually works for this exact client x hypothesis group. Paste it into your favorite AI to draft outreach. Reproduced in full.' });
+        B.code(segment.message_prompt);
+    }
+}
+
+/* ── Section writers: Lagging Hypothesis Groups tab ── */
+
+function pdfLaggingRowsTable(B, rows) {
+    const body = rows.map(r => {
+        const g = r.group, f = g.flag || {}, ok = lgIsOkGroup(g);
+        return [`${r.clientName} / ${lgDisplay(g.name || r.groupSlug)}`, ok ? fmtNum(f.n_messages_active_window) : '-', ok ? fmtNum(f.n_scheduled_underperf_window) : '-', lgIsDownturn(g) ? 'Yes' : 'No',
+            ok && (g.hypothesis_search || {}).status === 'ok' ? String(lgConfirmedCount(g)) : '-', ok ? (f.reason || '') : (g.error_message || 'Analysis failed this run')];
+    });
+    B.table({
+        head: ['Client / hypothesis group', 'Sent (recent)', 'Meetings (recent)', 'Downturn', 'Confirmed', 'Why it was flagged'], body, fontSize: 7.6, numericCols: [1, 2, 4],
+        columnStyles: { 0: { cellWidth: 44, fontStyle: 'bold' }, 1: { cellWidth: 18 }, 2: { cellWidth: 20 }, 3: { cellWidth: 16 }, 4: { cellWidth: 18 } },
+        didParseCell: d => { if (d.section === 'body' && d.column.index === 3 && d.cell.raw === 'Yes') { d.cell.styles.textColor = PDF_C.dangerDark; d.cell.styles.fontStyle = 'bold'; } }
+    });
+}
+
+function pdfAddHypothesisSearch(B, hs) {
+    if (!hs) { B.note('No Hypothesis Search data for this group.', 'plain'); return; }
+    if (hs.status !== 'ok') {
+        const why = {
+            insufficient_data: 'too few successful or unsuccessful example conversations, even after falling back to the client and global pool',
+            generation_failed: 'the AI hypothesis-generation step failed or returned nothing usable',
+            skipped_dry_run: 'this was a dry run (no AI spend)'
+        }[hs.status] || (hs.status || 'unknown reason');
+        B.note(`Hypothesis Search didn't produce results for this group this run (${why}).`, 'plain');
+        return;
+    }
+    const tested = lgArr(hs.hypotheses_tested).slice().sort((a, b) => Math.abs(b.effect_pp || 0) - Math.abs(a.effect_pp || 0));
+    const tested_n = hs.n_pool_rows_tested, pool_n = hs.n_pool_rows;
+    const sampled = isNum(tested_n) && isNum(pool_n) && pool_n > 0 && (pool_n - tested_n) / pool_n > 0.05
+        ? ` · tested ${fmtNum(tested_n)} of ${fmtNum(pool_n)} rows (random sample)` : (isNum(pool_n) ? ` · ${fmtNum(pool_n)} rows` : '');
+    B.p(`Tested against: ${hs.scope_label || hs.scope || 'this group'}${sampled}. ${isNum(hs.n_success_sampled) ? `${fmtNum(hs.n_success_sampled)} successful and ${fmtNum(hs.n_failure_sampled)} unsuccessful conversations were read to generate the hypotheses.` : ''}`, { size: 8.5 });
+    if (hs.scope === 'global') B.note('This group was too small to test alone, so these results come from all clients combined - a much weaker, less specific claim about this group.', 'warn');
+    else if (hs.scope === 'client') B.note("This group was too small to test alone, so these results come from all of this client's groups combined.", 'warn');
+    const zeroReplies = tested.length > 0 && tested.every(h => !h.rate_with && !h.rate_without && !h.effect_pp && (h.p_value == null));
+    if (zeroReplies) { B.note('No replies in the tested sample - too few data points to test hypotheses.', 'plain'); return; }
+    if (!tested.length) { B.note('No hypotheses were returned for this group this run.', 'plain'); return; }
+    const body = tested.map(h => [h.id || '', h.text || '', `${fmtPct(h.rate_with)}\nn=${fmtNum(h.n_with)}`, `${fmtPct(h.rate_without)}\nn=${fmtNum(h.n_without)}`,
+        isNum(h.effect_pp) ? fmtPP(h.effect_pp) + (h.connection_controlled ? ' (ctrl.)' : '') : '-', isNum(h.p_value) ? h.p_value.toFixed(3) : '-', h.confidence || 'Low', h.confirmed ? 'Confirmed' : 'Not confirmed']);
+    B.table({
+        head: ['#', 'Hypothesis', 'Reply rate with', 'Reply rate without', 'Effect', 'p', 'Conf.', 'Result'], body, fontSize: 7.5, numericCols: [2, 3, 4, 5],
+        columnStyles: { 0: { cellWidth: 9, fontStyle: 'bold' }, 2: { cellWidth: 18 }, 3: { cellWidth: 19 }, 4: { cellWidth: 19, fontStyle: 'bold' }, 5: { cellWidth: 12 }, 6: { cellWidth: 14 }, 7: { cellWidth: 20, fontStyle: 'bold' } },
+        didParseCell: d => {
+            if (d.section !== 'body') return;
+            const h = tested[d.row.index];
+            if (!h) return;
+            if (h.confirmed) d.cell.styles.fillColor = PDF_C.successBg;
+            if (d.column.index === 4 && isNum(h.effect_pp)) d.cell.styles.textColor = h.effect_pp >= 0 ? PDF_C.successDark : PDF_C.dangerDark;
+            if (d.column.index === 6) d.cell.styles.textColor = h.confidence === 'High' ? PDF_C.successDark : h.confidence === 'Medium' ? PDF_C.warningDark : PDF_C.muted;
+            if (d.column.index === 7) d.cell.styles.textColor = h.confirmed ? PDF_C.successDark : PDF_C.muted;
+        },
+        footnotes: ['Sorted by size of effect. Outcome tested is always reply rate. Some hypotheses are phrased as "don\'t do X" rules, so read the wording together with the sign. Confirmed = enough sample in both arms and High or Medium confidence. (ctrl.) = controlled for the prospect\'s LinkedIn connection count.']
+    });
+}
+
+function pdfAddLgTimeSeries(B, r) {
+    const ts = r.group.time_series;
+    if (!ts) return;
+    B.h2(`Recent Performance${lgIsDownturn(r.group) ? ' - recent downturn detected' : ''}`, { subtitle: "Weekly rates. The most recent weeks are compared against this group's own trailing baseline using the same connection-controlled statistics as the keys." });
+    const weekly = lgArr(ts.weekly).slice().sort((a, b) => String(a.week).localeCompare(String(b.week)));
+    if (ts.sufficient_data === false || !weekly.length) {
+        B.note(ts.note || 'Not enough weekly history yet to show a trend or check for a downturn.', 'plain');
+        return;
+    }
+    B.image(pdfWeeklyChartImage(ts), B.W * 0.4);
+    const checks = [['Connect rate', ts.connect_rate_check], ['Reply rate', ts.reply_rate_check]].filter(x => x[1]);
+    if (checks.length) {
+        B.table({
+            head: ['Metric', 'Recent weeks', 'Trailing baseline', 'Change', 'p', 'Downturn?'],
+            body: checks.map(([label, c]) => [label, fmtPct(c.recent_rate), fmtPct(c.baseline_rate), fmtPP(c.effect_pp), isNum(c.p_value) ? c.p_value.toFixed(2) : '-', c.is_downturn ? 'Yes - statistically meaningful drop' : 'No']),
+            numericCols: [1, 2, 3, 4], columnStyles: { 0: { fontStyle: 'bold', cellWidth: 30 } }, fontSize: 8,
+            didParseCell: d => {
+                if (d.section !== 'body') return;
+                const c = checks[d.row.index][1];
+                if (d.column.index === 5 || d.column.index === 3) { d.cell.styles.textColor = c.is_downturn ? PDF_C.dangerDark : PDF_C.successDark; d.cell.styles.fontStyle = 'bold'; }
+            },
+            footnotes: [`Recent window: ${lgArr(ts.recent_weeks).length || '-'} week(s); baseline window: ${lgArr(ts.baseline_weeks).length || '-'} week(s) immediately before. A downturn on either metric flags the group.`]
+        });
+    }
+    const recent = new Set(lgArr(ts.recent_weeks)), baseline = new Set(lgArr(ts.baseline_weeks));
+    B.h3(`Week by week (${weekly.length} week${weekly.length === 1 ? '' : 's'})`);
+    B.table({
+        head: ['Week of', 'Contacts', 'Connect rate', 'Reply rate', 'Meeting rate', 'Window'],
+        body: weekly.map(w => [new Date(w.week + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }), fmtNum(w.n), fmtPct(w.connect_rate), fmtPct(w.reply_rate), fmtPct(w.meeting_rate, 2), recent.has(w.week) ? 'Recent' : baseline.has(w.week) ? 'Baseline' : '']),
+        numericCols: [1, 2, 3, 4], fontSize: 7.8, columnStyles: { 0: { fontStyle: 'bold' } },
+        didParseCell: d => {
+            if (d.section !== 'body') return;
+            const w = weekly[d.row.index];
+            if (recent.has(w.week)) { d.cell.styles.fillColor = PDF_C.dangerBg; if (d.column.index === 5) { d.cell.styles.textColor = PDF_C.dangerDark; d.cell.styles.fontStyle = 'bold'; } }
+            else if (baseline.has(w.week) && d.column.index === 5) d.cell.styles.textColor = PDF_C.muted;
+        }
+    });
+}
+
+function pdfAddLgBaseline(B, r) {
+    const b = r.group.baseline;
+    if (!b) return;
+    const fn = b.funnel || {}, keys = b.keys || {}, phr = b.top_phrases || {};
+    const hasKeys = lgArr(keys.working).length || lgArr(keys.not_working).length;
+    const hasPhrases = lgArr(phr.working).length || lgArr(phr.not_working).length;
+    if (!isNum(fn.n) && !hasKeys && !hasPhrases) return;
+    const asOf = LG.payload && LG.payload.meta && LG.payload.meta.source_run_date ? ` as of ${LG.payload.meta.source_run_date}` : '';
+    B.h2('What We Already Knew About This Group', { subtitle: `The statistical baseline the optimizer started from - copied from this group's node in the main Connect Success Analysis${asOf}. (The full, current version of these numbers is in the Success Analysis part of this report.)` });
+    if (isNum(fn.n)) B.stats([{ value: fmtNum(fn.n), label: 'Contacts' }, { value: fmtPct(fn.connect_rate), label: 'Connect rate' }, { value: fmtPct(fn.reply_rate), label: 'Reply rate' }, { value: fmtPct(fn.meeting_rate, 2), label: 'Meeting rate' }]);
+    if (hasKeys) {
+        B.h3(`Baseline keys - what's working (${lgArr(keys.working).length})`);
+        pdfKeysTable(B, lgArr(keys.working), true);
+        B.h3(`Baseline keys - what to fix (${lgArr(keys.not_working).length})`);
+        pdfKeysTable(B, lgArr(keys.not_working), false);
+    }
+    if (hasPhrases) {
+        B.h3('Baseline phrases that boost reply rate');
+        pdfTopPhrasesTable(B, lgArr(phr.working), true);
+        B.h3('Baseline phrases that hurt reply rate');
+        pdfTopPhrasesTable(B, lgArr(phr.not_working), false);
+    }
+}
+
+function pdfAddLaggingGroup(B, r) {
+    const g = r.group, f = g.flag || {}, hs = g.hypothesis_search || {};
+    const ok = lgIsOkGroup(g), down = lgIsDownturn(g), confirmed = lgConfirmedCount(g);
+    B.h2('Why this group was flagged');
+    if (!ok) {
+        B.note(`This group's analysis failed this run${g.error_message ? ': ' + g.error_message : '.'} It will be retried on the next run.`, 'danger', { title: 'Analysis failed' });
+        return;
+    }
+    B.stats([
+        { value: fmtNum(f.n_messages_active_window), label: `Messages sent - last ${f.active_window_days || 7} days`, sub: isNum(f.active_min_messages) ? `flag threshold: ${fmtNum(f.active_min_messages)}+` : '' },
+        { value: fmtNum(f.n_scheduled_underperf_window), label: `Meetings - last ${f.underperf_window_days || 14} days`, color: PDF_C.dangerDark, sub: isNum(f.underperf_max_scheduled) ? `flag threshold: fewer than ${fmtNum(f.underperf_max_scheduled)}` : '' },
+        { value: down ? 'Yes' : 'No', label: 'Recent downturn', color: down ? PDF_C.dangerDark : PDF_C.successDark },
+        { value: hs.status === 'ok' ? String(confirmed) : '-', label: 'Confirmed new hypotheses', color: confirmed ? PDF_C.successDark : PDF_C.muted, sub: hs.status === 'ok' && hs.scope && hs.scope !== 'group' ? `tested on ${hs.scope === 'global' ? 'all clients' : 'whole client'}` : '' }
+    ]);
+    if (f.reason) B.note(f.reason, down ? 'danger' : 'warn', { title: 'Flag reason' });
+
+    B.h2('AI-Suggested Message Review Instructions', { subtitle: "Written by the optimizer from this group's baseline, downturn check and confirmed hypotheses - a concrete checklist a human or an AI can run against any draft message for this exact client x group before it is sent. Reproduced in full." });
+    const md = lgSuggestion(g);
+    if (md) B.markdown(md);
+    else B.note(pdfText(lgMissingSuggestionNote(r)), 'warn', { title: 'No AI-written instructions in this run' });
+
+    B.h2('Hypothesis Search', { subtitle: 'New, concrete, controllable-factor hypotheses proposed by AI from this group\'s most- and least-successful conversations, then classified across every message in scope and statistically tested on reply rate.' });
+    pdfAddHypothesisSearch(B, hs);
+    pdfAddLgTimeSeries(B, r);
+    pdfAddLgBaseline(B, r);
+}
+
+function pdfAddLaggingPart(B, ctx) {
+    const { kind, lgRow, clientSlug } = ctx;
+    const lp = LG.payload;
+    B.h1('Lagging Hypothesis Group Optimizer', { kicker: 'Lagging Hypothesis Groups tab', subtitle: 'The Connect Hypothesis Optimizer scans every client x hypothesis group each run and flags the ones that are currently active but under-performing. For each flagged group it proposes and statistically tests new hypotheses, checks for a recent downturn, and writes ready-to-use message review instructions.' });
+    if (!lp) {
+        B.note('No optimizer run was available when this report was generated (the Lagging Hypothesis Groups tab had no data), so nothing from the optimizer is included.', 'warn');
+        return;
+    }
+    const meta = lp.meta || {}, cfg = lp.config || {};
+    const criteria = isNum(cfg.active_min_messages) && isNum(cfg.underperf_max_scheduled)
+        ? `A group is flagged when it sent ${fmtNum(cfg.active_min_messages)}+ messages in the last ${cfg.active_window_days || 7} days but scheduled fewer than ${fmtNum(cfg.underperf_max_scheduled)} meetings in the last ${cfg.underperf_window_days || 14} days.` : '';
+    const flagged = isNum(lp.n_groups_flagged) ? lp.n_groups_flagged : LG.rows.length;
+    B.table({
+        head: ['Optimizer run', 'Value'],
+        body: [['Run date', meta.run_date || '-'], ['Statistical baseline as of', meta.source_run_date || '-'], ['Groups scanned', fmtNum(lp.n_groups_scanned)], ['Groups flagged', fmtNum(flagged)],
+            ['Flag criteria', criteria || '-'], ['Hypothesis search inputs', isNum(cfg.hs_n_success) ? `${fmtNum(cfg.hs_n_success)} most-successful and ${fmtNum(cfg.hs_n_failure)} least-successful conversations per group` : '-'],
+            ['Models', [cfg.opus_model, cfg.cheap_model].filter(Boolean).join(' / ') || '-'], ['Data source', LG.source === 'firebase' ? 'Live Firebase' : 'Local file']],
+        columnStyles: { 0: { cellWidth: 55, fontStyle: 'bold' } }, fontSize: 7.8
+    });
+    if (kind === 'overall') {
+        B.h2(`All flagged groups this run (${LG.rows.length})`);
+        if (LG.rows.length) pdfLaggingRowsTable(B, LG.rows.slice().sort((a, b) => (lgIsDownturn(b.group) - lgIsDownturn(a.group)) || a.clientName.localeCompare(b.clientName)));
+        else B.note('Nothing flagged this run - all active groups are performing within range.', 'success');
+        return;
+    }
+    if (kind === 'client' || (kind === 'missing' && !ctx.groupSlug)) {
+        const rows = LG.rows.filter(r => r.clientSlug === clientSlug);
+        B.h2(`Flagged groups for this client (${rows.length})`);
+        if (rows.length) pdfLaggingRowsTable(B, rows);
+        else B.note(`None of this client's hypothesis groups were flagged in the optimizer run of ${meta.run_date || '-'}. ${criteria}`, 'success', { title: 'Nothing flagged - performing within range' });
+        return;
+    }
+    if (!lgRow) {
+        B.note(`This hypothesis group was not flagged in the optimizer run of ${meta.run_date || '-'} - it is either performing within range or was not active enough to qualify. ${criteria}`, 'success', { title: 'Not flagged - performing within range' });
+        return;
+    }
+    pdfAddLaggingGroup(B, lgRow);
+}
+
+function pdfAddSavedInstructions(B, sd) {
+    const d = sd.data || {};
+    B.h1('Saved AI Instructions & Message Variations', { kicker: 'Admin - hypothesis_groups record', subtitle: `What is currently saved on the "${sd.name}" hypothesis-group record (id ${sd.id}) - the same record used by Connect Hypothesis Documentation, Fast Connect Review, Full AI Generate and Opus Review. Compare with the AI-suggested instructions in the optimizer section.` });
+    if (d.description) { B.h3('Hypothesis statement'); B.p(d.description); }
+    [
+        ['Target Contact / Exclude Rules (Opus Review - who to exclude)', d.targetContactInstructions],
+        ['Message Review Instructions (Opus Review - how to improve messages)', d.messageReviewInstructions],
+        ['Message Creation Instructions (Full AI Generate - how to write new messages)', d.messageCreationInstructions]
+    ].forEach(([label, val]) => {
+        B.h3(label);
+        if (val && String(val).trim()) B.markdown(String(val));
+        else B.p('Nothing saved yet.', { style: 'italic', color: PDF_C.muted });
+    });
+    const vars = lgArr(d.messageVariations);
+    B.h3(`Message variations (${vars.length})`);
+    if (!vars.length) { B.p('No variations on this group yet.', { style: 'italic', color: PDF_C.muted }); return; }
+    B.table({
+        head: ['Variation', 'Share', 'Status', 'Prompt / guidance'],
+        body: vars.map(v => [v.label || '(unnamed)', v.inactive ? '-' : `${Math.round(v.sharePercent || 0)}%`, v.inactive ? 'Stopped' : 'Active',
+            [v.prompt, v.exampleMessage ? `Example: ${v.exampleMessage}` : '', v.aiCriteria ? `AI criteria: ${v.aiCriteria}` : '', v.source ? `Source: ${v.source}${v.sourceRunDate ? ' (' + v.sourceRunDate + ')' : ''}` : ''].filter(Boolean).join('\n\n')]),
+        columnStyles: { 0: { cellWidth: 36, fontStyle: 'bold' }, 1: { cellWidth: 14 }, 2: { cellWidth: 16 } }, numericCols: [1], fontSize: 7.8,
+        didParseCell: dd => { if (dd.section === 'body' && dd.column.index === 2) dd.cell.styles.textColor = vars[dd.row.index].inactive ? PDF_C.muted : PDF_C.successDark; }
+    });
+}
+
+function pdfAddAppendix(B) {
+    const bw = (PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.blend_weights) || {};
+    B.h1('How to Read This Report', { kicker: 'Appendix', subtitle: 'Definitions and thresholds used throughout - identical to the ones used on the Connect Success Analysis page.' });
+    B.table({ head: ['Term', 'Definition'], body: GLOSSARY.map(([t, d]) => [t, d]), columnStyles: { 0: { cellWidth: 40, fontStyle: 'bold' } }, fontSize: 7.8 });
+    B.h3('Thresholds and conventions');
+    [
+        `Blended score weights in this run: ${isNum(bw.connected) ? `${Math.round(bw.connected * 100)}% connect` : '15% connect'}, ${isNum(bw.replied) ? `${Math.round(bw.replied * 100)}% reply` : '35% reply'}, ${isNum(bw.scheduled) ? `${Math.round(bw.scheduled * 100)}% meeting` : '50% meeting'}.`,
+        `Rows marked * have fewer than ${RATE_LOW_N} sends and are shown in gray - too small a sample to draw strong conclusions from. Highlighted (green) rows are the best-performing level among rows with at least ${RATE_LOW_N} sends.`,
+        `In every rate table, bar length is the rate relative to the best row with at least ${RATE_LOW_N} sends and bar thickness reflects sample size (n), so "high rate, thin bar" means a tiny sample and "high rate, thick bar" means real volume behind it.`,
+        `Trend charts drop months with fewer than ${TREND_MONTH_MIN_N} outreaches and are only shown for segments with at least ${TREND_MIN_N} contacts.`,
+        `Audience comparisons with fewer than ${AUD_SMALL_N} contacts in a dimension are directional only; realized vs. expected gaps within ${Math.round(AUD_FLAT_REL * 100)}% of expected count as "in line".`,
+        '"(ctrl.)" after an effect means it has been statistically adjusted for the prospect\'s LinkedIn connection count.',
+        'Send-time sections use the actual connection-request send moment (US Central). The legacy day / time breakdowns under Deep-Dive Research use first-message dates, which mostly track acceptance and reply timing.',
+        'Later-stage models (Message 2 / Message 3+) report meeting rate only, because every contact at those stages has already connected and replied.',
+        'Real Examples and the strongest-example cards contain real prospect names and message excerpts - for internal review only.'
+    ].forEach(t => B.bullet(t, { size: 8.6 }));
+}
+
+// Admin only: the hypothesis_groups Firestore record behind this segment (for the
+// "Saved AI Instructions & Message Variations" section). Best-effort - never blocks the report.
+async function pdfLoadSavedGroupDoc(segment, lgRow) {
+    if (!isAdmin || !emailDB || !fsGetDoc) return null;
+    let id = null;
+    if (segment) id = await resolveHypothesisGroupDocId(segment);
+    if (!id && lgRow) { try { const found = await lgResolveGroupDoc(lgRow); if (found) id = found.id; } catch (e) { /* ignore */ } }
+    if (!id) return null;
+    const snap = await fsGetDoc(fsDoc(emailDB, 'hypothesis_groups', id));
+    if (!snap.exists) return null;
+    const data = snap.data() || {};
+    return { id, name: data.name || (segment && segment.name) || id, data };
+}
+
+async function exportSegmentToPdf(target) {
+    target = target || {};
+    const btn = target.btn || null;
+    if (btn && btn.disabled) return;
+    const originalHtml = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Building PDF…'; }
+    try {
+        if (!window.jspdf || !window.jspdf.jsPDF) throw new Error('PDF library failed to load - check your connection and try again.');
+        await payloadReady;
+        const clientSlug = target.clientSlug || '', groupSlug = target.groupSlug || '';
+        const { segment, crumbs, kind } = pdfResolveSegment(clientSlug, groupSlug);
+        const lgRow = (clientSlug && groupSlug) ? (LG.rows.find(r => r.clientSlug === clientSlug && r.groupSlug === groupSlug) || null) : null;
+        if (!segment && !lgRow) throw new Error('Nothing to report: this selection is in neither the Success Analysis run nor the optimizer run.');
+
+        const meta = (PAYLOAD && PAYLOAD.meta) || {};
+        const runLabel = meta.run_date ? new Date(meta.run_date + 'T00:00:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : '';
+        const genLabel = new Date().toLocaleString('en-US', { dateStyle: 'long', timeStyle: 'short' });
+        const clientName = crumbs[0] || (lgRow && lgRow.clientName) || '';
+        const groupName = kind === 'group' ? crumbs[1] : (lgRow ? lgDisplay(lgRow.group.name || lgRow.groupSlug) : '');
+        const segmentName = groupName || clientName || 'Overall - All Clients';
+        let savedDoc = null;
+        if (kind === 'group' || lgRow) { try { savedDoc = await pdfLoadSavedGroupDoc(segment, lgRow); } catch (e) { console.warn('Saved group doc unavailable for PDF:', e.message); } }
+        const ctx = { segment, crumbs, kind, clientSlug, groupSlug, lgRow, runLabel, genLabel, savedDoc };
+        const logo = await pdfLoadLogo();
+
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ unit: 'mm', format: 'a4', compress: true });
+        doc.setProperties({ title: `Connect Success Analysis - ${segmentName}`, subject: 'Hypothesis group report (Success Analysis + Lagging Hypothesis Groups)', author: 'Pando Executive Networking Connect', creator: 'analysis_results.html' });
+        const B = pdfCreateBuilder(doc);
+
+        const f = (segment && segment.funnel) || null;
+        const lgMeta = (LG.payload && LG.payload.meta) || {};
+        const user = window.auth && window.auth.currentUser;
+        const coverStats = f ? [
+            { value: fmtNum(f.n), label: 'Contacts' }, { value: fmtScore(f.blended_score), label: 'Blended score' },
+            { value: fmtPct(f.connect_rate), label: 'Connect rate' }, { value: fmtPct(f.reply_rate), label: 'Reply rate' }, { value: fmtPct(f.meeting_rate, 2), label: 'Meeting rate' }
+        ] : (lgRow && lgRow.group.flag ? [
+            { value: fmtNum(lgRow.group.flag.n_messages_active_window), label: `Sent - last ${lgRow.group.flag.active_window_days || 7} days` },
+            { value: fmtNum(lgRow.group.flag.n_scheduled_underperf_window), label: `Meetings - last ${lgRow.group.flag.underperf_window_days || 14} days`, color: PDF_C.dangerDark }
+        ] : []);
+        const summary = [];
+        if (segment) {
+            summary.push('Executive summary: funnel, blended score, at-a-glance findings and data coverage.');
+            if (isNum(f.n) && f.n >= TREND_MIN_N) summary.push('Trend over time: monthly connect / reply / meeting rates.');
+            if (segment.sufficient_data) {
+                summary.push('Keys to success, audience makeup, best time to send, every deep-dive research breakdown (with the strongest real example), phrases, follow-up behavior and real examples.');
+                if (contentBlockUsable(segment.message_2) || contentBlockUsable(segment.message_3plus)) summary.push('Later-stage models: Message 2 and / or Message 3+ keys, research and phrases (meeting rate only).');
+            } else summary.push('Deep-dive sections are omitted because this segment does not yet have enough data (same rule as the site).');
+            if (segment.message_prompt) summary.push('The complete AI message-writing prompt for this segment.');
+        }
+        summary.push(lgRow
+            ? 'Lagging Hypothesis Group Optimizer: why it was flagged, the AI-suggested message review instructions, hypothesis search results, weekly performance with downturn checks, and the baseline.'
+            : 'Lagging Hypothesis Group Optimizer: run summary and this selection\'s status.');
+        if (savedDoc) summary.push('Admin: the AI instructions and message variations currently saved on this hypothesis-group record.');
+        summary.push('Appendix: definitions and thresholds.');
+
+        B.cover({
+            logo, title: segmentName,
+            subtitle: kind === 'group' ? `${clientName}  >  ${groupName}` : (kind === 'client' ? `${clientName} - all hypothesis groups combined` : (kind === 'overall' ? 'All clients and hypothesis groups combined' : `${clientName}  >  ${groupName}`)),
+            tagline: 'What is driving connections and meetings for this group, what to do more of, and what the optimizer recommends fixing.',
+            meta: [
+                ['Client', clientName || 'All clients'], ['Hypothesis group', groupName || (kind === 'client' ? 'All groups (combined)' : 'n/a')],
+                ['Success Analysis run', runLabel || 'not available'], ['Optimizer run', lgMeta.run_date ? `${lgMeta.run_date}${lgRow ? ' - flagged' : (kind === 'group' ? ' - not flagged' : '')}` : 'not available'],
+                ['Generated', genLabel], ['Generated by', (user && user.email) || '-'],
+                ['Data source', `${CURRENT_SOURCE === 'firebase' ? 'Live Firebase' : 'Local snapshot'}${LG.payload ? ` / optimizer: ${LG.source === 'firebase' ? 'live Firebase' : 'local file'}` : ''}`], ['Report scope', 'Success Analysis tab + Lagging Hypothesis Groups tab']
+            ],
+            stats: coverStats, summary,
+            confidential: 'Pando Executive Networking - internal use only. This report contains real prospect names and message excerpts. Figures are from the analysis runs named above and mirror what the Connect Success Analysis page shows for this selection.'
+        });
+
+        pdfAddSuccessPart(B, ctx);
+        pdfAddLaggingPart(B, ctx);
+        if (savedDoc) pdfAddSavedInstructions(B, savedDoc);
+        pdfAddAppendix(B);
+        B.finish({
+            headerLeft: `Connect Success Analysis - ${kind === 'group' ? `${clientName} > ${groupName}` : segmentName}`,
+            headerRight: runLabel ? `Run: ${runLabel}` : (lgMeta.run_date ? `Optimizer run: ${lgMeta.run_date}` : ''),
+            footerLeft: 'Pando Executive Networking Connect - Hypothesis Group Report - internal use only (contains real prospect names)'
+        });
+
+        const safe = s => String(s || '').replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '');
+        const nameBits = [safe(clientName) || 'Overall', kind === 'group' || lgRow ? safe(groupName) : ''].filter(Boolean).join('_');
+        const dateSafe = meta.run_date || lgMeta.run_date || new Date().toISOString().slice(0, 10);
+        doc.save(`Connect_Group_Report_${nameBits}_${dateSafe}.pdf`);
+    } catch (err) {
+        console.error('PDF export failed:', err);
+        alert('Sorry, something went wrong building the PDF report: ' + err.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = originalHtml; }
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════
    WIRE UP CONTROLS
    ══════════════════════════════════════════════════════════════════ */
 
@@ -3975,6 +5402,9 @@ document.getElementById('glossaryBtn').addEventListener('click', () => {
     drawer.style.display = drawer.style.display === 'none' ? 'block' : 'none';
 });
 document.getElementById('exportPptxBtn').addEventListener('click', () => { exportSegmentToPowerpoint(); });
+document.getElementById('exportPdfBtn').addEventListener('click', () => {
+    exportSegmentToPdf({ clientSlug: state.client, groupSlug: state.group, btn: document.getElementById('exportPdfBtn') });
+});
 document.getElementById('runSelect').addEventListener('change', async e => {
     await switchRun(e.target.value);
 });
@@ -4627,7 +6057,10 @@ function lgDetailHtml(r) {
         return `<div class="lg-section"><div class="lg-note danger"><i class="fas fa-circle-exclamation"></i> This group\u2019s analysis failed this run${g.error_message ? ': ' + escapeHtml(g.error_message) : '.'} It will be retried on the next run.</div></div>`;
     }
     return lgInstructionsSection(r) + lgHypothesisSection(r) + lgTimeSeriesSection(r) + lgBaselineSection(r) + `
-        <div class="lg-section"><button type="button" class="lg-btn" data-act="openSuccess"><i class="fas fa-lightbulb"></i> Open this group in Success Analysis <i class="fas fa-arrow-right"></i></button></div>`;
+        <div class="lg-section" style="display:flex;flex-wrap:wrap;gap:0.5rem;">
+            <button type="button" class="lg-btn" data-act="openSuccess"><i class="fas fa-lightbulb"></i> Open this group in Success Analysis <i class="fas fa-arrow-right"></i></button>
+            <button type="button" class="lg-btn" data-act="exportPdf" title="Full printable report for this group — this tab's optimizer findings plus everything the Success Analysis tab knows about it"><i class="fas fa-file-pdf"></i> Export PDF report (both tabs)</button>
+        </div>`;
 }
 
 // The AI-written instructions for a group. The spec's field is `message_review_instructions`
@@ -5175,6 +6608,7 @@ function lgInit() {
             case 'closeVariation': { const f = lgQ(r, 'varForm'); if (f) f.classList.remove('open'); break; }
             case 'createVariation': lgCreateVariation(r, actEl); break;
             case 'openSuccess': lgOpenInSuccessAnalysis(r); break;
+            case 'exportPdf': exportSegmentToPdf({ clientSlug: r.clientSlug, groupSlug: r.groupSlug, btn: actEl }); break;
         }
     });
     list.addEventListener('input', e => {
