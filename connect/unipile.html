@@ -261,6 +261,8 @@
             </div>
             <div class="status-line" id="lookupStatus"></div>
             <div class="profile" id="profileCard" hidden></div>
+            <div class="status-line" id="mutualStatus"></div>
+            <div class="results-wrap" id="mutualBox" hidden><table class="results" id="mutualTable"></table></div>
         </div>
 
         <div class="card">
@@ -725,6 +727,7 @@ function renderProfile(p) {
                 <dt>public id</dt><dd>${esc(p.public_identifier || '')}</dd>
                 ${sp.relations_count != null ? `<dt>connections</dt><dd>${esc(sp.relations_count)}</dd>` : ''}
                 ${sp.followers_count != null ? `<dt>followers</dt><dd>${esc(sp.followers_count)}</dd>` : ''}
+                ${sp.shared_relations_count != null ? `<dt>shared connections</dt><dd>${esc(sp.shared_relations_count)}</dd>` : ''}
                 ${sp.can_send_inmail != null ? `<dt>can InMail</dt><dd>${esc(sp.can_send_inmail)}</dd>` : ''}
             </dl>
             <div class="btn-row" style="margin-top:.75rem;">
@@ -732,6 +735,7 @@ function renderProfile(p) {
                 <button class="btn btn-outline btn-sm" id="useForMessage" ${connected ? '' : 'title="LinkedIn only allows messaging 1st-degree connections"'}><i class="fas fa-message"></i> Use for message</button>
                 <button class="btn btn-outline btn-sm" id="pastMessages"><i class="fas fa-clock-rotate-left"></i> View past messages</button>
                 <button class="btn btn-outline btn-sm" id="theirConnections"><i class="fas fa-user-group"></i> View their connections</button>
+                <button class="btn btn-outline btn-sm" id="findMutual" title="Compares your connection list with theirs"><i class="fas fa-people-arrows"></i> Find mutual connections</button>
             </div>
         </div>`;
     $('profileCard').hidden = false;
@@ -739,6 +743,7 @@ function renderProfile(p) {
     $('useForInvite').addEventListener('click', () => { $('inviteUserId').value = p.id; $('inviteNote').focus(); });
     $('useForMessage').addEventListener('click', () => { $('msgUserId').value = p.id; $('msgText').focus(); });
     $('pastMessages').addEventListener('click', () => openConversationWith(p.id, profileName(p), 'lookupStatus'));
+    $('findMutual').addEventListener('click', () => findMutual(p));
     $('theirConnections').addEventListener('click', () => {
         $('relationsOf').value = 'profile';
         syncRelationsOf();
@@ -749,12 +754,91 @@ function renderProfile(p) {
     if (connected) $('msgUserId').value = p.id; else $('inviteUserId').value = p.id;
 }
 
+// ───────── Mutual connections ─────────
+// Unipile only exposes a *count* of shared connections (profile `specifics.shared_relations_count`), not a list.
+// To list them we read their connections and ours and intersect by user id here in the browser. That is many paged
+// requests to LinkedIn, so the page cap is modest, your own list is cached for a while, and it asks first.
+const MUTUAL_MAX_PAGES = 30;               // per list, 100 per page
+const MUTUAL_CACHE_MS = 15 * 60 * 1000;
+let myRelationsCache = null;               // { accountId, items, complete, at }
+
+async function fetchAllRelations(userId, label) {
+    const items = [];
+    const seen = new Set();
+    let cursor = null;
+    for (let page = 1; page <= MUTUAL_MAX_PAGES; page++) {
+        const qs = new URLSearchParams({ account_id: accountId(), user_id: userId, limit: '100' });
+        if (cursor) qs.set('cursor', cursor);
+        const data = await api('/relations?' + qs);
+        let added = 0;
+        for (const r of data.data || []) {
+            const id = r.user && r.user.id;
+            if (id && !seen.has(id)) { seen.add(id); items.push(r); added++; }
+        }
+        setStatus('mutualStatus', `Reading ${label} connections… ${items.length} so far (page ${page})`);
+        cursor = data.next_cursor || null;
+        if (!cursor) return { items, complete: true };
+        if (!added) return { items, complete: false };   // cursor didn't advance; don't loop
+    }
+    return { items, complete: false };                   // hit the page cap
+}
+
+async function findMutual(p) {
+    if (!needAccount('mutualStatus')) return;
+    const name = profileName(p);
+    const sp = p.specifics || {};
+    const cached = myRelationsCache && myRelationsCache.accountId === accountId() && Date.now() - myRelationsCache.at < MUTUAL_CACHE_MS;
+    const note = sp.shared_relations_count === 0
+        ? `LinkedIn reports 0 shared connections with ${name}, so there is probably nothing to find.\n\n` : '';
+    if (!confirm(`${note}Find mutual connections with ${name}?\n\nThis reads ${name}'s connection list${cached ? '' : ' and then yours'} through Unipile ` +
+                 `(up to ${MUTUAL_MAX_PAGES} requests each) and compares them. Many requests count against LinkedIn's daily limits, so don't repeat it needlessly.`)) return;
+
+    await busy($('findMutual'), 'mutualStatus', 'Starting…', async () => {
+        $('mutualBox').hidden = true;
+        // Theirs first: if LinkedIn hides it, stop before spending requests on ours.
+        const theirs = await fetchAllRelations(p.id, name + '’s');
+        if (!theirs.items.length) {
+            return setStatus('mutualStatus', `${name}'s connection list is not visible to this account (LinkedIn decides who can see it), so mutual connections can't be listed.${sp.shared_relations_count != null ? ` LinkedIn still reports ${sp.shared_relations_count} shared.` : ''}`, 'error');
+        }
+        if (!cached) {
+            const mine = await fetchAllRelations('me', 'your');
+            myRelationsCache = { accountId: accountId(), items: mine.items, complete: mine.complete, at: Date.now() };
+        }
+        const mineIds = new Set(myRelationsCache.items.map(r => r.user.id));
+        const common = theirs.items.filter(r => mineIds.has(r.user.id));
+        renderMutual(common);
+
+        const partial = !theirs.complete || !myRelationsCache.complete;
+        const expected = sp.shared_relations_count;
+        setStatus('mutualStatus',
+            `${common.length} mutual connection(s) found` +
+            (expected != null ? ` (LinkedIn reports ${expected})` : '') +
+            ` — compared ${theirs.items.length} of theirs with ${myRelationsCache.items.length} of yours.` +
+            (partial ? ' A list was cut off by the page cap, so some may be missing.' : ''),
+            partial ? '' : 'ok');
+    });
+}
+
+function renderMutual(rows) {
+    const t = $('mutualTable');
+    t.innerHTML = rows.length
+        ? '<thead><tr><th>Mutual connection</th><th>Headline</th></tr></thead><tbody>' + rows.map(r => `
+            <tr>
+                <td>${esc(r.user.display_name || '(unknown)')}<span class="sub">${esc(r.user.public_identifier || '')} ${esc(r.user.id)}</span></td>
+                <td>${esc(r.user.description || '')}</td>
+            </tr>`).join('') + '</tbody>'
+        : emptyRow(2, 'No mutual connections found.');
+    $('mutualBox').hidden = false;
+}
+
 async function lookup() {
     if (!needAccount('lookupStatus')) return;
     const identifier = $('profileInput').value.trim();
     if (!identifier) return setStatus('lookupStatus', 'Enter a LinkedIn profile URL or identifier.', 'error');
     await busy($('lookupBtn'), 'lookupStatus', 'Looking up…', async () => {
         $('profileCard').hidden = true;
+        $('mutualBox').hidden = true;
+        setStatus('mutualStatus', '');
         const p = await api(`/profile?account_id=${encodeURIComponent(accountId())}&identifier=${encodeURIComponent(identifier)}`);
         lastProfile = p;
         renderProfile(p);
