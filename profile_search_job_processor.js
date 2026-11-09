@@ -215,6 +215,7 @@ class ProfileSearchJobProcessor {
       ...(apifyInput.currentJobTitles?.length   && { currentJobTitles:   apifyInput.currentJobTitles   }),
       ...(apifyInput.pastJobTitles?.length      && { pastJobTitles:      apifyInput.pastJobTitles      }),
       ...(apifyInput.industries?.length         && { industries:         apifyInput.industries         }),
+      ...(apifyInput.currentCompanies?.length   && { currentCompanies:   apifyInput.currentCompanies   }),
       recentlyChangedJobs:      apifyInput.recentlyChangedJobs      || false,
       recentlyPostedOnLinkedIn: apifyInput.recentlyPostedOnLinkedIn || false,
       autoQuerySegmentation:    apifyInput.autoQuerySegmentation    || false,
