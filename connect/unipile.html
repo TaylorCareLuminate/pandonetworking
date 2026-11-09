@@ -95,6 +95,11 @@
             transition: background .15s, border-color .15s, color .15s;
         }
         .btn:disabled { opacity: .45; cursor: not-allowed; }
+        .attach { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-top: .5rem; font-size: .85rem; }
+        .attach select { padding: .3rem .5rem; max-width: 20rem; }
+        .attach .chip { display: inline-flex; align-items: center; gap: .4rem; padding: .2rem .55rem; border: 1px solid var(--border, #d0d7de); border-radius: 999px; background: rgba(127,127,127,.08); }
+        .attach .chip button { border: 0; background: transparent; cursor: pointer; color: inherit; padding: 0; font-size: 1rem; line-height: 1; }
+        .msg .att { display: block; margin-top: .3rem; font-size: .8rem; opacity: .85; }
         .btn-primary { background: var(--navy); color: #fff; }
         .btn-primary:hover:not(:disabled) { background: var(--navy-soft); }
         .btn-outline { background: var(--paper); color: var(--navy); border-color: var(--line-strong); }
@@ -290,6 +295,15 @@
                 <div class="field wide">
                     <label for="msgText">Message</label>
                     <textarea id="msgText" placeholder="Type your message…"></textarea>
+                    <div class="attach">
+                        <input type="file" id="msgFiles" multiple hidden>
+                        <button type="button" class="btn btn-outline btn-sm" id="msgPick"><i class="fas fa-paperclip"></i> Attach file</button>
+                        <select id="msgMode" title="How Unipile should send the file">
+                            <option value="native">Auto: audio as voice note, images as pictures</option>
+                            <option value="file">Regular file attachment</option>
+                        </select>
+                        <span id="msgChips"></span>
+                    </div>
                 </div>
             </div>
             <div class="btn-row" style="margin-top:1rem;">
@@ -330,6 +344,15 @@
                     </div>
                     <div class="reply-box" id="replyBox" hidden>
                         <textarea id="replyText" placeholder="Write a reply…"></textarea>
+                        <div class="attach">
+                            <input type="file" id="replyFiles" multiple hidden>
+                            <button type="button" class="btn btn-outline btn-sm" id="replyPick"><i class="fas fa-paperclip"></i> Attach file</button>
+                            <select id="replyMode" title="How Unipile should send the file">
+                                <option value="native">Auto: audio as voice note, images as pictures</option>
+                                <option value="file">Regular file attachment</option>
+                            </select>
+                            <span id="replyChips"></span>
+                        </div>
                         <div class="btn-row">
                             <button class="btn btn-primary btn-sm" id="replyBtn"><i class="fas fa-reply"></i> Send reply</button>
                             <button class="btn btn-outline btn-sm" id="olderBtn" hidden><i class="fas fa-clock-rotate-left"></i> Older messages</button>
@@ -767,18 +790,117 @@ $('inviteBtn').addEventListener('click', async () => {
     });
 });
 
+// ───────── Attachments (files, PDFs, images, voice notes) ─────────
+// Files are sent as base64 in the JSON body. Limits mirror the server's; larger files would need Unipile's multipart upload.
+const ATTACH_MAX_FILES = 5;
+const ATTACH_MAX_BYTES = 10 * 1024 * 1024;
+const ATTACH_MAX_TOTAL = 20 * 1024 * 1024;
+const MIME_BY_EXT = {
+    pdf: 'application/pdf', doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    txt: 'text/plain', csv: 'text/csv', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+    mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav', ogg: 'audio/ogg', opus: 'audio/ogg', webm: 'audio/webm',
+    mp4: 'video/mp4', mov: 'video/quicktime'
+};
+
+function mimeFor(file) {
+    if (file.type) return file.type.toLowerCase();
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    return MIME_BY_EXT[ext] || 'application/octet-stream';
+}
+function fmtBytes(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB'; }
+
+function readBase64(file) {
+    return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result).split(',')[1] || '');
+        r.onerror = () => reject(new Error(`Could not read ${file.name}`));
+        r.readAsDataURL(file);
+    });
+}
+
+// Best effort: Unipile accepts an optional duration for voice notes. null if the browser can't decode the file.
+function audioDuration(file) {
+    return new Promise(resolve => {
+        const url = URL.createObjectURL(file);
+        const a = new Audio();
+        const finish = v => { clearTimeout(timer); URL.revokeObjectURL(url); resolve(v); };
+        const timer = setTimeout(() => finish(null), 3000);
+        a.preload = 'metadata';
+        a.onloadedmetadata = () => finish(Number.isFinite(a.duration) ? Math.round(a.duration * 10) / 10 : null);
+        a.onerror = () => finish(null);
+        a.src = url;
+    });
+}
+
+// One picker per form: `${prefix}Files` (input), `${prefix}Pick` (button), `${prefix}Mode` (select), `${prefix}Chips` (list).
+function attachPicker(prefix, statusId) {
+    const input = $(prefix + 'Files'), chips = $(prefix + 'Chips');
+    let files = [];
+
+    function render() {
+        chips.innerHTML = files.map((f, i) => `
+            <span class="chip">${esc(f.name)} <span class="muted">(${esc(fmtBytes(f.size))})</span>
+            <button type="button" data-i="${i}" title="Remove" aria-label="Remove ${esc(f.name)}">&times;</button></span>`).join(' ');
+        chips.querySelectorAll('button[data-i]').forEach(b => b.addEventListener('click', () => {
+            files.splice(Number(b.dataset.i), 1);
+            render();
+        }));
+    }
+
+    $(prefix + 'Pick').addEventListener('click', () => input.click());
+    input.addEventListener('change', () => {
+        const picked = Array.from(input.files || []);
+        input.value = ''; // allow re-picking the same file later
+        for (const f of picked) {
+            if (files.length >= ATTACH_MAX_FILES) { setStatus(statusId, `At most ${ATTACH_MAX_FILES} files per message.`, 'error'); break; }
+            if (f.size === 0) { setStatus(statusId, `${f.name} is empty.`, 'error'); continue; }
+            if (f.size > ATTACH_MAX_BYTES) { setStatus(statusId, `${f.name} is ${fmtBytes(f.size)}; the limit is ${fmtBytes(ATTACH_MAX_BYTES)}.`, 'error'); continue; }
+            if (files.reduce((n, x) => n + x.size, f.size) > ATTACH_MAX_TOTAL) { setStatus(statusId, `Files total more than ${fmtBytes(ATTACH_MAX_TOTAL)}.`, 'error'); break; }
+            files.push(f);
+        }
+        render();
+    });
+
+    return {
+        has: () => files.length > 0,
+        clear() { files = []; render(); },
+        describe: () => files.map(f => `  • ${f.name} (${fmtBytes(f.size)})`).join('\n'),
+        async build() {
+            const sendMode = $(prefix + 'Mode').value;
+            return Promise.all(files.map(async f => {
+                const type = mimeFor(f);
+                const att = { filename: f.name, content_type: type, content: await readBase64(f), send_mode: sendMode };
+                if (sendMode === 'native' && type.startsWith('audio/')) {
+                    const duration = await audioDuration(f);
+                    if (duration) att.metadata = { duration };
+                }
+                return att;
+            }));
+        }
+    };
+}
+const msgAttach = attachPicker('msg', 'startChatStatus');
+const replyAttach = attachPicker('reply', 'replyStatus');
+
 // ───────── Start new chat ─────────
 $('startChatBtn').addEventListener('click', async () => {
     if (!needAccount('startChatStatus')) return;
     const userId = $('msgUserId').value.trim();
     const text = $('msgText').value.trim();
     if (!userId) return setStatus('startChatStatus', 'User ID is required (look up a profile first).', 'error');
-    if (!text) return setStatus('startChatStatus', 'Write a message first.', 'error');
-    if (!confirm(`Send a REAL LinkedIn message to ${targetLabel(userId)}?\n\n${text}`)) return;
-    await busy($('startChatBtn'), 'startChatStatus', 'Sending…', async () => {
-        const r = await api('/chats', { method: 'POST', body: { account_id: accountId(), user_id: userId, text, inbox_id: $('inboxSelect').value || undefined } });
+    if (!text && !msgAttach.has()) return setStatus('startChatStatus', 'Write a message or attach a file first.', 'error');
+    const files = msgAttach.has() ? `\n\nAttachments:\n${msgAttach.describe()}` : '';
+    if (!confirm(`Send a REAL LinkedIn message to ${targetLabel(userId)}?\n\n${text || '(no text)'}${files}`)) return;
+    await busy($('startChatBtn'), 'startChatStatus', msgAttach.has() ? 'Uploading and sending…' : 'Sending…', async () => {
+        const body = { account_id: accountId(), user_id: userId, text, inbox_id: $('inboxSelect').value || undefined };
+        if (msgAttach.has()) body.attachments = await msgAttach.build();
+        const r = await api('/chats', { method: 'POST', body });
         setStatus('startChatStatus', `Message sent${r && r.chat_id ? ` (chat ${r.chat_id})` : ''}.`, 'ok');
         $('msgText').value = '';
+        msgAttach.clear();
     });
 });
 
@@ -858,6 +980,15 @@ function renderThreadHead() {
         <div class="sub">chat_id ${esc(state.thread.chatId)}</div>`;
 }
 
+// How a message attachment is shown in the thread: name, type and size (voice notes get a microphone). No download link on purpose.
+function attachmentLine(a) {
+    const kind = a.voice_note ? 'voice note' : (a.mimetype || a.type || 'file');
+    const name = a.filename || a.name || kind;
+    const size = a.file_size ? ` · ${fmtBytes(a.file_size)}` : '';
+    const label = `${a.voice_note ? '🎤' : '📎'} ${esc(name)} <span class="muted">(${esc(kind)}${esc(size)})</span>`;
+    return `<span class="att">${label}${a.is_unavailable ? ' · no longer available' : ''}</span>`;
+}
+
 function renderThread() {
     const box = $('messages');
     renderThreadHead();
@@ -865,7 +996,7 @@ function renderThread() {
     // API returns newest first; show oldest at top.
     const ordered = state.thread.items.slice().reverse();
     box.innerHTML = ordered.map(m => `
-        <div class="msg ${m.is_sender ? 'me' : 'them'}">${esc(m.text || (m.attachments?.length ? '[attachment]' : '[no text]'))}<span class="when">${esc(fmtTime(m.timestamp))}</span></div>`).join('');
+        <div class="msg ${m.is_sender ? 'me' : 'them'}">${esc(m.text || (m.attachments?.length ? '' : '[no text]'))}${(m.attachments || []).map(attachmentLine).join('')}<span class="when">${esc(fmtTime(m.timestamp))}</span></div>`).join('');
     box.scrollTop = box.scrollHeight;
     $('olderBtn').hidden = !state.thread.next;
     $('fullHistoryBtn').hidden = !state.thread.next;
@@ -952,11 +1083,15 @@ $('replyBtn').addEventListener('click', async () => {
     const chatId = state.thread.chatId;
     const text = $('replyText').value.trim();
     if (!chatId) return;
-    if (!text) return setStatus('replyStatus', 'Write a reply first.', 'error');
-    if (!confirm(`Send this REAL reply on LinkedIn?\n\n${text}`)) return;
-    await busy($('replyBtn'), 'replyStatus', 'Sending…', async () => {
-        await api(`/chats/${encodeURIComponent(chatId)}/messages`, { method: 'POST', body: { account_id: accountId(), text } });
+    if (!text && !replyAttach.has()) return setStatus('replyStatus', 'Write a reply or attach a file first.', 'error');
+    const files = replyAttach.has() ? `\n\nAttachments:\n${replyAttach.describe()}` : '';
+    if (!confirm(`Send this REAL reply on LinkedIn?\n\n${text || '(no text)'}${files}`)) return;
+    await busy($('replyBtn'), 'replyStatus', replyAttach.has() ? 'Uploading and sending…' : 'Sending…', async () => {
+        const body = { account_id: accountId(), text };
+        if (replyAttach.has()) body.attachments = await replyAttach.build();
+        await api(`/chats/${encodeURIComponent(chatId)}/messages`, { method: 'POST', body });
         $('replyText').value = '';
+        replyAttach.clear();
         setStatus('replyStatus', 'Reply sent.', 'ok');
         await loadMessages(false);
         setStatus('replyStatus', 'Reply sent.', 'ok');
