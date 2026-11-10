@@ -1488,6 +1488,22 @@
             </div>
         </div>
 
+        <!-- LinkedIn engine (Unipile) outbox: admin only, shown when the selected BDR has engine items -->
+        <div id="engineOutbox" style="display:none;margin-bottom:1.5rem;background:#fff;border:1.5px solid #cfc9ba;border-radius:10px;padding:1rem 1.1rem;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+                <strong><i class="fas fa-paper-plane"></i> Sending engine queue <span id="engineOutboxCount" style="font-weight:400;color:#7c8594;"></span></strong>
+                <span>
+                    <a href="linkedin_engine_status.html" target="_blank" rel="noopener" style="font-size:.85rem;margin-right:.8rem;">Engine status</a>
+                    <button id="engineOutboxToggle" class="btn btn-secondary" style="padding:.3rem .7rem;font-size:.8rem;">Show</button>
+                </span>
+            </div>
+            <div id="engineOutboxBody" style="display:none;margin-top:.8rem;">
+                <p style="font-size:.84rem;color:#4b5563;margin:0 0 .6rem;">Messages the engine has not sent yet. Edit or cancel any of them before they go out; the AI check runs again after an edit. &ldquo;Held&rdquo; ones need a person.</p>
+                <div style="overflow:auto;"><table id="engineOutboxTable" style="width:100%;border-collapse:collapse;font-size:.84rem;"></table></div>
+                <div id="engineOutboxStatus" style="font-size:.84rem;margin-top:.5rem;min-height:1.2em;"></div>
+            </div>
+        </div>
+
         <div id="loadingContainer" class="loading-container">
             <div class="loading-spinner"></div>
             <div class="loading-text">Loading sent messages and results...</div>
@@ -9629,6 +9645,88 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                 window.location.href = '../login.html';
             }
         });
+    </script>
+
+    <!-- Engine outbox panel (self-contained; does nothing unless the signed-in admin's BDR has engine items) -->
+    <script type="module">
+        import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
+        await window.firebaseReady;
+        const auth = window.auth;
+        const API = 'https://railwayclemail-production.up.railway.app/linkedin-engine';
+        const panel = document.getElementById('engineOutbox');
+        const body = document.getElementById('engineOutboxBody');
+        const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        const toDate = (v) => { if (!v) return null; if (typeof v === 'string') return new Date(v); if (v._seconds) return new Date(v._seconds * 1000); return null; };
+        const fmt = (v) => { const d = toDate(v); return d ? d.toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) + ' CT' : '—'; };
+        const say = (m, err) => { const el = document.getElementById('engineOutboxStatus'); el.textContent = m || ''; el.style.color = err ? '#a23b3b' : '#4b5563'; };
+        async function api(path, opts = {}) {
+            const token = await auth.currentUser.getIdToken();
+            const r = await fetch(API + path, { method: opts.method || 'GET', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: opts.body ? JSON.stringify(opts.body) : undefined });
+            const j = await r.json().catch(() => ({}));
+            if (!r.ok || j.success === false) throw new Error(j.error || `HTTP ${r.status}`);
+            return j;
+        }
+        const viewedBdr = () => {
+            const sel = document.getElementById('bdrSelect');
+            const v = sel && sel.value ? sel.value : (auth.currentUser && auth.currentUser.email) || '';
+            return v.toLowerCase();
+        };
+        let busy = false;
+        async function refresh() {
+            if (busy || !auth.currentUser) return; busy = true;
+            try {
+                const r = await api('/outbox?status=held,outcome_unknown,queued,scheduled&limit=1000');
+                const me = viewedBdr();
+                const items = r.items.filter(i => String(i.bdrEmail || '').toLowerCase() === me && !i.shadow);
+                if (!items.length) { panel.style.display = 'none'; return; }
+                panel.style.display = 'block';
+                const needs = items.filter(i => ['held', 'outcome_unknown'].includes(i.status)).length;
+                document.getElementById('engineOutboxCount').textContent = `(${items.length} waiting${needs ? `, ${needs} need a person` : ''})`;
+                if (needs && body.style.display === 'none') { body.style.display = 'block'; document.getElementById('engineOutboxToggle').textContent = 'Hide'; }
+                const th = 'style="text-align:left;padding:.4rem .5rem;border-bottom:1px solid #cfc9ba;font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;color:#7c8594;"';
+                const td = 'style="padding:.45rem .5rem;border-bottom:1px solid #e4e0d6;vertical-align:top;"';
+                const btn = (label, act, id) => `<button class="btn btn-secondary" style="padding:.2rem .5rem;font-size:.75rem;margin:0 .25rem .25rem 0;" data-act="${act}" data-id="${esc(id)}">${label}</button>`;
+                document.getElementById('engineOutboxTable').innerHTML = `<thead><tr><th ${th}>Person</th><th ${th}>Status</th><th ${th}>Text</th><th ${th}>Planned</th><th ${th}></th></tr></thead><tbody>` + items.map(i => {
+                    const a = [];
+                    if (['queued', 'scheduled', 'held'].includes(i.status)) a.push(btn('Edit', 'edit', i.id));
+                    if (i.status === 'held') a.push(btn('Release', 'release', i.id));
+                    if (['queued', 'scheduled'].includes(i.status)) a.push(btn('Hold', 'hold', i.id), btn('Send sooner', 'send-sooner', i.id));
+                    if (['queued', 'scheduled', 'held'].includes(i.status)) a.push(btn('Cancel', 'cancel', i.id));
+                    if (i.status === 'outcome_unknown') a.push('<a href="linkedin_engine_status.html" target="_blank" rel="noopener" style="font-size:.78rem;">Resolve on the status page</a>');
+                    const bad = ['held', 'outcome_unknown'].includes(i.status);
+                    return `<tr><td ${td}>${esc((i.firstName || '') + ' ' + (i.lastName || ''))}<div style="font-size:.74rem;color:#7c8594;">${esc(i.company || '')} · ${esc(i.kind)}${i.isReply ? ' (reply)' : ''}</div></td>
+                        <td ${td}><span style="font-weight:600;color:${bad ? '#a23b3b' : '#1f4462'};">${esc(i.status.replace('_', ' '))}</span>${i.holdReason ? `<div style="font-size:.76rem;color:#a23b3b;">${esc(i.holdReason)}</div>` : ''}</td>
+                        <td ${td}><div style="max-width:440px;white-space:pre-wrap;word-break:break-word;">${esc(i.text || '(no note)')}</div></td>
+                        <td ${td}>${i.plan && i.plan.sendAfter ? esc(fmt(i.plan.sendAfter)) : '—'}</td><td ${td}>${a.join('')}</td></tr>`;
+                }).join('') + '</tbody>';
+            } catch (e) { panel.style.display = 'none'; /* not an admin, or the engine is not reachable: stay out of the way */ }
+            finally { busy = false; }
+        }
+        document.getElementById('engineOutboxToggle').addEventListener('click', () => {
+            const open = body.style.display === 'none'; body.style.display = open ? 'block' : 'none';
+            document.getElementById('engineOutboxToggle').textContent = open ? 'Hide' : 'Show';
+        });
+        document.getElementById('engineOutboxTable').addEventListener('click', async (ev) => {
+            const b = ev.target.closest('button[data-act]'); if (!b) return;
+            const { act, id } = b.dataset;
+            try {
+                if (act === 'edit') {
+                    const cur = await api('/outbox/' + encodeURIComponent(id));
+                    const text = prompt('Edit the text. The AI check runs again on the new text.', cur.item.text || '');
+                    if (text === null) return;
+                    await api(`/outbox/${encodeURIComponent(id)}/edit`, { method: 'POST', body: { text } });
+                } else if (act === 'cancel') {
+                    if (!confirm('Cancel this message? It will not be sent.')) return;
+                    await api(`/outbox/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+                } else {
+                    await api(`/outbox/${encodeURIComponent(id)}/${act}`, { method: 'POST' });
+                }
+                say('Done.'); busy = false; refresh();
+            } catch (e) { say(e.message, true); }
+        });
+        const sel = document.getElementById('bdrSelect'); if (sel) sel.addEventListener('change', () => setTimeout(refresh, 300));
+        const rb = document.getElementById('refreshBtn'); if (rb) rb.addEventListener('click', () => setTimeout(refresh, 300));
+        onAuthStateChanged(auth, (u) => { if (u) { setTimeout(refresh, 1500); setInterval(refresh, 60000); } });
     </script>
 </body>
 </html>

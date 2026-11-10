@@ -1027,3 +1027,42 @@ Tests that must exist before phase 2, because they are the ones that protect us 
 - Whether nights, Thursdays and Sundays are better on true send times. Needs the `CONNECTION_REQUEST_SENT` events in Firestore, which I could not read.
 - Whether live HeyReach campaigns all use the builder's default 1 PM to 10 PM Central schedule.
 - How LinkedIn counts its weekly limit (rolling seven days or otherwise), and how it treats 215 a week on our accounts.- The second copy of the site: `c:\repos\HealthLuminateSiteFromLocal` has its own copies of `connect_push.html`, `fast_connect_review.html`, `sent_messages.html`, `index_admin.html` and `company_review_replies.html` among 149 files that mention HeyReach. If that site is live, its pages need the same changes. I did not inventory it.
+
+---
+
+## 19. Implementation status (what was built, and where it differs from the plan)
+
+Everything below ships **off and in dry-run** (`system_settings/linkedin_engine`: `enabled:false`, `dryRun:true`). Nothing sends until the engine is on, dry-run is off (both need the typed word SEND), and an account has been moved to the engine step by step.
+
+**Backend (`RailwayCLemail`)**
+
+- `services/linkedin_engine/`: settings, Central-time utilities, URL keys, calendar and make-up, week plan, send windows, learned timing, Unipile client, store, hard checks, AI gate, outbox, planner, compat mirrors, sender, inbound webhook handling, reconciler, account and cutover logic.
+- `routes/linkedin_engine_routes.js`, mounted at `/linkedin-engine`: public (webhook, hosted-login start and callback) and admin routes (status, settings, stop, outbox actions, plan, calendar, timing, account cutover, backfill, gate preview, webhook registration, ledger, log, `POST /invites` for hosted-login invites).
+- Guards on the HeyReach side: a HeyReach write for an account the engine owns is refused (`ENGINE_OWNED`, HTTP 409); the HeyReach acceptance and reply webhooks skip engine-owned accounts; the reserve queue, auto-reply and message-queue services route engine-owned senders through the outbox; inbox replies for engine-owned accounts go through the outbox. Every lookup failure blocks rather than falls through to HeyReach.
+- Engine collections are in `BLOCKED_COLLECTIONS`, so the generic collection API cannot touch them.
+- 64 automated tests: `npm run test:engine` (races, crash recovery, timeouts, duplicate URL variants, edits during a claim, webhook replay, reply cancellation, AI outage, no-send days, minimum gap, caps under a faulty planner, the 80/20/10 split, make-up arithmetic, cutover gates and the HeyReach guards).
+
+**Pages (`pandonetworking`)**
+
+- `connect/linkedin_engine_status.html`: switches and STOP, accounts and the cutover buttons with their confirmations, the queue (held, unknown outcome, waiting, dry run), limits and AI sensitivity, an AI-check tester, recent log.
+- `connect/linkedin_sending_calendar.html`: holiday editing, make-up choices, how each holiday performed (acceptances against nearby ordinary days), the next fourteen days of plan, what the engine has learned with pin and reset.
+- `connect/sent_messages.html`: an admin-only engine queue panel (edit, hold, release, send sooner, cancel) that appears when the viewed BDR has engine items.
+- `connect/mistake_queue.html`: a "Held by the sending engine" section (edit, release, cancel).
+- `connect/linkedin_account_setup.html` and `public/linkedin_connect.html`: a choice of HeyReach or hosted login; hosted-login invites open `linkedin_connect.html?p=unipile`.
+- `connect/analysis_data.html`: exports `first_outreach_sent_at_source`; `connect/analysis_results.html` warns that send-time findings are trustworthy only on true send times.
+- `connect/index_admin.html`: cards for the two new pages.
+- `firestore.rules`: explicit denies for the engine collections and settings document (the existing catch-all would otherwise allow any signed-in user to read them). **These need deploying.**
+
+**Differences from the plan above**
+
+- The holiday calendar collection is `linkedin_engine_calendar`, not `linkedin_calendar`, because `crm/email_calendar.html` already stores its settings under that name.
+- Hosted-login invites are created by `POST /linkedin-engine/invites` (method `unipile`), and the old `/public/connect` route refuses them.
+- Chat polling and a daily replay of missed webhook events are not built. The relations poll and the nightly audit are. If a webhook is missed, an acceptance or reply can be late until the audit finds it.
+- The account cache is 30 seconds per replica. The sender re-checks ownership at claim time, so a stale cache cannot cause a send through the wrong path.
+- At 60 sends in a day the prime windows (about 44 at the minimum spacing) fill, so the remainder spills into the other windows.
+- `connect_queue` mirroring and the invite list on the setup page use HeyReach-shaped fields.
+- `functions/index.js` reserve top-up is unchanged.
+
+**Still to verify against the Unipile sandbox before the pilot** (field names are read tolerantly, but not confirmed): profile id on lookup, `network_distance`, the invite-status and sent-invitation list shapes, the webhook payloads, and the `providers` value for the hosted-login link (override with `UNIPILE_AUTH_PROVIDERS`).
+
+**Environment** (Railway): `UNIPILE_API_KEY`, `UNIPILE_SERVICE_API_KEY`, `PUBLIC_API_BASE`, `LINKEDIN_ENGINE_RETURN_HOSTS`; optional `UNIPILE_BASE_URL`, `UNIPILE_AUTH_PROVIDERS`. Then register the webhook with `POST /linkedin-engine/webhook/register` and set Unipile's own rate limits to match ours.

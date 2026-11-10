@@ -397,6 +397,13 @@
     </div>
 
     <div id="itemList"></div>
+
+    <!-- Messages the LinkedIn sending engine (Unipile) refused to send without a person looking -->
+    <div id="engineHeldSection" style="display:none;margin-top:2rem;">
+        <h2 style="font-size:1.15rem;margin-bottom:.4rem;"><i class="fas fa-hand"></i> Held by the sending engine <span id="engineHeldCount" style="font-weight:400;color:var(--gray);"></span></h2>
+        <p style="font-size:.88rem;color:var(--gray);margin-bottom:1rem;">These were stopped before sending (placeholder text, a name mismatch, a possible mistake flagged by the AI check). Fix the text and release, or cancel. Nothing here is sent until you release it.</p>
+        <div id="engineHeldList"></div>
+    </div>
 </div>
 
 <!-- Bulk push confirm modal -->
@@ -766,6 +773,73 @@
 
     issueFilter.addEventListener('change', renderItems);
 
+    // ── Engine-held messages (linkedin_outbox status "held") ──────────────────
+    const ENGINE_API = RAILWAY_API_BASE + '/linkedin-engine';
+    async function engineApi(path, opts = {}) {
+        const token = await auth.currentUser.getIdToken();
+        const r = await fetch(ENGINE_API + path, { method: opts.method || 'GET', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: opts.body ? JSON.stringify(opts.body) : undefined });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.success === false) throw new Error(j.error || `HTTP ${r.status}`);
+        return j;
+    }
+    async function loadEngineHeld() {
+        const section = document.getElementById('engineHeldSection');
+        const list = document.getElementById('engineHeldList');
+        try {
+            const r = await engineApi('/outbox?status=held&limit=300');
+            const items = r.items.filter(i => !i.shadow);
+            if (!items.length) { section.style.display = 'none'; return; }
+            section.style.display = 'block';
+            document.getElementById('engineHeldCount').textContent = `(${items.length})`;
+            list.innerHTML = '';
+            items.forEach(i => {
+                const card = document.createElement('div');
+                card.className = 'item-card';
+                const name = [i.firstName, i.lastName].filter(Boolean).join(' ') || 'Unknown contact';
+                card.innerHTML = `
+                    <div class="item-header"><div class="item-meta">
+                        <h3>${escHtml(name)}${i.company ? ` <span style="color:var(--gray);font-weight:400;">@ ${escHtml(i.company)}</span>` : ''}</h3>
+                        <div class="meta-details"><span><i class="fas fa-user"></i> ${escHtml(i.bdrEmail || '')}</span><span><i class="fas fa-building"></i> ${escHtml(i.customerName || '')}</span>
+                        ${i.profileUrl ? `<span><a href="${escHtml(i.profileUrl)}" target="_blank" rel="noopener"><i class="fas fa-link"></i> Profile</a></span>` : ''}</div></div>
+                        <div class="item-badges"><span class="badge ${i.kind === 'invite' ? 'badge-connect' : 'badge-message'}">${i.kind === 'invite' ? 'Connect' : 'Message'}</span></div></div>
+                    <div class="item-body">
+                        ${i.text ? `<div class="message-preview">${escHtml(i.text)}</div>` : '<p style="color:var(--gray);font-size:.88rem;font-style:italic;margin-bottom:1rem;">(no note)</p>'}
+                        <div class="issues-section"><h4>Why it was held</h4><div class="issue-item factual"><span>${escHtml(i.holdReason || i.holdCode || 'Held')}</span></div></div>
+                    </div>
+                    <div class="item-actions">
+                        <button class="btn btn-secondary btn-sm" data-act="edit" data-id="${escHtml(i.id)}"><i class="fas fa-pen"></i> Edit</button>
+                        <button class="btn btn-success btn-sm" data-act="release" data-id="${escHtml(i.id)}"><i class="fas fa-check"></i> Release</button>
+                        <button class="btn btn-secondary btn-sm" data-act="cancel" data-id="${escHtml(i.id)}"><i class="fas fa-times"></i> Cancel</button>
+                    </div>`;
+                list.appendChild(card);
+            });
+        } catch (e) {
+            section.style.display = 'none';   // engine not reachable or not configured: leave the page as it was
+            console.warn('Engine held list unavailable:', e.message);
+        }
+    }
+    document.getElementById('engineHeldList').addEventListener('click', async (ev) => {
+        const b = ev.target.closest('button[data-act]'); if (!b) return;
+        const { act, id } = b.dataset;
+        try {
+            if (act === 'edit') {
+                const cur = await engineApi('/outbox/' + encodeURIComponent(id));
+                const text = prompt('Edit the text. The AI check runs again on the new text. Release it afterwards.', cur.item.text || '');
+                if (text === null) return;
+                await engineApi(`/outbox/${encodeURIComponent(id)}/edit`, { method: 'POST', body: { text } });
+                showAlert('Saved. Click Release when it is ready.', 'success');
+            } else if (act === 'cancel') {
+                if (!confirm('Cancel this message? It will not be sent.')) return;
+                await engineApi(`/outbox/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+                showAlert('Cancelled.', 'info');
+            } else {
+                await engineApi(`/outbox/${encodeURIComponent(id)}/release`, { method: 'POST' });
+                showAlert('Released. It will be checked again and scheduled.', 'success');
+            }
+            loadEngineHeld();
+        } catch (e) { showAlert(e.message, 'danger'); }
+    });
+
     function isAdminUser(user) {
         if (!user?.email) return false;
         const domain = user.email.split('@')[1];
@@ -781,6 +855,7 @@
                 return;
             }
             await loadItems();
+            loadEngineHeld();
         } else {
             const authState = window.getCurrentAuthState?.();
             if (authState?.isLoggedIn) return;

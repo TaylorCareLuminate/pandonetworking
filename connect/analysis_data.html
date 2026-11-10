@@ -696,7 +696,8 @@
                 <div class="legend-row"><span class="legend-col">currently_connected_on_linkedin</span><span class="legend-desc">1 if this contact is a current 1st-degree LinkedIn connection (from heyreach_contacts), regardless of who initiated the request (catches pre-existing/inbound connections that Pando Executive Networking did not initiate)</span></div>
                 <div class="legend-row"><span class="legend-col">connection_date</span><span class="legend-desc">Date connection was accepted (blank if unknown)</span></div>
                 <div class="legend-row"><span class="legend-col">first_outreach_date</span><span class="legend-desc">Date of first outbound message</span></div>
-                <div class="legend-row" style="background:#fef9c3;"><span class="legend-col" style="color:#92400e;">first_outreach_sent_at</span><span class="legend-desc">Full date + time (ISO 8601, UTC) the first connection request was actually <strong>sent</strong> — from the HeyReach message log's own timestamp, not when the contact accepted it (see connection_date) and not just a date like first_outreach_date. Use this to check whether send day-of-week / time-of-day correlates with connect, reply, or meeting rates. Blank if no message-log timestamp or queue timestamp is available.</span></div>
+                <div class="legend-row" style="background:#fef9c3;"><span class="legend-col" style="color:#92400e;">first_outreach_sent_at</span><span class="legend-desc">Full date + time (ISO 8601, UTC) the first connection request was actually <strong>sent</strong> — from the HeyReach message log's own timestamp, not when the contact accepted it (see connection_date) and not just a date like first_outreach_date. Use this to check whether send day-of-week / time-of-day correlates with connect, reply, or meeting rates. <strong>Now taken from the CONNECTION_REQUEST_SENT event (the true send time) whenever one exists</strong>; only if none exists does it fall back to the message log or the queue approval time, which are different clocks and are not reliable for time-of-day analysis. Filter on <code>first_outreach_sent_at_source = send_event</code> for timing work.</span></div>
+                <div class="legend-row" style="background:#fef9c3;"><span class="legend-col" style="color:#92400e;">first_outreach_sent_at_source</span><span class="legend-desc"><code>send_event</code> = the true send time (CONNECTION_REQUEST_SENT event). <code>message_log</code> = when HeyReach's conversation log starts. <code>queue_timestamp</code> = when a person approved/pushed it. Only <code>send_event</code> rows are valid for send-time analysis.</span></div>
                 <div class="legend-row"><span class="legend-col">last_message_date</span><span class="legend-desc">Date of most recent message in conversation</span></div>
                 <div class="legend-row"><span class="legend-col">message_type</span><span class="legend-desc">The generation method used to create the outreach message, matching the tabs in generate_messages.html: post (Post Reply) / profile (Profile Message) / about_me_connect (About Me Connect) / org_news / contact_news / story_search / recovered_post / news (generic Internet Search / legacy) / complement (Org Complement) / fast_prospect (Fast Prospect Messaging) / harvest_fast_prospect (Harvest Fast Prospect) / surround_connections (Surround Connections) / other</span></div>
                 <div class="legend-row"><span class="legend-col">replied</span><span class="legend-desc">1 if contact sent any reply, 0 otherwise</span></div>
@@ -735,7 +736,7 @@
                             <th onclick="sortTable('connected_by_healthluminate')" title="1 if the connection request was initially sent by Pando Executive Networking — cross-checked against both the HeyReach webhook and the connect_queue sent-message log">HL Sent <span class="sort-icon"></span></th>
                             <th onclick="sortTable('connection_date')">Conn. Date <span class="sort-icon"></span></th>
                             <th onclick="sortTable('first_outreach_date')">First Outreach <span class="sort-icon"></span></th>
-                            <th onclick="sortTable('first_outreach_sent_at')" title="Full date + time the first connection request was actually sent (from the HeyReach message log — not when it was accepted). Use this to check for correlations with send day-of-week / time-of-day.">Sent At <span class="sort-icon"></span></th>
+                            <th onclick="sortTable('first_outreach_sent_at')" title="Full date + time the first connection request was actually sent (the CONNECTION_REQUEST_SENT event when one exists; otherwise an older, less reliable timestamp — see the Sent-At Source column in the export). Not when it was accepted.">Sent At <span class="sort-icon"></span></th>
                             <th onclick="sortTable('message_type')">Msg Type <span class="sort-icon"></span></th>
                             <th onclick="sortTable('replied')">Replied <span class="sort-icon"></span></th>
                             <th onclick="sortTable('scheduled')">Scheduled <span class="sort-icon"></span></th>
@@ -1149,6 +1150,8 @@
             const connectionDateMap = await loadConnectionDates(allEmailsArr, daysBack, accountIdMap);
             doneStep(s3, `${connectionDateMap.size} connection dates found`);
             await reconcileSentEvents(allEmailsArr, accountIdMap, sentItems, daysBack);
+            const sentEventMap = await loadSentEventTimes(allEmailsArr, accountIdMap, emailToCanonical);
+            console.log(`[SentTimes] ${sentEventMap.size} true send times found`);
 
             // ── Step 4: Load scheduled meetings ──
             const s4 = addStep('Loading scheduled meeting records…');
@@ -1167,7 +1170,7 @@
 
             // ── Step 7: Build rows ──
             const s5 = addStep('Assembling dataset rows (connect_queue outreach only)…');
-            dataset = buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledInfo, bdrEmailToName, urlToGroupMap, bdrEmailToCompany, currentConnectionUrls, emailToCanonical);
+            dataset = buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledInfo, bdrEmailToName, urlToGroupMap, bdrEmailToCompany, currentConnectionUrls, emailToCanonical, sentEventMap);
             doneStep(s5, `${dataset.length} rows built (outreach-initiated, with job title)`);
 
             // ── Step 8: Load profile enrichment from prospect_contacts ──
@@ -1775,6 +1778,46 @@
         return connectionDateMap;
     }
 
+    // ── Load true send times ───────────────────────────────────────────────────
+    // CONNECTION_REQUEST_SENT events (HeyReach webhook, or the Unipile engine's mirror of it) carry the moment the request
+    // was actually sent. The message-log and queue timestamps used before this mix two different clocks (the message
+    // log is when HeyReach started the conversation, the queue time is when a person approved it), so any day/hour
+    // analysis built on them is unreliable. Map key: "<normalized url>||<canonical bdr email>" -> earliest Date.
+    async function loadSentEventTimes(emailArr, accountIdMap, emailToCanonical) {
+        const sentEventMap = new Map();
+        const emailSet = new Set(emailArr.map(e => e.toLowerCase()));
+        const diag = { events: 0, notOwned: 0, noUrl: 0, noTs: 0, kept: 0 };
+        try {
+            const snap = await getAllDocs(query(
+                collection(emailDB, 'heyreach_activity'),
+                where('eventType', '==', 'CONNECTION_REQUEST_SENT')
+            ), { maxDocs: 1000000 });
+            snap.forEach(d => {
+                const data = d.data();
+                diag.events++;
+                let bdr = (data.bdrEmail || data.accountEmail || '').toLowerCase();
+                if ((!bdr || !emailSet.has(bdr)) && data.linkedInAccountId) {
+                    const mapped = accountIdMap.get(String(data.linkedInAccountId));
+                    if (mapped) bdr = mapped;
+                }
+                if (!bdr || !emailSet.has(bdr)) { diag.notOwned++; return; }
+                const url = extractActivityUrl(data);
+                const ts  = safeToDate(data.timestamp);
+                if (!url) { diag.noUrl++; return; }
+                if (!ts)  { diag.noTs++;  return; }
+                const key = `${url}||${emailToCanonical.get(bdr) || bdr}`;
+                const prev = sentEventMap.get(key);
+                if (!prev || ts < prev) sentEventMap.set(key, ts);
+                diag.kept++;
+            });
+            console.log('[SentTimes] send-event breakdown:', JSON.stringify(diag));
+        } catch (e) {
+            console.warn('loadSentEventTimes failed:', e);
+            recordLoadIssue(`heyreach_activity (send times) FAILED (${e?.message || e}) — first_outreach_sent_at falls back to the old, less reliable timestamps`);
+        }
+        return sentEventMap;
+    }
+
     // ── Diagnostic: reconcile connect_queue against HeyReach CONNECTION_REQUEST_SENT ──
     // The dataset is built from connect_queue (pushed_to_heyreach == true). HeyReach's own
     // "sent" count can be higher if requests went out that connect_queue doesn't know about
@@ -2086,7 +2129,7 @@
     }
 
     // ── Build rows ────────────────────────────────────────────────────────────
-    function buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledInfo, bdrEmailToName, urlToGroupMap = new Map(), bdrEmailToCompany = new Map(), currentConnectionUrls = new Set(), emailToCanonical = new Map()) {
+    function buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledInfo, bdrEmailToName, urlToGroupMap = new Map(), bdrEmailToCompany = new Map(), currentConnectionUrls = new Set(), emailToCanonical = new Map(), sentEventMap = new Map()) {
         const rows = [];
         // Track which (normalizedUrl, bdrEmail) pairs have been added
         const seen = new Set();
@@ -2252,7 +2295,12 @@
                 item.adminApprovedAt || item.customerApprovedAt ||
                 item.pushed_at || item.created_at || item.uploaded_date || item.generated_at
             );
-            const firstSentAt    = earliestBdrMessageTime(rawMessages) || sentDate;
+            // True send time first (CONNECTION_REQUEST_SENT event); the two older sources are kept as fallbacks only and the
+            // column first_outreach_sent_at_source says which one was used, so mixed-clock rows can be excluded from timing analysis.
+            const sentEventAt    = (liUrl && bdrEmail) ? sentEventMap.get(`${liUrl}||${bdrEmail}`) : null;
+            const messageLogAt   = earliestBdrMessageTime(rawMessages);
+            const firstSentAt    = sentEventAt || messageLogAt || sentDate;
+            const firstSentSource = sentEventAt ? 'send_event' : (messageLogAt ? 'message_log' : (sentDate ? 'queue_timestamp' : ''));
 
             // Use real conversation messages if available; otherwise build a
             // synthetic one-message entry from the connect_queue message text
@@ -2285,6 +2333,7 @@
                 // the actual send moment); fall back to the connect_queue approval/push
                 // timestamp only when no message-log entry exists for this contact yet.
                 first_outreach_sent_at: firstSentAt ? firstSentAt.toISOString() : '',
+                first_outreach_sent_at_source: firstSentSource,
                 last_message_date:     lastMessageDate(rawMessages) || (sentDate ? sentDate.toISOString().slice(0, 10) : ''),
                 message_type:          msgType,
                 replied,
@@ -2344,7 +2393,12 @@
                 currently_connected_on_linkedin: currentlyConnected,
                 connection_date:       connDate ? connDate.toISOString().slice(0, 10) : '',
                 first_outreach_date:   firstOutreachDate(inbox.rawMessages || []),
-                first_outreach_sent_at: (() => { const t = earliestBdrMessageTime(inbox.rawMessages || []); return t ? t.toISOString() : ''; })(),
+                ...(() => {
+                    const ev = (liUrl && bdrEmail) ? sentEventMap.get(`${liUrl}||${bdrEmail}`) : null;
+                    const t = earliestBdrMessageTime(inbox.rawMessages || []);
+                    const at = ev || t;
+                    return { first_outreach_sent_at: at ? at.toISOString() : '', first_outreach_sent_at_source: ev ? 'send_event' : (t ? 'message_log' : '') };
+                })(),
                 last_message_date:     lastMessageDate(inbox.rawMessages || []),
                 message_type:          classifyMessageType(inbox),
                 replied:               inbox.hasLeadReply ? 1 : 0,
@@ -2649,7 +2703,7 @@
             'bdr_name','bdr_email','client_company',
             'hypothesis_group','hypothesis_group_id','hypothesis_variation_id','hypothesis_variation_label',
             'connected','connected_by_healthluminate','currently_connected_on_linkedin',
-            'connection_date','first_outreach_date','first_outreach_sent_at','last_message_date',
+            'connection_date','first_outreach_date','first_outreach_sent_at','first_outreach_sent_at_source','last_message_date',
             'message_type','replied','scheduled','total_messages','bdr_messages','contact_messages',
             'conversation_history',
             'linkedin_connections','follower_count','about','experience','education','enriched_at'
@@ -2673,6 +2727,7 @@
             connection_date:       'Connection Date',
             first_outreach_date:   'First Outreach Date',
             first_outreach_sent_at: 'First Connection Request Sent At (UTC)',
+            first_outreach_sent_at_source: 'Sent-At Source (send_event = true send time; message_log / queue_timestamp = unreliable)',
             last_message_date:     'Last Message Date',
             message_type:          'Message Type',
             replied:               'Replied',
