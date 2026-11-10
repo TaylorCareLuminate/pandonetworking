@@ -4760,8 +4760,47 @@
             // Without this, each toggle re-scans the whole contact list, making this O(N²) for N contacts.
             _suppressCheckboxSideEffects = true;
             try {
-                _lastOpusResults.forEach(({ result, sourceMsg }) => {
-                    opusApplyResult(result, sourceMsg, counts, threshold);
+                _lastOpusResults.forEach(({ result, sourceMsg, keepText }) => {
+                    opusApplyResult(result, sourceMsg, counts, threshold, { keepText: !!keepText });
+                });
+
+                // Several messages to the same prospect can all clear the threshold (e.g. a 5 and
+                // a 6 at threshold 5). Keep only the highest-rated one approved and mark the rest
+                // as duplicate deletes — otherwise which one stays approved is arbitrary.
+                const byProspect = new Map();
+                _lastOpusResults.forEach(entry => {
+                    const url = opusNormalizeUrl(entry.sourceMsg.prospect_li_url);
+                    if (!url || entry.result.exclude || typeof entry.result.rating !== 'number') return;
+                    if (!byProspect.has(url)) byProspect.set(url, []);
+                    byProspect.get(url).push(entry);
+                });
+                byProspect.forEach(entries => {
+                    if (entries.length < 2) return;
+                    const best = entries.reduce((a, b) => (b.result.rating > a.result.rating ? b : a));
+                    if (best.result.rating < threshold) return; // nothing approved for this prospect
+                    entries.forEach(e => {
+                        if (e === best) return;
+                        const id = e.sourceMsg.id;
+                        ['approve', 'exclude'].forEach(type => {
+                            const cb = document.getElementById(`${type}_${id}`);
+                            if (cb && cb.checked) { cb.checked = false; cb.dispatchEvent(new Event('change')); }
+                        });
+                        const delCb = document.getElementById(`delete_${id}`);
+                        if (delCb && !delCb.checked) {
+                            delCb.checked = true;
+                            delCb.dispatchEvent(new Event('change'));
+                            if (e.result.rating >= threshold) { counts.approved = Math.max(0, counts.approved - 1); counts.deleted++; }
+                        }
+                        deletedAsDuplicate.add(id); // after the change event (it clears the tag)
+                        const card = document.querySelector(`.message-card[data-message-id="${id}"]`);
+                        if (card) {
+                            card.querySelectorAll('.opus-banner').forEach(el => el.remove());
+                            const b = document.createElement('div');
+                            b.className = 'opus-banner opus-delete';
+                            b.innerHTML = `<span class="opus-banner-icon">🗑️</span><div><strong>Opus:</strong> Duplicate prospect — lower-rated than another message (rated ${e.result.rating}/10 vs ${best.result.rating}/10).</div>`;
+                            card.insertBefore(b, card.querySelector('.message-header') || card.firstChild);
+                        }
+                    });
                 });
             } finally {
                 _suppressCheckboxSideEffects = false;
@@ -4816,7 +4855,14 @@
                 banner.innerHTML = `<span class="opus-banner-icon">${m.opusExclude ? '🚫' : decision === 'delete' ? '🗑️' : '—'}</span><div style="flex:1;"><strong>Opus:</strong> ${escapeHtml(reason)} <span style="opacity:0.75;">(saved decision kept)</span></div>`;
                 card.insertBefore(banner, card.querySelector('.message-header') || card.firstChild);
             });
-            if (preReviewed.length === 0) return;
+            // These keep their saved decision/text on load, but must still be registered in
+            // _lastOpusResults so "Re-apply threshold" can move them when the reviewer lowers/raises
+            // the 1-10 pills. (Previously only unsaved messages were registered, so any message
+            // whose Opus decision had been auto-saved — nearly all after a first visit — silently
+            // ignored threshold changes.) Re-apply only changes their decision, never saved text.
+            const savedReviewed = loadedMessages.filter(m =>
+                m.opusReviewStatus === 'completed' && hasSavedReviewerWork(m));
+            if (preReviewed.length === 0 && savedReviewed.length === 0) return;
 
             const threshold = parseInt(document.getElementById('opusAutoApproveThreshold')?.value || '7', 10);
             const counts = { approved: 0, deleted: 0, excluded: 0, edited: 0, none: 0, reserved: 0 };
@@ -4839,6 +4885,21 @@
             } finally {
                 _suppressCheckboxSideEffects = false;
             }
+            // Register saved-work messages (not applied now — their saved decision stands)
+            savedReviewed.forEach(m => {
+                _lastOpusResults.push({
+                    result: {
+                        id: m.id,
+                        exclude: !!m.opusExclude,
+                        excludeReason: m.opusExcludeReason || null,
+                        improvedMessage: m.opusImprovedMessage || null,
+                        rating: typeof m.opusRating === 'number' ? m.opusRating : null,
+                        ratingReason: m.opusRatingReason || null
+                    },
+                    sourceMsg: m,
+                    keepText: true
+                });
+            });
             updateGrayedOutMessages();
             if (activeActionFilter) applyActionFilter();
 
@@ -4860,6 +4921,7 @@
             if (counts.excluded > 0) parts.push(`${counts.excluded} excluded`);
             if (counts.reserved > 0) parts.push(`${counts.reserved} sent to Reserve Queue`);
             console.log(`[OpusReview] Auto-applied ${preReviewed.length} Railway-reviewed message(s): ${parts.join(', ') || 'no changes'}.`);
+            if (preReviewed.length === 0) return;
             showAlert(`🧠 ${preReviewed.length} message${preReviewed.length !== 1 ? 's were' : ' was'} already Opus-reviewed by Railway during generation (${parts.join(', ') || 'no changes'}). Decisions are pre-applied but nothing has been submitted — review and adjust as needed.`, 'success', 7000);
         }
         window.applyStoredOpusReviews = applyStoredOpusReviews;
@@ -12691,7 +12753,7 @@
         }
 
         // Apply a single Opus result object to the DOM. Returns { edited, action } for tallying.
-        function opusApplyResult(r, sourceMsg, opusCounts, autoApproveThreshold) {
+        function opusApplyResult(r, sourceMsg, opusCounts, autoApproveThreshold, opts = {}) {
             const card = document.querySelector(`.message-card[data-message-id="${r.id}"]`);
             const originalText = editedMessages.get(r.id) || sourceMsg.message_to_contact || '';
 
@@ -12699,7 +12761,8 @@
 
             // "Don't edit message text" — Opus still decides approve/delete/exclude (and Reserve
             // routing below) but the reviewer wants the original wording left untouched.
-            const skipTextEdits = !!document.getElementById('opusNoTextEdits')?.checked;
+            // opts.keepText: decision-only apply (message has saved reviewer text edits to preserve)
+            const skipTextEdits = !!opts.keepText || !!document.getElementById('opusNoTextEdits')?.checked;
             // "Send approved messages to Reserve Queue" — mirrors the approve decision onto each
             // card's per-message "Send to Reserve" checkbox (see checkbox-reserve in the card markup).
             const sendApprovedToReserve = !!document.getElementById('opusSendApprovedToReserve')?.checked;
