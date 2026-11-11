@@ -1065,7 +1065,7 @@ Everything below ships **off and in dry-run** (`system_settings/linkedin_engine`
 
 **Still to verify against the Unipile sandbox before the pilot** (field names are read tolerantly, but not confirmed): profile id on lookup, `network_distance`, the invite-status and sent-invitation list shapes, the webhook payloads, and the `providers` value for the hosted-login link (override with `UNIPILE_AUTH_PROVIDERS`).
 
-**Environment** (Railway): `UNIPILE_API_KEY`, `UNIPILE_SERVICE_API_KEY`, `PUBLIC_API_BASE`, `LINKEDIN_ENGINE_RETURN_HOSTS`; optional `UNIPILE_BASE_URL`, `UNIPILE_AUTH_PROVIDERS`. Then register the webhook with `POST /linkedin-engine/webhook/register` and set Unipile's own rate limits to match ours.
+**Environment** (Railway): `UNIPILE_API_KEY`, `UNIPILE_SERVICE_KEY`, `PUBLIC_API_BASE`, `LINKEDIN_ENGINE_RETURN_HOSTS`; optional `UNIPILE_BASE_URL`, `UNIPILE_AUTH_PROVIDERS`. Then register the webhook with `POST /linkedin-engine/webhook/register` and set Unipile's own rate limits to match ours.
 
 ### 19.1 Added later: moving in-process leads, and stricter send times
 
