@@ -53,7 +53,6 @@ const HEALTHCONNECT_CONFIG = {
             items: [
                 // Unified management + search suite (My Connections, Prospect Contacts,
                 // Prospect Organizations, and — for admins — the search/cleanup tools)
-                { label: 'Manage Data', href: 'manage_data.html', icon: 'fa-database' },
                 { label: 'My Connections', href: 'my_leads.html', icon: 'fa-users' },
                 { label: 'Harvest Pool', href: 'harvest_pool.html', icon: 'fa-seedling' },
                 { label: 'Prospect Organizations', href: 'manage_data.html?tool=prospect_organizations', icon: 'fa-building' },
@@ -112,7 +111,6 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Filtered Messages', href: 'filtered_messages.html', icon: 'fa-filter' },
                 { label: 'divider' },
                 // Contact & Search Tools
-                { label: 'Manage Data (Suite)', href: 'manage_data.html', icon: 'fa-database' },
                 { label: 'Prospect Org Admin', href: 'manage_data.html?tool=prospect_organizations_admin', icon: 'fa-building-circle-check' },
                 { label: 'LinkedIn Contact Search', href: 'linkedin_contact_search.html', icon: 'fa-search' },
                 { label: 'Contact Search by Keyword', href: 'manage_data.html?tool=contact_search_by_keyword', icon: 'fa-key' },
