@@ -116,6 +116,7 @@
             <button class="btn btn-danger" onclick="stopEngine()"><i class="fas fa-hand"></i> STOP everything</button>
             <button class="btn btn-outline" onclick="planNow()"><i class="fas fa-wand-magic-sparkles"></i> Re-plan now</button>
             <button class="btn btn-outline" onclick="requeueDry()" title="Put items that were only rehearsed back in the queue (live sending only)"><i class="fas fa-rotate-left"></i> Re-queue dry-run items</button>
+            <button class="btn btn-outline" onclick="cancelNoMessage()" title="Cancel every waiting item that has no message text. Nothing is ever sent without a message."><i class="fas fa-trash-can"></i> Delete items with no message</button>
             <button class="btn btn-outline" onclick="registerWebhook()" title="Tell Unipile where to send accepted invites, replies and account problems. Do this once."><i class="fas fa-plug"></i> Register Unipile webhook</button>
             <button class="btn btn-outline" onclick="load()"><i class="fas fa-rotate"></i> Refresh</button>
         </div>
@@ -235,7 +236,7 @@ function render() {
     document.getElementById('stats').innerHTML =
         stat(t.queued || 0, 'Waiting for a time') + stat(t.scheduled || 0, 'Scheduled') + stat(t.held || 0, 'Held for a person', true) +
         stat(t.outcome_unknown || 0, 'Unknown outcome', true) + stat(t.dry_run || 0, 'Dry-run items') +
-        stat(state.accounts.reduce((a, r) => a + r.sentToday, 0), 'Requests today') + stat(state.accounts.reduce((a, r) => a + r.sentThisWeek, 0), 'Requests this week');
+        stat(state.accounts.reduce((a, r) => a + r.sentToday, 0), 'Connection requests today') + stat(state.accounts.reduce((a, r) => a + (r.messagesToday || 0), 0), 'Messages to connections today') + stat(state.accounts.reduce((a, r) => a + r.sentThisWeek, 0), 'Connection requests this week');
 
     document.getElementById('btnEnable').innerHTML = s.enabled ? '<i class="fas fa-toggle-on"></i> Engine is ON (click to turn off)' : '<i class="fas fa-toggle-off"></i> Engine is OFF (click to turn on)';
     document.getElementById('btnDry').innerHTML = s.dryRun ? '<i class="fas fa-flask"></i> Dry run is ON (click to allow real sending)' : '<i class="fas fa-paper-plane"></i> Real sending is ON (click to return to dry run)';
@@ -267,6 +268,49 @@ function pauseInfo(a) {
     else { label = 'Paused until ' + fmt(e.pausedUntil); headline = 'Paused by a person until ' + fmt(e.pausedUntil) + '.'; }
     return { paused: true, indefinite, label, headline };
 }
+
+// Plain names for the two kinds of send, used everywhere on this page.
+function kindLabel(i) { return i.kind === 'invite' ? 'connection request' : i.kind === 'message' ? 'message to a connection' : i.kind === 'comment' ? 'post comment' : i.kind; }
+
+// Today's numbers, one line per kind, so a connection request is never mistaken for a message.
+function usageCell(a) {
+    const l = a.limits || { invites: {}, messages: {} };
+    const iDay = l.invites.dayMax != null ? ` of ${l.invites.dayMax}` : '';
+    const iWeek = l.invites.weekMax != null ? ` of ${l.invites.weekMax}` : '';
+    const mDay = l.messages.dayMax != null ? ` of ${l.messages.dayMax}` : '';
+    const b = a.boost;
+    const boostTxt = b ? `<span class="sub" style="color:#b45309;font-weight:600;">Extra today: ${b.invites ? 'up to ' + b.invites.day + ' connection requests' : ''}${b.invites && b.messages ? ' and ' : ''}${b.messages ? 'up to ' + b.messages.day + ' messages' : ''}</span>` : '';
+    return `<strong>Connection requests</strong><span class="sub">${a.sentToday}${iDay} today · ${a.sentThisWeek}${iWeek} this week ${spark(a.last7)}</span>`
+        + `<strong style="display:block;margin-top:.35rem;">Messages to connections</strong><span class="sub">${a.messagesToday || 0}${mDay} today</span>`
+        + (a.warmupFactor < 1 ? `<span class="sub">warm-up at ${Math.round(a.warmupFactor * 100)}% (limits shown already include it)</span>` : '') + boostTxt;
+}
+
+// "Send N ... today": a one-day override for one account (engine accounts only).
+function boostBox(a) {
+    if (a.mode !== 'engine') return '';
+    const id = esc(a.id);
+    return `<div class="boost" style="margin-top:.5rem;padding:.5rem;border:1px dashed var(--line-strong);border-radius:6px;">
+        <strong style="font-size:.8rem;">Send extra today</strong>
+        <div class="btn-row" style="margin-top:.3rem;align-items:center;">
+            Send <input type="number" id="bn_${id}" value="10" min="1" max="200" style="width:4.5rem;">
+            <select id="bk_${id}"><option value="message">messages to connections</option><option value="invite">connection requests</option></select> today
+            <button class="btn btn-primary btn-sm" onclick="sendExtraToday('${id}')">Send</button>
+        </div>
+        <div class="sub">Skips the warm-up and the normal daily target for today only. Never goes past the full limits, and never skips the pauses, the gap between sends, the AI check, or the safety checks.</div>
+    </div>`;
+}
+window.sendExtraToday = async (id) => {
+    const n = parseInt(document.getElementById('bn_' + id).value, 10);
+    const kind = document.getElementById('bk_' + id).value;
+    const what = kind === 'message' ? 'messages to connections' : 'connection requests';
+    if (!(n >= 1)) { alert('Enter how many to send today.'); return; }
+    if (!confirm(`Send up to ${n} ${what} today from this account?\n\nThey go out one at a time a few minutes apart, still checked as usual. Only items that are waiting and allowed to go are used.${kind === 'invite' ? '\n\nConnection requests are the ones LinkedIn watches most closely. Extra ones raise the risk of a rate limit.' : ''}`)) return;
+    try {
+        const r = await api(`/accounts/${encodeURIComponent(id)}/boost`, { method: 'POST', body: { kind, count: n } });
+        const m = `Scheduled ${r.result.scheduled} ${what} to go out today.` + (r.result.note ? '\n\n' + r.result.note : '');
+        say('acctStatus', m.replace(/\n+/g, ' ')); alert(m); load(); loadQueue();
+    } catch (e) { say('acctStatus', e.message, true); alert('Could not do that:\n\n' + e.message); }
+};
 
 function backfillLine(b) {
     if (!b) return '';
@@ -315,9 +359,9 @@ function renderAccounts() {
                 ${a.engine.invitesPausedUntil && new Date(a.engine.invitesPausedUntil) > new Date() ? `<span class="err">Invites paused until ${esc(fmt(a.engine.invitesPausedUntil))}</span>` : ''}
                 ${backfillLine(a.backfill)}
                 ${a.identityCheck === 'mismatch' ? '<span class="err">Linked profile does not match the BDR!</span>' : ''}</td>
-            <td>${a.sentToday} today<span class="sub">${a.sentThisWeek} this week ${spark(a.last7)}</span>${a.warmupFactor < 1 ? `<span class="sub">warm-up at ${Math.round(a.warmupFactor * 100)}%</span>` : ''}</td>
+            <td>${usageCell(a)}</td>
             <td>${esc(qtxt)}<span class="sub">next action ${esc(fmt(a.engine.nextActionAt))}</span></td>
-            <td class="actions">${buttons.join('')}<div class="cutover" id="cut_${esc(a.id)}" hidden>
+            <td class="actions">${buttons.join('')}${boostBox(a)}<div class="cutover" id="cut_${esc(a.id)}" hidden>
                 <strong>Before going live, confirm each of these:</strong>
                 <label><input type="checkbox" class="cf_empty"> HeyReach has no leads left in process for this account.</label>
                 <label><input type="checkbox" class="cf_paused"> The HeyReach campaigns for this account are paused and protected from auto-resume.</label>
@@ -349,6 +393,11 @@ window.verifyIdentity = async (id) => {
 };
 window.syncStatus = async (id) => { try { const r = await api(`/accounts/${encodeURIComponent(id)}/sync-status`, { method: 'POST' }); say('acctStatus', 'Unipile says: ' + r.status); load(); } catch (e) { say('acctStatus', e.message, true); } };
 window.pause = async (id) => { const h = prompt('Pause for how many hours?', '24'); if (!h) return; try { await api(`/accounts/${encodeURIComponent(id)}/pause`, { method: 'POST', body: { hours: Number(h) } }); load(); } catch (e) { say('acctStatus', e.message, true); } };
+window.cancelNoMessage = async () => {
+    if (!confirm('Cancel every waiting item that has no message text? They will not be sent. This cannot be undone.')) return;
+    try { const r = await api('/cancel-no-message', { method: 'POST' }); say('switchStatus', r.cancelled ? `${r.cancelled} item(s) with no message were cancelled.` : 'No waiting items without a message.'); load(); loadQueue(); }
+    catch (e) { say('switchStatus', e.message, true); }
+};
 window.registerWebhook = async () => {
     try {
         await api('/webhook/register', { method: 'POST', body: {} });
@@ -427,7 +476,7 @@ async function loadQueue() {
             if (['queued', 'scheduled', 'held'].includes(i.status)) act.push(`<button class="btn btn-danger-outline btn-sm" onclick="itemAct('${esc(i.id)}','cancel')">Cancel</button>`);
             if (i.status === 'outcome_unknown') act.push(`<button class="btn btn-outline btn-sm" onclick="resolveItem('${esc(i.id)}','sent')">It was sent</button>`, `<button class="btn btn-outline btn-sm" onclick="resolveItem('${esc(i.id)}','not_sent')">It was NOT sent</button>`);
             return `<tr>
-                <td>${esc((i.firstName || '') + ' ' + (i.lastName || ''))}<span class="sub">${esc(i.company || '')}</span><span class="sub"><a href="${esc(i.profileUrl)}" target="_blank" rel="noopener">profile</a> · ${esc(i.kind)}${i.isReply ? ' (reply)' : ''}${i.shadow ? ' · rehearsal' : ''}</span></td>
+                <td>${esc((i.firstName || '') + ' ' + (i.lastName || ''))}<span class="sub">${esc(i.company || '')}</span><span class="sub"><a href="${esc(i.profileUrl)}" target="_blank" rel="noopener">profile</a> · ${esc(kindLabel(i))}${i.isReply ? ' (reply)' : ''}${i.shadow ? ' · rehearsal' : ''}</span></td>
                 <td><span class="badge ${esc(i.status)}">${esc(i.status.replace('_', ' '))}</span>${i.holdReason ? `<span class="err">${esc(i.holdReason)}</span>` : ''}${i.needsPerson ? '<span class="err">Unresolved for over 24 hours</span>' : ''}
                     <span class="sub">${esc(i.customerName || '')}${i.bdrEmail ? ' · ' + esc(i.bdrEmail) : ''}</span></td>
                 <td><div class="msg">${esc(i.text || '(no note)')}</div>${i.gate && i.gate.risk !== undefined ? `<span class="sub">AI risk ${esc(i.gate.risk)}${i.gate.reason ? ': ' + esc(i.gate.reason) : ''}</span>` : ''}</td>

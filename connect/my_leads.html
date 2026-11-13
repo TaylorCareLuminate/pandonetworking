@@ -1039,6 +1039,10 @@
                         <div class="stat-label">No group yet</div>
                         <div class="stat-value" id="hypothesisUnassignedCount">0</div>
                     </div>
+                    <div class="stat" id="duplicatesHiddenStat" style="display:none;" title="Extra records for people already in the list (same LinkedIn URL). They are hidden, not deleted.">
+                        <div class="stat-label">Duplicates hidden</div>
+                        <div class="stat-value" id="duplicatesHiddenCount">0</div>
+                    </div>
                 </div>
 
                 <div class="bulk-actions" style="flex-wrap: wrap;">
@@ -1907,6 +1911,63 @@
         }
 
         /**
+         * Collapse contact records that are the same person, judged by LinkedIn profile URL
+         * (linkedin.com/in/<slug>, case, trailing slash, query string and www/http differences ignored).
+         * Records with no profile URL cannot be matched and are all kept.
+         *
+         * Which record is kept: the one that carries work done on this page (a lead category, groups, a hypothesis
+         * group, an AI flag), so nothing you already set disappears; then the most recently synced; then the lowest
+         * id, so the same record wins on every load.
+         * Returns { contacts, removed } with the original order preserved.
+         */
+        let duplicateRecordsHidden = 0;
+        function dedupeContactsByLinkedInUrl(contacts) {
+            const ms = (v) => {
+                if (!v) return 0;
+                if (typeof v.toDate === 'function') { try { return v.toDate().getTime() || 0; } catch (e) { return 0; } }
+                const secs = v.seconds != null ? v.seconds : v._seconds;
+                if (secs != null) return Number(secs) * 1000;
+                const t = new Date(v).getTime();
+                return Number.isFinite(t) ? t : 0;
+            };
+            const worked = (c) =>
+                (c.leadCategory && c.leadCategory !== 'Uncategorized' ? 1 : 0) +
+                (Array.isArray(c.customGroups) && c.customGroups.length ? 1 : 0) +
+                (c.hypothesisFit && c.hypothesisFit.groupId ? 1 : 0) +
+                (c.aiSearchFlag === 1 ? 1 : 0);
+            const better = (a, b) => {     // is a a better record to keep than b?
+                const wa = worked(a), wb = worked(b);
+                if (wa !== wb) return wa > wb;
+                const sa = Math.max(ms(a.lastSyncAt), ms(a.syncedAt)), sb = Math.max(ms(b.lastSyncAt), ms(b.syncedAt));
+                if (sa !== sb) return sa > sb;
+                return String(a.id) < String(b.id);
+            };
+            const best = new Map();        // person key -> record kept
+            contacts.forEach(c => {
+                const key = c.profileUrl ? hypothesisMatchKey(c.profileUrl) : '';
+                if (!key) return;
+                const cur = best.get(key);
+                if (!cur || better(c, cur)) best.set(key, c);
+            });
+            const out = [];
+            const emitted = new Set();
+            contacts.forEach(c => {
+                const key = c.profileUrl ? hypothesisMatchKey(c.profileUrl) : '';
+                if (!key) { out.push(c); return; }                 // no URL: nothing to match on
+                if (best.get(key) === c && !emitted.has(key)) { emitted.add(key); out.push(c); }
+            });
+            return { contacts: out, removed: contacts.length - out.length };
+        }
+
+        /** Shows how many duplicate records are hidden (only when there are some). */
+        function updateDuplicateNote() {
+            const box = document.getElementById('duplicatesHiddenStat');
+            if (!box) return;
+            box.style.display = duplicateRecordsHidden > 0 ? '' : 'none';
+            document.getElementById('duplicatesHiddenCount').textContent = duplicateRecordsHidden;
+        }
+
+        /**
          * Load all leads and company research data with progressive rendering
          */
         async function loadLeads(userEmail) {
@@ -1938,6 +1999,8 @@
                 selectedLeads.clear();
                 companyResearch.clear();
                 conversationData.clear();
+                duplicateRecordsHidden = 0;
+                updateDuplicateNote();
                 document.getElementById('selectAll').checked = false;
 
                 // Show loading state
@@ -2092,7 +2155,17 @@
                     }
                 }
 
-                console.log(`📊 Total unique contacts: ${contactsArray.length}`);
+                console.log(`📊 Contact records fetched: ${contactsArray.length}`);
+
+                // One row per person. The same connection can be stored several times (a re-added HeyReach account,
+                // the login email and the LinkedIn email both matching, a different id key between syncs), so
+                // collapse the records that share a LinkedIn profile URL.
+                const dedupe = dedupeContactsByLinkedInUrl(contactsArray);
+                contactsArray.length = 0;
+                dedupe.contacts.forEach(c => contactsArray.push(c));
+                duplicateRecordsHidden = dedupe.removed;
+                updateDuplicateNote();
+                console.log(`📊 Total unique contacts: ${contactsArray.length}` + (dedupe.removed ? ` (${dedupe.removed} duplicate record(s) with the same LinkedIn URL hidden)` : ''));
 
                 if (contactsArray.length === 0) {
                     document.getElementById('tableLoading').style.display = 'none';
