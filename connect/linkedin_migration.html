@@ -106,6 +106,20 @@
         <div class="status-line" id="scanStatus"></div>
     </div>
 
+    <div class="card" id="oldCard" hidden>
+        <div class="card-head"><h2><i class="fas fa-broom"></i> Remove old leads</h2></div>
+        <p style="font-size:.86rem;color:var(--muted);margin:0 0 .8rem;">
+            Leads that were pushed to HeyReach <b>more than 30 days ago</b> were stuck there and are never moved over. If some already came over and are still waiting in the queue,
+            this cancels them so they never send. It uses the date each lead was pushed to HeyReach. Leads with no recorded push date are left alone.
+        </p>
+        <div class="btn-row">
+            <button class="btn btn-outline" id="btnOldPreview" onclick="oldPreview()"><i class="fas fa-eye"></i> Preview what would be removed</button>
+            <button class="btn btn-danger-outline" id="btnOldRun" onclick="oldRun()" disabled><i class="fas fa-trash"></i> Remove them</button>
+        </div>
+        <div class="status-line" id="oldStatus"></div>
+        <div class="results-wrap" id="oldWrap" hidden><table class="results" id="oldTable"></table></div>
+    </div>
+
     <div class="card" id="summaryCard" hidden>
         <div class="card-head"><h2><i class="fas fa-list-check"></i> What was found</h2></div>
         <div id="summaryBanners"></div>
@@ -212,6 +226,7 @@ window.pickBdr = () => {
     document.getElementById('summaryCard').hidden = true; document.getElementById('itemsCard').hidden = true; say('scanStatus', '');
     renderChecks();
     document.getElementById('btnScan').disabled = !bdrId;
+    document.getElementById('oldCard').hidden = !bdrId; document.getElementById('oldWrap').hidden = true; document.getElementById('btnOldRun').disabled = true; say('oldStatus', '');
     if (bdrId) refresh(); 
 };
 window.syncButtons = () => {
@@ -249,6 +264,8 @@ function render() {
     if (s.unlistedInHeyReach > 0) banners.push(['bad', `HeyReach reports ${s.unlistedInHeyReach} more lead(s) waiting that we cannot list by name, so they cannot be moved here. Do not go live until these have gone out or been removed in HeyReach.`]);
     if (s.paused > 0) banners.push(['warn', `${s.paused} lead(s) are paused in HeyReach. They are not counted as in process and will not be moved; they will not send unless someone un-pauses them.`]);
     if (!s.statsAvailable) banners.push(['warn', 'HeyReach campaign statistics could not be read, so a rougher rule was used to decide which old queue rows are still live.']);
+    if (s.tooOld > 0) banners.push(['warn', `${s.tooOld} lead(s) were pushed to HeyReach more than ${s.maxPushAgeDays || 30} days ago. They will NOT be moved to the engine; the move step only stops them in HeyReach.`]);
+    if (s.noPushDate > 0) banners.push(['warn', `${s.noPushDate} lead(s) have no recorded push date, so their age is unknown. They will be moved as normal; check them in the list if you are unsure.`]);
     const open = c.found + c.enqueued + c.stopped + c.blocked;
     if (open === 0 && s.unlistedInHeyReach === 0 && s.complete) banners.push(['ok', 'Nothing is left in process in HeyReach for this BDR. You can tick the “HeyReach has no leads left” confirmation on the Engine page.']);
     document.getElementById('summaryBanners').innerHTML = banners.map(([k, t]) => `<div class="banner ${k}">${esc(t)}</div>`).join('');
@@ -275,7 +292,7 @@ function renderItems() {
     document.getElementById('itemsTable').innerHTML = `<thead><tr><th>Person</th><th>Progress</th><th>Text</th><th>In HeyReach</th><th></th></tr></thead><tbody>${rows || '<tr><td class="empty-row" colspan="5">Nothing here.</td></tr>'}</tbody>`;
     say('itemsStatus', current.total > current.items.length ? `Showing ${current.items.length} of ${current.total}.` : '');
 }
-const OUTCOME = { queued: 'Moved: now in the engine queue', stopped_only: 'Stopped in HeyReach; not queued', missing_outbox_item: 'Stopped in HeyReach; the engine copy is missing' };
+const OUTCOME = { queued: 'Moved: now in the engine queue', stopped_only: 'Stopped in HeyReach; not queued', 'stopped_only:pushed_over_30_days_ago': 'Pushed to HeyReach over 30 days ago: stopped in HeyReach, not moved', cancelled_too_old: 'Cancelled: pushed to HeyReach over 30 days ago', missing_outbox_item: 'Stopped in HeyReach; the engine copy is missing' };
 document.getElementById('tabs').addEventListener('click', (e) => {
     const b = e.target.closest('button'); if (!b) return;
     document.querySelectorAll('#tabs button').forEach(x => x.classList.toggle('on', x === b));
@@ -289,6 +306,29 @@ document.getElementById('itemsTable').addEventListener('click', async (e) => {
     try { await api(`/migration/${encodeURIComponent(bdrId)}/items/${encodeURIComponent(id)}/${act}`, { method: 'POST' }); await refresh(); }
     catch (err) { say('itemsStatus', err.message, true); }
 });
+
+// ── Remove old leads ────────────────────────────────────────────────────────
+window.oldPreview = async () => {
+    const b = document.getElementById('btnOldPreview'); b.disabled = true; document.getElementById('btnOldRun').disabled = true; say('oldStatus', 'Looking…');
+    try {
+        const { result: r } = await api(`/migration/${encodeURIComponent(bdrId)}/cancel-old`, { method: 'POST', body: { dryRun: true } });
+        const note = r.unknownPushDate ? ` ${r.unknownPushDate} moved lead(s) have no known push date and will be left alone.` : '';
+        say('oldStatus', r.tooOld ? `${r.tooOld} waiting lead(s) were pushed to HeyReach before ${fmt(r.cutoff)} (of ${r.lookedAt} moved leads still waiting).${note}` : `Nothing to remove: none of the ${r.lookedAt} moved leads still waiting is older than ${r.days} days.${note}`);
+        document.getElementById('oldTable').innerHTML = `<thead><tr><th>Person</th><th>Pushed to HeyReach</th><th>Age</th><th>Now</th></tr></thead><tbody>${r.sample.map(x => `<tr><td>${esc(x.name)}<span class="sub">${esc(x.company)}</span></td><td>${esc(fmt(x.pushedAt))}</td><td>${x.daysOld} days</td><td>${esc(x.status)}</td></tr>`).join('')}</tbody>`;
+        document.getElementById('oldWrap').hidden = !r.sample.length;
+        document.getElementById('btnOldRun').disabled = !r.tooOld; document.getElementById('btnOldRun').dataset.n = r.tooOld;
+    } catch (e) { say('oldStatus', 'Could not check: ' + e.message, true); }
+    finally { b.disabled = false; }
+};
+window.oldRun = async () => {
+    const n = document.getElementById('btnOldRun').dataset.n || '?';
+    if (!confirm(`Cancel ${n} waiting lead(s) pushed to HeyReach more than 30 days ago? They will never be sent.`)) return;
+    const b = document.getElementById('btnOldRun'); b.disabled = true; say('oldStatus', 'Removing…');
+    try {
+        const { result: r } = await api(`/migration/${encodeURIComponent(bdrId)}/cancel-old`, { method: 'POST', body: { dryRun: false } });
+        say('oldStatus', `Removed ${r.cancelled} lead(s) from the queue.`); document.getElementById('oldWrap').hidden = true; await refresh();
+    } catch (e) { say('oldStatus', 'Could not remove them: ' + e.message, true); b.disabled = false; }
+};
 
 // ── Move ────────────────────────────────────────────────────────────────────
 window.stopRun = () => { stopFlag = true; say('runStatus', 'Stopping after this batch…'); };
