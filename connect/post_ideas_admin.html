@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Post Ideas (admin) - PandoConnect</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="icon" type="image/png" href="../images/pando_logo_transparent.png">
+
+    <script src="healthconnect-header.js?v=3.4"></script>
+    <script src="../js/auth.js?v=2.1"></script>
+    <script src="../js/folder-protection.js?v=2.1"></script>
+    <script src="../js/clemail-firestore-wrapper.js"></script>
+    <script src="post-comments-common.js?v=2"></script>
+
+    <link rel="stylesheet" href="pando-theme.css?v=4">
+    <link rel="stylesheet" href="post-comments.css?v=2">
+</head>
+<body>
+<div class="container">
+    <header class="page-header">
+        <h1><i class="fas fa-lightbulb"></i> Post Ideas</h1>
+        <p>
+            Write ten complete LinkedIn posts for a BDR (2 about the company, 4 built on current industry news, 4 reacting to posts their network is sharing),
+            then choose which ones get a picture. Pictures follow the company's image style guide, and the writing follows its writing style guide
+            (both on <a href="about_me.html">About Me</a>, at the company level). Finished posts show up on the BDR's
+            <a href="posts_reposts.html">Repost Ideas</a> page, where they choose one and a time. Nothing is published from this page.
+        </p>
+    </header>
+
+    <div class="card" id="bdrPick" hidden>
+        <div class="field" style="max-width:420px;"><label for="bdrSelect">BDR</label><select id="bdrSelect"></select></div>
+    </div>
+    <div id="notice"></div>
+
+    <div id="main" hidden>
+        <div class="card">
+            <div class="card-head"><h2><i class="fas fa-clipboard-check"></i> Ready to write?</h2>
+                <button class="btn btn-primary" id="generateBtn" data-action="generate"><i class="fas fa-wand-magic-sparkles"></i> Write 10 new ideas</button>
+            </div>
+            <div id="readiness" class="check-list"></div>
+            <div class="status-line" id="genStatus"></div>
+        </div>
+
+        <div class="card">
+            <div class="toolbar">
+                <div class="tabs" id="viewTabs">
+                    <button data-view="review" class="on">To review<span class="n" id="n-review">0</span></button>
+                    <button data-view="images">Pictures<span class="n" id="n-images">0</span></button>
+                    <button data-view="live">Scheduled and published<span class="n" id="n-live">0</span></button>
+                    <button data-view="rejected">Not wanted</button>
+                </div>
+                <div class="btn-row" id="reviewTools">
+                    <button class="btn btn-primary btn-sm" data-action="build"><i class="fas fa-image"></i> Build pictures for the ticked ideas</button>
+                    <button class="btn btn-outline btn-sm" data-action="reject-selected">Not wanted</button>
+                </div>
+            </div>
+            <div id="list"></div>
+            <div class="status-line" id="status"></div>
+        </div>
+
+        <div class="card">
+            <div class="card-head"><h2><i class="fas fa-sliders"></i> Models and rules</h2></div>
+            <p class="muted">Model names are OpenRouter names. "Test the models" makes one tiny call to the writing and checking models so a wrong name shows up here, not in the middle of a run.</p>
+            <div class="form-grid" id="settingsForm">
+                <div class="field"><label for="s-ideas">Writes the ten posts</label><input type="text" id="s-ideas"></div>
+                <div class="field"><label for="s-image">Builds the pictures</label><input type="text" id="s-image"><span class="hint">Must be a model that can output images.</span></div>
+                <div class="field"><label for="s-judge">Checks for repeats before publishing</label><input type="text" id="s-judge"></div>
+                <div class="field"><label for="s-perday">Posts per day (1 or 2)</label><input type="number" id="s-perday" min="1" max="2"></div>
+                <div class="field"><label for="s-gap">Hours between posts</label><input type="number" id="s-gap" min="4" max="168"></div>
+                <div class="field"><label for="s-late">Give up after (minutes late)</label><input type="number" id="s-late" min="15" max="1440"><span class="hint">A post that cannot go out this soon after its time is not published; the BDR picks a new time.</span></div>
+            </div>
+            <div class="btn-row" style="margin-top:.9rem;">
+                <button class="btn btn-primary" data-action="save-settings">Save</button>
+                <button class="btn btn-outline" data-action="test-models">Test the models</button>
+            </div>
+            <div class="status-line" id="settingsStatus"></div>
+        </div>
+    </div>
+</div>
+
+<script type="module">
+await window.firebaseReady;
+const auth = window.auth;
+const PC = window.PostComments;
+const { esc, say } = PC;
+const api = PC.ideasApi;
+PC.wire();
+const $ = (id) => document.getElementById(id);
+
+let bdrId = null, bdr = null, view = 'review', ideas = [], data = null, timer = null;
+const picked = new Set();
+const imageUrls = new Map();       // idea id + version -> object URL
+
+const KIND = { promo: ['Promotional', 'fa-bullhorn'], news: ['Industry news', 'fa-newspaper'], reaction: ['Reaction to a post', 'fa-comments'] };
+const STATUS_TEXT = { idea: 'Idea', rejected: 'Not wanted', image_pending: 'Building the picture', ready: 'Ready for the BDR', scheduled: 'Scheduled', claimed: 'Publishing', sending: 'Publishing', sent: 'Published', dry_run: 'Checked (dry run)', missed: 'Missed its time', blocked: 'Blocked', failed: 'Failed', outcome_unknown: 'Unknown: check LinkedIn', dismissed: 'Dismissed by the BDR' };
+const VIEWS = {
+    review: (i) => i.status === 'idea',
+    images: (i) => ['image_pending', 'ready', 'missed', 'blocked', 'dry_run'].includes(i.status) || (i.status === 'idea' && i.imageError),
+    live: (i) => ['scheduled', 'claimed', 'sending', 'sent', 'failed', 'outcome_unknown', 'dismissed'].includes(i.status),
+    rejected: (i) => i.status === 'rejected'
+};
+
+async function load(quiet) {
+    if (!bdrId) return;
+    $('main').hidden = false;
+    try {
+        data = await api(`/admin/ideas?bdrId=${encodeURIComponent(bdrId)}`);
+        bdr = data.bdr; ideas = data.ideas;
+        renderReadiness(); renderBatch(); render(); fillSettings(data.settings);
+        schedulePoll();
+    } catch (e) { if (!quiet) say('status', e.message, true); }
+}
+
+function schedulePoll() {
+    clearTimeout(timer);
+    const busy = ideas.some(i => i.status === 'image_pending') || (data.batches[0] && data.batches[0].status === 'running');
+    if (busy) timer = setTimeout(() => load(true), 5000);
+}
+
+function renderReadiness() {
+    const r = data.readiness;
+    const row = (ok, text, fix) => `<div class="check"><i class="fas ${ok ? 'fa-circle-check' : 'fa-circle-xmark'}" style="color:${ok ? 'var(--sage)' : 'var(--danger)'};margin-top:.2rem;"></i><span>${text}${!ok && fix ? ` ${fix}` : ''}</span></div>`;
+    const aboutUrl = `about_me.html?bdr=${encodeURIComponent(bdr.email || '')}`;
+    $('readiness').innerHTML = [
+        row(r.profile.complete, r.profile.complete ? `About Me is filled in (industry: ${esc(r.profile.industry)}).` : `About Me is missing: ${esc(r.profile.missing.join(', '))}.`, `<a href="${esc(aboutUrl)}">Open About Me</a>`),
+        row(r.reposts.available >= r.reposts.needed, `${r.reposts.available} interesting posts from the BDR's network to react to (${r.reposts.needed} needed).`, 'They come from the post-comment runs.'),
+        row(r.style.saved, r.style.saved ? 'The company style guides are saved.' : 'The company has no style guide saved yet, so default styles are used.', `<a href="about_me.html">Set it on About Me</a>`),
+        row(r.account.ok, r.account.ok ? 'The BDR\'s LinkedIn account can post through Unipile.' : esc(r.account.reason || 'The LinkedIn account cannot post yet.'), '')
+    ].join('');
+    const b = data.batches[0];
+    const running = b && b.status === 'running';
+    $('generateBtn').disabled = running || !r.profile.complete;
+    say('genStatus', running ? 'Writing the ideas now. This takes a minute or two; the page updates by itself.' : (b && b.status === 'failed' ? `The last attempt failed: ${b.error}` : ''), b && b.status === 'failed' && !running);
+}
+function renderBatch() { /* progress is shown in genStatus */ }
+
+function render() {
+    const counts = Object.fromEntries(Object.keys(VIEWS).map(k => [k, ideas.filter(VIEWS[k]).length]));
+    $('n-review').textContent = counts.review; $('n-images').textContent = counts.images; $('n-live').textContent = counts.live;
+    $('reviewTools').hidden = view !== 'review';
+    const list = ideas.filter(VIEWS[view]);
+    $('list').innerHTML = list.map(cardHtml).join('') || `<div class="empty">${view === 'review' ? 'No ideas waiting. Click "Write 10 new ideas".' : 'Nothing here.'}</div>`;
+    list.forEach(loadImage);
+}
+
+function cardHtml(i) {
+    const [label, icon] = KIND[i.kind] || [i.kind, 'fa-pen'];
+    const src = (i.sources || []).map(s => s.type === 'news'
+        ? `<span class="sub"><i class="fas fa-newspaper"></i> <a href="${esc(/^https:/.test(s.url) ? s.url : '#')}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a>${s.source ? ` (${esc(s.source)})` : ''}</span>`
+        : `<span class="sub"><i class="fas fa-comments"></i> Reacting to a post by ${esc(s.authorName || 'someone')}${PC.linkedInUrl(s.url) ? ` · <a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">open it</a>` : ''}</span>`).join('');
+    const editable = ['idea', 'ready', 'missed', 'blocked'].includes(i.status);
+    const act = [];
+    if (i.status === 'idea') act.push(`<button class="btn btn-outline btn-sm" data-action="reject-one" data-id="${esc(i.id)}">Not wanted</button>`);
+    if (i.status === 'rejected') act.push(`<button class="btn btn-outline btn-sm" data-action="restore" data-id="${esc(i.id)}">Bring back</button>`);
+    if (i.status === 'ready') act.push(`<button class="btn btn-outline btn-sm" data-action="rebuild" data-id="${esc(i.id)}"><i class="fas fa-rotate"></i> New picture</button>`);
+    if (editable) act.push(`<button class="btn btn-outline btn-sm" data-action="save" data-id="${esc(i.id)}"><i class="fas fa-floppy-disk"></i> Save changes</button>`);
+    const pick = i.status === 'idea' ? `<label class="check" style="margin-bottom:.4rem;"><input type="checkbox" data-pick="${esc(i.id)}" ${picked.has(i.id) ? 'checked' : ''}> <strong>Build a picture for this one</strong></label>` : '';
+    const meta = [i.scheduledFor ? `Scheduled for ${PC.fmt(i.scheduledFor)}` : '', i.sentAt ? `Published ${PC.fmt(i.sentAt)}` : '', i.replyCount ? `${i.replyCount} comment(s)` : ''].filter(Boolean).join(' · ');
+    return `<div class="pc-item" data-card="${esc(i.id)}">
+        <div>
+            ${pick}
+            <div class="pc-meta"><span class="badge ${esc(i.status)}">${esc(STATUS_TEXT[i.status] || i.status)}</span><span><i class="fas ${icon}"></i> ${esc(label)}</span>${meta ? `<span>${esc(meta)}</span>` : ''}${i.postUrl && PC.linkedInUrl(i.postUrl) ? `<a href="${esc(i.postUrl)}" target="_blank" rel="noopener noreferrer">Open the post</a>` : ''}</div>
+            <div class="sub" style="margin-bottom:.4rem;"><b>${esc(i.angle || '')}</b></div>
+            ${src}
+            ${i.holdReason ? `<div class="err">${esc(i.holdReason)}</div>` : ''}
+            ${i.imageError ? `<div class="err">Picture: ${esc(i.imageError)}</div>` : ''}
+            <img class="rp-img" data-img="${esc(i.id)}" alt="" hidden style="max-width:100%;border-radius:6px;margin-top:.6rem;">
+        </div>
+        <div class="pc-side">
+            <h3>The post</h3>
+            <textarea data-text="${esc(i.id)}" rows="12" ${editable ? '' : 'disabled'}>${esc(i.text)}</textarea>
+            <div class="pc-count">${i.text.length} characters</div>
+            <h3 style="margin-top:.6rem;">What the picture should show</h3>
+            <textarea data-brief="${esc(i.id)}" rows="2" ${['idea', 'ready', 'rejected'].includes(i.status) ? '' : 'disabled'}>${esc(i.imageBrief || '')}</textarea>
+            <div class="btn-row" style="margin-top:.6rem;">${act.join('')}</div>
+            <div class="status-line" data-status></div>
+        </div>
+    </div>`;
+}
+
+async function loadImage(i) {
+    if (!i.hasImage) return;
+    const img = document.querySelector(`img[data-img="${CSS.escape(i.id)}"]`); if (!img) return;
+    const key = `${i.id}:${i.updatedAt}`;
+    if (!imageUrls.has(key)) imageUrls.set(key, await PC.ideasImage(`/ideas/${encodeURIComponent(i.id)}/image`).catch(() => null));
+    const url = imageUrls.get(key);
+    if (url) { img.src = url; img.hidden = false; }
+}
+
+const cardOf = (el) => el.closest('[data-card]');
+const statusOf = (el) => cardOf(el).querySelector('[data-status]');
+
+async function decide(ids, action) {
+    if (!ids.length) { say('status', 'Tick at least one idea first.', true); return; }
+    say('status', action === 'image' ? 'Starting the pictures…' : 'Saving…');
+    try {
+        const out = await api('/admin/ideas/decide', { method: 'POST', body: { ids, action } });
+        ids.forEach(id => picked.delete(id));
+        const skipped = (out.skipped || []).map(s => s.reason).join(' ');
+        say('status', action === 'image' ? `Building ${out.started.length} picture(s). They appear on the Pictures tab as they finish.${skipped ? ' ' + skipped : ''}` : (skipped || 'Done.'));
+        if (action === 'image' && out.started.length) { view = 'images'; document.querySelectorAll('#viewTabs button').forEach(x => x.classList.toggle('on', x.dataset.view === 'images')); }
+        await load(true);
+    } catch (e) { say('status', e.message, true); }
+}
+
+async function saveEdits(btn) {
+    const id = btn.dataset.id, card = cardOf(btn), st = statusOf(btn);
+    const text = card.querySelector(`[data-text="${CSS.escape(id)}"]`), brief = card.querySelector(`[data-brief="${CSS.escape(id)}"]`);
+    const cur = ideas.find(x => x.id === id);
+    btn.disabled = true; st.className = 'status-line'; st.textContent = 'Saving…';
+    try {
+        const body = {};
+        if (!text.disabled && text.value !== cur.text) body.text = text.value;
+        if (!brief.disabled && brief.value !== (cur.imageBrief || '')) body.imageBrief = brief.value;
+        if (!Object.keys(body).length) { st.textContent = 'Nothing changed.'; btn.disabled = false; return; }
+        await api(`/admin/ideas/${encodeURIComponent(id)}/edit`, { method: 'POST', body });
+        st.textContent = 'Saved.'; await load(true);
+    } catch (e) { st.textContent = e.message; st.className = 'status-line error'; btn.disabled = false; }
+}
+
+function fillSettings(s) {
+    if (document.activeElement && document.activeElement.closest('#settingsForm')) return;
+    $('s-ideas').value = s.models.ideas; $('s-image').value = s.models.image; $('s-judge').value = s.models.judge;
+    $('s-perday').value = s.publish.postsPerDay; $('s-gap').value = s.publish.minGapHours; $('s-late').value = s.publish.maxLateMinutes;
+}
+
+document.addEventListener('click', async (e) => {
+    const b = e.target.closest('button[data-action]'); if (!b) return;
+    const a = b.dataset.action;
+    if (a === 'generate') {
+        b.disabled = true; say('genStatus', 'Starting…');
+        try { await api('/admin/generate', { method: 'POST', body: { bdrId } }); await load(true); }
+        catch (err) { say('genStatus', err.message, true); b.disabled = false; }
+    } else if (a === 'build') decide([...picked], 'image');
+    else if (a === 'reject-selected') decide([...picked], 'reject');
+    else if (a === 'reject-one') decide([b.dataset.id], 'reject');
+    else if (a === 'restore') decide([b.dataset.id], 'restore');
+    else if (a === 'rebuild') { if (confirm('Build a new picture? The current one is replaced.')) decide([b.dataset.id], 'image'); }
+    else if (a === 'save') saveEdits(b);
+    else if (a === 'save-settings') {
+        say('settingsStatus', 'Saving…');
+        try {
+            const out = await api('/admin/settings', { method: 'POST', body: { models: { ideas: $('s-ideas').value, image: $('s-image').value, judge: $('s-judge').value }, publish: { postsPerDay: +$('s-perday').value, minGapHours: +$('s-gap').value, maxLateMinutes: +$('s-late').value } } });
+            fillSettings(out.settings); say('settingsStatus', 'Saved.');
+        } catch (err) { say('settingsStatus', err.message, true); }
+    } else if (a === 'test-models') {
+        say('settingsStatus', 'Testing…');
+        try {
+            const out = await api('/admin/test-models', { method: 'POST', body: {} });
+            say('settingsStatus', Object.entries(out.results).map(([k, r]) => `${k}: ${r.ok ? `ok (${r.ms} ms)` : `FAILED - ${r.error}`}`).join('   '), Object.values(out.results).some(r => !r.ok));
+        } catch (err) { say('settingsStatus', err.message, true); }
+    }
+});
+document.addEventListener('change', (e) => {
+    const c = e.target.closest('input[data-pick]'); if (!c) return;
+    if (c.checked) picked.add(c.dataset.pick); else picked.delete(c.dataset.pick);
+});
+document.addEventListener('input', (e) => {
+    const t = e.target.closest('textarea[data-text]'); if (!t) return;
+    t.parentElement.querySelector('.pc-count').textContent = `${t.value.length} characters`;
+});
+$('viewTabs').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-view]'); if (!b) return;
+    document.querySelectorAll('#viewTabs button').forEach(x => x.classList.toggle('on', x === b));
+    view = b.dataset.view; render();
+});
+window.addEventListener('pagehide', () => { imageUrls.forEach(u => { if (u) URL.revokeObjectURL(u); }); clearTimeout(timer); });
+
+let started = false;
+async function start() {
+    if (started) return; started = true;
+    try {
+        const r = await PC.chooseBdr({ selectId: 'bdrSelect', wrapId: 'bdrPick', onChange: (id) => { bdrId = id; picked.clear(); $('notice').innerHTML = ''; $('main').hidden = !id; ideas = []; load(); } });
+        if (!r.me.isAdmin) { $('notice').innerHTML = '<div class="banner stop">This page is for PandoConnect administrators.</div>'; return; }
+        bdrId = r.bdrId;
+        if (!bdrId) { $('notice').innerHTML = '<div class="banner">Choose a BDR above.</div>'; return; }
+        load();
+    } catch (e) { started = false; $('notice').innerHTML = `<div class="banner stop">Could not load: ${esc(e.message)}</div>`; }
+}
+
+import { onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
+onAuthStateChanged(auth, (u) => { if (u) start(); });
+</script>
+</body>
+</html>

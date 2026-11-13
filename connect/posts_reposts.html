@@ -14,17 +14,17 @@
     <script src="../js/auth.js?v=2.1"></script>
     <script src="../js/folder-protection.js?v=2.1"></script>
     <script src="../js/clemail-firestore-wrapper.js"></script>
-    <script src="post-comments-common.js?v=1"></script>
+    <script src="post-comments-common.js?v=2"></script>
 
     <link rel="stylesheet" href="pando-theme.css?v=4">
-    <link rel="stylesheet" href="post-comments.css?v=1">
+    <link rel="stylesheet" href="post-comments.css?v=2">
 </head>
 <body>
 <div class="container">
     <header class="page-header">
-        <h1><i class="fas fa-retweet"></i> Repost Ideas</h1>
+        <h1><i class="fas fa-retweet"></i> Your Posts and Repost Ideas</h1>
         <p>
-            Recent posts from people in your network that stood out as especially interesting, and could be worth sharing with your own network.
+            Your own posts are at the top. Below them are recent posts from people in your network that stood out as especially interesting, and could be worth sharing with your own network.
             Keep the ones you like and dismiss the rest. Open a post on LinkedIn to repost it yourself; reposting straight from this page is coming later.
         </p>
     </header>
@@ -35,7 +35,28 @@
 
     <div id="notice"></div>
 
+    <div class="card" id="postsCard" hidden>
+        <div class="card-head"><h2><i class="fas fa-paper-plane"></i> Your posts</h2>
+            <button class="btn btn-outline btn-sm" data-action="refresh-posts"><i class="fas fa-rotate"></i> Refresh</button>
+        </div>
+        <p class="muted">
+            Finished posts with a picture, written for you from your About Me profile, your company's style, current news and what your network is sharing.
+            Pick the ones you like and choose when each goes out. Before anything is published, the system checks it against your recent LinkedIn posts and stops it if it repeats or closely resembles one.
+            Comments people leave on your posts show up on your Replies page.
+        </p>
+        <div id="postsNote"></div>
+        <div class="tabs" id="postTabs" style="margin-bottom:1rem;">
+            <button data-pview="ready" class="on">Ready<span class="n" id="pn-ready">0</span></button>
+            <button data-pview="scheduled">Scheduled<span class="n" id="pn-scheduled">0</span></button>
+            <button data-pview="posted">Posted<span class="n" id="pn-posted">0</span></button>
+            <button data-pview="attention">Needs attention<span class="n" id="pn-attention">0</span></button>
+        </div>
+        <div id="posts"></div>
+        <div class="status-line" id="postsStatus"></div>
+    </div>
+
     <div class="card" id="main" hidden>
+        <div class="card-head"><h2><i class="fas fa-retweet"></i> Posts from your network</h2></div>
         <div class="toolbar">
             <div class="tabs" id="viewTabs">
                 <button data-view="new" class="on">New<span class="n" id="n-new">0</span></button>
@@ -130,26 +151,179 @@ async function cardAction(btn) {
     } catch (e) { status.textContent = e.message; status.className = 'status-line error'; btn.disabled = false; }
 }
 
+// ── Your posts (written for you, with a picture; published by the LinkedIn engine at the time you choose) ──
+
+const ideasApi = PC.ideasApi;
+let posts = [], postInfo = { account: null, rules: null }, postView = 'ready', postTimer = null;
+const postImages = new Map();
+const POST_VIEWS = {
+    ready: (p) => p.status === 'ready',
+    scheduled: (p) => ['scheduled', 'claimed', 'sending'].includes(p.status),
+    posted: (p) => ['sent', 'dry_run'].includes(p.status),
+    attention: (p) => ['missed', 'blocked', 'failed', 'outcome_unknown'].includes(p.status)
+};
+const POST_STATUS = { ready: 'Ready', scheduled: 'Scheduled', claimed: 'Publishing now', sending: 'Publishing now', sent: 'Posted', dry_run: 'Checked, not sent (test mode)', missed: 'Missed its time', blocked: 'Stopped', failed: 'Failed', outcome_unknown: 'Check LinkedIn' };
+const KIND_ICON = { promo: 'fa-bullhorn', news: 'fa-newspaper', reaction: 'fa-comments' };
+
+/** The value a datetime-local input wants (local time), a day from now at 9:00. */
+function defaultWhen() {
+    const d = new Date(Date.now() + 24 * 3600e3); d.setHours(9, 0, 0, 0);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+async function loadPosts(quiet) {
+    if (!bdrId) return;
+    $('postsCard').hidden = false;
+    try {
+        const out = await ideasApi(`/ideas?bdrId=${encodeURIComponent(bdrId)}`);
+        posts = out.ideas; postInfo = { account: out.account, rules: out.rules };
+        renderPosts();
+        clearTimeout(postTimer);
+        if (posts.some(p => ['claimed', 'sending'].includes(p.status))) postTimer = setTimeout(() => loadPosts(true), 10000);
+    } catch (e) { if (!quiet) say('postsStatus', e.message, true); }
+}
+
+function renderPosts() {
+    Object.keys(POST_VIEWS).forEach(k => { $('pn-' + k).textContent = posts.filter(POST_VIEWS[k]).length; });
+    const acct = postInfo.account;
+    $('postsNote').innerHTML = acct && !acct.ok ? `<div class="banner dry">Posts cannot be published for you yet: ${esc(acct.reason || 'your LinkedIn account is not connected for posting')}. You can still prepare and schedule posts, but they will wait.</div>` : '';
+    const empty = { ready: 'No finished posts waiting. Your administrator writes new ideas and builds the pictures; they appear here.', scheduled: 'Nothing scheduled.', posted: 'Nothing posted yet.', attention: 'Nothing needs attention.' }[postView];
+    // Keep what the BDR is typing when the list refreshes by itself.
+    const typing = document.activeElement && document.activeElement.closest('#posts') ? document.activeElement : null;
+    if (typing && typing.tagName !== 'BUTTON') return;
+    const list = posts.filter(POST_VIEWS[postView]);
+    $('posts').innerHTML = list.map(postHtml).join('') || `<div class="empty">${esc(empty)}</div>`;
+    list.forEach(loadPostImage);
+}
+
+function postHtml(p) {
+    const editable = ['ready', 'missed', 'blocked'].includes(p.status);
+    const when = p.scheduledFor ? PC.fmt(p.scheduledFor) : '';
+    const act = [];
+    if (p.status === 'ready' || p.status === 'missed' || p.status === 'blocked') {
+        act.push(`<input type="datetime-local" data-when="${esc(p.id)}" value="${esc(defaultWhen())}" style="padding:.4rem .5rem;border:1px solid var(--line-strong);border-radius:4px;font-family:var(--sans);">`);
+        act.push(`<button class="btn btn-primary btn-sm" data-pact="schedule" data-id="${esc(p.id)}"><i class="fas fa-clock"></i> Schedule</button>`);
+        act.push(`<button class="btn btn-outline btn-sm" data-pact="save" data-id="${esc(p.id)}">Save my edits</button>`);
+        act.push(`<button class="btn btn-outline btn-sm" data-pact="dismiss" data-id="${esc(p.id)}">Not for me</button>`);
+    }
+    if (p.status === 'scheduled') act.push(`<button class="btn btn-outline btn-sm" data-pact="unschedule" data-id="${esc(p.id)}">Cancel the schedule</button>`);
+    if (p.status === 'dry_run') act.push(`<button class="btn btn-outline btn-sm" data-pact="dismiss" data-id="${esc(p.id)}">Dismiss</button>`);
+    if (p.status === 'outcome_unknown') {
+        act.push(`<button class="btn btn-primary btn-sm" data-pact="resolve" data-outcome="published" data-id="${esc(p.id)}">It is on LinkedIn</button>`);
+        act.push(`<button class="btn btn-outline btn-sm" data-pact="resolve" data-outcome="not_published" data-id="${esc(p.id)}">It is not on LinkedIn</button>`);
+    }
+    if (p.postUrl && PC.linkedInUrl(p.postUrl)) act.push(`<a class="btn btn-outline btn-sm" href="${esc(p.postUrl)}" target="_blank" rel="noopener noreferrer"><i class="fab fa-linkedin"></i> Open the post</a>`);
+    const notes = [];
+    if (p.status === 'scheduled' || p.status === 'claimed' || p.status === 'sending') {
+        notes.push(`<div class="sub">${p.status === 'scheduled' ? 'Goes out' : 'Going out'} ${esc(when)} (your computer's time).</div>`);
+        if (p.lastSkip && p.status === 'scheduled') notes.push(`<div class="sub">Waiting: ${esc(p.lastSkip.detail || p.lastSkip.reason)}</div>`);
+    }
+    if (p.status === 'sent') notes.push(`<div class="sub">Posted ${esc(PC.fmt(p.sentAt))}${p.replyCount ? ` · ${p.replyCount} comment(s), see your Replies page` : ' · comments will show up on your Replies page'}.</div>`);
+    if (p.status === 'dry_run') notes.push('<div class="sub">The system is in test mode, so this post was checked but not published.</div>');
+    if (p.status === 'outcome_unknown') notes.push('<div class="err">The system could not confirm whether this reached LinkedIn. Look at your LinkedIn profile, then tell us. Nothing else will be posted for you until you do.</div>');
+    if (p.holdReason && ['missed', 'blocked', 'failed'].includes(p.status)) notes.push(`<div class="err">${esc(p.holdReason)}</div>`);
+    if (p.status === 'blocked' && p.duplicateOf && p.duplicateOf.length) {
+        notes.push('<div class="sub">Too close to:</div>' + p.duplicateOf.map(m => `<div class="sub">"${esc(m.excerpt || '')}"${m.at ? ` (${esc(PC.fmt(m.at))})` : ''}</div>`).join(''));
+        notes.push('<div class="sub">Change the wording enough that it says something new, then schedule it again.</div>');
+    }
+    const icon = KIND_ICON[p.kind] || 'fa-pen';
+    return `<div class="pc-item" data-pcard="${esc(p.id)}">
+        <div>
+            <div class="pc-meta"><span class="badge ${esc(p.status)}">${esc(POST_STATUS[p.status] || p.status)}</span><span><i class="fas ${icon}"></i> ${esc(p.kindLabel || p.kind)}</span></div>
+            <img alt="Picture for this post" data-pimg="${esc(p.id)}" hidden style="max-width:100%;border-radius:6px;">
+            ${p.hasImage ? '' : '<div class="sub">No picture.</div>'}
+        </div>
+        <div class="pc-side">
+            <h3>The post</h3>
+            <textarea data-ptext="${esc(p.id)}" rows="12" ${editable ? '' : 'readonly'}>${esc(p.text)}</textarea>
+            <div class="pc-count">${p.text.length} characters</div>
+            ${notes.join('')}
+            <div class="btn-row" style="margin-top:.6rem;">${act.join('')}</div>
+            <div class="status-line" data-pstatus></div>
+        </div>
+    </div>`;
+}
+
+async function loadPostImage(p) {
+    if (!p.hasImage) return;
+    const img = document.querySelector(`img[data-pimg="${CSS.escape(p.id)}"]`); if (!img) return;
+    const key = `${p.id}:${p.contentVersion}`;
+    if (!postImages.has(key)) postImages.set(key, await PC.ideasImage(`/ideas/${encodeURIComponent(p.id)}/image`).catch(() => null));
+    const url = postImages.get(key);
+    if (url) { img.src = url; img.hidden = false; }
+}
+
+async function postAction(btn) {
+    const id = btn.dataset.id, act = btn.dataset.pact, p = posts.find(x => x.id === id); if (!p) return;
+    const card = btn.closest('[data-pcard]'), st = card.querySelector('[data-pstatus]');
+    const text = card.querySelector('[data-ptext]');
+    const fail = (e) => { st.textContent = e.message; st.className = 'status-line error'; btn.disabled = false; };
+    st.className = 'status-line'; st.textContent = '';
+    btn.disabled = true;
+    try {
+        if (act === 'save' || (act === 'schedule' && !text.readOnly && text.value !== p.text)) {
+            await ideasApi(`/ideas/${encodeURIComponent(id)}/edit`, { method: 'POST', body: { text: text.value } });
+            if (act === 'save') { st.textContent = 'Saved.'; await loadPosts(true); return; }
+        }
+        if (act === 'schedule') {
+            const v = card.querySelector('[data-when]').value;
+            const at = v ? new Date(v) : null;
+            if (!at || Number.isNaN(at.getTime())) throw new Error('Choose a date and time first.');
+            const out = await ideasApi(`/ideas/${encodeURIComponent(id)}/schedule`, { method: 'POST', body: { at: at.toISOString() } });
+            say('postsStatus', `Scheduled for ${PC.fmt(out.scheduledFor)}.`);
+            postView = 'scheduled'; document.querySelectorAll('#postTabs button').forEach(x => x.classList.toggle('on', x.dataset.pview === 'scheduled'));
+        } else if (act === 'unschedule') {
+            await ideasApi(`/ideas/${encodeURIComponent(id)}/unschedule`, { method: 'POST', body: {} });
+        } else if (act === 'dismiss') {
+            if (!confirm('Remove this post from your list?')) { btn.disabled = false; return; }
+            await ideasApi(`/ideas/${encodeURIComponent(id)}/dismiss`, { method: 'POST', body: {} });
+        } else if (act === 'resolve') {
+            const published = btn.dataset.outcome === 'published';
+            let postUrl = '';
+            if (published) postUrl = (prompt('Paste the link to the post on LinkedIn (optional):') || '').trim();
+            else if (!confirm('Confirm: this post is NOT on your LinkedIn profile. It will go back to your list.')) { btn.disabled = false; return; }
+            await ideasApi(`/ideas/${encodeURIComponent(id)}/resolve`, { method: 'POST', body: { outcome: btn.dataset.outcome, postUrl } });
+        }
+        await loadPosts(true);
+    } catch (e) { fail(e); }
+}
+
+$('postTabs').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-pview]'); if (!b) return;
+    document.querySelectorAll('#postTabs button').forEach(x => x.classList.toggle('on', x === b));
+    postView = b.dataset.pview; renderPosts();
+});
+$('posts').addEventListener('input', (e) => {
+    const t = e.target.closest('textarea[data-ptext]'); if (!t) return;
+    t.parentElement.querySelector('.pc-count').textContent = `${t.value.length} characters`;
+});
+
 $('viewTabs').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-view]'); if (!b) return;
     document.querySelectorAll('#viewTabs button').forEach(x => x.classList.toggle('on', x === b));
     view = b.dataset.view; render();
 });
 document.addEventListener('click', (e) => {
+    const pb = e.target.closest('button[data-pact]'); if (pb) { postAction(pb); return; }
     const b = e.target.closest('button[data-action]'); if (!b) return;
-    if (b.dataset.action === 'refresh') load(); else cardAction(b);
+    if (b.dataset.action === 'refresh') load(); else if (b.dataset.action === 'refresh-posts') loadPosts(); else cardAction(b);
 });
-window.addEventListener('pagehide', () => { imageUrls.forEach(u => { if (u) URL.revokeObjectURL(u); }); });
+window.addEventListener('pagehide', () => {
+    imageUrls.forEach(u => { if (u) URL.revokeObjectURL(u); });
+    postImages.forEach(u => { if (u) URL.revokeObjectURL(u); });
+    clearTimeout(postTimer);
+});
 
 let started = false;
 async function start() {
     if (started) return; started = true;
     try {
-        const r = await PC.chooseBdr({ selectId: 'bdrSelect', wrapId: 'bdrPick', onChange: (id) => { bdrId = id; $('notice').innerHTML = ''; $('main').hidden = !id; all = []; load(); } });
+        const r = await PC.chooseBdr({ selectId: 'bdrSelect', wrapId: 'bdrPick', onChange: (id) => { bdrId = id; $('notice').innerHTML = ''; $('main').hidden = !id; $('postsCard').hidden = !id; all = []; posts = []; load(); loadPosts(); } });
         bdrId = r.bdrId;
         if (!r.me.bdrs.length) { $('notice').innerHTML = '<div class="banner">Your login is not linked to a PandoConnect account yet, so there is nothing to show here. Please contact your PandoConnect team.</div>'; return; }
         if (!bdrId) { $('notice').innerHTML = '<div class="banner">Choose a BDR above to see their repost ideas.</div>'; return; }
-        load();
+        load(); loadPosts();
     } catch (e) { started = false; $('notice').innerHTML = `<div class="banner stop">Could not load: ${esc(e.message)}</div>`; }
 }
 

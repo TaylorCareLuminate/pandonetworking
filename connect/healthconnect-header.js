@@ -70,7 +70,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Review Queue', href: 'connect_review.html', icon: 'fa-check-circle' },
                 // Comments drafted for posts by target contacts (second review by the BDR) and posts worth resharing
                 { label: 'Post Replies Review', href: 'post_replies_review.html', icon: 'fa-comment-dots' },
-                { label: 'Repost Ideas', href: 'posts_reposts.html', icon: 'fa-retweet' },
+                { label: 'Your Posts and Reposts', href: 'posts_reposts.html', icon: 'fa-retweet' },
                 { label: 'Prospect Follow Up', href: 'review_replies.html', icon: 'fa-reply' },
                 { label: 'Campaign Follow-up', href: 'linkedin_campaign_followup.html', icon: 'fa-rotate-left' },
                 { label: 'Personal Inbox', href: 'personal_messages.html', icon: 'fa-inbox' },
@@ -113,6 +113,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Mass Upload', href: 'mass_upload.html', icon: 'fa-cloud-upload-alt' },
                 { label: 'Manage Prompts', href: 'generate_prompts.html', icon: 'fa-brain' },
                 { label: 'Post Comments', href: 'post_comments.html', icon: 'fa-comments' },
+                { label: 'Post Ideas', href: 'post_ideas_admin.html', icon: 'fa-lightbulb' },
                 { label: 'Scraped Posts', href: 'scrapped_linkedin_posts.html', icon: 'fab fa-linkedin' },
                 { label: 'Filtered Messages', href: 'filtered_messages.html', icon: 'fa-filter' },
                 { label: 'divider' },

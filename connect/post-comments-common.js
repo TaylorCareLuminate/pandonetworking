@@ -48,7 +48,7 @@ window.PostComments = (function () {
     async function request(path, opts = {}) {
         const user = await signedInUser();
         const token = await user.getIdToken();
-        return fetch(API + path, {
+        return fetch((opts.base || API) + path, {
             method: opts.method || 'GET',
             headers: { 'Authorization': `Bearer ${token}`, ...(opts.body ? { 'Content-Type': 'application/json' } : {}) },
             body: opts.body ? JSON.stringify(opts.body) : undefined
@@ -150,5 +150,15 @@ window.PostComments = (function () {
         return { me, bdrId: start ? start.id : null };
     }
 
-    return { API, COMMENT_MAX, esc, toDate, fmt, fmtDay, ago, linkedInUrl, linkedInImage, api, apiImage, say, personHtml, postHtml, scoreHtml, wire, updateCount, chooseBdr, signedInUser };
+    // The post-ideas API (the BDR's own posts: ideas, pictures, schedule). Same sign-in, same rules about whose BDR is whose.
+    const IDEAS_API = API.replace(/\/post-comments$/, '/post-ideas');
+    const ideasApi = (path, opts = {}) => api(path, { ...opts, base: IDEAS_API });
+    async function ideasImage(path) {
+        const resp = await request(path, { base: IDEAS_API });
+        if (!resp.ok) return null;
+        const blob = await resp.blob();
+        return /^image\/(jpeg|png|webp)$/.test(blob.type) ? URL.createObjectURL(blob) : null;
+    }
+
+    return { API, IDEAS_API, COMMENT_MAX, esc, toDate, fmt, fmtDay, ago, linkedInUrl, linkedInImage, api, apiImage, ideasApi, ideasImage, say, personHtml, postHtml, scoreHtml, wire, updateCount, chooseBdr, signedInUser };
 })();
