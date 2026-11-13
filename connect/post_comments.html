@@ -115,13 +115,17 @@
     <section id="tab-runs" hidden>
         <div class="card">
             <div class="card-head"><h2><i class="fas fa-clock-rotate-left"></i> Recent runs</h2><button class="btn btn-outline btn-sm" data-action="refresh-runs"><i class="fas fa-rotate"></i> Refresh</button></div>
-            <p class="muted">Each run reads LinkedIn slowly (a few seconds between people) and counts against the account's daily read limit. Click a run to see what it found.</p>
+            <p class="muted">Each run reads LinkedIn slowly (by default one person every 1 to 2 minutes, set under Settings) and counts against the account's daily read limit. Click a run to open its live console and see what it found.</p>
             <div class="results-wrap"><table class="results" id="runTable"></table></div>
             <div class="status-line" id="runStatus"></div>
         </div>
         <div class="card" id="runDetailCard" hidden>
-            <div class="card-head"><h2 id="runDetailTitle"><i class="fas fa-list"></i> Run</h2></div>
-            <pre class="log" id="runLog"></pre>
+            <div class="card-head"><h2 id="runDetailTitle"><i class="fas fa-list"></i> Run</h2>
+                <div class="btn-row"><span class="badge" id="runLiveTag"></span><button class="btn btn-outline btn-sm" id="stopRunBtn" data-action="stop-run" hidden><i class="fas fa-stop"></i> Stop run</button></div></div>
+            <div class="console-stats" id="consoleStats"></div>
+            <pre class="log console" id="runLog" aria-live="polite"></pre>
+            <label class="check" style="margin-bottom:1rem;"><input type="checkbox" id="consoleFollow" checked> Follow new lines as they appear</label>
+            <div class="status-line" id="consoleStatus"></div>
             <div class="results-wrap"><table class="results" id="runItems"></table></div>
         </div>
     </section>
@@ -152,6 +156,8 @@
                 <div class="field"><label for="stRepost">Post score to save as a repost idea</label><input type="number" id="stRepost" min="0" max="100"></div>
                 <div class="field"><label for="stAge">Comment on posts up to this many days old</label><input type="number" id="stAge" min="1" max="60"></div>
                 <div class="field"><label for="stRepostAge">Repost ideas up to this many days old</label><input type="number" id="stRepostAge" min="1" max="90"></div>
+                <div class="field"><label for="stPauseMin">Wait between people: shortest (seconds)</label><input type="number" id="stPauseMin" min="5" max="900"><span class="hint">Each run asks LinkedIn about one person, then waits a random time between the shortest and longest before the next, so requests are never sent in a burst.</span></div>
+                <div class="field"><label for="stPauseMax">Wait between people: longest (seconds)</label><input type="number" id="stPauseMax" min="5" max="900"></div>
                 <div class="field"><label for="stPosts">Latest posts to look at per person</label><input type="number" id="stPosts" min="1" max="10"></div>
                 <div class="field"><label for="stLen">Longest comment to draft (characters)</label><input type="number" id="stLen" min="80" max="1000"></div>
                 <div class="field"><label for="stCongLen">Longest congratulations (characters)</label><input type="number" id="stCongLen" min="40" max="400"></div>
@@ -405,7 +411,7 @@ async function processAction(btn) {
         if (btn.dataset.action === 'run-process') {
             btn.disabled = true;
             const r = await api(`/admin/processes/${encodeURIComponent(id)}/run`, { method: 'POST' });
-            say('procStatus', `${r.note} Watch it under Runs.`);
+            say('procStatus', r.note); showTab('runs'); if (r.runId) followRun(r.runId);
         } else if (btn.dataset.action === 'toggle-process') {
             await api(`/admin/processes/${encodeURIComponent(id)}`, { method: 'PUT', body: { enabled: !p.enabled } });
         } else if (btn.dataset.action === 'delete-process') {
@@ -433,28 +439,64 @@ async function loadRuns() {
                 <td>${esc(c.repostCandidates || 0)}</td></tr>`;
         }).join('');
         $('runTable').innerHTML = `<thead><tr><th>Started</th><th>Process</th><th>Status</th><th>People read</th><th>New posts</th><th>For review</th><th>Repost ideas</th></tr></thead><tbody>${rows || '<tr><td class="empty-row" colspan="7">No runs yet.</td></tr>'}</tbody>`;
+        const going = runs.find(r => ['running', 'requested'].includes(r.status));
+        if (going && !followId) followRun(going.id);               // a run is in progress: show its console without a click
         clearTimeout(runTimer);
         // While something is running, refresh on its own (only while this tab is showing).
         if (runs.some(r => ['running', 'requested'].includes(r.status)) && !$('tab-runs').hidden) runTimer = setTimeout(loadRuns, 15000);
     } catch (e) { say('runStatus', e.message, true); }
 }
 
-async function showRun(id) {
+// The console: follows one run, refreshing every 3 seconds while it is requested or running.
+let followId = null, followTimer = null, followWasLive = false, polls = 0;
+const clock = (v) => { const d = new Date(v); return isNaN(d) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); };
+const lineClass = (m) => /rate limit|error|failed|refused|could not|not available|stopped by|^Stopped/i.test(m) ? 'err' : /^waiting|\bwaiting \d/i.test(m) ? 'dim' : /worth commenting|pending_admin|reached|done\./i.test(m) ? 'ok' : /below_bar|skipped|nothing to comment/i.test(m) ? 'warn' : '';
+function renderConsole(run) {
+    const c = run.counts || {};
+    const live = ['running', 'requested'].includes(run.status);
+    $('runDetailTitle').innerHTML = `<i class="fas fa-terminal"></i> ${esc(run.processName || 'Run')} · ${esc(fmt(run.startedAt))}`;
+    $('runLiveTag').className = 'badge ' + run.status; $('runLiveTag').textContent = run.cancelRequested && run.status === 'running' ? 'stopping…' : run.status;
+    $('stopRunBtn').hidden = !(run.status === 'running' && !run.cancelRequested);
+    $('consoleStats').innerHTML = [['People read', `${c.contactsRead || 0} of ${c.contactsPlanned || 0}`], ['With a post to comment on', c.contactsWithPost || 0], ['New posts', c.postsNew || 0], ['Drafted', c.drafted || 0], ['For review', c.queuedForReview || 0], ['Errors', c.errors || 0]].map(([k, v]) => `<span>${esc(k)}: <strong>${esc(v)}</strong></span>`).join('');
+    const lines = (run.log || []).map(l => `<span class="t">${esc(clock(l.at))}</span>  <span class="${lineClass(l.msg)}">${esc(l.msg)}</span>`);
+    if (!lines.length) lines.push(`<span class="dim">${run.status === 'requested' ? 'Waiting for the server to pick this run up (it checks about once a minute)…' : 'No notes.'}</span>`);
+    if (live) lines.push('<span class="dim">…</span>');
+    const box = $('runLog');
+    box.innerHTML = lines.join('\n');
+    if ($('consoleFollow').checked) box.scrollTop = box.scrollHeight;
+}
+async function refreshConsole(withItems) {
+    clearTimeout(followTimer);
+    const id = followId; if (!id) return;
     try {
-        const r = await api(`/admin/runs/${encodeURIComponent(id)}`);
+        const r = await api(`/admin/runs/${encodeURIComponent(id)}${withItems ? '' : '?items=0'}`);
+        if (id !== followId) return;                               // the person opened another run meanwhile
         $('runDetailCard').hidden = false;
-        $('runDetailTitle').innerHTML = `<i class="fas fa-list"></i> ${esc(r.run.processName || 'Run')} · ${esc(fmt(r.run.startedAt))}`;
-        $('runLog').textContent = (r.run.log || []).map(l => `${fmt(l.at)}  ${l.msg}`).join('\n') || 'No notes.';
-        const rows = r.items.map(i => `<tr>
+        renderConsole(r.run);
+        if (r.items) renderItems(r.items);
+        say('consoleStatus', '');
+        const live = ['running', 'requested'].includes(r.run.status);
+        if (live) { followWasLive = true; polls++; if (!$('tab-runs').hidden) followTimer = setTimeout(() => refreshConsole(polls % 10 === 0), 3000); }   // the posts table follows every ~30 s
+        else if (followWasLive) { followWasLive = false; loadRuns(); refreshConsole(true); }
+    } catch (e) { say('consoleStatus', e.message, true); if (followId === id && !$('tab-runs').hidden) followTimer = setTimeout(() => refreshConsole(false), 8000); }
+}
+function followRun(id) { followId = id; followWasLive = false; polls = 0; $('runLog').textContent = 'Loading…'; $('runItems').innerHTML = ''; refreshConsole(true); }
+async function stopRun() {
+    if (!followId || !confirm('Stop this run? It finishes the step it is on, keeps everything it has saved, and ends.')) return;
+    try { await api(`/admin/runs/${encodeURIComponent(followId)}/stop`, { method: 'POST' }); say('consoleStatus', 'Stopping: it ends within about 15 seconds.'); refreshConsole(false); }
+    catch (e) { say('consoleStatus', e.message, true); }
+}
+
+function renderItems(items) {
+        const rows = (items || []).map(i => `<tr>
             <td>${esc((i.contact || {}).name || '')}<span class="sub">${esc((i.contact || {}).company || '')}</span></td>
             <td style="max-width:420px;">${esc(String((i.post || {}).text || '').slice(0, 220))}${String((i.post || {}).text || '').length > 220 ? '…' : ''}<span class="sub">${esc(PC.fmtDay((i.post || {}).createdAt))}</span></td>
             <td>${i.sort ? `<span class="badge ${esc(i.sort.category)}">${esc(i.sort.category)}</span><span class="sub">${esc(i.sort.reason || '')}</span>` : '—'}</td>
             <td><span class="badge ${esc(i.status)}">${esc(i.status.replace(/_/g, ' '))}</span>${i.statusReason ? `<span class="sub">${esc(i.statusReason)}</span>` : ''}</td>
             <td>${i.grade && i.grade.postScore != null ? esc(i.grade.postScore) : '—'}</td><td>${i.grade && i.grade.replyScore != null ? esc(i.grade.replyScore) : '—'}</td></tr>`).join('');
         $('runItems').innerHTML = `<thead><tr><th>Person</th><th>Post</th><th>Sorted as</th><th>Result</th><th>Post score</th><th>Comment score</th></tr></thead><tbody>${rows || '<tr><td class="empty-row" colspan="6">No new posts were found in this run.</td></tr>'}</tbody>`;
-        $('runDetailCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } catch (e) { say('runStatus', e.message, true); }
 }
+const showRun = (id) => followRun(id);
 
 // ── Settings ────────────────────────────────────────────────────────────────
 function renderSettings() {
@@ -462,7 +504,7 @@ function renderSettings() {
     $('stEnabled').checked = !!s.enabled;
     $('mClassifier').value = s.models.classifier; $('mInteresting').value = s.models.interesting; $('mCongratulations').value = s.models.congratulations; $('mGrader').value = s.models.grader;
     $('stMinReply').value = s.thresholds.minReplyScore; $('stMinPost').value = s.thresholds.minPostScore; $('stRepost').value = s.thresholds.repostMinScore;
-    $('stAge').value = s.maxPostAgeDays; $('stRepostAge').value = s.repostMaxPostAgeDays; $('stPosts').value = s.postsPerContact; $('stLen').value = s.commentMaxChars; $('stCongLen').value = s.congratsMaxChars;
+    $('stAge').value = s.maxPostAgeDays; $('stRepostAge').value = s.repostMaxPostAgeDays; $('stPosts').value = s.postsPerContact; $('stPauseMin').value = s.scanPauseSeconds.min; $('stPauseMax').value = s.scanPauseSeconds.max; $('stLen').value = s.commentMaxChars; $('stCongLen').value = s.congratsMaxChars;
     $('engineNote').innerHTML = `Sending limits live with the <a href="linkedin_engine_status.html">LinkedIn engine</a>: at most <strong>${esc(e.commentsPerDay)}</strong> comments a day per LinkedIn account (it can be lowered there, never raised above ${esc(e.commentsPerDayMax)}), and at most ${esc(e.postScansPerDay)} people's posts read per account per day.`;
 }
 const modelFields = () => ({ classifier: $('mClassifier').value.trim(), interesting: $('mInteresting').value.trim(), congratulations: $('mCongratulations').value.trim(), grader: $('mGrader').value.trim() });
@@ -476,7 +518,7 @@ async function saveSettings() {
         await api('/admin/settings', { method: 'PUT', body: {
             enabled: $('stEnabled').checked, models,
             thresholds: { minReplyScore: n('stMinReply'), minPostScore: n('stMinPost'), repostMinScore: n('stRepost') },
-            maxPostAgeDays: n('stAge'), repostMaxPostAgeDays: n('stRepostAge'), postsPerContact: n('stPosts'), commentMaxChars: n('stLen'), congratsMaxChars: n('stCongLen')
+            scanPauseSeconds: { min: n('stPauseMin'), max: n('stPauseMax') }, maxPostAgeDays: n('stAge'), repostMaxPostAgeDays: n('stRepostAge'), postsPerContact: n('stPosts'), commentMaxChars: n('stLen'), congratsMaxChars: n('stCongLen')
         } });
         say('settingsStatus', 'Saved.'); await loadOverview();
     } catch (e) { say('settingsStatus', e.message, true); }
@@ -503,7 +545,7 @@ function showTab(tab) {
     ['review', 'processes', 'runs', 'settings'].forEach(t => { $('tab-' + t).hidden = t !== tab; });
     if (tab === 'review') loadItems();
     if (tab === 'processes') loadProcesses();
-    if (tab === 'runs') loadRuns(); else clearTimeout(runTimer);
+    if (tab === 'runs') { loadRuns(); if (followId) refreshConsole(false); } else { clearTimeout(runTimer); clearTimeout(followTimer); }
 }
 $('mainTabs').addEventListener('click', (e) => { const b = e.target.closest('button[data-tab]'); if (b) showTab(b.dataset.tab); });
 $('viewTabs').addEventListener('click', (e) => {
@@ -525,6 +567,7 @@ document.addEventListener('click', (e) => {
     else if (a === 'cancel-process') $('procFormCard').hidden = true;
     else if (a === 'refresh') loadOverview().then(loadItems).catch(err => say('itemsStatus', err.message, true));
     else if (a === 'refresh-runs') loadRuns();
+    else if (a === 'stop-run') stopRun();
     else if (a === 'save-settings') saveSettings();
     else if (a === 'test-models') testModels();
 });
