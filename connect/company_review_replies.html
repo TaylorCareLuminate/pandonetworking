@@ -8413,6 +8413,25 @@
                 return;
             }
 
+            // A conversation on a sender that moved to Unipile is checked against Unipile, not HeyReach.
+            if (conv.provider === 'unipile') {
+                if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Checking Unipile...'; }
+                try {
+                    const r = await fetch(`${RAILWAY_URL}/api/linkedin-engine/inbox-sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sinceMinutes: 10080 }) });
+                    const out = await r.json();
+                    if (!out.success) { alert(`❌ Could not check Unipile: ${out.error || 'Unknown error'}`); return; }
+                    if (out.errors && out.errors.length) { alert(`⚠️ Checked Unipile, but: ${out.errors[0]}`); }
+                    else if (out.ingested || out.history) { alert(`✅ Found ${out.ingested} new message(s) on Unipile. Reloading...`); }
+                    else { alert('✅ Up to date — Unipile has nothing newer than what is shown here.'); }
+                    await loadConversations();
+                } catch (e) {
+                    alert(`❌ Error checking Unipile: ${e.message}`);
+                } finally {
+                    if (btn) { btn.disabled = false; btn.innerHTML = originalBtnHtml; }
+                }
+                return;
+            }
+
             const leadProfileUrl = conv.leadProfileUrl || conv.linkedin_url || conv.leadLinkedInUrl || '';
             const customerId = conv.customerId || '';
             const linkedInAccountId = conv.linkedInAccountId || conv.rawData?.linkedInAccount?.id || null;
@@ -9837,8 +9856,8 @@
                                 })()}
                             </div>
                             <div style="display:flex; gap:0.5rem;">
-                                <button class="btn-screenshot" id="checkHrBtn-${conv.id}" onclick="checkHeyReachNow('${conv.id}')" title="Query HeyReach directly right now to make sure this conversation is fully up to date">
-                                    <i class="fas fa-sync-alt"></i> Check HeyReach Now
+                                <button class="btn-screenshot" id="checkHrBtn-${conv.id}" onclick="checkHeyReachNow('${conv.id}')" title="${conv.provider === 'unipile' ? 'Ask Unipile right now for the newest messages in this sender\'s LinkedIn chats' : 'Query HeyReach directly right now to make sure this conversation is fully up to date'}">
+                                    <i class="fas fa-sync-alt"></i> ${conv.provider === 'unipile' ? 'Check Unipile Now' : 'Check HeyReach Now'}
                                 </button>
                                 <button class="btn-screenshot" id="notifyBdrBtn-${conv.id}" onclick="notifyBdrOfMeeting('${conv.id}')" title="A meeting was just scheduled for this contact. Adjust and send the heads-up email to the BDR from Taylor, Sam or Joe's mailbox, with their signature.">
                                     ${(window.PandoMeetingNotify && window.PandoMeetingNotify.wasNotified('conv:' + conv.id)) ? '<i class="fas fa-check"></i> BDR Notified' : '<i class="fas fa-calendar-check"></i> Notify BDR'}
@@ -12354,8 +12373,16 @@ Respond ONLY with valid JSON (no markdown, no code fences):
 
                 const data = await response.json();
 
+                // Senders that moved to Unipile: the reply goes into the LinkedIn engine's queue and leaves within a minute or two.
+                const viaEngine = data.success && data.engine === 'unipile';
+                if (viaEngine && ['cancelled', 'failed', 'held'].includes(data.status)) {
+                    // The engine refused or parked it (a safety check), so it is NOT going out. Keep the draft.
+                    alert(`⚠️ The reply was not sent: ${data.holdReason || 'the LinkedIn engine held it'}.\n\nIt is on the Scheduled page if you want to review it.`);
+                    return;
+                }
+
                 if (data.success) {
-                    alert('✅ Message sent successfully! 📨');
+                    alert(viaEngine ? '✅ Reply queued through Unipile. It goes out within a minute or two. 📨' : '✅ Message sent successfully! 📨');
                     
                     // Track follow-up message for cost/revenue reporting
                     try {
@@ -12487,7 +12514,9 @@ Respond ONLY with valid JSON (no markdown, no code fences):
                         }
                         
                         // Update Firestore via backend
-                        const updateResponse = await fetch(`${RAILWAY_URL}/heyreach/inbox/add-sent-message`, {
+                        // A Unipile reply is saved into the thread by Unipile's own message event (with its real id) once it is
+                        // actually sent. Saving it here too would show it twice, so skip this step for those.
+                        const updateResponse = viaEngine ? { ok: true } : await fetch(`${RAILWAY_URL}/heyreach/inbox/add-sent-message`, {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json'
