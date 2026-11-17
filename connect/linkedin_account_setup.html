@@ -148,6 +148,18 @@
         .badge.failed     { background: var(--danger-tint); color: var(--danger); }
         .badge.revoked, .badge.expired { background: #EEE; color: #666; }
 
+        /* ── Verification code entry (invites in "Code needed") ── */
+        .pin-box {
+            margin-top: .45rem; padding: .6rem .7rem; border-radius: 5px; max-width: 320px;
+            background: #FBEFD5; border: 1px solid #F0D9A4;
+        }
+        .pin-box .pin-msg { display: block; font-size: .76rem; color: #8A5A00; line-height: 1.45; margin-bottom: .45rem; }
+        .pin-row { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; margin-bottom: .4rem; }
+        .pin-row input {
+            width: 120px; padding: .35rem .5rem; font-family: 'SF Mono', Consolas, monospace;
+            font-size: .95rem; letter-spacing: .2em; text-align: center; border: 1px solid var(--line-strong); border-radius: 4px;
+        }
+
         @media (max-width: 760px) {
             .form-grid { grid-template-columns: 1fr; }
         }
@@ -163,6 +175,10 @@
             2FA authenticator key (saved with the invite), then send them the link. They sign in on a public page; their
             username and password go straight to HeyReach and are <strong>never stored</strong> by us. If LinkedIn emails
             or texts them a verification code, the page asks for it and relays it to HeyReach.
+        </p>
+        <p>
+            If an invite shows <strong>Code needed</strong> in the list below, ask the BDR for the code LinkedIn sent them
+            and enter it right in that row. If the code has expired, use <strong>Request new code</strong>.
         </p>
     </header>
 
@@ -511,9 +527,29 @@ window.createInvite = async function() {
 function fmtDate(iso) { return iso ? new Date(iso).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '—'; }
 const STATUS_LABEL = { pending: 'Waiting for BDR', connecting: 'Connecting', pin_required: 'Code needed', connected: 'Connected', failed: 'Failed', revoked: 'Revoked', expired: 'Expired' };
 
+// Verification codes typed by the admin, keyed by invite id. Kept here (not in the DOM) so a re-render doesn't wipe them.
+const pinDrafts = new Map();
+window.setPinDraft = function(id, value) { pinDrafts.set(id, value); };
+
+function pinBox(i) {
+    const id = escHtml(i.id);
+    return `<div class="pin-box">
+        <span class="pin-msg">LinkedIn sent a code to ${escHtml(i.bdrEmail)} (email, text, or authenticator app). Enter it here once the BDR shares it.</span>
+        <div class="pin-row">
+            <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="Code"
+                   aria-label="Verification code" value="${escHtml(pinDrafts.get(i.id) || '')}"
+                   oninput="setPinDraft('${id}', this.value)"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();submitPin('${id}', this);}">
+            <button class="btn btn-primary btn-sm" onclick="submitPin('${id}', this)"><i class="fas fa-check"></i> Submit code</button>
+        </div>
+        <button class="btn btn-outline btn-sm" onclick="reconnectInvite('${id}', this)" title="Ask HeyReach to send LinkedIn a fresh code (use if the old one expired)"><i class="fas fa-rotate"></i> Request new code</button>
+    </div>`;
+}
+
 function renderInvites() {
     const rows = invites.map(i => {
         const open = ['pending', 'connecting', 'pin_required', 'failed'].includes(i.status);
+        const pin = i.status === 'pin_required' && i.heyreachAccountId ? pinBox(i) : '';
         const detail = i.status === 'connected'
             ? `${escHtml(i.profileName || '')}${i.profileUrl ? ` <a href="${escHtml(i.profileUrl)}" target="_blank" rel="noopener"><i class="fas fa-arrow-up-right-from-square"></i></a>` : ''}<span class="sub">HeyReach account #${escHtml(i.heyreachAccountId)}</span>`
             : (i.failureReason ? `<span class="err">${escHtml(i.failureReason)}</span>` : '') +
@@ -524,7 +560,7 @@ function renderInvites() {
         return `<tr>
             <td>${escHtml(i.bdrName || i.bdrEmail)}<span class="sub">${escHtml(i.bdrEmail)}</span></td>
             <td><span class="badge ${escHtml(i.status)}">${escHtml(STATUS_LABEL[i.status] || i.status)}</span></td>
-            <td>${detail || '<span class="sub">—</span>'}</td>
+            <td>${detail || (pin ? '' : '<span class="sub">—</span>')}${pin}</td>
             <td>${i.hasTwoFactorKey ? '<i class="fas fa-lock" style="color:var(--sage)"></i> saved' + (i.twoFactorEncrypted ? '<span class="sub">encrypted</span>' : '<span class="sub" style="color:var(--danger)">legacy, not encrypted</span>') : '<span class="sub">none</span>'}</td>
             <td>${fmtDate(i.createdAt)}<span class="sub">by ${escHtml(i.createdBy || '')}</span></td>
             <td>${fmtDate(i.expiresAt)}</td>
@@ -581,6 +617,52 @@ window.refreshActive = async function() {
     status.textContent = `Checking ${plural(active.length, 'invite')} with HeyReach…`;
     for (const i of active) await refreshOne(i.id);
     status.textContent = 'Live status updated.';
+};
+
+function setListStatus(msg, isError) {
+    const status = document.getElementById('listStatus');
+    status.className = isError ? 'status-line error' : 'status-line';
+    status.textContent = msg;
+}
+
+window.submitPin = async function(id, btn) {
+    const pin = (pinDrafts.get(id) || '').replace(/[\s-]/g, '');
+    if (pin.length < 4) { setListStatus('Enter the full code LinkedIn sent the BDR.', true); return; }
+    if (btn) btn.disabled = true;
+    try {
+        const { invite } = await api(`/invites/${encodeURIComponent(id)}/submit-pin`, { method: 'POST', body: { pin } });
+        pinDrafts.delete(id);
+        replaceInvite(invite);
+        setListStatus('Code sent to HeyReach. Checking the connection…');
+        // HeyReach takes a moment to act on the code; re-check this invite shortly after.
+        setTimeout(async () => {
+            await refreshOne(id);
+            const updated = invites.find(x => x.id === id);
+            setListStatus(updated && updated.status === 'connected'
+                ? 'Connected.'
+                : (updated && updated.status === 'pin_required'
+                    ? 'LinkedIn is still asking for a code. Check the code and try again, or request a new one.'
+                    : 'Code accepted. Use Check live status to see progress.'), !!(updated && updated.status === 'pin_required'));
+        }, 4000);
+    } catch (e) {
+        setListStatus('Error: ' + e.message, true);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+};
+
+window.reconnectInvite = async function(id, btn) {
+    if (btn) btn.disabled = true;
+    try {
+        const { invite } = await api(`/invites/${encodeURIComponent(id)}/reconnect`, { method: 'POST' });
+        pinDrafts.delete(id);
+        replaceInvite(invite);
+        setListStatus('New code requested. LinkedIn will send it to the BDR; ask them for it, then enter it here.');
+    } catch (e) {
+        setListStatus('Error: ' + e.message, true);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
 };
 
 window.revokeInvite = async function(id) {
