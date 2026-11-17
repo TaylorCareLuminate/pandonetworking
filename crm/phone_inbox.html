@@ -2,7 +2,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <!-- CACHE BUSTER v2.7.3 - WORKING: Auth fixed + 404 cache + exists() compatibility -->
+    <!-- CACHE BUSTER v2.7.4 - REMOVE MEETING: admins can remove an accidental scheduled meeting and the achievement pool is rebuilt to the amount from before it reset. -->
     <!-- TODO: Make "flagged" show as an outcome in phone-calls.html call history so agents can see contact was flagged by another agent -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1462,7 +1462,7 @@
 
     <script type="module">
         // 📄 PAGE VERSION FOR CACHE BUSTING
-        const PAGE_VERSION = 'v1.2.1-call-tracking-timeout-fix';
+        const PAGE_VERSION = 'v1.2.2-remove-meeting-pool';
         console.log(`📄 Phone Inbox Page Version: ${PAGE_VERSION}`);
         console.log('🔥 Using Firebase Project: clemail (via secure wrapper)');
         console.log('📊 Data Sources: campaign_call_tracking (calls), emailRequests (emails), campaigns (names), outreach_sets (contacts), sends (email history)');
@@ -1474,9 +1474,11 @@
         import { getAuth, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
         import { getDatabase, ref, get, set, update, child, orderByChild, limitToFirst, equalTo, query as rtdbQuery } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js';
         import { getApps } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js';
+        import { deleteField } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js';
+        import { calculateAchievementPool, qualifyingCallsAfterHistory } from '../js/payment-config.js';
         
         // Use CLEmail secure wrapper for Firestore
-        const { collection, getDocs, doc, getDoc, updateDoc, addDoc, query, where, orderBy, limit } = window.clemailFirestore;
+        const { collection, getDocs, doc, getDoc, updateDoc, addDoc, setDoc, deleteDoc, query, where, orderBy, limit } = window.clemailFirestore;
         const db = window.clemailDb;
         const auth = window.auth; // Auth from auth.js
         const rtdb = getDatabase(window.app); // Realtime DB from auth.js (HealthcareITDatabase)
@@ -2197,7 +2199,12 @@
                             </div>
                         </div>
                     ` : `
-                        <div style="margin-top: 1rem;">
+                        <div style="margin-top: 1rem; display: flex; flex-direction: column; gap: 0.5rem;">
+                            ${call.type === 'meeting' ? `
+                                <button class="btn btn-small" style="width: 100%; background: #dc2626; color: white;" onclick="window.removeAccidentalMeeting('${call.id}')">
+                                    <i class="fas fa-rotate-left"></i> Remove meeting
+                                </button>
+                            ` : ''}
                             <button class="btn btn-success btn-small" style="width: 100%;" onclick="window.markScheduledCallAsCompleted('${call.id}')">
                                 <i class="fas fa-check"></i> Mark as Completed
                             </button>
@@ -4122,6 +4129,182 @@
             } catch (error) {
                 console.error('❌ Error completing email request:', error);
                 showAlert('Error marking email as completed', 'danger');
+            }
+        };
+
+        const MEETING_ADMINS = [
+            'samellsworth@careluminate.com',
+            'taylor@careluminate.com',
+            'taylordavis@careluminate.com'
+        ];
+        const RELATED_MEETING_WINDOW_MS = 2 * 60 * 60 * 1000;
+
+        function isMeetingAdmin() {
+            return MEETING_ADMINS.includes((currentUser?.email || '').toLowerCase());
+        }
+
+        async function describePoolWithoutMeetings(campaignId, excludeIds) {
+            const poolDoc = await getDoc(doc(db, 'campaign_pool_stats', campaignId));
+            const poolExists = typeof poolDoc.exists === 'function' ? poolDoc.exists() : poolDoc.exists;
+            const beforeCalls = poolExists ? (poolDoc.data().qualifyingCalls || 0) : 0;
+            const snapshot = await getDocs(query(
+                collection(db, 'campaign_call_tracking'),
+                where('campaignId', '==', campaignId)
+            ));
+            const calls = snapshot.docs
+                .map((item) => ({ id: item.id, ...item.data() }))
+                .filter((call) => !excludeIds.has(call.id));
+            const afterCalls = qualifyingCallsAfterHistory(calls);
+            const remainingMeeting = [...calls].reverse().find((call) => call.outcome === 'spoke-scheduled-meeting') || null;
+            return {
+                beforeCalls,
+                beforeAmount: calculateAchievementPool(beforeCalls),
+                afterCalls,
+                afterAmount: calculateAchievementPool(afterCalls),
+                remainingMeeting
+            };
+        }
+
+        function formatPoolRestore(pool) {
+            if (!pool) return '';
+            let text = `Achievement pool restored from $${pool.beforeAmount.toFixed(2)} to $${pool.afterAmount.toFixed(2)} (${pool.afterCalls} qualifying calls).`;
+            if (pool.remainingMeeting && pool.afterCalls === 0 && pool.beforeCalls === 0) {
+                text += ' Another meeting is still resetting this pool. Remove that one too.';
+            }
+            return text;
+        }
+
+        async function reopenActivityCompletedAsMeeting(timestamp, userEmail) {
+            if (!timestamp || !userEmail) return;
+            const snapshot = await getDocs(query(
+                collection(db, 'phone_activities'),
+                where('completedAt', '==', String(timestamp))
+            ));
+            for (const activityDoc of snapshot.docs) {
+                const data = activityDoc.data();
+                if (data.outcome !== 'spoke-scheduled-meeting') continue;
+                if ((data.completedBy || '').toLowerCase() !== userEmail.toLowerCase()) continue;
+                await updateDoc(doc(db, 'phone_activities', activityDoc.id), {
+                    status: data.scheduledDate || data.scheduledAt ? 'scheduled' : 'pending',
+                    outcome: deleteField(),
+                    completedAt: deleteField(),
+                    completedBy: deleteField(),
+                    basePayment: deleteField(),
+                    achievementPoolAwarded: deleteField(),
+                    totalPayment: deleteField(),
+                    additionalData: deleteField(),
+                    notes: data.schedulingNotes || '',
+                    claimedBy: null,
+                    claimedAt: null,
+                    claimedByName: null,
+                    undoneAt: new Date().toISOString(),
+                    undoneBy: currentUser?.email || userEmail
+                });
+            }
+        }
+
+        window.removeAccidentalMeeting = async function(callId) {
+            if (!isMeetingAdmin()) {
+                showAlert('Only an administrator can remove a scheduled meeting.', 'danger');
+                return;
+            }
+            if (!/^[A-Za-z0-9_-]+$/.test(callId || '')) {
+                showAlert('That meeting could not be identified.', 'danger');
+                return;
+            }
+
+            try {
+                const meetingRef = doc(db, 'campaign_call_tracking', callId);
+                const snapshot = await getDoc(meetingRef);
+                const exists = typeof snapshot.exists === 'function' ? snapshot.exists() : snapshot.exists;
+                if (!exists) {
+                    showAlert('That meeting is already gone from the schedule.', 'info');
+                    await loadScheduledCalls();
+                    return;
+                }
+                const meeting = { id: callId, ...snapshot.data() };
+                if (meeting.outcome !== 'spoke-scheduled-meeting') {
+                    showAlert('That record is not a scheduled meeting, so it was left in place.', 'warning');
+                    return;
+                }
+
+                let toRemove = [meeting];
+                if (meeting.userEmail) {
+                    const sameAgent = await getDocs(query(
+                        collection(db, 'campaign_call_tracking'),
+                        where('userEmail', '==', meeting.userEmail)
+                    ));
+                    const when = new Date(meeting.timestamp || 0).getTime();
+                    const related = sameAgent.docs
+                        .map((item) => ({ id: item.id, ...item.data() }))
+                        .filter((item) => item.id !== meeting.id && item.outcome === 'spoke-scheduled-meeting')
+                        .filter((item) => {
+                            const itemWhen = new Date(item.timestamp || 0).getTime();
+                            return itemWhen && when && Math.abs(itemWhen - when) <= RELATED_MEETING_WINDOW_MS;
+                        });
+                    toRemove = [meeting, ...related].sort((a, b) => new Date(a.timestamp || 0) - new Date(b.timestamp || 0));
+                }
+
+                const describeMeeting = (item) => {
+                    const slot = [item.additionalData?.date, item.additionalData?.time].filter(Boolean).join(' at ');
+                    const paid = Number(item.achievementPoolAwarded || 0).toFixed(2);
+                    return `• ${item.contactName || 'Unknown'} at ${item.companyName || 'Unknown'} — ${slot || 'time not stored'} — pool paid $${paid}`;
+                };
+                if (toRemove.length > 1) {
+                    const removeAll = confirm(
+                        `${meeting.userEmail || 'This agent'} scheduled ${toRemove.length} meetings in the last 2 hours:\n\n` +
+                        `${toRemove.map(describeMeeting).join('\n')}\n\n` +
+                        `OK removes all of them and puts the achievement pool back to the amount before the first one.\n` +
+                        `Cancel removes only ${meeting.contactName || 'the meeting you clicked'}.`
+                    );
+                    if (!removeAll) toRemove = [meeting];
+                }
+
+                const excludeIds = new Set(toRemove.map((item) => item.id));
+                const campaignIds = [...new Set(toRemove.map((item) => item.campaignId).filter(Boolean))];
+                const previews = [];
+                for (const campaignId of campaignIds) {
+                    previews.push(await describePoolWithoutMeetings(campaignId, excludeIds));
+                }
+                const poolPreview = previews.map((pool) =>
+                    `Pool goes from $${pool.beforeAmount.toFixed(2)} to $${pool.afterAmount.toFixed(2)} (${pool.afterCalls} qualifying calls).`
+                ).join('\n');
+                const confirmed = confirm(
+                    `Remove ${toRemove.length === 1 ? 'this scheduled meeting' : `these ${toRemove.length} scheduled meetings`}?\n\n` +
+                    `${toRemove.map(describeMeeting).join('\n')}\n\n` +
+                    `${poolPreview}\n\n` +
+                    `Pay for the removed meetings is reversed. The achievement pool is rebuilt from the calls that remain.`
+                );
+                if (!confirmed) return;
+
+                for (const item of toRemove) {
+                    await deleteDoc(doc(db, 'campaign_call_tracking', item.id));
+                    try {
+                        await reopenActivityCompletedAsMeeting(item.timestamp, item.userEmail);
+                    } catch (activityError) {
+                        console.warn('⚠️ Meeting removed, but its call could not be reopened:', activityError);
+                    }
+                }
+
+                const restored = [];
+                for (const campaignId of campaignIds) {
+                    const described = await describePoolWithoutMeetings(campaignId, new Set());
+                    await setDoc(doc(db, 'campaign_pool_stats', campaignId), {
+                        qualifyingCalls: described.afterCalls,
+                        lastUpdated: new Date().toISOString(),
+                        lastUpdatedBy: currentUser?.email || 'admin-meeting-removal'
+                    }, { merge: true });
+                    restored.push(described);
+                }
+
+                showAlert(
+                    `Removed ${toRemove.length} meeting${toRemove.length === 1 ? '' : 's'}. ${restored.map(formatPoolRestore).join(' ')}`,
+                    'success'
+                );
+                await loadScheduledCalls();
+            } catch (error) {
+                console.error('❌ Error removing scheduled meeting:', error);
+                showAlert('Could not remove the meeting: ' + (error.message || error), 'danger');
             }
         };
 

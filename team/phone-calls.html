@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en" class="protection-hide">
 <head>
-    <!-- CACHE BUSTER v4.17.3 - OUTCOME PHONES: missing numbers are also read from phone2/phone3, contact/company phone, and custom fields named like a phone. Previous v4.17.2 - BACKGROUND COUNTS: campaign buttons render immediately with a "counting…" badge; available-call counts load one campaign at a time in the background and re-render (selected campaign kept). Previous v4.17.1 - FEWER READS: declined/wrong-person lookups shared between campaign counts and loadCalls (one sequential fetch, 5-min cache; parallel version caused 502s); bad-number pass reuses the main pool and applies its writes locally instead of two extra full-campaign reads. Previous v4.17.0 - PER-CALLER ORDER: queue stays oldest-first but each window of 25 contacts is shuffled per caller (seeded by email, stable across reloads) so teammates stop colliding; callbacks still first. Previous v4.16.1 - CLAIM GUARD: claims refuse activities a teammate already completed; recording your own call no longer marks the shared call log as fresh (teammates' calls are re-read before each contact); queue recheck window 15s -> 5s. Previous v4.16.0 - BAD NUMBERS: all-time bad-number block from completed outcomes, 10-digit matching, auto-switch to alternate numbers, bad-number attempts no longer start the 72h contact cooldown, call card shows the activity's current number -->
+    <!-- CACHE BUSTER v4.17.5 - POOL RESTORE: removing a meeting rebuilds the achievement pool to the amount from before that meeting reset it. Previous v4.17.4 - REMOVE ACCIDENTAL MEETING: undoing a scheduled meeting deletes it from the schedule (including a double-click copy) and the confirm button ignores a second click. Previous v4.17.3 - OUTCOME PHONES: missing numbers are also read from phone2/phone3, contact/company phone, and custom fields named like a phone. Previous v4.17.2 - BACKGROUND COUNTS: campaign buttons render immediately with a "counting…" badge; available-call counts load one campaign at a time in the background and re-render (selected campaign kept). Previous v4.17.1 - FEWER READS: declined/wrong-person lookups shared between campaign counts and loadCalls (one sequential fetch, 5-min cache; parallel version caused 502s); bad-number pass reuses the main pool and applies its writes locally instead of two extra full-campaign reads. Previous v4.17.0 - PER-CALLER ORDER: queue stays oldest-first but each window of 25 contacts is shuffled per caller (seeded by email, stable across reloads) so teammates stop colliding; callbacks still first. Previous v4.16.1 - CLAIM GUARD: claims refuse activities a teammate already completed; recording your own call no longer marks the shared call log as fresh (teammates' calls are re-read before each contact); queue recheck window 15s -> 5s. Previous v4.16.0 - BAD NUMBERS: all-time bad-number block from completed outcomes, 10-digit matching, auto-switch to alternate numbers, bad-number attempts no longer start the 72h contact cooldown, call card shows the activity's current number -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
@@ -1658,7 +1658,7 @@
                                 <i class="fas fa-rotate-left"></i> Correct an Accidental Call
                             </div>
                             <div style="font-size: 0.8rem; color: #7f1d1d; margin-bottom: 0.75rem;">
-                                Removes your most recent call from the leaderboard and restores it to the queue.
+                                Removes your most recent call from the leaderboard and restores it to the queue. A scheduled meeting is also taken off the schedule.
                             </div>
                             <button id="undoMostRecentRecordedCallBtn" onclick="undoMostRecentRecordedCall()" class="btn" style="background: #dc2626; color: white; font-size: 0.85rem; padding: 0.5rem 1rem; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;">
                                 <i class="fas fa-trash-arrow-up"></i> Review &amp; Undo My Latest Call
@@ -2303,10 +2303,13 @@
 
             <div class="modal-buttons">
                 <button class="btn btn-secondary" onclick="cancelMeetingScheduler()">Cancel</button>
-                <button class="btn btn-success" onclick="confirmMeeting()">
+                <button class="btn btn-success" id="confirmMeetingBtn" onclick="confirmMeeting()">
                     <i class="fas fa-check"></i> Confirm Meeting
                 </button>
             </div>
+            <p style="font-size: 0.8rem; color: #92400e; margin: 0.75rem 0 0;">
+                Click once, then wait for the next call. A second click can save another meeting. Use “Undo meeting” if that happens.
+            </p>
         </div>
     </div>
 
@@ -2472,7 +2475,7 @@
 
     <script type="module">
         // 🔐 PAGE VERSION FOR CACHE BUSTING
-            const PAGE_VERSION = 'v2.15.3-outcome-phone-fields';
+            const PAGE_VERSION = 'v2.15.5-pool-restore';
         console.log(`📄 Phone Calls Page Version: ${PAGE_VERSION}`);
         console.log('🛡️ Duplicate Call Checking: ENABLED (72-hour / 3-day cooldown)');
         console.log('🔒 Assignment System: FIXED (respects assignment expiry - prevents queue overlaps)');
@@ -2492,7 +2495,7 @@
         import { deleteField } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js';
         
         // Import centralized payment configuration (SINGLE SOURCE OF TRUTH)
-        import { PAYMENT_STRUCTURE as PAYMENT_RATES, QUALIFYING_OUTCOMES, ACHIEVEMENT_POOL_CONFIG, calculateAchievementPool } from '../js/payment-config.js';
+        import { PAYMENT_STRUCTURE as PAYMENT_RATES, QUALIFYING_OUTCOMES, ACHIEVEMENT_POOL_CONFIG, calculateAchievementPool, qualifyingCallsAfterHistory } from '../js/payment-config.js';
 
         // Use CLEmail secure wrapper
         const { collection, getDocs, doc, getDoc, addDoc, updateDoc, setDoc, deleteDoc, query, where, orderBy, runTransaction, writeBatch, limit } = window.clemailFirestore;
@@ -3014,6 +3017,52 @@
             return added;
         }
 
+        function meetingRecordPhone(record) {
+            return String(record?.phoneNumber || record?.contactPhone || record?.additionalData?.phoneNumber || '')
+                .replace(/\D/g, '')
+                .slice(-10);
+        }
+
+        function meetingRecordName(record) {
+            return String(record?.contactName || record?.additionalData?.contactName || '').trim().toLowerCase();
+        }
+
+        function meetingRecordCompany(record) {
+            return String(record?.companyName || record?.contactCompany || record?.company || '').trim().toLowerCase();
+        }
+
+        // A second click while the page is still saving books the same person again.
+        function isSameAccidentalMeeting(a, b) {
+            const nameA = meetingRecordName(a);
+            const nameB = meetingRecordName(b);
+            if (!nameA || nameA !== nameB) return false;
+            const companyA = meetingRecordCompany(a);
+            const companyB = meetingRecordCompany(b);
+            if (companyA && companyB && companyA !== companyB) return false;
+            const phoneA = meetingRecordPhone(a);
+            const phoneB = meetingRecordPhone(b);
+            if (phoneA.length >= 10 && phoneB.length >= 10 && phoneA !== phoneB) return false;
+            const timeA = new Date(a?.timestamp || 0).getTime();
+            const timeB = new Date(b?.timestamp || 0).getTime();
+            if (!timeA || !timeB) return false;
+            return Math.abs(timeA - timeB) <= 5 * 60 * 1000;
+        }
+
+        // Drop a meeting from this session's exclusion list so the company can be called again.
+        function forgetScheduledMeeting(record) {
+            const name = meetingRecordName(record);
+            const phone = meetingRecordPhone(record);
+            const company = meetingRecordCompany(record);
+            for (let i = pendingScheduledMeetings.length - 1; i >= 0; i--) {
+                const pending = pendingScheduledMeetings[i];
+                const sameName = name && meetingRecordName(pending) === name;
+                const sameCompany = !company || !meetingRecordCompany(pending) || meetingRecordCompany(pending) === company;
+                const samePhone = phone.length < 10 || meetingRecordPhone(pending).length < 10 || meetingRecordPhone(pending) === phone;
+                if (sameName && sameCompany && samePhone) pendingScheduledMeetings.splice(i, 1);
+            }
+            scheduledMeetingsLoadedAt = 0;
+        }
+
         function companyHasScheduledMeeting(record) {
             const keys = companyKeysFromRecord(record);
             for (const key of keys) {
@@ -3137,6 +3186,16 @@
             });
 
             return scheduledMeetingsRefreshPromise;
+        }
+
+        async function reloadScheduledMeetingsAfterRemoval() {
+            if (scheduledMeetingsRefreshPromise) {
+                try { await scheduledMeetingsRefreshPromise; } catch (refreshError) {
+                    console.warn('⚠️ Scheduled-meeting refresh was already running:', refreshError);
+                }
+            }
+            scheduledMeetingsLoadedAt = 0;
+            await refreshScheduledMeetings({ force: true });
         }
 
         // Payment rates and qualifying outcomes imported from ../js/payment-config.js
@@ -8456,7 +8515,8 @@
             document.getElementById('phoneUpdateNotice').style.display = 'none';
             document.getElementById('flagForReviewSection').style.display = 'none';
             document.getElementById('flagConfirmationNotice').style.display = 'none';
-            document.getElementById('meetingScheduler').style.display = 'none';
+            if (window.cancelMeetingScheduler) window.cancelMeetingScheduler();
+            else document.getElementById('meetingScheduler').style.display = 'none';
             document.getElementById('callbackModal').style.display = 'none';
             document.getElementById('skipJustification').style.display = 'none';
             
@@ -9800,6 +9860,8 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     payment: totalPayment,
                     notes: notes,
                     timestamp: now,
+                    meetingDate: additionalData?.date || '',
+                    meetingTime: additionalData?.time || '',
                     // Store full call data so we can reload it
                     callData: { ...currentCall }
                 };
@@ -9818,8 +9880,11 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 // Show undo button (button itself, container is always visible)
                 // Reuse undoBtn variable already declared at top of function
                 if (undoBtn) {
+                    undoBtn.innerHTML = outcome === 'spoke-scheduled-meeting'
+                        ? '<i class="fas fa-rotate-left" style="margin-right: 0.5rem;"></i> UNDO MEETING & REMOVE FROM SCHEDULE'
+                        : '<i class="fas fa-rotate-left" style="margin-right: 0.5rem;"></i> UNDO LAST RECORDED CALL';
                     undoBtn.style.display = 'block';
-                    console.log('✅ RETURN BUTTON NOW VISIBLE - Purple button above contact info says "RETURN TO PREVIOUS CALL"');
+                    console.log('✅ RETURN BUTTON NOW VISIBLE - Purple button above contact info');
                 } else {
                     console.error('❌ Undo button element not found!');
                 }
@@ -10520,9 +10585,19 @@ Would you have 15 minutes available this week or next for a quick call?`;
                                  currentCall?.contactData?.phone ||
                                  document.getElementById('contactPhone')?.textContent ||
                                  '';
+            document.getElementById('meetingDate').value = '';
+            document.getElementById('meetingTime').value = '';
+            document.getElementById('meetingBackupDate').value = '';
+            document.getElementById('meetingBackupTime').value = '';
+            document.getElementById('meetingNotes').value = '';
             document.getElementById('meetingEmail').value = currentEmail;
             document.getElementById('meetingPhoneNumber').value = currentPhone;
             document.getElementById('meetingContactName').value = '';
+            const confirmBtn = document.getElementById('confirmMeetingBtn');
+            if (confirmBtn) {
+                confirmBtn.disabled = false;
+                confirmBtn.innerHTML = '<i class="fas fa-check"></i> Confirm Meeting';
+            }
             document.getElementById('meetingDate').focus();
         };
 
@@ -10539,7 +10614,14 @@ Would you have 15 minutes available this week or next for a quick call?`;
             document.getElementById('meetingNotes').value = '';
         };
 
+        let isConfirmingMeeting = false;
+
         window.confirmMeeting = async function() {
+            if (isConfirmingMeeting || isRecordingOutcome) {
+                setMeetingSchedulerError('This meeting is already being saved. Please wait — clicking again will not schedule a second one.');
+                return;
+            }
+
             const meetingDate = document.getElementById('meetingDate').value;
             const meetingTime = document.getElementById('meetingTime').value;
             const meetingBackupDate = document.getElementById('meetingBackupDate').value;
@@ -10563,6 +10645,12 @@ Would you have 15 minutes available this week or next for a quick call?`;
             }
 
             setMeetingSchedulerError('');
+            isConfirmingMeeting = true;
+            const confirmBtn = document.getElementById('confirmMeetingBtn');
+            if (confirmBtn) {
+                confirmBtn.disabled = true;
+                confirmBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Scheduling...';
+            }
 
             const meetingDetails = {
                 date: meetingDate,
@@ -10578,7 +10666,15 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 scheduledAt: new Date().toISOString()
             };
 
-            await recordOutcome('spoke-scheduled-meeting', meetingDetails);
+            try {
+                await recordOutcome('spoke-scheduled-meeting', meetingDetails);
+            } finally {
+                isConfirmingMeeting = false;
+                if (confirmBtn) {
+                    confirmBtn.disabled = false;
+                    confirmBtn.innerHTML = '<i class="fas fa-check"></i> Confirm Meeting';
+                }
+            }
         };
 
         // Show callback modal
@@ -11161,34 +11257,97 @@ Would you have 15 minutes available this week or next for a quick call?`;
         }
 
         async function recomputeCampaignPoolAfterUndo(campaignId) {
-            if (!campaignId) return;
+            if (!campaignId) return null;
 
+            const beforeStats = await getCampaignPoolStats(campaignId);
+            const beforeCalls = beforeStats.qualifyingCalls || 0;
             const snapshot = await getDocs(query(
                 collection(db, 'campaign_call_tracking'),
                 where('campaignId', '==', campaignId)
             ));
-            const calls = snapshot.docs
-                .map((item) => item.data())
-                .sort((a, b) => new Date(a.timestamp || 0) - new Date(b.timestamp || 0));
-
-            let qualifyingCalls = 0;
-            calls.forEach((call) => {
-                if (call.outcome === 'spoke-scheduled-meeting') {
-                    qualifyingCalls = 0;
-                } else if (QUALIFYING_OUTCOMES.includes(call.outcome)) {
-                    qualifyingCalls++;
-                }
-            });
+            const qualifyingCalls = qualifyingCallsAfterHistory(snapshot.docs.map((item) => item.data()));
 
             await setDoc(doc(db, 'campaign_pool_stats', campaignId), {
                 qualifyingCalls,
                 lastUpdated: new Date().toISOString(),
                 lastUpdatedBy: currentUser?.email || 'admin-undo'
             }, { merge: true });
+
+            if (selectedCampaign === campaignId) await updateAchievementPool();
+
+            return {
+                beforeCalls,
+                beforeAmount: calculateAchievementPool(beforeCalls),
+                afterCalls: qualifyingCalls,
+                afterAmount: calculateAchievementPool(qualifyingCalls)
+            };
+        }
+
+        function formatPoolRestore(pool) {
+            if (!pool) return '';
+            return ` Achievement pool restored from $${pool.beforeAmount.toFixed(2)} to $${pool.afterAmount.toFixed(2)} (${pool.afterCalls} qualifying calls).`;
+        }
+
+        async function reopenActivityCompletedAsMeeting(timestamp, userEmail) {
+            if (!timestamp || !userEmail) return;
+            const iso = timestamp instanceof Date ? timestamp.toISOString() : String(timestamp);
+            const snapshot = await getDocs(query(
+                collection(db, 'phone_activities'),
+                where('completedAt', '==', iso)
+            ));
+            for (const activityDoc of snapshot.docs) {
+                const data = activityDoc.data();
+                if (data.outcome !== 'spoke-scheduled-meeting') continue;
+                if ((data.completedBy || '').toLowerCase() !== userEmail.toLowerCase()) continue;
+                await updateDoc(doc(db, 'phone_activities', activityDoc.id), {
+                    status: restoredActivityStatus(data),
+                    outcome: deleteField(),
+                    completedAt: deleteField(),
+                    completedBy: deleteField(),
+                    basePayment: deleteField(),
+                    achievementPoolAwarded: deleteField(),
+                    totalPayment: deleteField(),
+                    additionalData: deleteField(),
+                    notes: data.schedulingNotes || '',
+                    claimedBy: null,
+                    claimedAt: null,
+                    claimedByName: null,
+                    undoneAt: new Date().toISOString(),
+                    undoneBy: currentUser?.email || 'admin'
+                });
+            }
+        }
+
+        // A double-click writes a second campaign_call_tracking meeting. Undo used to
+        // delete only the latest id, so the first copy stayed on the schedule.
+        async function deleteAccidentalDuplicateMeetings(trackingData, primaryId) {
+            if (!trackingData?.userEmail || trackingData.outcome !== 'spoke-scheduled-meeting') return 0;
+            const snapshot = await getDocs(query(
+                collection(db, 'campaign_call_tracking'),
+                where('userEmail', '==', trackingData.userEmail)
+            ));
+            const duplicates = snapshot.docs
+                .map((item) => ({ id: item.id, ...item.data() }))
+                .filter((item) => item.id !== primaryId && item.outcome === 'spoke-scheduled-meeting' && isSameAccidentalMeeting(trackingData, item));
+            for (const duplicate of duplicates) {
+                await deleteDoc(doc(db, 'campaign_call_tracking', duplicate.id));
+                recentCallLog = recentCallLog.filter((entry) => entry.id !== duplicate.id);
+                try {
+                    await reopenActivityCompletedAsMeeting(duplicate.timestamp, duplicate.userEmail);
+                } catch (activityError) {
+                    console.warn('⚠️ Extra meeting removed, but its call could not be reopened:', activityError);
+                }
+                forgetScheduledMeeting(duplicate);
+            }
+            if (duplicates.length > 0) {
+                console.log(`🗑️ Removed ${duplicates.length} extra meeting copy${duplicates.length === 1 ? '' : ' copies'} from the schedule`);
+            }
+            return duplicates.length;
         }
 
         async function revertRecordedCall({ trackingId, activityId, trackingData, activityData }) {
             const completionTimestamp = trackingData.timestamp;
+            let removedDuplicateMeetings = 0;
             const activityRef = doc(db, 'phone_activities', activityId);
             const phone10 = String(
                 activityData.phoneNumber || activityData.phone || trackingData.phoneNumber || ''
@@ -11197,6 +11356,13 @@ Would you have 15 minutes available this week or next for a quick call?`;
             await deleteDoc(doc(db, 'campaign_call_tracking', trackingId));
             recentCallLog = recentCallLog.filter((entry) => entry.id !== trackingId);
             invalidateCompletedCallsCache();
+            if (trackingData.outcome === 'spoke-scheduled-meeting') {
+                try {
+                    removedDuplicateMeetings = await deleteAccidentalDuplicateMeetings(trackingData, trackingId);
+                } catch (duplicateError) {
+                    console.error('⚠️ Could not remove the extra meeting copy:', duplicateError);
+                }
+            }
             if (isBadNumberOutcome(trackingData.outcome)) {
                 knownBadPhones.delete(extractMainPhoneNumber(
                     trackingData.phoneNumber || activityData.phoneNumber || activityData.phone || ''));
@@ -11305,7 +11471,17 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 }
             }
 
-            await recomputeCampaignPoolAfterUndo(trackingData.campaignId);
+            if (trackingData.outcome === 'spoke-scheduled-meeting') {
+                forgetScheduledMeeting(trackingData);
+                try {
+                    await reloadScheduledMeetingsAfterRemoval();
+                } catch (refreshError) {
+                    console.warn('⚠️ Meeting was removed but the company exclusion list did not refresh:', refreshError);
+                }
+            }
+
+            const pool = await recomputeCampaignPoolAfterUndo(trackingData.campaignId);
+            return { removedDuplicates: removedDuplicateMeetings, pool };
         }
 
         window.undoMostRecentRecordedCall = async function() {
@@ -11346,28 +11522,77 @@ Would you have 15 minutes available this week or next for a quick call?`;
                 });
 
                 if (!matchingActivity) {
-                    throw new Error('The matching phone activity could not be found, so nothing was changed.');
+                    if (latest.outcome !== 'spoke-scheduled-meeting') {
+                        throw new Error('The matching phone activity could not be found, so nothing was changed.');
+                    }
+                    const when = new Date(latest.timestamp).toLocaleString();
+                    const meetingWhen = [latest.additionalData?.date, latest.additionalData?.time].filter(Boolean).join(' at ');
+                    const confirmedMeeting = confirm(
+                        `Remove this scheduled meeting?\n\n` +
+                        `Contact: ${latest.contactName || 'Unknown'}\n` +
+                        `Company: ${latest.companyName || latest.contactCompany || 'Unknown'}\n` +
+                        `Meeting: ${meetingWhen || 'time not stored'}\n` +
+                        `Recorded: ${when}\n\n` +
+                        `It was saved without a matching call, so only the meeting comes off the schedule. Pay and the achievement pool are reversed. A second copy from a double-click is removed too.`
+                    );
+                    if (!confirmedMeeting) return;
+                    await deleteDoc(doc(db, 'campaign_call_tracking', latest.id));
+                    const extraCopies = await deleteAccidentalDuplicateMeetings(latest, latest.id);
+                    forgetScheduledMeeting(latest);
+                    try {
+                        await reloadScheduledMeetingsAfterRemoval();
+                    } catch (refreshError) {
+                        console.warn('⚠️ Meeting was removed but the company exclusion list did not refresh:', refreshError);
+                    }
+                    const pool = await recomputeCampaignPoolAfterUndo(latest.campaignId);
+                    showAlert(
+                        `Meeting removed from the schedule.${extraCopies ? ` Also removed ${extraCopies} extra copy.` : ''}${formatPoolRestore(pool)}`,
+                        'success',
+                        7000
+                    );
+                    await Promise.all([
+                        loadTeamLeaderboard(true),
+                        updatePerformanceStats(),
+                        calculateReservationState()
+                    ]);
+                    return;
                 }
 
                 const when = new Date(latest.timestamp).toLocaleString();
+                const isMeeting = latest.outcome === 'spoke-scheduled-meeting';
+                const meetingWhen = [latest.additionalData?.date, latest.additionalData?.time].filter(Boolean).join(' at ');
                 const confirmed = confirm(
-                    `Undo your most recent recorded call?\n\n` +
-                    `Contact: ${latest.contactName || 'Unknown'}\n` +
-                    `Company: ${latest.companyName || latest.contactCompany || 'Unknown'}\n` +
-                    `Outcome: ${PREVIEW_OUTCOME_LABELS[latest.outcome] || latest.outcome}\n` +
-                    `Recorded: ${when}\n\n` +
-                    `This removes it from the leaderboard/payment totals and restores the call to the queue.`
+                    isMeeting
+                        ? `Remove this scheduled meeting and undo the call?\n\n` +
+                          `Contact: ${latest.contactName || 'Unknown'}\n` +
+                          `Company: ${latest.companyName || latest.contactCompany || 'Unknown'}\n` +
+                          `Meeting: ${meetingWhen || 'time not stored'}\n` +
+                          `Recorded: ${when}\n\n` +
+                          `This takes the meeting off the schedule, reverses the pay and achievement pool, and restores the call to the queue. A second copy from a double-click is removed too.`
+                        : `Undo your most recent recorded call?\n\n` +
+                          `Contact: ${latest.contactName || 'Unknown'}\n` +
+                          `Company: ${latest.companyName || latest.contactCompany || 'Unknown'}\n` +
+                          `Outcome: ${PREVIEW_OUTCOME_LABELS[latest.outcome] || latest.outcome}\n` +
+                          `Recorded: ${when}\n\n` +
+                          `This removes it from the leaderboard/payment totals and restores the call to the queue.`
                 );
                 if (!confirmed) return;
 
-                await revertRecordedCall({
+                const undoResult = await revertRecordedCall({
                     trackingId: latest.id,
                     activityId: matchingActivity.id,
                     trackingData: latest,
                     activityData: matchingActivity.data()
-                });
+                }) || {};
+                const extraCopies = undoResult.removedDuplicates || 0;
 
-                showAlert('The accidental call was removed and restored to the queue.', 'success', 7000);
+                showAlert(
+                    isMeeting
+                        ? `Meeting removed from the schedule and the call was restored.${extraCopies ? ` Also removed ${extraCopies} extra copy.` : ''}${formatPoolRestore(undoResult.pool)}`
+                        : 'The accidental call was removed and restored to the queue.',
+                    'success',
+                    7000
+                );
                 await Promise.all([
                     loadTeamLeaderboard(true),
                     updatePerformanceStats(),
@@ -11393,20 +11618,44 @@ Would you have 15 minutes available this week or next for a quick call?`;
             }
 
             const outcomeToUndo = lastRecordedOutcome;
+            const isMeeting = outcomeToUndo.outcome === 'spoke-scheduled-meeting';
+            const meetingWhen = [outcomeToUndo.meetingDate, outcomeToUndo.meetingTime].filter(Boolean).join(' at ');
             const confirmed = confirm(
-                `Undo the recorded call for ${outcomeToUndo.contactName || 'this contact'}?\n\n` +
-                `Outcome: ${PREVIEW_OUTCOME_LABELS[outcomeToUndo.outcome] || outcomeToUndo.outcome}\n` +
-                `Payment: $${outcomeToUndo.payment.toFixed(2)}\n\n` +
-                'This removes the leaderboard/payment entry and restores the call to the queue.'
+                isMeeting
+                    ? `Remove the scheduled meeting for ${outcomeToUndo.contactName || 'this contact'}?\n\n` +
+                      `Meeting: ${meetingWhen || 'time not stored'}\n` +
+                      `Payment: $${outcomeToUndo.payment.toFixed(2)}\n\n` +
+                      'This takes the meeting off the schedule, reverses the pay and achievement pool, and puts the call back in the queue. A second copy from a double-click is removed too.'
+                    : `Undo the recorded call for ${outcomeToUndo.contactName || 'this contact'}?\n\n` +
+                      `Outcome: ${PREVIEW_OUTCOME_LABELS[outcomeToUndo.outcome] || outcomeToUndo.outcome}\n` +
+                      `Payment: $${outcomeToUndo.payment.toFixed(2)}\n\n` +
+                      'This removes the leaderboard/payment entry and restores the call to the queue.'
             );
             if (!confirmed) return;
 
+            await undoRecordedOutcome(outcomeToUndo, true);
+        };
+
+        window.removeRecentMeeting = async function(index) {
+            const outcomeToUndo = recentCallsHistory[index];
+            if (!outcomeToUndo || outcomeToUndo.outcome !== 'spoke-scheduled-meeting') return;
+            const meetingWhen = [outcomeToUndo.meetingDate, outcomeToUndo.meetingTime].filter(Boolean).join(' at ');
+            const confirmed = confirm(
+                `Remove the scheduled meeting for ${outcomeToUndo.contactName || 'this contact'}?\n\n` +
+                `Meeting: ${meetingWhen || 'time not stored'}\n` +
+                `Payment: $${Number(outcomeToUndo.payment || 0).toFixed(2)}\n\n` +
+                'This takes the meeting off the schedule and reverses the pay. The call is put back in the queue.'
+            );
+            if (!confirmed) return;
+            await undoRecordedOutcome(outcomeToUndo, outcomeToUndo.trackingId === lastRecordedOutcome?.trackingId);
+        };
+
+        async function undoRecordedOutcome(outcomeToUndo, restoreIntoQueue) {
+            const isMeeting = outcomeToUndo.outcome === 'spoke-scheduled-meeting';
             try {
                 console.log('↩️ Undoing previous call:', outcomeToUndo);
                 const returnBtn = document.getElementById('undoLastOutcomeBtn');
-                if (returnBtn) {
-                    returnBtn.disabled = true;
-                }
+                if (returnBtn) returnBtn.disabled = true;
 
                 const activitySnapshot = await getDoc(doc(db, 'phone_activities', outcomeToUndo.activityId));
                 const activityExists = typeof activitySnapshot.exists === 'function'
@@ -11416,7 +11665,7 @@ Would you have 15 minutes available this week or next for a quick call?`;
                     throw new Error('The phone activity no longer exists.');
                 }
 
-                await revertRecordedCall({
+                const undoResult = await revertRecordedCall({
                     trackingId: outcomeToUndo.trackingId,
                     activityId: outcomeToUndo.activityId,
                     trackingData: {
@@ -11425,34 +11674,46 @@ Would you have 15 minutes available this week or next for a quick call?`;
                             ? outcomeToUndo.timestamp.toISOString()
                             : outcomeToUndo.timestamp,
                         userEmail: currentUser.email,
-                        campaignId: outcomeToUndo.callData.campaignId || selectedCampaign
+                        campaignId: outcomeToUndo.callData?.campaignId || selectedCampaign,
+                        phoneNumber: outcomeToUndo.phoneNumber,
+                        contactName: outcomeToUndo.contactName,
+                        companyName: outcomeToUndo.companyName
                     },
                     activityData: activitySnapshot.data()
-                });
+                }) || {};
+                const extraCopies = undoResult.removedDuplicates || 0;
 
-                lastRecordedOutcome = null;
+                if (lastRecordedOutcome?.trackingId === outcomeToUndo.trackingId) {
+                    lastRecordedOutcome = null;
+                    if (returnBtn) returnBtn.style.display = 'none';
+                }
                 recentCallsHistory = recentCallsHistory.filter(
                     (call) => call.trackingId !== outcomeToUndo.trackingId
                 );
                 updateRecentCallsDisplay();
+                if (returnBtn) returnBtn.disabled = false;
 
-                if (returnBtn) {
-                    returnBtn.style.display = 'none';
-                    returnBtn.disabled = false;
+                if (restoreIntoQueue && outcomeToUndo.callData) {
+                    const restoredCall = {
+                        ...outcomeToUndo.callData,
+                        status: restoredActivityStatus(outcomeToUndo.callData),
+                        outcome: null,
+                        completedAt: null,
+                        completedBy: null
+                    };
+                    callQueue = callQueue.filter((call) => call.id !== restoredCall.id);
+                    callQueue.splice(currentCallIndex, 0, restoredCall);
+                    await loadCurrentCall();
                 }
 
-                const restoredCall = {
-                    ...outcomeToUndo.callData,
-                    status: restoredActivityStatus(outcomeToUndo.callData),
-                    outcome: null,
-                    completedAt: null,
-                    completedBy: null
-                };
-                callQueue = callQueue.filter((call) => call.id !== restoredCall.id);
-                callQueue.splice(currentCallIndex, 0, restoredCall);
-                await loadCurrentCall();
-
-                showAlert('Call outcome undone. The call is active again and totals were corrected.', 'success', 7000);
+                const extra = extraCopies ? ` Also removed ${extraCopies} extra copy from the double-click.` : '';
+                showAlert(
+                    isMeeting
+                        ? `Meeting removed from the schedule.${extra} Pay was reversed and the call can be made again.${formatPoolRestore(undoResult.pool)}`
+                        : 'Call outcome undone. The call is active again and totals were corrected.',
+                    'success',
+                    7000
+                );
                 await Promise.all([
                     loadTeamLeaderboard(true),
                     updatePerformanceStats(),
@@ -11515,6 +11776,11 @@ Would you have 15 minutes available this week or next for a quick call?`;
                         <span class="recent-call-payment">$${call.payment.toFixed(2)}</span>
                         <span class="recent-call-time">${getTimeAgo(call.timestamp)}</span>
                     </div>
+                    ${call.outcome === 'spoke-scheduled-meeting' ? `
+                        <button type="button" onclick="event.stopPropagation(); removeRecentMeeting(${index})" style="margin-top: 0.4rem; background: #dc2626; color: white; border: none; border-radius: 6px; padding: 0.35rem 0.6rem; font-size: 0.75rem; font-weight: 700; cursor: pointer;">
+                            Remove meeting
+                        </button>
+                    ` : ''}
                 </div>
             `).join('');
         }

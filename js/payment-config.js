@@ -186,6 +186,25 @@ export function isQualifyingOutcome(outcome) {
 }
 
 /**
+ * Qualifying-call count left after replaying call history.
+ * A scheduled meeting resets the count to 0. Every other qualifying
+ * outcome adds one. Pass only the calls that should remain.
+ * @param {Array<{outcome?: string, timestamp?: string}>} calls
+ * @returns {number}
+ */
+export function qualifyingCallsAfterHistory(calls) {
+    const ordered = [...(calls || [])].sort(
+        (a, b) => new Date(a.timestamp || 0) - new Date(b.timestamp || 0)
+    );
+    let qualifyingCalls = 0;
+    ordered.forEach((call) => {
+        if (call.outcome === 'spoke-scheduled-meeting') qualifyingCalls = 0;
+        else if (QUALIFYING_OUTCOMES.includes(call.outcome)) qualifyingCalls++;
+    });
+    return qualifyingCalls;
+}
+
+/**
  * Get a formatted display name for an outcome
  * @param {string} outcome - The call outcome
  * @returns {string} Display name
@@ -209,6 +228,7 @@ export default {
     ACHIEVEMENT_POOL_CONFIG,
     SOFT_CAP_EFFECTIVE_DATE,
     calculateAchievementPool,
+    qualifyingCallsAfterHistory,
     getPaymentForOutcome,
     isQualifyingOutcome,
     getOutcomeDisplayName,
