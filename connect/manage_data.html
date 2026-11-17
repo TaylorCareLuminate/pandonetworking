@@ -14,6 +14,7 @@
     <script src="../js/auth.js?v=2.1"></script>
     <script src="../js/folder-protection.js?v=2.1"></script>
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <script src="client-work-log.js?v=1"></script>
     <script src="workspace-routing.js?v=3"></script>
     <link rel="stylesheet" href="pando-theme.css?v=4">
 
@@ -885,6 +886,25 @@
     // ═════════════════════════════════════════════════════════════════════
     // Opening a view
     // ═════════════════════════════════════════════════════════════════════
+    // Client work log: records which Manage Data tool was used, and in which BDR / workspace context
+    // (throttled to once per tool+context per 10 minutes). The tools run in embedded pages, so this is
+    // the only shell-level evidence of "what data work happened for whom" besides the CSV import record.
+    const _wlViewSeen = new Map();
+    function logViewOpen(view) {
+        try {
+            if (!window.ClientWorkLog || !state.authKnown || !view || view.key === 'overview') return;
+            const k = view.key + '|' + (state.ctx || '');
+            if (Date.now() - (_wlViewSeen.get(k) || 0) < 10 * 60 * 1000) return;
+            _wlViewSeen.set(k, Date.now());
+            window.ClientWorkLog.log({
+                page: 'manage_data', category: 'data_management', action: 'tool_opened',
+                summary: `Opened Manage Data tool "${view.label || view.key}"${view.group && view.group.label ? ` (${view.group.label})` : ''} while working in ${state.ctxLabel || KIND_LABEL[state.ctxKind] || 'no context'}`,
+                bdrEmail: state.ctxKind === 'bdr' ? state.ctx : '',
+                detail: { view: view.key, view_label: view.label || '', group: (view.group && view.group.label) || '', context_kind: state.ctxKind, contextLabel: state.ctxLabel || '' }
+            });
+        } catch (e) { /* non-fatal */ }
+    }
+
     function open(key, opts) {
         opts = opts || {};
         if (key && key.startsWith('page:')) key = PAGE_DEFAULT_VIEW[key.slice(5)] || 'overview';
@@ -897,6 +917,7 @@
         }
 
         state.view = view.key;
+        logViewOpen(view);
         document.querySelectorAll('.md-item').forEach(b => b.classList.toggle('active', b.dataset.view === view.key));
         document.querySelectorAll('.md-native').forEach(s => s.classList.remove('active'));
         state.frames.forEach(f => f.classList.remove('active'));
@@ -1470,6 +1491,18 @@
                     <div style="margin-top:.5rem; font-size:.8rem;">${state.ctx === target ? 'Other panels show the new contacts after you reload them (the Reload button above).' : `To work with them, choose <b>${esc(wsLabel)}</b> in “Working in” at the top.`}</div>`, !!failed);
                 $('lcBar').style.display = 'none';
                 if (hg && hg.created) { $('lcHgNew').value = ''; await loadGroups(); $('lcHg').value = hg.groupId; $('lcHgNew').style.display = 'none'; }
+                // Client work log: one record per CSV import (the contacts themselves carry importBatchId)
+                try {
+                    window.ClientWorkLog?.log({
+                        page: 'manage_data', category: 'data_management', action: 'csv_contacts_imported',
+                        summary: `CSV import "${st.fileName}" into ${wsLabel}: ${created} new contact(s), ${alreadyThere} already present (${filled} blanks filled, ${tagged} newly tagged), ${st.parsed.invalid.length} row(s) skipped${failed ? `, ${failed} failed` : ''}`,
+                        bdrEmail: kindOf(target) === 'bdr' ? target : '',
+                        hypothesisGroupId: hg ? hg.groupId : '', hypothesisGroupName: hg ? hg.groupName : '',
+                        batchId,
+                        counts: { contacts_created: created, already_present: alreadyThere, blanks_filled: filled, newly_tagged: tagged, left_unchanged: untouched, in_other_group: otherGroup, rows_skipped_no_url: st.parsed.invalid.length, failed, rows_in_file: contacts.length + st.parsed.invalid.length },
+                        detail: { file_name: st.fileName, destination: wsLabel, destination_kind: kindOf(target), contextLabel: wsLabel, hypothesis_group_created: !!(hg && hg.created) }
+                    });
+                } catch (_wlErr) { /* non-fatal */ }
                 toast(`Loaded <b>${created.toLocaleString()}</b> contact${created !== 1 ? 's' : ''} into <b>${esc(wsLabel)}</b>${hg ? ` · hypothesis group <b>${esc(hg.groupName)}</b>` : ''}.`);
                 // Retire the mapping UI (so it can't be re-run by accident) but keep the skipped-rows download working
                 lastRun = st; st = null;

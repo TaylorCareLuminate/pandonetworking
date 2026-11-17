@@ -15,6 +15,8 @@
     <script src="../js/folder-protection.js?v=2.1"></script>
     <!-- CLEmail Secure API Wrapper -->
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <!-- Client Work Log: records pipeline runs for the weekly client report (export_outreach_history.html) -->
+    <script src="client-work-log.js?v=1"></script>
     <!-- Shared Final AI Review rules store (Firestore-backed, localStorage cache) -->
     <script src="final-ai-review-rules-store.js"></script>
     <!-- Message Generation Data Archive: full research snapshot per generated message, 90-day retention -->
@@ -2224,6 +2226,19 @@
             if (!popup) return;
             const ids = new Set((popup._dncMatches || []).map(m => m.msgId));
             if (ids.size === 0) return;
+
+            // Client work log: the removal is otherwise in-memory only, so record which orgs were dropped
+            try {
+                const _wlGrpEl = document.getElementById('fpGroupSelect');
+                const _wlRemoved = (popup._dncMatches || []).slice(0, 25).map(m => m.orgName || m.name || m.company || m.msgId);
+                window.ClientWorkLog?.log({
+                    page: 'full_pipeline', category: 'pipeline', action: 'dnc_orgs_removed_from_queue',
+                    summary: `Removed ${ids.size} Do-Not-Contact organization(s) from this pipeline run's queue`,
+                    hypothesisGroupId: _wlGrpEl?.value || '',
+                    hypothesisGroupName: _wlGrpEl?.value ? (_wlGrpEl.selectedOptions[0]?.text || '') : '',
+                    counts: { orgs_removed: ids.size }, detail: { sample_orgs: _wlRemoved }
+                });
+            } catch (_wlErr) { /* non-fatal */ }
 
             fpGroupOrgs = fpGroupOrgs.filter(o => !ids.has(o.id));
             fpRenderGroupOrgsTable();
@@ -9014,6 +9029,34 @@
                 report.totals.noMessageTally = window.fpRunNoMsgTally || {};
                 report.totals.postTypeTally = fpRunPostTypeTally || {};
                 report.totals.messageSourceTally = fpRunMessageSourceTally || {};
+
+                // Client work log: one record per pipeline run (full detail stays in full_pipeline_runs/{runId}).
+                // One record per BDR in the run's plan so the work is attributable to each client.
+                try {
+                    const _wlT = report.totals || {};
+                    const _wlMinutes = Math.round((new Date(report.finishedAt) - new Date(report.startedAt)) / 60000);
+                    (bdrPlan.length ? bdrPlan : [{ bdrEmail: '', target: 0, generated: 0 }]).forEach(plan => {
+                        window.ClientWorkLog?.log({
+                            page: 'full_pipeline', category: 'pipeline', action: 'pipeline_run_' + report.status,
+                            summary: `Full Pipeline run ${report.status} for group "${groupName}" — ${plan.bdrEmail || 'no BDR'}: ${plan.generated}/${plan.target} message(s) generated; ` +
+                                     `run totals: ${_wlT.contactsScanned || 0} contacts scanned, ${_wlT.matched || 0} matched target rules, ${_wlT.dropped || 0} dropped, ` +
+                                     `${_wlT.messages || 0} messages, ${(report.orgs || []).length} organizations processed (${_wlMinutes} min)`,
+                            bdrEmail: plan.bdrEmail, runId,
+                            hypothesisGroupId: groupId || '', hypothesisGroupName: groupName || '',
+                            counts: {
+                                bdr_target: plan.target, bdr_generated: plan.generated,
+                                run_orgs_processed: (report.orgs || []).length,
+                                run_contacts_scanned: _wlT.contactsScanned || 0, run_cross_bdr_imported: _wlT.crossBdrImported || 0,
+                                run_matched_rules: _wlT.matched || 0, run_dropped_rules: _wlT.dropped || 0, run_messages: _wlT.messages || 0,
+                                run_opus_approved: _wlT.opusApproved || 0, run_opus_needs_attention: _wlT.opusNeedsAttention || 0,
+                                run_opus_excluded: _wlT.opusExcluded || 0, run_final_review_flagged: _wlT.finalReviewFlagged || 0,
+                                run_dnc_skipped_orgs: _wlT.dncSkippedOrgs || 0, run_already_connected: _wlT.alreadyConnected || 0,
+                                run_apify_usd: _wlT.apifyUsd || 0, run_minutes: _wlMinutes
+                            },
+                            detail: { status: report.status, error: report.error || '', build_model: report.models?.buildModel || '', opus_model: report.models?.opusModel || '', scan_name: report.settings?.scanName || '', started_by: report.startedBy }
+                        });
+                    });
+                } catch (_wlErr) { /* non-fatal */ }
 
                 const totalGen = bdrPlan.reduce((s, b) => s + b.generated, 0);
 
