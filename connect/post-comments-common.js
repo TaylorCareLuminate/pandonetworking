@@ -1,5 +1,5 @@
 /**
- * Shared helpers for post_comments.html, post_replies_review.html and posts_reposts.html.
+ * Shared helpers for unipile_processes.html, post_replies_review.html and posts_reposts.html.
  * Everything goes through the Railway API (/post-comments); these pages never touch Firestore or Unipile directly.
  * Auth follows .cursor/rules/auth-patterns.mdc: window.firebaseReady / window.auth, no redirects from here.
  */

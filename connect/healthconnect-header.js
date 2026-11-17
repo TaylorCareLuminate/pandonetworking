@@ -112,7 +112,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'Mass Messages to Connections', href: 'mass_messages_to_connections.html', icon: 'fa-paper-plane' },
                 { label: 'Mass Upload', href: 'mass_upload.html', icon: 'fa-cloud-upload-alt' },
                 { label: 'Manage Prompts', href: 'generate_prompts.html', icon: 'fa-brain' },
-                { label: 'Post Comments', href: 'post_comments.html', icon: 'fa-comments' },
+                { label: 'Unipile Processes', href: 'unipile_processes.html', icon: 'fa-diagram-project' },
                 { label: 'Post Ideas', href: 'post_ideas_admin.html', icon: 'fa-lightbulb' },
                 { label: 'Scraped Posts', href: 'scrapped_linkedin_posts.html', icon: 'fab fa-linkedin' },
                 { label: 'Filtered Messages', href: 'filtered_messages.html', icon: 'fa-filter' },
