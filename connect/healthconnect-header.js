@@ -101,6 +101,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'divider' },
                 // Message Generation & Content
                 { label: 'Generate Messages', href: 'generate_messages.html', icon: 'fa-wand-magic-sparkles' },
+                { label: 'Surveys', href: 'surveys.html', icon: 'fa-square-poll-vertical' },
                 { label: 'New Prospects Quick Message', href: 'quick_outreach.html', icon: 'fa-bolt-lightning' },
                 { label: 'Fast Batch Review', href: 'fast_connect_review.html', icon: 'fa-bolt' },
                 { label: 'Elion Batch Review', href: 'elion_batch_review.html', icon: 'fa-file-import' },

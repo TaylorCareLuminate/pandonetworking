@@ -420,14 +420,42 @@
         // paged manually so only one raw 5,000-doc page is in memory at a time.
         const db = window.clemailDb;
         const { collection, getDocs, query, limit, startAfter } = window.clemailFirestoreModule;
-        const PAGE = 5000, MAX_DOCS = 500000;
+        // Smaller pages + field projection + per-page retries: a 5,000-doc page of FULL
+        // prospect_contacts docs (education, skills, campaign fields…) took longer than the
+        // wrapper's 60 s default and the whole load failed with "Request timed out after 60s".
+        // Only the fields trimProspect()/the accessors above actually read are requested.
+        const PAGE = 1500, MAX_DOCS = 500000, PAGE_TIMEOUT_MS = 180000, MAX_RETRIES = 3;
+        const FIELDS = [
+            'first_name', 'firstName', 'last_name', 'lastName', 'fullName', 'name',
+            'current_title', 'title', 'position', 'headline',
+            'current_company', 'company', 'companyName', 'searched_organization_name',
+            'location', 'linkedin_url', 'linkedInUrl',
+            'summary', 'about', 'experience_paragraph', 'experience'
+        ];
         const contacts = [];
         const seen = new Set();
         let duplicatesSkipped = 0, fetched = 0, lastId = null;
         statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Downloading prospect_contacts (paged, large collection — this can take a few minutes)…</div>`;
         for (;;) {
             const constraints = lastId ? [startAfter({ id: lastId }), limit(PAGE)] : [limit(PAGE)];
-            const snap = await getDocs(query(collection(db, 'prospect_contacts'), ...constraints));
+            let pageQuery = query(collection(db, 'prospect_contacts'), ...constraints);
+            if (typeof pageQuery.select === 'function') pageQuery = pageQuery.select(...FIELDS);
+            let snap = null, lastErr = null;
+            for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+                try {
+                    snap = await getDocs(pageQuery, { timeoutMs: PAGE_TIMEOUT_MS });
+                    lastErr = null;
+                    break;
+                } catch (err) {
+                    lastErr = err;
+                    const retryable = err && (err.code === 'TIMEOUT' || err.name === 'TypeError' || err.code === 502 || err.code === 503 || err.code === 504);
+                    if (!retryable || attempt === MAX_RETRIES) break;
+                    console.warn(`[AI Screener] page fetch failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying…`, err.message);
+                    statusEl.innerHTML = `<div class="loading-spinner"><i class="fas fa-circle-notch fa-spin fa-lg"></i> Server slow — retrying page (attempt ${attempt + 2}/${MAX_RETRIES + 1}); ${contacts.length.toLocaleString()} contacts so far…</div>`;
+                    await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+                }
+            }
+            if (lastErr) throw lastErr;
             const docs = snap.docs;
             if (!docs.length) break;
             docs.forEach(d => {
