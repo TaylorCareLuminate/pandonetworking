@@ -2837,6 +2837,899 @@
       return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     }
 
+    // =====================================================================
+    // CASH, RECEIVABLES & PROFITABILITY
+    // ChatGPT reviews mailboxes + accounting records and returns a JSON file
+    // (schema healthluminate.finance-import.v1). We validate it, store it as a
+    // dated snapshot in cl/finance_snapshots, and render it at the bottom of the page.
+    // =====================================================================
+    const FIN_PATH = 'cl/finance_snapshots';
+    const FIN_SCHEMA_IN = 'healthluminate.finance-import.v1';
+    const FIN_SCHEMA_OUT = 'healthluminate.finance-export.v1';
+    const FIN_CF_FIELDS = ['receivablesCollections', 'newBillingCollections', 'otherInflows', 'cogsPayments', 'payablesPayments', 'debtService', 'payroll', 'operatingExpenses', 'otherOutflows'];
+    const FIN_PF_FIELDS = ['revenue', 'cogs', 'operatingExpenses', 'payroll'];
+    const FIN_AGING = [
+      { key: 'current', label: 'Not yet due', color: '#2a9d8f' },
+      { key: 'd1_30', label: '1-30 days late', color: '#e9c46a' },
+      { key: 'd31_60', label: '31-60 days late', color: '#f4a261' },
+      { key: 'd61_90', label: '61-90 days late', color: '#e76f51' },
+      { key: 'd90p', label: '90+ days late', color: '#a4161a' },
+      { key: 'nodate', label: 'No due date', color: '#bbb' }
+    ];
+
+    const finEl = id => document.getElementById(id);
+    const finEsc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const finArr = v => Array.isArray(v) ? v.filter(x => x !== null && x !== undefined) : (v && typeof v === 'object' ? Object.values(v) : []);
+    const finStr = (v, max) => (v === null || v === undefined) ? '' : String(v).trim().slice(0, max || 2000);
+    const finPad = n => String(n).padStart(2, '0');
+    const finSum = (list, fn) => list.reduce((t, x) => t + (fn(x) || 0), 0);
+
+    // "$1,234.50", "(1,200)", "-300", 5000 -> number; anything unusable -> null
+    function finNum(v) {
+      if (v === null || v === undefined || v === '') return null;
+      if (typeof v === 'number') return isFinite(v) ? v : null;
+      let s = String(v).trim();
+      if (!s) return null;
+      const neg = /^\(.*\)$/.test(s) || /^-/.test(s);
+      s = s.replace(/[^0-9.]/g, '');
+      if (!s || s === '.') return null;
+      const n = parseFloat(s);
+      return isFinite(n) ? (neg ? -n : n) : null;
+    }
+
+    function finTodayStr() {
+      const d = new Date();
+      return `${d.getFullYear()}-${finPad(d.getMonth() + 1)}-${finPad(d.getDate())}`;
+    }
+
+    // -> 'YYYY-MM-DD' or ''
+    function finDate(v) {
+      const s = finStr(v, 40);
+      if (!s) return '';
+      let m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
+      let y, mo, d;
+      if (m) { y = +m[1]; mo = +m[2]; d = +m[3]; }
+      else {
+        const dt = new Date(s);
+        if (isNaN(dt.getTime())) return '';
+        y = dt.getFullYear(); mo = dt.getMonth() + 1; d = dt.getDate();
+      }
+      const chk = new Date(y, mo - 1, d);
+      if (chk.getFullYear() !== y || chk.getMonth() !== mo - 1 || chk.getDate() !== d) return '';
+      return `${y}-${finPad(mo)}-${finPad(d)}`;
+    }
+
+    // -> 'YYYY-MM' or ''
+    function finMonth(v) {
+      const m = /^(\d{4})-(\d{1,2})/.exec(finStr(v, 20));
+      if (!m) return '';
+      const mo = +m[2];
+      return (mo >= 1 && mo <= 12) ? `${m[1]}-${finPad(mo)}` : '';
+    }
+
+    function finDayNum(ymd) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || '');
+      return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) / 864e5 : null;
+    }
+
+    // Positive = days past due as of today. null = no usable due date.
+    function finDaysOverdue(due) {
+      const a = finDayNum(due);
+      return a === null ? null : finDayNum(finTodayStr()) - a;
+    }
+
+    function finMoney(v) {
+      if (v === null || v === undefined || isNaN(v)) return '—';
+      const r = Math.round(v);
+      return (r < 0 ? '-$' : '$') + Math.abs(r).toLocaleString('en-US');
+    }
+
+    function finMonthLabel(mk) {
+      const m = /^(\d{4})-(\d{2})$/.exec(mk || '');
+      return m ? new Date(+m[1], +m[2] - 1, 1).toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) : (mk || '');
+    }
+
+    function finDateLabel(ymd) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || '');
+      return m ? new Date(+m[1], +m[2] - 1, +m[3]).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
+    }
+
+    function finNormName(s) {
+      return String(s || '').toLowerCase().replace(/&/g, ' and ')
+        .replace(/\b(inc|llc|ltd|corp|corporation|co|company|pllc|pc|llp)\b\.?/g, ' ')
+        .replace(/[^a-z0-9]+/g, ' ').trim();
+    }
+
+    // Match an invoice's customer to a CRM company (exact id first, then a unique normalized-name match)
+    function finMatchCompany(companyId, name) {
+      if (companyId) {
+        const byId = allCompanies.find(c => c.id === companyId);
+        if (byId) return byId;
+      }
+      const n = finNormName(name);
+      if (!n) return null;
+      const hits = allCompanies.filter(c => finNormName(c.name) === n);
+      return hits.length === 1 ? hits[0] : null;
+    }
+
+    function finStrList(v, max) {
+      return finArr(v).map(x => {
+        if (typeof x === 'string') return finStr(x, max || 600);
+        if (x && typeof x === 'object') {
+          const main = finStr(x.text || x.risk || x.action || x.item || x.title || x.name || x.description, max || 600);
+          const extra = finStr(x.detail || x.need || x.why || x.notes, max || 600);
+          return extra ? (main ? `${main} - ${extra}` : extra) : main;
+        }
+        return finStr(x, max || 600);
+      }).filter(Boolean);
+    }
+
+    // Tolerant JSON parse: code fences, leading/trailing prose, trailing commas
+    function finParseResponse(text) {
+      let t = String(text || '').replace(/^\uFEFF/, '').trim();
+      const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (fence) t = fence[1].trim();
+      const a = t.indexOf('{'), b = t.lastIndexOf('}');
+      if (a >= 0 && b > a) t = t.slice(a, b + 1);
+      try { return JSON.parse(t); }
+      catch (e1) {
+        try { return JSON.parse(t.replace(/,\s*([}\]])/g, '$1')); }
+        catch (e2) { throw new Error('Could not read this as JSON: ' + e1.message); }
+      }
+    }
+
+    function finNormRows(list, fields, label, warnings) {
+      const map = {};
+      finArr(list).forEach((row, i) => {
+        if (!row || typeof row !== 'object') return;
+        const m = finMonth(row.month);
+        if (!m) { warnings.push(`${label} row #${i + 1} has no valid month (use YYYY-MM) - skipped.`); return; }
+        if (map[m]) warnings.push(`${label}: month ${m} appears twice - using the later row.`);
+        const o = { month: m, notes: finStr(row.notes, 600) };
+        fields.forEach(f => { const n = finNum(row[f]); o[f] = n === null ? 0 : n; });
+        map[m] = o;
+      });
+      const rows = Object.values(map).sort((a, b) => a.month.localeCompare(b.month));
+      if (rows.length && rows.length < 12) warnings.push(`${label} covers only ${rows.length} month(s); 12 were requested.`);
+      return rows;
+    }
+
+    // Validate + clean ChatGPT's response into a snapshot. Returns { snap, warnings, errors }
+    function finNormalize(raw) {
+      const warnings = [], errors = [];
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { errors: ['The response must be a single JSON object.'], warnings };
+      if (raw.schema && raw.schema !== FIN_SCHEMA_IN) warnings.push(`Schema is "${raw.schema}" (expected "${FIN_SCHEMA_IN}"). Importing anyway.`);
+
+      const snap = { schema: FIN_SCHEMA_IN };
+      snap.asOf = finDate(raw.asOf);
+      if (!snap.asOf) { snap.asOf = finTodayStr(); warnings.push('No valid "asOf" date - using today.'); }
+
+      // ---- cash
+      const cashIn = raw.cash && typeof raw.cash === 'object' && !Array.isArray(raw.cash) ? raw.cash : {};
+      snap.cash = { accounts: [], note: finStr(cashIn.note, 1000) };
+      finArr(cashIn.accounts || raw.cashAccounts).forEach((a, i) => {
+        if (!a || typeof a !== 'object') return;
+        const name = finStr(a.name, 150), bal = finNum(a.balance);
+        if (!name) { warnings.push(`Cash account #${i + 1} has no name - skipped.`); return; }
+        if (bal === null) { warnings.push(`Cash account "${name}" has no balance - skipped.`); return; }
+        snap.cash.accounts.push({ name, type: finStr(a.type, 40) || 'other', balance: bal, asOf: finDate(a.asOf) || snap.asOf, source: finStr(a.source, 400), notes: finStr(a.notes, 600) });
+      });
+
+      // ---- debt
+      snap.debt = [];
+      finArr(raw.debt).forEach((d, i) => {
+        if (!d || typeof d !== 'object') return;
+        const name = finStr(d.name || d.lender, 150), bal = finNum(d.balance);
+        if (!name) { warnings.push(`Debt #${i + 1} has no name - skipped.`); return; }
+        if (bal === null) { warnings.push(`Debt "${name}" has no balance - skipped.`); return; }
+        snap.debt.push({
+          name, lender: finStr(d.lender, 150), type: finStr(d.type, 40), balance: bal,
+          interestRate: finNum(d.interestRate), monthlyPayment: finNum(d.monthlyPayment),
+          nextPaymentDate: finDate(d.nextPaymentDate), maturityDate: finDate(d.maturityDate),
+          secured: d.secured === true || String(d.secured).toLowerCase() === 'true',
+          notes: finStr(d.notes, 600), source: finStr(d.source, 400)
+        });
+      });
+
+      // ---- receivables
+      const unmatched = new Set();
+      snap.receivables = [];
+      finArr(raw.receivables).forEach((r, i) => {
+        if (!r || typeof r !== 'object') return;
+        const rawName = finStr(r.customerName || r.customer || r.name, 200);
+        const match = finMatchCompany(finStr(r.companyId, 100), rawName);
+        const customerName = rawName || (match ? match.name : '');
+        if (!customerName) { warnings.push(`Receivable #${i + 1} has no customer name - skipped.`); return; }
+        const amount = finNum(r.amount), paid = finNum(r.amountPaid) || 0;
+        let outstanding = finNum(r.outstanding);
+        if (outstanding === null && amount !== null) outstanding = Math.max(0, amount - paid);
+        if (outstanding === null) { warnings.push(`Receivable for ${customerName}${r.invoiceNumber ? ' #' + r.invoiceNumber : ''} has no amount - skipped.`); return; }
+        let status = finStr(r.status, 20).toLowerCase().replace(/[\s-]+/g, '_');
+        if (!['open', 'partial', 'disputed', 'paid', 'written_off'].includes(status)) status = outstanding <= 0 ? 'paid' : (paid > 0 ? 'partial' : 'open');
+        const dueDate = finDate(r.dueDate);
+        const isOpen = outstanding > 0 && status !== 'paid' && status !== 'written_off';
+        if (!dueDate && isOpen) warnings.push(`Receivable for ${customerName}${r.invoiceNumber ? ' #' + r.invoiceNumber : ''} has no valid due date, so it cannot be aged.`);
+        if (!match) unmatched.add(customerName);
+        snap.receivables.push({
+          id: 'ar-' + (snap.receivables.length + 1),
+          companyId: match ? match.id : '', customerName: match ? (rawName || match.name) : customerName,
+          invoiceNumber: finStr(r.invoiceNumber, 60), invoiceDate: finDate(r.invoiceDate), dueDate,
+          amount: amount === null ? outstanding + paid : amount, amountPaid: paid, outstanding, status,
+          lastContactDate: finDate(r.lastContactDate), promisedPaymentDate: finDate(r.promisedPaymentDate),
+          notes: finStr(r.notes, 800), source: finStr(r.source, 400)
+        });
+      });
+      if (unmatched.size) {
+        const names = Array.from(unmatched);
+        warnings.push(`${names.length} customer(s) could not be matched to a CRM company (shown without a link): ${names.slice(0, 8).join(', ')}${names.length > 8 ? ', ...' : ''}.`);
+      }
+
+      // ---- payables
+      snap.payables = [];
+      finArr(raw.payables).forEach((p, i) => {
+        if (!p || typeof p !== 'object') return;
+        const vendor = finStr(p.vendor || p.name, 200);
+        if (!vendor) { warnings.push(`Payable #${i + 1} has no vendor - skipped.`); return; }
+        const amount = finNum(p.amount), paid = finNum(p.amountPaid) || 0;
+        let outstanding = finNum(p.outstanding);
+        if (outstanding === null && amount !== null) outstanding = Math.max(0, amount - paid);
+        if (outstanding === null) { warnings.push(`Payable to ${vendor} has no amount - skipped.`); return; }
+        let status = finStr(p.status, 20).toLowerCase().replace(/[\s-]+/g, '_');
+        if (!['open', 'partial', 'disputed', 'scheduled', 'paid'].includes(status)) status = outstanding <= 0 ? 'paid' : (paid > 0 ? 'partial' : 'open');
+        snap.payables.push({
+          id: 'ap-' + (snap.payables.length + 1), vendor,
+          invoiceNumber: finStr(p.invoiceNumber, 60), invoiceDate: finDate(p.invoiceDate), dueDate: finDate(p.dueDate),
+          amount: amount === null ? outstanding + paid : amount, amountPaid: paid, outstanding, status,
+          category: finStr(p.category, 60), notes: finStr(p.notes, 800), source: finStr(p.source, 400)
+        });
+      });
+
+      // ---- forecasts
+      snap.cashForecast = finNormRows(raw.cashForecast, FIN_CF_FIELDS, 'Cash forecast', warnings);
+      snap.profitForecast = finNormRows(raw.profitForecast, FIN_PF_FIELDS, 'Profit forecast', warnings);
+
+      // ---- cash summary
+      const cs = raw.cashSummary && typeof raw.cashSummary === 'object' && !Array.isArray(raw.cashSummary) ? raw.cashSummary : null;
+      if (cs) {
+        let health = finStr(cs.overallHealth, 20).toLowerCase();
+        if (!['strong', 'stable', 'watch', 'critical'].includes(health)) { if (health) warnings.push(`overallHealth "${health}" is not one of strong/stable/watch/critical.`); health = ''; }
+        const narr = Array.isArray(cs.narrative) ? cs.narrative.map(x => finStr(x, 3000)).join('\n\n') : finStr(cs.narrative, 8000);
+        snap.cashSummary = {
+          overallHealth: health, headline: finStr(cs.headline, 300), narrative: narr,
+          keyRisks: finStrList(cs.keyRisks, 500),
+          recommendedActions: finArr(cs.recommendedActions).map(a => {
+            if (typeof a === 'string') return { action: finStr(a, 500), priority: '', owner: '', dueDate: '' };
+            const pr = finStr(a && a.priority, 10).toLowerCase();
+            return { action: finStr(a && (a.action || a.text), 500), priority: ['high', 'medium', 'low'].includes(pr) ? pr : '', owner: finStr(a && a.owner, 80), dueDate: finDate(a && a.dueDate) };
+          }).filter(a => a.action),
+          runwayMonths: finNum(cs.runwayMonths),
+          confidence: ['high', 'medium', 'low'].includes(finStr(cs.confidence, 10).toLowerCase()) ? finStr(cs.confidence, 10).toLowerCase() : ''
+        };
+        if (!snap.cashSummary.headline && !snap.cashSummary.narrative) { warnings.push('cashSummary has no headline or narrative.'); }
+      } else {
+        snap.cashSummary = null;
+        warnings.push('No cashSummary was included.');
+      }
+
+      snap.assumptions = finStrList(raw.assumptions);
+      snap.dataGaps = finStrList(raw.dataGaps);
+      snap.sources = finStrList(raw.sources, 400);
+
+      if (!snap.cash.accounts.length && !snap.debt.length && !snap.receivables.length && !snap.payables.length && !snap.cashForecast.length && !snap.profitForecast.length && !snap.cashSummary) {
+        errors.push('No usable finance data was found in this response.');
+      }
+      if (!snap.cash.accounts.length) warnings.push('No cash balances were included - cash projections will start from $0.');
+      return { snap, warnings, errors };
+    }
+
+    // Rebuild a snapshot read back from Firebase (empty arrays are dropped, arrays can come back as objects)
+    function finHydrate(s) {
+      if (!s) return null;
+      const cs = s.cashSummary ? Object.assign({}, s.cashSummary, { keyRisks: finArr(s.cashSummary.keyRisks), recommendedActions: finArr(s.cashSummary.recommendedActions) }) : null;
+      return Object.assign({}, s, {
+        cash: { accounts: finArr(s.cash && s.cash.accounts), note: (s.cash && s.cash.note) || '' },
+        debt: finArr(s.debt), receivables: finArr(s.receivables), payables: finArr(s.payables),
+        cashForecast: finArr(s.cashForecast), profitForecast: finArr(s.profitForecast),
+        cashSummary: cs, assumptions: finArr(s.assumptions), dataGaps: finArr(s.dataGaps), sources: finArr(s.sources)
+      });
+    }
+
+    const finIsOpen = r => r.outstanding > 0 && r.status !== 'paid' && r.status !== 'written_off';
+
+    function finBucket(days) {
+      if (days === null) return 'nodate';
+      if (days <= 0) return 'current';
+      if (days <= 30) return 'd1_30';
+      if (days <= 60) return 'd31_60';
+      if (days <= 90) return 'd61_90';
+      return 'd90p';
+    }
+
+    // All derived numbers for a snapshot (days overdue are measured as of today)
+    function finMetrics(s) {
+      const cashTotal = finSum(s.cash.accounts, a => a.balance);
+      const debtTotal = finSum(s.debt, d => d.balance);
+      const openAR = s.receivables.filter(finIsOpen).map(r => Object.assign({}, r, { days: finDaysOverdue(r.dueDate) }));
+      const openAP = s.payables.filter(finIsOpen).map(p => Object.assign({}, p, { days: finDaysOverdue(p.dueDate) }));
+      const aging = list => { const a = {}; FIN_AGING.forEach(b => a[b.key] = 0); list.forEach(x => { a[finBucket(x.days)] += x.outstanding; }); return a; };
+      const arTotal = finSum(openAR, r => r.outstanding), apTotal = finSum(openAP, p => p.outstanding);
+      const arOverdue = finSum(openAR.filter(r => r.days !== null && r.days > 0), r => r.outstanding);
+      const apOverdue = finSum(openAP.filter(p => p.days !== null && p.days > 0), p => p.outstanding);
+      const arCollectible = finSum(openAR.filter(r => r.status !== 'disputed' && (r.days === null || r.days <= 60)), r => r.outstanding);
+
+      let w = cashTotal, wo = cashTotal;
+      const rows = s.cashForecast.map(r => {
+        const inflowNew = r.newBillingCollections + r.otherInflows;
+        const outflow = r.cogsPayments + r.payablesPayments + r.debtService + r.payroll + r.operatingExpenses + r.otherOutflows;
+        w += r.receivablesCollections + inflowNew - outflow;
+        wo += inflowNew - outflow;
+        return Object.assign({}, r, { inflowNew, outflow, net: r.receivablesCollections + inflowNew - outflow, closingWith: w, closingWithout: wo });
+      });
+      const firstNeg = key => rows.find(r => r[key] < 0) || null;
+
+      const profitRows = s.profitForecast.map(r => {
+        const gross = r.revenue - r.cogs;
+        const net = gross - r.operatingExpenses - r.payroll;
+        return Object.assign({}, r, { gross, net, margin: r.revenue > 0 ? net / r.revenue * 100 : null });
+      });
+
+      return {
+        cashTotal, debtTotal, openAR, openAP, arTotal, apTotal, arOverdue, apOverdue,
+        arAging: aging(openAR), apAging: aging(openAP),
+        cashAfterAP: cashTotal - apTotal,
+        liquidity: cashTotal + arTotal - apTotal,
+        conservative: cashTotal + arCollectible - apTotal,
+        netPosition: cashTotal + arTotal - apTotal - debtTotal,
+        monthlyDebtService: finSum(s.debt, d => d.monthlyPayment),
+        rows, firstNegWith: firstNeg('closingWith'), firstNegWithout: firstNeg('closingWithout'),
+        lowWith: rows.length ? Math.min(...rows.map(r => r.closingWith)) : null,
+        lowWithout: rows.length ? Math.min(...rows.map(r => r.closingWithout)) : null,
+        profitRows,
+        profitTotals: profitRows.reduce((t, r) => ({ revenue: t.revenue + r.revenue, cogs: t.cogs + r.cogs, gross: t.gross + r.gross, opex: t.opex + r.operatingExpenses, payroll: t.payroll + r.payroll, net: t.net + r.net }), { revenue: 0, cogs: 0, gross: 0, opex: 0, payroll: 0, net: 0 })
+      };
+    }
+
+    // ---------- Rendering ----------
+    function finDaysPill(d) {
+      if (d === null || d === undefined) return '<span class="fin-pill gray">no due date</span>';
+      if (d <= 0) return `<span class="fin-pill ok">${d === 0 ? 'due today' : 'due in ' + (-d) + 'd'}</span>`;
+      const cls = d > 60 ? 'bad' : d > 30 ? 'warn' : 'mild';
+      return `<span class="fin-pill ${cls}">${d}d late</span>`;
+    }
+
+    function finCustomerCell(r) {
+      if (r.companyId) {
+        const co = allCompanies.find(c => c.id === r.companyId);
+        return `<a href="account-detail.html?id=${encodeURIComponent(r.companyId)}">${finEsc(r.customerName)}</a>${co && co.stage ? `<div class="sub">${finEsc(co.stage)}</div>` : ''}`;
+      }
+      return `${finEsc(r.customerName)}<div class="sub">not matched to a CRM company</div>`;
+    }
+
+    function finTable(headers, rowsHtml, emptyMsg) {
+      if (!rowsHtml.length) return `<div class="empty-state" style="padding:20px;"><p>${finEsc(emptyMsg)}</p></div>`;
+      return `<table class="fin-table"><thead><tr>${headers.map(h => `<th${h[1] ? ' class="num"' : ''}>${h[0]}</th>`).join('')}</tr></thead><tbody>${rowsHtml.join('')}</tbody></table>`;
+    }
+
+    function renderFinance() {
+      const has = !!finCurrent;
+      finEl('finEmpty').style.display = has ? 'none' : 'block';
+      finEl('finContent').style.display = has ? 'block' : 'none';
+      finEl('finDeleteBtn').style.display = has ? '' : 'none';
+
+      const sel = finEl('finHistorySelect');
+      if (finSnapshots.length > 1) {
+        sel.style.display = '';
+        sel.innerHTML = finSnapshots.slice().reverse().map(s => `<option value="${finEsc(s.id)}"${finCurrent && s.id === finCurrent.id ? ' selected' : ''}>As of ${finEsc(finDateLabel(s.asOf))}${s.id === finSnapshots[finSnapshots.length - 1].id ? ' (latest)' : ''}</option>`).join('');
+      } else { sel.style.display = 'none'; }
+
+      if (!has) {
+        finEl('finAsOfVal').textContent = 'None imported yet';
+        finEl('finAsOfSub').textContent = 'Use "Export for ChatGPT", then "Import results".';
+        return;
+      }
+
+      const s = finCurrent, m = finMetrics(s);
+      const age = finDayNum(finTodayStr()) - finDayNum(s.asOf);
+      finEl('finAsOfVal').innerHTML = `As of ${finEsc(finDateLabel(s.asOf))}${age > 7 ? `<span class="fin-stale">${age} days old - consider refreshing</span>` : ''}`;
+      finEl('finAsOfSub').textContent = `Imported ${s.createdAt ? new Date(s.createdAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : ''}${s.createdBy ? ' by ' + s.createdBy : ''}`;
+
+      renderFinanceSummary(s, m);
+      renderFinanceKpis(s, m);
+      renderFinanceCash(s, m);
+      renderFinanceReceivables(s, m);
+      renderFinanceAp(s, m);
+      renderFinanceDebt(s, m);
+      renderFinanceProfit();
+      renderFinanceNotes(s);
+    }
+
+    function renderFinanceSummary(s, m) {
+      const cs = s.cashSummary, el = finEl('finSummaryCard');
+      if (!cs) {
+        el.innerHTML = '<h3><i class="fas fa-comment-dollar"></i> Cash Summary</h3><div class="fin-alert warn">ChatGPT did not include a written cash summary in this snapshot.</div>';
+        return;
+      }
+      const paras = String(cs.narrative || '').split(/\r?\n\s*\r?\n/).map(p => p.trim()).filter(Boolean)
+        .map(p => `<p>${finEsc(p).replace(/\r?\n/g, '<br>')}</p>`).join('');
+      const risks = (cs.keyRisks || []).map(r => `<li>${finEsc(r)}</li>`).join('');
+      const acts = (cs.recommendedActions || []).map(a =>
+        `<li>${a.priority ? `<span class="fin-prio ${finEsc(a.priority)}">${finEsc(a.priority)}</span>` : ''}${finEsc(a.action)}${a.owner ? ` <span class="muted">(${finEsc(a.owner)}${a.dueDate ? ', by ' + finEsc(finDateLabel(a.dueDate)) : ''})</span>` : (a.dueDate ? ` <span class="muted">(by ${finEsc(finDateLabel(a.dueDate))})</span>` : '')}</li>`).join('');
+      el.innerHTML = `
+        <h3><i class="fas fa-comment-dollar"></i> Cash Summary <span class="fin-h-note">Written by ChatGPT from the snapshot data</span></h3>
+        ${cs.overallHealth ? `<span class="fin-health ${finEsc(cs.overallHealth)}">${finEsc(cs.overallHealth)}</span>` : ''}
+        ${cs.headline ? `<div class="fin-headline">${finEsc(cs.headline)}</div>` : ''}
+        <div class="fin-narrative">${paras}</div>
+        ${(risks || acts) ? `<div class="fin-two-col">
+          <div><h4>Key risks</h4>${risks ? `<ul>${risks}</ul>` : '<p class="muted">None listed.</p>'}</div>
+          <div><h4>Recommended actions</h4>${acts ? `<ul>${acts}</ul>` : '<p class="muted">None listed.</p>'}</div>
+        </div>` : ''}
+        <div class="fin-meta">${cs.confidence ? `Confidence in data: <strong>${finEsc(cs.confidence)}</strong>. ` : ''}${cs.runwayMonths !== null && cs.runwayMonths !== undefined ? `Runway if no current receivables are collected: <strong>${cs.runwayMonths} month(s)</strong>. ` : ''}This is an AI-written assessment - check the underlying numbers below.</div>`;
+    }
+
+    function renderFinanceKpis(s, m) {
+      const pct = m.arTotal > 0 ? Math.round(m.arOverdue / m.arTotal * 100) : 0;
+      const k = [];
+      k.push({ cls: m.cashTotal < 0 ? 'bad' : '', lbl: 'Cash on hand', val: finMoney(m.cashTotal), sub: `${s.cash.accounts.length} account(s) as of ${finDateLabel(s.asOf)}` });
+      k.push({ cls: m.debtTotal > m.cashTotal ? 'warn' : '', lbl: 'Total debt', val: finMoney(m.debtTotal), sub: `Cash less debt: ${finMoney(m.cashTotal - m.debtTotal)}${m.monthlyDebtService ? ` · ${finMoney(m.monthlyDebtService)}/mo payments` : ''}` });
+      k.push({ cls: pct >= 40 ? 'bad' : (m.arOverdue > 0 ? 'warn' : ''), lbl: 'Receivables outstanding', val: finMoney(m.arTotal), sub: `${finMoney(m.arOverdue)} overdue (${pct}%) across ${m.openAR.length} invoice(s)` });
+      k.push({ cls: m.apOverdue > 0 ? 'warn' : '', lbl: 'Payables outstanding', val: finMoney(m.apTotal), sub: `${finMoney(m.apOverdue)} past due across ${m.openAP.length} bill(s)` });
+      k.push({ cls: m.cashAfterAP < 0 ? 'bad' : 'good', lbl: 'Cash after paying all payables', val: finMoney(m.cashAfterAP), sub: 'No receivables collected' });
+      k.push({ cls: 'hl ' + (m.liquidity < 0 ? 'bad' : 'good'), lbl: 'Cash + receivables − payables', val: finMoney(m.liquidity), sub: 'If every open invoice is collected' });
+      k.push({ cls: m.conservative < 0 ? 'bad' : '', lbl: 'Same, conservative', val: finMoney(m.conservative), sub: 'Leaves out disputed and 60+ days late receivables' });
+      k.push({ cls: m.netPosition < 0 ? 'bad' : '', lbl: 'Net position after debt', val: finMoney(m.netPosition), sub: 'Cash + receivables − payables − debt' });
+      if (m.profitRows.length) {
+        const t = m.profitTotals;
+        k.push({ cls: t.net < 0 ? 'bad' : 'good', lbl: `Projected net profit (${m.profitRows.length} mo)`, val: finMoney(t.net), sub: `${t.revenue > 0 ? (t.net / t.revenue * 100).toFixed(1) + '% margin on ' + finMoney(t.revenue) + ' revenue' : 'No revenue forecast'}` });
+      }
+      finEl('finKpis').innerHTML = k.map(x => `<div class="fin-kpi ${x.cls}"><div class="lbl">${x.lbl}</div><div class="val">${x.val}</div><div class="sub">${x.sub}</div></div>`).join('');
+    }
+
+    function finChartSvg(rows) {
+      const W = 860, H = 280, pl = 74, pr = 20, pt = 14, pb = 38;
+      const vals = rows.flatMap(r => [r.closingWith, r.closingWithout]);
+      let lo = Math.min(0, ...vals), hi = Math.max(0, ...vals);
+      if (hi === lo) hi = lo + 1;
+      const pad = (hi - lo) * 0.08; hi += pad; if (lo < 0) lo -= pad;
+      const x = i => pl + (rows.length === 1 ? (W - pl - pr) / 2 : i * (W - pl - pr) / (rows.length - 1));
+      const y = v => pt + (hi - v) * (H - pt - pb) / (hi - lo);
+      const path = key => rows.map((r, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(r[key]).toFixed(1)}`).join(' ');
+      let grid = '';
+      for (let i = 0; i <= 4; i++) {
+        const v = lo + (hi - lo) * i / 4, yy = y(v).toFixed(1);
+        grid += `<line x1="${pl}" x2="${W - pr}" y1="${yy}" y2="${yy}" stroke="#eee"/><text x="${pl - 8}" y="${(+yy + 4)}" text-anchor="end" font-size="11" fill="#888">${finEsc(finMoney(v))}</text>`;
+      }
+      const labels = rows.map((r, i) => `<text x="${x(i).toFixed(1)}" y="${H - 14}" text-anchor="middle" font-size="11" fill="#888">${finEsc(finMonthLabel(r.month).replace(' 20', " '"))}</text>`).join('');
+      const dots = (key, color) => rows.map((r, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(r[key]).toFixed(1)}" r="3.5" fill="${color}"><title>${finEsc(finMonthLabel(r.month))}: ${finEsc(finMoney(r[key]))}</title></circle>`).join('');
+      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%; height:auto; max-height:300px;" role="img" aria-label="Cash projection chart">
+        ${grid}<line x1="${pl}" x2="${W - pr}" y1="${y(0).toFixed(1)}" y2="${y(0).toFixed(1)}" stroke="#e76f51" stroke-dasharray="5 4"/>
+        <path d="${path('closingWithout')}" fill="none" stroke="#e76f51" stroke-width="2.5"/>
+        <path d="${path('closingWith')}" fill="none" stroke="#2a9d8f" stroke-width="2.5"/>
+        ${dots('closingWithout', '#e76f51')}${dots('closingWith', '#2a9d8f')}${labels}</svg>`;
+    }
+
+    function renderFinanceCash(s, m) {
+      const alerts = [];
+      if (!s.cash.accounts.length) alerts.push('<div class="fin-alert warn">No cash balances were provided, so the projection starts from $0.</div>');
+      if (!m.rows.length) {
+        finEl('finCashAlerts').innerHTML = alerts.join('') + '<div class="fin-alert warn">No cash forecast was included in this snapshot.</div>';
+        finEl('finChartWrap').innerHTML = ''; finEl('finCashTable').innerHTML = '';
+        return;
+      }
+      if (m.firstNegWith) alerts.push(`<div class="fin-alert">Even collecting current receivables as ChatGPT expects, cash goes <strong>negative in ${finEsc(finMonthLabel(m.firstNegWith.month))}</strong> (lowest point ${finEsc(finMoney(m.lowWith))}).</div>`);
+      else alerts.push(`<div class="fin-alert ok">Including receivables, cash stays positive through the projection (lowest point ${finEsc(finMoney(m.lowWith))}).</div>`);
+      if (m.firstNegWithout) alerts.push(`<div class="fin-alert ${m.firstNegWith ? '' : 'warn'}">If none of the current receivables are collected, cash goes <strong>negative in ${finEsc(finMonthLabel(m.firstNegWithout.month))}</strong> (lowest point ${finEsc(finMoney(m.lowWithout))}).</div>`);
+      else alerts.push('<div class="fin-alert ok">Cash stays positive even if none of the current receivables are collected.</div>');
+      finEl('finCashAlerts').innerHTML = alerts.join('');
+      finEl('finChartWrap').innerHTML = finChartSvg(m.rows);
+
+      const body = m.rows.map(r => {
+        const tip = `COGS ${finMoney(r.cogsPayments)} · Payables ${finMoney(r.payablesPayments)} · Debt service ${finMoney(r.debtService)} · Payroll ${finMoney(r.payroll)} · Operating ${finMoney(r.operatingExpenses)} · Other ${finMoney(r.otherOutflows)}`;
+        return `<tr title="${finEsc(r.notes)}"><td>${finEsc(finMonthLabel(r.month))}${r.notes ? ' <i class="fas fa-info-circle muted"></i>' : ''}</td>
+          <td class="num">${finMoney(r.receivablesCollections)}</td><td class="num">${finMoney(r.newBillingCollections)}</td><td class="num">${finMoney(r.otherInflows)}</td>
+          <td class="num" title="${finEsc(tip)}">${finMoney(r.outflow)}</td>
+          <td class="num ${r.net < 0 ? 'neg' : 'pos'}">${finMoney(r.net)}</td>
+          <td class="num ${r.closingWith < 0 ? 'neg' : ''}"><strong>${finMoney(r.closingWith)}</strong></td>
+          <td class="num ${r.closingWithout < 0 ? 'neg' : ''}">${finMoney(r.closingWithout)}</td></tr>`;
+      });
+      finEl('finCashTable').innerHTML = finTable([['Month'], ['Current receivables collected', 1], ['New billings collected', 1], ['Other inflows', 1], ['Total outflows', 1], ['Net change', 1], ['Cash incl. receivables', 1], ['Cash excl. current receivables', 1]], body, '');
+    }
+
+    function renderFinanceReceivables(s, m) {
+      // aging bar
+      const total = FIN_AGING.reduce((t, b) => t + m.arAging[b.key], 0);
+      finEl('finAging').innerHTML = total > 0 ? `
+        <div class="fin-aging">${FIN_AGING.map(b => m.arAging[b.key] > 0 ? `<div style="width:${(m.arAging[b.key] / total * 100).toFixed(2)}%; background:${b.color};" title="${b.label}: ${finEsc(finMoney(m.arAging[b.key]))}"></div>` : '').join('')}</div>
+        <div class="fin-aging-legend">${FIN_AGING.filter(b => m.arAging[b.key] > 0).map(b => `<span style="--c:${b.color};">${b.label}: <strong>${finMoney(m.arAging[b.key])}</strong></span>`).join('')}</div>`
+        : '<div class="fin-alert ok">No open receivables in this snapshot.</div>';
+
+      // behind-in-paying by customer
+      const groups = {};
+      m.openAR.forEach(r => {
+        const key = r.companyId || ('n:' + finNormName(r.customerName));
+        const g = groups[key] || (groups[key] = { r, overdue: 0, lateCount: 0, maxDays: 0, all: 0, disputed: false, lastContact: '', promised: '', notes: [] });
+        g.all += r.outstanding;
+        if (r.status === 'disputed') g.disputed = true;
+        if (r.lastContactDate && r.lastContactDate > g.lastContact) g.lastContact = r.lastContactDate;
+        if (r.promisedPaymentDate && (!g.promised || r.promisedPaymentDate < g.promised)) g.promised = r.promisedPaymentDate;
+        if (r.days !== null && r.days > 0) {
+          g.overdue += r.outstanding; g.lateCount++; g.maxDays = Math.max(g.maxDays, r.days);
+          if (r.notes && !g.notes.includes(r.notes)) g.notes.push(r.notes);
+        }
+      });
+      const late = Object.values(groups).filter(g => g.lateCount > 0).sort((a, b) => b.overdue - a.overdue);
+      const body = late.map(g => `<tr>
+        <td>${finCustomerCell(g.r)}</td>
+        <td class="num neg">${finMoney(g.overdue)}</td>
+        <td class="num">${g.lateCount}</td>
+        <td>${finDaysPill(g.maxDays)}${g.disputed ? ' <span class="fin-pill gray">disputed</span>' : ''}</td>
+        <td class="num">${finMoney(g.all)}</td>
+        <td>${g.lastContact ? finEsc(finDateLabel(g.lastContact)) : '<span class="muted">no contact logged</span>'}</td>
+        <td>${g.promised ? finEsc(finDateLabel(g.promised)) : '<span class="muted">—</span>'}</td>
+        <td>${g.notes.slice(0, 2).map(n => finEsc(n)).join('<br>') || '<span class="muted">—</span>'}</td></tr>`);
+      finEl('finOverdueTable').innerHTML = finTable([['Customer'], ['Overdue', 1], ['Late invoices', 1], ['Oldest'], ['Total owed', 1], ['Last follow-up'], ['Promised payment'], ['Why / status']], body, 'No customers are past due.');
+      renderFinanceAr();
+    }
+
+    function renderFinanceAr() {
+      if (!finCurrent) return;
+      const filter = finEl('finArFilter').value;
+      let list = finCurrent.receivables.map(r => Object.assign({}, r, { days: finDaysOverdue(r.dueDate) }));
+      if (filter === 'overdue') list = list.filter(r => finIsOpen(r) && r.days !== null && r.days > 0);
+      else if (filter === 'open') list = list.filter(finIsOpen);
+      list.sort((a, b) => (b.days === null ? -9999 : b.days) - (a.days === null ? -9999 : a.days));
+      const body = list.map(r => `<tr>
+        <td>${finCustomerCell(r)}</td><td>${finEsc(r.invoiceNumber) || '<span class="muted">—</span>'}</td>
+        <td>${finEsc(finDateLabel(r.invoiceDate))}</td><td>${finEsc(finDateLabel(r.dueDate))}</td>
+        <td>${finIsOpen(r) ? finDaysPill(r.days) : `<span class="fin-pill gray">${finEsc(r.status.replace('_', ' '))}</span>`}</td>
+        <td class="num">${finMoney(r.outstanding)}${r.amount !== r.outstanding ? `<div class="sub">of ${finMoney(r.amount)}</div>` : ''}</td>
+        <td>${finEsc(r.status.replace('_', ' '))}</td>
+        <td>${r.lastContactDate ? finEsc(finDateLabel(r.lastContactDate)) : '<span class="muted">—</span>'}${r.promisedPaymentDate ? `<div class="sub">promised ${finEsc(finDateLabel(r.promisedPaymentDate))}</div>` : ''}</td>
+        <td>${finEsc(r.notes)}${r.source ? `<div class="sub">${finEsc(r.source)}</div>` : ''}</td></tr>`);
+      if (body.length) body.push(`<tr class="total"><td colspan="5">Total</td><td class="num">${finMoney(finSum(list.filter(finIsOpen), r => r.outstanding))}</td><td colspan="3"></td></tr>`);
+      finEl('finArTable').innerHTML = finTable([['Customer'], ['Invoice'], ['Invoiced'], ['Due'], ['Timing'], ['Outstanding', 1], ['Status'], ['Last follow-up'], ['Notes / source']], body, filter === 'overdue' ? 'No overdue invoices.' : 'No invoices to show.');
+    }
+
+    function renderFinanceAp(s, m) {
+      const list = m.openAP.slice().sort((a, b) => (b.days === null ? -9999 : b.days) - (a.days === null ? -9999 : a.days));
+      const body = list.map(p => `<tr>
+        <td>${finEsc(p.vendor)}</td><td>${finEsc(p.invoiceNumber) || '<span class="muted">—</span>'}</td>
+        <td>${finEsc(finDateLabel(p.dueDate))}</td><td>${finDaysPill(p.days)}</td>
+        <td class="num">${finMoney(p.outstanding)}</td><td>${finEsc(p.category) || '<span class="muted">—</span>'}</td>
+        <td>${finEsc(p.status.replace('_', ' '))}</td><td>${finEsc(p.notes)}${p.source ? `<div class="sub">${finEsc(p.source)}</div>` : ''}</td></tr>`);
+      if (body.length) body.push(`<tr class="total"><td colspan="4">Total owed (${finMoney(m.apOverdue)} past due)</td><td class="num">${finMoney(m.apTotal)}</td><td colspan="3"></td></tr>`);
+      finEl('finApTable').innerHTML = finTable([['Vendor'], ['Bill #'], ['Due'], ['Timing'], ['Outstanding', 1], ['Category'], ['Status'], ['Notes / source']], body, 'No open payables in this snapshot.');
+    }
+
+    function renderFinanceDebt(s, m) {
+      const body = s.debt.map(d => `<tr>
+        <td>${finEsc(d.name)}${d.secured ? ' <span class="fin-pill gray">secured</span>' : ''}</td><td>${finEsc(d.lender) || '<span class="muted">—</span>'}</td><td>${finEsc(d.type) || '<span class="muted">—</span>'}</td>
+        <td class="num">${finMoney(d.balance)}</td><td class="num">${d.interestRate !== null && d.interestRate !== undefined ? d.interestRate + '%' : '—'}</td>
+        <td class="num">${finMoney(d.monthlyPayment)}</td><td>${finEsc(finDateLabel(d.nextPaymentDate))}</td><td>${finEsc(finDateLabel(d.maturityDate))}</td>
+        <td>${finEsc(d.notes)}${d.source ? `<div class="sub">${finEsc(d.source)}</div>` : ''}</td></tr>`);
+      if (body.length) body.push(`<tr class="total"><td colspan="3">Total</td><td class="num">${finMoney(m.debtTotal)}</td><td></td><td class="num">${finMoney(m.monthlyDebtService)}</td><td colspan="3"></td></tr>`);
+      const accts = s.cash.accounts.length ? `<table class="fin-table" style="margin-top:18px;"><thead><tr><th>Cash account</th><th>Type</th><th class="num">Balance</th><th>As of</th><th>Source</th></tr></thead><tbody>${s.cash.accounts.map(a => `<tr><td>${finEsc(a.name)}</td><td>${finEsc(a.type)}</td><td class="num ${a.balance < 0 ? 'neg' : ''}">${finMoney(a.balance)}</td><td>${finEsc(finDateLabel(a.asOf))}</td><td>${finEsc(a.source)}${a.notes ? `<div class="sub">${finEsc(a.notes)}</div>` : ''}</td></tr>`).join('')}<tr class="total"><td colspan="2">Total cash</td><td class="num">${finMoney(m.cashTotal)}</td><td colspan="2"></td></tr></tbody></table>` : '';
+      finEl('finDebtTable').innerHTML = finTable([['Obligation'], ['Lender'], ['Type'], ['Balance', 1], ['Rate', 1], ['Monthly payment', 1], ['Next payment'], ['Matures'], ['Notes / source']], body, 'No debt was reported in this snapshot.') + accts;
+    }
+
+    // Revenue the calendar above currently forecasts, by month (for comparison with ChatGPT's profit forecast)
+    function finCrmRevenueByMonth() {
+      const out = {};
+      Object.keys(calendarData).forEach(mk => { out[mk] = (calendarData[mk] || []).reduce((t, it) => t + (it.revenue || 0), 0); });
+      return out;
+    }
+
+    function renderFinanceProfit() {
+      if (!finCurrent) return;
+      const m = finMetrics(finCurrent), crm = finCrmRevenueByMonth(), hasCrm = Object.keys(crm).length > 0;
+      const t = m.profitTotals;
+      const body = m.profitRows.map(r => `<tr title="${finEsc(r.notes)}">
+        <td>${finEsc(finMonthLabel(r.month))}${r.notes ? ' <i class="fas fa-info-circle muted"></i>' : ''}</td>
+        <td class="num muted">${hasCrm && crm[r.month] !== undefined ? finMoney(crm[r.month]) : '—'}</td>
+        <td class="num">${finMoney(r.revenue)}</td><td class="num">${finMoney(r.cogs)}</td><td class="num">${finMoney(r.gross)}</td>
+        <td class="num">${finMoney(r.operatingExpenses)}</td><td class="num">${finMoney(r.payroll)}</td>
+        <td class="num ${r.net < 0 ? 'neg' : 'pos'}"><strong>${finMoney(r.net)}</strong></td>
+        <td class="num ${r.margin !== null && r.margin < 0 ? 'neg' : ''}">${r.margin === null ? '—' : r.margin.toFixed(1) + '%'}</td></tr>`);
+      if (body.length) {
+        const crmTotal = hasCrm ? m.profitRows.reduce((a, r) => a + (crm[r.month] || 0), 0) : null;
+        body.push(`<tr class="total"><td>Total</td><td class="num">${crmTotal === null ? '—' : finMoney(crmTotal)}</td><td class="num">${finMoney(t.revenue)}</td><td class="num">${finMoney(t.cogs)}</td><td class="num">${finMoney(t.gross)}</td><td class="num">${finMoney(t.opex)}</td><td class="num">${finMoney(t.payroll)}</td><td class="num ${t.net < 0 ? 'neg' : ''}">${finMoney(t.net)}</td><td class="num">${t.revenue > 0 ? (t.net / t.revenue * 100).toFixed(1) + '%' : '—'}</td></tr>`);
+      }
+      finEl('finProfitTable').innerHTML = finTable([['Month'], ['Revenue on calendar above', 1], ['Revenue (ChatGPT)', 1], ['COGS', 1], ['Gross profit', 1], ['Operating expenses', 1], ['Payroll', 1], ['Net profit', 1], ['Net margin', 1]], body, 'No profitability forecast was included in this snapshot.');
+    }
+
+    function renderFinanceNotes(s) {
+      const list = (title, icon, items, cls) => items.length ? `<div ${cls ? `class="${cls}"` : ''}><h4 style="margin:0 0 6px 0; font-size:0.85em; text-transform:uppercase; letter-spacing:.4px; color:var(--primary);"><i class="fas ${icon}"></i> ${title}</h4><ul class="fin-note-list">${items.map(i => `<li>${finEsc(i)}</li>`).join('')}</ul></div>` : '';
+      const parts = [
+        s.dataGaps.length ? `<div class="fin-alert warn" style="margin-bottom:14px;">${list('Needs your input', 'fa-circle-question', s.dataGaps)}</div>` : '',
+        list('Assumptions behind the forecasts', 'fa-lightbulb', s.assumptions),
+        s.sources.length ? `<div style="margin-top:14px;">${list('Sources ChatGPT used', 'fa-envelope-open-text', s.sources)}</div>` : ''
+      ].filter(Boolean);
+      finEl('finNotesCard').style.display = parts.length ? 'block' : 'none';
+      finEl('finNotesCard').innerHTML = parts.join('');
+    }
+
+    // ---------- Load / save ----------
+    async function loadFinanceSnapshots(selectId) {
+      try {
+        const snap = await get(query(ref(db, FIN_PATH), limitToLast(12)));
+        finSnapshots = [];
+        snap.forEach(ch => { finSnapshots.push(Object.assign({ id: ch.key }, finHydrate(ch.val()))); });
+        finSnapshots.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+        finCurrent = (selectId && finSnapshots.find(s => s.id === selectId)) || finSnapshots[finSnapshots.length - 1] || null;
+      } catch (e) {
+        console.error('Error loading finance snapshots:', e);
+        finSnapshots = []; finCurrent = null;
+        showToast('Could not load finance snapshots: ' + e.message, 'error');
+      }
+      renderFinance();
+    }
+
+    async function finSaveImport() {
+      if (!finPending) return;
+      const btn = finEl('finSaveImportBtn');
+      btn.disabled = true;
+      try {
+        const nref = push(ref(db, FIN_PATH));
+        const payload = JSON.parse(JSON.stringify(Object.assign({}, finPending, {
+          createdAt: new Date().toISOString(), createdBy: (currentUser && currentUser.email) || '', source: 'chatgpt'
+        })));
+        await set(nref, payload);
+        finPending = null;
+        await loadFinanceSnapshots(nref.key);
+        window.closeFinImportModal();
+        showToast('Finance snapshot saved', 'success');
+        finEl('financeSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (e) {
+        console.error(e);
+        btn.disabled = false;
+        showToast('Could not save: ' + e.message, 'error');
+      }
+    }
+
+    async function finDeleteCurrent() {
+      if (!finCurrent) return;
+      if (!confirm(`Delete the finance snapshot as of ${finDateLabel(finCurrent.asOf)}? This cannot be undone.`)) return;
+      try {
+        await remove(ref(db, `${FIN_PATH}/${finCurrent.id}`));
+        await loadFinanceSnapshots();
+        showToast('Snapshot deleted', 'success');
+      } catch (e) { showToast('Could not delete: ' + e.message, 'error'); }
+    }
+
+    // ---------- Export for ChatGPT ----------
+    function finBuildExport(includePrev) {
+      const r2 = n => Math.round((n || 0) * 100) / 100;
+      const monthsMap = {}, cust = {};
+      Object.keys(calendarData).sort().forEach(mk => {
+        (calendarData[mk] || []).forEach(it => {
+          const mm = monthsMap[mk] || (monthsMap[mk] = { month: mk, revenue: 0, cogs: 0 });
+          mm.revenue += it.revenue || 0; mm.cogs += it.costs || 0;
+          const co = allCompanies.find(c => c.id === it.customerId);
+          const c = cust[it.customerId] || (cust[it.customerId] = {
+            customerId: it.customerId, customerName: it.customerName || (co && co.name) || '', stage: co ? co.stage : '',
+            owner: getOwnerForCustomer(it.customerId), forecastCategory: '', total: 0, byMonth: {}, products: []
+          });
+          c.total += it.revenue || 0; c.byMonth[mk] = r2((c.byMonth[mk] || 0) + (it.revenue || 0));
+          if (!c.forecastCategory && it.forecastCategory) c.forecastCategory = it.forecastCategory;
+          const pn = it.productName || it.product || '';
+          if (pn && !c.products.includes(pn)) c.products.push(pn);
+        });
+      });
+      const months = Object.values(monthsMap).map(x => ({ month: x.month, revenue: r2(x.revenue), cogs: r2(x.cogs), grossProfit: r2(x.revenue - x.cogs) }));
+      const byCustomer = Object.values(cust).map(c => Object.assign(c, { total: r2(c.total) })).sort((a, b) => b.total - a.total);
+
+      let prev = null;
+      if (includePrev && finCurrent) {
+        prev = JSON.parse(JSON.stringify(finCurrent));
+        delete prev.id; delete prev.createdBy; delete prev.source;
+      }
+      const owners = calculateOwnerStats(getAllPlacedItems());
+      Object.keys(owners).forEach(o => { owners[o] = { revenue: r2(owners[o].revenue), minimumPay: r2(owners[o].minPay) }; });
+
+      return {
+        schema: FIN_SCHEMA_OUT,
+        generatedAt: new Date().toISOString(),
+        asOf: finTodayStr(),
+        company: 'HealthLuminate',
+        businessNotes: [
+          'crmRevenueForecast comes from the Revenue Planning calendar. Pipeline accounts may already be probability-weighted (see forecastCategory).',
+          'Revenue less COGS is labelled "Total Payroll" in the CRM. Owners (Sam, Taylor, Joe) have a minimum pay of 35% of the revenue on accounts they own.',
+          'Product COGS rates: Accelerate 34% (14% AI services + 20% call team), Identify 30%, Connect 20%, Other 0%.',
+          'The "companies" list contains every live CRM company; use its id as companyId on receivables when the customer is one of them.'
+        ],
+        crmRevenueForecast: { forecastName: currentForecastName || '(unsaved calendar)', months, byCustomer, ownerSummary: owners },
+        companies: allCompanies.map(c => ({ id: c.id, name: c.name, stage: c.stage })),
+        previousSnapshot: prev
+      };
+    }
+
+    function finBuildPrompt(asOf) {
+      return `You are the finance analyst for HealthLuminate. I am giving you a JSON export from our CRM (schema "${FIN_SCHEMA_OUT}"). Review it together with everything else you can access, then reply with ONE JSON document (schema "${FIN_SCHEMA_IN}") that I will import into the CRM's Revenue Planning page. The page will use it to show: our cash position, accounts receivable (including which customers are behind in paying), accounts payable, debt, a 12-month cash projection with and without the current receivables, a 12-month profitability forecast, and your written cash summary.
+
+AS-OF DATE: ${asOf}
+
+WHERE TO LOOK
+- Mailboxes: invoices we sent, customer payment confirmations and remittances, past-due and collections correspondence, vendor bills and statements, bank / loan / line-of-credit / credit-card notices, payroll and tax notices.
+- Any QuickBooks, bank or accounting exports I upload in this chat.
+- The CRM export: revenue forecast by month and customer, company list with stages, account owners, and the previous snapshot if present.
+- Read.ai transcripts and emails for payment-related commitments ("we will pay on the 15th"), disputes, or budget freezes.
+
+HARD RULES
+1. Never invent numbers. If you cannot find a figure, use null and add an entry to "dataGaps" saying exactly what I need to give you (for example "Current balance of the operating checking account"). An estimate is allowed only if you explain how you derived it in that item's "notes" and in "assumptions".
+2. Every cash account, debt, receivable and payable needs a short "source" (for example "Email: Invoice 1042 from billing@..., 2026-10-03" or "Upload: QuickBooks AR aging 2026-11-15").
+3. Money: plain numbers in US dollars, no "$" and no commas. Dates: YYYY-MM-DD. Months: YYYY-MM. Interest rates: percent as a number (7.5 means 7.5%).
+4. Never include full account numbers, card numbers or SSNs - last 4 digits at most.
+5. Reply with the JSON only, in a single code block. No comments, no trailing commas.
+
+WHAT TO PRODUCE
+A. cash.accounts - latest known balance for every bank account / cash equivalent, with the date of that balance. Overdrafts are negative.
+B. debt - every loan, line of credit, credit card, deferred tax or payroll liability, owner/shareholder loan, or other obligation with a balance. Include interest rate, monthly payment, next payment date and maturity date when known.
+C. receivables - one entry per invoice that is unpaid, partly paid, or was paid in the last 60 days. Do NOT list revenue we merely expect to bill later (that belongs in the forecasts).
+   - companyId: the exact "id" from the export's "companies" list when the customer is in it; otherwise omit it and give the customer's exact name.
+   - status: open | partial | disputed | paid | written_off.
+   - lastContactDate: the last time we followed up on this invoice or they replied. promisedPaymentDate: a date the customer committed to, if any.
+   - notes: why it is late (dispute, waiting on a PO, their AP process, bounced payment) and what has been done so far.
+   - Call out customers who pay late repeatedly, even when the current invoice is not yet due.
+D. payables - one entry per unpaid or partly paid vendor bill, with due date, category (payroll, contractors, software, call-team, taxes, rent, insurance, other) and status: open | partial | disputed | scheduled | paid.
+E. cashForecast - 12 rows starting with the month of the as-of date. Estimate CASH movements, not accrual revenue:
+   - receivablesCollections: when you realistically expect the CURRENT receivables to be paid. Use promised dates and each customer's real payment history rather than due dates; late payers belong in later months, doubtful ones in none.
+   - newBillingCollections: cash from invoices not yet issued, based on crmRevenueForecast and each customer's typical days-to-pay.
+   - otherInflows, cogsPayments, payablesPayments (the current payables), debtService, payroll, operatingExpenses, otherOutflows - all positive numbers.
+   Do not calculate running balances; the page does that from opening cash.
+F. profitForecast - 12 rows (same months): revenue, cogs, operatingExpenses, payroll - all positive numbers.
+   - Start from crmRevenueForecast.months. Adjust for specific customers when the evidence says the CRM is too optimistic or pessimistic (customer not paying, unhappy, stalled deal) and explain each adjustment in that row's "notes".
+   - Revenue less COGS is called "Total Payroll" in our CRM and owners' minimum pay is 35% of revenue on their accounts (see ownerSummary). In this file, "payroll" means all salaries, owner pay and contractor labor that is NOT already in COGS. Do not double count.
+   - operatingExpenses: software, insurance, rent, professional fees, marketing, interest, taxes and other overhead, based on recurring costs you actually found.
+G. cashSummary - an honest, plain-English assessment written for the owners:
+   - overallHealth: strong | stable | watch | critical
+   - headline: one sentence, 140 characters max
+   - narrative: 3 to 6 short paragraphs separated by blank lines covering: cash today; cash after payables; cash including receivables versus excluding them; which customers are behind and how much it matters; debt and obligations due in the next 90 days; the profit trend; the single biggest risk.
+   - keyRisks: list of short strings
+   - recommendedActions: list of { action, priority (high|medium|low), owner, dueDate }, for example who should chase which customer
+   - runwayMonths: months until cash goes negative in the "excluding current receivables" case, or null if it never does
+   - confidence: high | medium | low, reflecting how complete the data was
+H. assumptions, dataGaps, sources - lists of short strings.
+
+If the export contains "previousSnapshot", update it: keep items that are still open, mark paid ones as paid, add new ones, and say in the narrative what changed since then.
+
+OUTPUT FORMAT (replace the example values, keep the key names exactly)
+{
+  "schema": "${FIN_SCHEMA_IN}",
+  "asOf": "${asOf}",
+  "cash": { "accounts": [ { "name": "Operating checking (x1234)", "type": "checking", "balance": 84250.12, "asOf": "${asOf}", "source": "", "notes": "" } ], "note": "" },
+  "debt": [ { "name": "Term loan", "lender": "", "type": "term_loan", "balance": 120000, "interestRate": 7.5, "monthlyPayment": 2400, "nextPaymentDate": "", "maturityDate": "", "secured": true, "notes": "", "source": "" } ],
+  "receivables": [ { "companyId": "<id from companies list, or omit>", "customerName": "Acme Health", "invoiceNumber": "1042", "invoiceDate": "", "dueDate": "", "amount": 12000, "amountPaid": 0, "status": "open", "lastContactDate": "", "promisedPaymentDate": "", "notes": "", "source": "" } ],
+  "payables": [ { "vendor": "", "invoiceNumber": "", "invoiceDate": "", "dueDate": "", "amount": 0, "amountPaid": 0, "category": "software", "status": "open", "notes": "", "source": "" } ],
+  "cashForecast": [ { "month": "YYYY-MM", "receivablesCollections": 0, "newBillingCollections": 0, "otherInflows": 0, "cogsPayments": 0, "payablesPayments": 0, "debtService": 0, "payroll": 0, "operatingExpenses": 0, "otherOutflows": 0, "notes": "" } ],
+  "profitForecast": [ { "month": "YYYY-MM", "revenue": 0, "cogs": 0, "operatingExpenses": 0, "payroll": 0, "notes": "" } ],
+  "cashSummary": { "overallHealth": "watch", "headline": "", "narrative": "Paragraph one.\\n\\nParagraph two.", "keyRisks": [], "recommendedActions": [ { "action": "", "priority": "high", "owner": "", "dueDate": "" } ], "runwayMonths": null, "confidence": "medium" },
+  "assumptions": [],
+  "dataGaps": [],
+  "sources": []
+}`;
+    }
+
+    async function finCopy(text, okMsg) {
+      try { await navigator.clipboard.writeText(text); showToast(okMsg || 'Copied', 'success'); }
+      catch (e) {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); showToast(okMsg || 'Copied', 'success'); }
+        catch (e2) { showToast('Copy failed - select the text and copy it manually', 'error'); }
+        ta.remove();
+      }
+    }
+
+    function finDownload(filename, text) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+      a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+
+    function openFinExportModal() {
+      const items = getAllPlacedItems();
+      const rev = items.reduce((t, i) => t + (i.revenue || 0), 0);
+      const asOf = finTodayStr();
+      const modal = finEl('finExportModal');
+      finEl('finExportBody').innerHTML = `
+        <div class="fin-alert ${items.length ? 'ok' : 'warn'}">${items.length
+          ? `Using the forecast on the calendar${currentForecastName ? ` ("${finEsc(currentForecastName)}")` : ''}: ${items.length} placements, ${finEsc(finMoney(rev))} total revenue.`
+          : 'No forecast is on the calendar. Load one first (Load button above) so ChatGPT can base its revenue and profit projections on it.'}</div>
+        <label style="display:flex; gap:8px; align-items:center; font-size:0.88em; margin-bottom:16px;">
+          <input type="checkbox" id="finIncludePrev" ${finCurrent ? 'checked' : 'disabled'}>
+          Include the latest imported snapshot${finCurrent ? ` (as of ${finEsc(finDateLabel(finCurrent.asOf))})` : ' (none yet)'} so ChatGPT updates it instead of starting over
+        </label>
+        <div class="fin-step">
+          <h4>1. Give ChatGPT these instructions</h4>
+          <p>Paste them into a new chat (or into your skill) that has access to your mailboxes and any accounting exports.</p>
+          <textarea class="fin-textarea" id="finPromptText" readonly style="min-height:150px;">${finEsc(finBuildPrompt(asOf))}</textarea>
+          <div class="fin-btn-row" style="margin-top:8px;"><button class="btn btn-secondary" id="finCopyPromptBtn"><i class="fas fa-copy"></i> Copy instructions</button></div>
+        </div>
+        <div class="fin-step">
+          <h4>2. Give ChatGPT the CRM data</h4>
+          <p>Contains financial and customer information - only share it with ChatGPT.</p>
+          <div class="fin-btn-row">
+            <button class="btn btn-secondary" id="finCopyDataBtn"><i class="fas fa-copy"></i> Copy JSON</button>
+            <button class="btn btn-secondary" id="finDownloadDataBtn"><i class="fas fa-download"></i> Download JSON</button>
+            <button class="btn btn-primary" id="finCopyBothBtn"><i class="fas fa-clipboard-list"></i> Copy instructions + data (one paste)</button>
+          </div>
+          <div class="fin-msg" id="finExportInfo"></div>
+        </div>
+        <div class="fin-step">
+          <h4>3. Bring the answer back</h4>
+          <p>Close this window and click <strong>Import results</strong>, then paste ChatGPT's JSON.</p>
+        </div>`;
+      const getData = () => JSON.stringify(finBuildExport(finEl('finIncludePrev').checked), null, 2);
+      const infoSize = () => { const t = getData(); finEl('finExportInfo').textContent = `Data size: ${(t.length / 1024).toFixed(1)} KB`; return t; };
+      infoSize();
+      finEl('finIncludePrev').addEventListener('change', infoSize);
+      finEl('finCopyPromptBtn').onclick = () => finCopy(finBuildPrompt(asOf), 'Instructions copied');
+      finEl('finCopyDataBtn').onclick = () => finCopy(getData(), 'JSON copied');
+      finEl('finDownloadDataBtn').onclick = () => finDownload(`finance-export-${asOf}.json`, getData());
+      finEl('finCopyBothBtn').onclick = () => finCopy(`${finBuildPrompt(asOf)}\n\n===== CRM DATA (JSON) =====\n${getData()}`, 'Instructions + data copied');
+      modal.style.display = 'flex'; modal.classList.add('show');
+    }
+
+    window.closeFinExportModal = function () {
+      const modal = finEl('finExportModal'); modal.style.display = 'none'; modal.classList.remove('show');
+    };
+
+    // ---------- Import from ChatGPT ----------
+    function openFinImportModal() {
+      finPending = null;
+      finEl('finImportText').value = '';
+      finEl('finImportFile').value = '';
+      finEl('finImportMsg').innerHTML = '';
+      finEl('finSaveImportBtn').disabled = true;
+      const modal = finEl('finImportModal'); modal.style.display = 'flex'; modal.classList.add('show');
+    }
+
+    window.closeFinImportModal = function () {
+      const modal = finEl('finImportModal'); modal.style.display = 'none'; modal.classList.remove('show');
+    };
+
+    function finValidateImport() {
+      const msg = finEl('finImportMsg'), saveBtn = finEl('finSaveImportBtn');
+      finPending = null; saveBtn.disabled = true;
+      const text = finEl('finImportText').value;
+      if (!text.trim()) { msg.innerHTML = '<div class="err">Paste ChatGPT\'s JSON first.</div>'; return; }
+      let result;
+      try { result = finNormalize(finParseResponse(text)); }
+      catch (e) { msg.innerHTML = `<div class="err"><strong>Problem:</strong> ${finEsc(e.message)}</div>`; return; }
+      const { snap, warnings, errors } = result;
+      if (errors.length) { msg.innerHTML = `<div class="err"><strong>Cannot import:</strong><ul>${errors.map(e => `<li>${finEsc(e)}</li>`).join('')}</ul></div>`; return; }
+      const m = finMetrics(snap);
+      const shown = warnings.slice(0, 25);
+      msg.innerHTML = `
+        <div class="okk"><strong>Looks good.</strong> As of ${finEsc(finDateLabel(snap.asOf))}: ${snap.cash.accounts.length} cash account(s) totaling ${finEsc(finMoney(m.cashTotal))}; ${snap.debt.length} debt item(s) (${finEsc(finMoney(m.debtTotal))});
+        ${m.openAR.length} open receivable(s) (${finEsc(finMoney(m.arTotal))}, ${finEsc(finMoney(m.arOverdue))} overdue); ${m.openAP.length} open payable(s) (${finEsc(finMoney(m.apTotal))});
+        ${snap.cashForecast.length} cash-forecast month(s); ${snap.profitForecast.length} profit-forecast month(s); cash summary: ${snap.cashSummary ? 'yes' : 'no'}.</div>
+        ${warnings.length ? `<div class="wrn" style="margin-top:8px;"><strong>${warnings.length} thing(s) to be aware of:</strong><ul>${shown.map(w => `<li>${finEsc(w)}</li>`).join('')}${warnings.length > shown.length ? `<li>...and ${warnings.length - shown.length} more</li>` : ''}</ul></div>` : ''}
+        ${snap.dataGaps.length ? `<div class="wrn" style="margin-top:8px;"><strong>ChatGPT says it still needs:</strong><ul>${snap.dataGaps.slice(0, 10).map(w => `<li>${finEsc(w)}</li>`).join('')}</ul></div>` : ''}
+        <div style="margin-top:8px; color:#666;">Saving adds a new dated snapshot; earlier snapshots are kept and can be switched to from the dropdown.</div>`;
+      finPending = snap; saveBtn.disabled = false;
+    }
+
+    // ---------- Wiring ----------
+    finEl('finExportBtn').addEventListener('click', openFinExportModal);
+    finEl('finImportBtn').addEventListener('click', openFinImportModal);
+    finEl('finDeleteBtn').addEventListener('click', finDeleteCurrent);
+    finEl('finValidateBtn').addEventListener('click', finValidateImport);
+    finEl('finSaveImportBtn').addEventListener('click', finSaveImport);
+    finEl('finArFilter').addEventListener('change', renderFinanceAr);
+    finEl('finHistorySelect').addEventListener('change', e => {
+      finCurrent = finSnapshots.find(s => s.id === e.target.value) || finCurrent;
+      renderFinance();
+    });
+    finEl('finImportFile').addEventListener('change', e => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => { finEl('finImportText').value = String(reader.result || ''); finValidateImport(); };
+      reader.readAsText(f);
+    });
+
     // Initialize
     let authCheckComplete = false;
     let authCheckTimeout = null;
@@ -2855,6 +3748,7 @@
         await loadAccountOwners();
         renderCalendar();
         updateCurrentForecastInfo();
+        await loadFinanceSnapshots();
       } else if (!authCheckComplete) {
         // Wait 2 seconds for Firebase to restore session before redirecting
         console.log('No user detected yet, waiting for session restore...');
