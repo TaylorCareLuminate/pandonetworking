@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en" class="protection-hide">
 <head>
-    <!-- CACHE BUSTER v1.2.2 - KEEP CALL PAY: dropping a meeting keeps the call as Good Number, No Message at $0.50 and removes only the pool bonus. -->
+    <!-- CACHE BUSTER v1.2.3 - NO BULK REMOVAL: removed the unused code that could delete several meetings at once. Previous v1.2.2 - KEEP CALL PAY: dropping a meeting keeps the call as Good Number, No Message at $0.50 and removes only the pool bonus. -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Schedule Callbacks - Team Dashboard</title>
@@ -970,7 +970,7 @@
         import { ACHIEVEMENT_POOL_CONFIG, QUALIFYING_OUTCOMES, calculateAchievementPool, qualifyingCallsAfterHistory } from '../js/payment-config.js';
         import { deleteField } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js';
 
-        const PAGE_VERSION = 'v1.2.2-keep-call-pay';
+        const PAGE_VERSION = 'v1.2.3-no-bulk-removal';
         console.log(`📄 Callback Page Version: ${PAGE_VERSION}`);
         const pageVersionEl = document.getElementById('pageVersion');
         if (pageVersionEl) pageVersionEl.textContent = PAGE_VERSION;
@@ -993,7 +993,6 @@
         let isSchedulingMeeting = false;
         let lastScheduledMeetingId = null;
         const MEETING_REMOVAL_WINDOW_MS = 48 * 60 * 60 * 1000;
-        const ACCIDENTAL_MEETING_WINDOW_MS = 5 * 60 * 1000;
         let currentFilter = 'all-contacts';
 
         // Initialize the page
@@ -2342,10 +2341,6 @@
             return /^[A-Za-z0-9_-]+$/.test(id || '') ? id : '';
         }
 
-        function meetingPhoneLast10(value) {
-            return String(value || '').replace(/\D/g, '').slice(-10);
-        }
-
         function canRemoveMeeting(record) {
             if (!record) return false;
             const outcome = record.outcome || (record.source === 'scheduled-meetings' ? 'spoke-scheduled-meeting' : '');
@@ -2365,26 +2360,9 @@
             'taylor@careluminate.com',
             'taylordavis@careluminate.com'
         ];
-        const RELATED_MEETING_WINDOW_MS = 2 * 60 * 60 * 1000;
 
         function isMeetingAdmin() {
             return MEETING_ADMINS.includes((currentUser?.email || '').toLowerCase());
-        }
-
-        function isSameAccidentalMeeting(a, b) {
-            const nameA = String(a.contactName || a.additionalData?.contactName || '').trim().toLowerCase();
-            const nameB = String(b.contactName || b.additionalData?.contactName || '').trim().toLowerCase();
-            if (!nameA || nameA !== nameB) return false;
-            const companyA = String(a.companyName || '').trim().toLowerCase();
-            const companyB = String(b.companyName || '').trim().toLowerCase();
-            if (companyA && companyB && companyA !== companyB) return false;
-            const phoneA = meetingPhoneLast10(a.phoneNumber || a.additionalData?.phoneNumber);
-            const phoneB = meetingPhoneLast10(b.phoneNumber || b.additionalData?.phoneNumber);
-            if (phoneA.length >= 10 && phoneB.length >= 10 && phoneA !== phoneB) return false;
-            const timeA = new Date(a.timestamp || 0).getTime();
-            const timeB = new Date(b.timestamp || 0).getTime();
-            if (!timeA || !timeB) return false;
-            return Math.abs(timeA - timeB) <= ACCIDENTAL_MEETING_WINDOW_MS;
         }
 
         async function loadCampaignCallHistory(campaignId) {
@@ -2479,76 +2457,6 @@
                 lastUpdatedBy: currentUser?.email || 'meeting-removal'
             }, { merge: true });
             return described;
-        }
-
-        async function meetingsToRemoveWith(meeting) {
-            if (!meeting?.userEmail) return [meeting];
-            const snapshot = await getDocs(query(
-                collection(db, 'campaign_call_tracking'),
-                where('userEmail', '==', meeting.userEmail)
-            ));
-            const when = new Date(meeting.timestamp || 0).getTime();
-            const related = snapshot.docs
-                .map((item) => ({ id: item.id, ...item.data() }))
-                .filter((item) => item.id !== meeting.id && item.outcome === 'spoke-scheduled-meeting')
-                .filter((item) => {
-                    const itemWhen = new Date(item.timestamp || 0).getTime();
-                    return itemWhen && when && Math.abs(itemWhen - when) <= RELATED_MEETING_WINDOW_MS;
-                });
-            return [meeting, ...related].sort((a, b) => new Date(a.timestamp || 0) - new Date(b.timestamp || 0));
-        }
-
-        async function reopenActivityCompletedAsMeeting(timestamp, userEmail) {
-            if (!timestamp || !userEmail) return false;
-            const iso = timestamp instanceof Date ? timestamp.toISOString() : String(timestamp);
-            const snapshot = await getDocs(query(
-                collection(db, 'phone_activities'),
-                where('completedAt', '==', iso)
-            ));
-            let reopened = false;
-            for (const activityDoc of snapshot.docs) {
-                const data = activityDoc.data();
-                if (data.outcome !== 'spoke-scheduled-meeting') continue;
-                if ((data.completedBy || '').toLowerCase() !== userEmail.toLowerCase()) continue;
-                await updateDoc(doc(db, 'phone_activities', activityDoc.id), {
-                    status: data.isCallback ? 'callback-scheduled' : (data.scheduledDate || data.scheduledAt ? 'scheduled' : 'pending'),
-                    outcome: deleteField(),
-                    completedAt: deleteField(),
-                    completedBy: deleteField(),
-                    basePayment: deleteField(),
-                    achievementPoolAwarded: deleteField(),
-                    totalPayment: deleteField(),
-                    additionalData: deleteField(),
-                    notes: data.schedulingNotes || '',
-                    claimedBy: null,
-                    claimedAt: null,
-                    claimedByName: null,
-                    undoneAt: new Date().toISOString(),
-                    undoneBy: currentUser?.email || userEmail
-                });
-                reopened = true;
-            }
-            return reopened;
-        }
-
-        async function deleteAccidentalDuplicateMeetings(meeting, primaryId) {
-            if (!meeting?.userEmail) return 0;
-            const snapshot = await getDocs(query(
-                collection(db, 'campaign_call_tracking'),
-                where('userEmail', '==', meeting.userEmail)
-            ));
-            const duplicates = snapshot.docs
-                .map((item) => ({ id: item.id, ...item.data() }))
-                .filter((item) => item.id !== primaryId && item.outcome === 'spoke-scheduled-meeting' && isSameAccidentalMeeting(meeting, item));
-            for (const duplicate of duplicates) {
-                await deleteDoc(doc(db, 'campaign_call_tracking', duplicate.id));
-                try {
-                    await reopenActivityCompletedAsMeeting(duplicate.timestamp, duplicate.userEmail);
-                } catch (activityError) {
-                    console.warn('⚠️ Extra meeting removed, but its call could not be reopened:', activityError);
-                }
-            }
-            return duplicates.length;
         }
 
         window.undoJustScheduledMeeting = function() {
