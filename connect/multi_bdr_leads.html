@@ -40,9 +40,9 @@
     <header class="page-header">
         <h1><i class="fas fa-people-arrows"></i> Bulk Group Assignment</h1>
         <p>
-            Work on the contacts of several BDRs at the same time. Pick the BDRs, export their contacts to Excel (with each person's experience and
-            education where we have it, and the hypothesis groups each BDR can use), give the file to ChatGPT to sort the contacts into groups, then load
-            the JSON it returns here. Contacts are only ever put into a group their own BDR is associated with.
+            Work on several BDRs in one visit, but one BDR at a time for ChatGPT. Pick the BDRs, and each BDR gets their own Excel file (with each person's
+            experience and education where we have it, and only the hypothesis groups that BDR can use). Give each file to ChatGPT in its own chat to sort the
+            contacts into groups, then load the JSON it returns into that BDR's own upload box. Contacts are only ever put into a group their own BDR is associated with.
         </p>
     </header>
 
@@ -65,7 +65,7 @@
             <label class="check"><input type="checkbox" id="optDetails" checked> <span>Include each person's stored profile details (headline, about, every role, education)</span></label>
             <div class="field" style="max-width:300px;"><label for="optPerFile">Contacts per Excel file</label>
                 <input type="number" id="optPerFile" min="0" max="5000" step="50" value="400">
-                <span class="hint">ChatGPT sorts smaller files more carefully. 0 puts everything in one file.</span></div>
+                <span class="hint">Each BDR always gets their own file. A BDR with more contacts than this gets several files. 0 keeps each BDR's contacts in one file.</span></div>
         </div>
         <div class="btn-row">
             <button class="btn btn-primary" id="loadBtn" data-action="load" disabled><i class="fas fa-download"></i> Load their contacts</button>
@@ -79,36 +79,24 @@
         <div class="results-wrap"><table class="results" id="loadedTable"></table></div>
         <div id="warnings"></div>
         <h3 style="margin:1.2rem 0 .5rem;font-size:.95rem;" id="partsTitle">Files</h3>
+        <p class="muted" style="margin-bottom:.5rem;">One Excel file per BDR. Attach one file to a new ChatGPT chat and paste that BDR's instructions as your message. Use a new chat for each file.</p>
         <div id="parts"></div>
         <div class="status-line" id="exportStatus"></div>
-
-        <h3 style="margin:1.4rem 0 .3rem;font-size:.95rem;">Instructions for ChatGPT</h3>
-        <p class="muted" style="margin-bottom:.4rem;">Attach one Excel file to a new ChatGPT chat and paste this as your message. Use a new chat for each file.</p>
-        <div class="btn-row">
-            <button class="btn btn-outline btn-sm" data-action="copy-prompt"><i class="fas fa-copy"></i> Copy instructions</button>
-            <button class="btn btn-outline btn-sm" data-action="toggle-prompt">Show them</button>
-            <span class="sub" id="copyStatus"></span>
-        </div>
+        <div class="status-line" id="copyStatus"></div>
         <pre class="prompt" id="promptText" hidden></pre>
     </div>
 
     <div class="card" id="importCard">
         <h2><i class="fas fa-file-import"></i> 3. Load the JSON from ChatGPT</h2>
         <p class="muted">
-            Choose the JSON file(s) ChatGPT gave you. You can pick several at once, for several BDRs or several Excel files. Nothing is saved until you have
-            seen the check and pressed Save. A contact ChatGPT left without a group is left alone.
+            Each chosen BDR has their own upload box. Choose the JSON ChatGPT gave you for that BDR (if the BDR had several Excel files, you can pick all of
+            their JSON files together). A file that contains another BDR's contacts is rejected for this box. Nothing is saved until you have seen the check
+            and pressed Save. A contact ChatGPT left without a group is left alone.
         </p>
         <div class="opts" style="margin-top:.4rem;">
-            <label class="check"><input type="checkbox" id="optOnlyUnassigned" checked> <span>Only assign contacts that have no group yet <span class="sub">(untick to let this file replace groups that were assigned before)</span></span></label>
+            <label class="check"><input type="checkbox" id="optOnlyUnassigned" checked> <span>Only assign contacts that have no group yet <span class="sub">(untick to let a file replace groups that were assigned before)</span></span></label>
         </div>
-        <div class="btn-row">
-            <label class="btn btn-primary" for="jsonFiles" style="margin:0;"><i class="fas fa-folder-open"></i> Choose JSON file(s)</label>
-            <input type="file" id="jsonFiles" accept=".json,application/json" multiple hidden>
-            <button class="btn btn-outline" id="applyBtn" data-action="apply" disabled><i class="fas fa-floppy-disk"></i> Save these assignments</button>
-            <span class="sub" id="fileNames"></span>
-        </div>
-        <div class="status-line" id="importStatus"></div>
-        <div id="importReport"></div>
+        <div id="importSlots"><div class="empty">Choose at least one BDR above.</div></div>
     </div>
 </div>
 
@@ -126,8 +114,10 @@ const clip = (v) => { const s = v == null ? '' : String(v); return s.length > CE
 let bdrs = [];                       // [{ id, name, email, customerName }]
 const selected = new Set();
 const data = new Map();              // bdrId -> { bdr, stats, groups, leads } | { bdr, error }
-let parts = [];                      // [{ rows: [{ bdrId, lead }] }]
-let parsedEntries = [];              // assignments read from the chosen JSON file(s)
+let parts = [];                      // [{ bdrId, n, of, rows: [{ bdrId, lead }] }]  (every part belongs to exactly one BDR)
+const slots = new Map();             // bdrId -> { el, entries, willSave, wrongBdr, ... }  (one JSON upload box per BDR)
+
+const slug = (s) => String(s || 'bdr').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'bdr';
 
 // ── 1. Choose the BDRs ──────────────────────────────────────────────────────
 
@@ -145,12 +135,13 @@ function renderBdrList() {
 function updateSelCount() {
     $('selCount').textContent = selected.size ? `${selected.size} BDR${selected.size === 1 ? '' : 's'} selected` : 'Choose at least one BDR';
     $('loadBtn').disabled = selected.size === 0;
+    renderImportSlots();
 }
 
 // ── Loading their contacts ──────────────────────────────────────────────────
 
-async function loadSelected({ fresh = false } = {}) {
-    const ids = [...selected];
+async function loadSelected({ fresh = false, only = null } = {}) {
+    const ids = only || [...selected];
     if (!ids.length) return;
     $('loadBtn').disabled = true;
     for (let i = 0; i < ids.length; i++) {
@@ -200,18 +191,29 @@ function renderLoaded() {
 }
 
 function buildParts() {
-    const rows = [];
-    selectedData().forEach(d => eligible(d).forEach(l => rows.push({ bdrId: d.bdr.id, lead: l })));
     const per = Math.max(0, Math.min(5000, parseInt($('optPerFile').value, 10) || 0));
     parts = [];
-    if (!rows.length) { $('parts').innerHTML = '<div class="empty">There are no contacts to export with these choices. Untick "Only contacts that have no hypothesis group yet" to export everyone.</div>'; $('partsTitle').textContent = 'Files'; return; }
-    for (let i = 0; i < rows.length; i += (per || rows.length)) parts.push({ rows: rows.slice(i, i + (per || rows.length)) });
-    $('partsTitle').textContent = parts.length === 1 ? 'File' : `Files (${parts.length})`;
-    $('parts').innerHTML = parts.map((p, i) => {
-        const names = [...new Set(p.rows.map(r => data.get(r.bdrId).bdr.name))];
-        return `<div class="part-row"><div><b>${parts.length === 1 ? 'Contacts' : `File ${i + 1} of ${parts.length}`}</b>: ${p.rows.length} contacts
-            <span class="sub">${esc(names.slice(0, 4).join(', '))}${names.length > 4 ? ` and ${names.length - 4} more` : ''}</span></div>
-            <button class="btn btn-primary btn-sm" data-action="download" data-part="${i}"><i class="fas fa-file-excel"></i> Download Excel</button></div>`;
+    // Never mix BDRs in a file: each BDR's contacts are split up on their own.
+    selectedData().forEach(d => {
+        const leads = eligible(d);
+        if (!leads.length) return;
+        const size = per || leads.length, count = Math.ceil(leads.length / size);
+        for (let i = 0; i < leads.length; i += size) {
+            parts.push({ bdrId: d.bdr.id, n: i / size + 1, of: count, rows: leads.slice(i, i + size).map(lead => ({ bdrId: d.bdr.id, lead })) });
+        }
+    });
+    if (!parts.length) { $('parts').innerHTML = '<div class="empty">There are no contacts to export with these choices. Untick "Only contacts that have no hypothesis group yet" to export everyone.</div>'; $('partsTitle').textContent = 'Files'; return; }
+    const bdrIds = [...new Set(parts.map(p => p.bdrId))];
+    $('partsTitle').textContent = `Files (${parts.length} for ${bdrIds.length} BDR${bdrIds.length === 1 ? '' : 's'})`;
+    $('parts').innerHTML = bdrIds.map(id => {
+        const b = data.get(id).bdr, mine = parts.map((p, i) => ({ p, i })).filter(x => x.p.bdrId === id);
+        const total = mine.reduce((a, x) => a + x.p.rows.length, 0);
+        const buttons = mine.map(({ p, i }) => `<button class="btn btn-primary btn-sm" data-action="download" data-part="${i}"><i class="fas fa-file-excel"></i> ${p.of === 1 ? 'Download Excel' : `Excel ${p.n} of ${p.of} (${p.rows.length})`}</button>`).join(' ');
+        return `<div class="part-row"><div><b>${esc(b.name)}</b>: ${total} contacts${mine.length > 1 ? `, ${mine.length} files` : ''}
+            <span class="sub">${esc(b.email || '')}${b.customerName ? ' · ' + esc(b.customerName) : ''}</span></div>
+            <div class="btn-row">${buttons}
+            <button class="btn btn-outline btn-sm" data-action="copy-prompt" data-bdr="${esc(id)}"><i class="fas fa-copy"></i> Copy instructions</button>
+            <button class="btn btn-outline btn-sm" data-action="show-prompt" data-bdr="${esc(id)}">Show</button></div></div>`;
     }).join('');
 }
 
@@ -249,6 +251,7 @@ async function fetchDetails(rows, progress) {
 
 async function downloadPart(index) {
     const part = parts[index]; if (!part) return;
+    const bdrData = data.get(part.bdrId);
     const btn = document.querySelector(`button[data-part="${index}"]`);
     const orig = btn.innerHTML; btn.disabled = true;
     try {
@@ -290,21 +293,15 @@ async function downloadPart(index) {
         });
         header(ws, cols.length);
 
-        // Hypothesis Groups: every group any BDR in this file can use, with who it belongs to
-        const groupBdrs = new Map();               // groupId -> { group, names:Set, emails:Set }
-        [...new Set(part.rows.map(r => r.bdrId))].forEach(id => data.get(id).groups.forEach(g => {
-            if (!groupBdrs.has(g.id)) groupBdrs.set(g.id, { group: g, names: new Set(), emails: new Set() });
-            groupBdrs.get(g.id).names.add(data.get(id).bdr.name); groupBdrs.get(g.id).emails.add(data.get(id).bdr.email || '');
-        }));
+        // Hypothesis Groups: only the groups this BDR is associated with
         const gcols = [
             ['Group ID', 'id', 26], ['Group Name', 'name', 32], ['Description', 'description', 60], ['Target Contact Instructions', 'target', 60], ['Message Review Instructions', 'review', 50],
-            ['Message Variations', 'variations', 60], ['Source Prompts', 'prompts', 50], ['Contact Source', 'source', 24], ['Workspace', 'workspace', 22], ['BDRs Who Can Use This Group', 'bdrs', 40], ['BDR Emails', 'emails', 40]
+            ['Message Variations', 'variations', 60], ['Source Prompts', 'prompts', 50], ['Contact Source', 'source', 24], ['Workspace', 'workspace', 22]
         ];
         const gs = wb.addWorksheet('Hypothesis Groups');
         gs.columns = gcols.map(([header, key, width]) => ({ header, key, width }));
-        [...groupBdrs.values()].sort((a, b) => a.group.name.localeCompare(b.group.name)).forEach((x, i) => {
-            const g = x.group;
-            const row = gs.addRow({ id: g.id, name: g.name, description: clip(g.description), target: clip(g.targetContactInstructions), review: clip(g.messageReviewInstructions), variations: clip(g.variations), prompts: clip(g.sourcePrompts), source: g.contactSource, workspace: g.workspaceName, bdrs: clip([...x.names].join('; ')), emails: clip([...x.emails].join('; ')) });
+        [...bdrData.groups].sort((a, b) => a.name.localeCompare(b.name)).forEach((g, i) => {
+            const row = gs.addRow({ id: g.id, name: g.name, description: clip(g.description), target: clip(g.targetContactInstructions), review: clip(g.messageReviewInstructions), variations: clip(g.variations), prompts: clip(g.sourcePrompts), source: g.contactSource, workspace: g.workspaceName });
             row.eachCell({ includeEmpty: true }, c => { c.font = { ...base }; c.alignment = { vertical: 'top', wrapText: true }; if (i % 2 === 1) c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFeff6ff' } }; });
         });
         header(gs, gcols.length);
@@ -313,11 +310,11 @@ async function downloadPart(index) {
         const scols = [['BDR', 'bdr', 24], ['BDR Email', 'email', 30], ['Company', 'company', 24], ['All Contacts', 'all', 12], ['Already In A Group', 'assigned', 14], ['No Group Yet', 'open', 12], ['Contacts In This File', 'inFile', 14], ['Groups This BDR Can Use', 'groups', 60]];
         const ss = wb.addWorksheet('BDR Summary');
         ss.columns = scols.map(([header, key, width]) => ({ header, key, width }));
-        [...new Set(part.rows.map(r => r.bdrId))].forEach(id => {
-            const d = data.get(id), assigned = d.leads.filter(l => l.fit).length;
-            const row = ss.addRow({ bdr: d.bdr.name, email: d.bdr.email || '', company: d.bdr.customerName || '', all: d.leads.length, assigned, open: d.leads.length - assigned, inFile: part.rows.filter(r => r.bdrId === id).length, groups: clip(d.groups.map(g => g.name).join('; ')) });
+        {
+            const d = bdrData, assigned = d.leads.filter(l => l.fit).length;
+            const row = ss.addRow({ bdr: d.bdr.name, email: d.bdr.email || '', company: d.bdr.customerName || '', all: d.leads.length, assigned, open: d.leads.length - assigned, inFile: part.rows.length, groups: clip(d.groups.map(g => g.name).join('; ')) });
             row.eachCell({ includeEmpty: true }, c => { c.font = { ...base }; c.alignment = { vertical: 'top', wrapText: true }; });
-        });
+        }
         header(ss, scols.length);
 
         const buffer = await wb.xlsx.writeBuffer();
@@ -325,7 +322,7 @@ async function downloadPart(index) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         const day = new Date().toISOString().slice(0, 10);
-        a.href = url; a.download = parts.length === 1 ? `contacts_by_bdr_${day}.xlsx` : `contacts_by_bdr_part${index + 1}of${parts.length}_${day}.xlsx`;
+        a.href = url; a.download = `contacts_${slug(bdrData.bdr.name)}${part.of === 1 ? '' : `_part${part.n}of${part.of}`}_${day}.xlsx`;
         a.style.visibility = 'hidden'; document.body.appendChild(a); a.click(); document.body.removeChild(a);
         setTimeout(() => URL.revokeObjectURL(url), 5000);
         say('exportStatus', detailError
@@ -336,22 +333,24 @@ async function downloadPart(index) {
     } finally { btn.innerHTML = orig; btn.disabled = false; }
 }
 
-// ── The instructions for ChatGPT ────────────────────────────────────────────
+// ── The instructions for ChatGPT (one BDR per file, so one BDR per chat) ─────
 
-const PROMPT = `I've attached an Excel file with three sheets (the headers are in row 1 of each): "Leads", "Hypothesis Groups" and "BDR Summary".
+function promptFor(b) {
+    const email = b.email || 'bdr@example.com';
+    return `I've attached an Excel file with the LinkedIn contacts of ONE BDR: ${b.name}${b.email ? ` (${b.email})` : ''}. It has three sheets (the headers are in row 1 of each): "Leads", "Hypothesis Groups" and "BDR Summary".
 
-Each row in "Leads" is a LinkedIn contact that belongs to one BDR (columns "BDR" and "BDR Email"). The "Hypothesis Groups" sheet describes the groups. A contact may ONLY be put into one of the groups listed in its own "Candidate Group IDs" column, which are the groups that contact's BDR is associated with.
+Every row in "Leads" is a contact of this one BDR. The "Hypothesis Groups" sheet lists the only groups this BDR is associated with. Put each contact only into a group from that sheet.
 
-Look at each contact and their background (position, company, headline, about, their full experience and education), then look at the hypothesis groups that contact can go into. Put each contact into the ONE best-fit group. If no group fits well, do not classify the contact: set bestFitGroupId to null. Only include contacts where "Needs Group Assignment" is "Yes".
+Look at each contact and their background (position, company, headline, about, their full experience and education), then look at the hypothesis groups. Put each contact into the ONE best-fit group. If no group fits well, do not classify the contact: set bestFitGroupId to null. Only include contacts where "Needs Group Assignment" is "Yes".
 
 Go through every contact, in batches of about 50, and do not skip or sample any. If you can't finish in one response, stop, give me the partial file and say which row you reached, and I'll say "continue". Judge each person on their actual role and background, not just keywords.
 
-Return one downloadable file, hypothesis_fit.json, with valid JSON and nothing else in it, shaped like this:
+Return one downloadable file, hypothesis_fit_${slug(b.name)}.json, with valid JSON and nothing else in it, shaped like this:
 
 {
   "assignments": [
     {
-      "bdrEmail": "bdr@example.com",
+      "bdrEmail": "${email}",
       "linkedinUrl": "https://www.linkedin.com/in/jane-doe",
       "bestFitGroupId": "GROUP_ID_FROM_SHEET",
       "bestFitGroupName": "Group Name From Sheet",
@@ -359,7 +358,7 @@ Return one downloadable file, hypothesis_fit.json, with valid JSON and nothing e
       "reason": "One short sentence on why."
     },
     {
-      "bdrEmail": "bdr@example.com",
+      "bdrEmail": "${email}",
       "linkedinUrl": "https://www.linkedin.com/in/john-smith",
       "bestFitGroupId": null,
       "bestFitGroupName": null,
@@ -369,10 +368,10 @@ Return one downloadable file, hypothesis_fit.json, with valid JSON and nothing e
   ]
 }
 
-Rules: copy "BDR Email" and the LinkedIn URL exactly as they appear in the sheet. Copy Group IDs exactly as they appear in the "Group ID" column, and never invent or rename one. Never use a group that is not in that contact's "Candidate Group IDs". Include each contact once. fitScore is 0-100. When you finish, tell me how many contacts went into each group and how many got null.`;
-$('promptText').textContent = PROMPT;
+Rules: use "${email}" as the bdrEmail on every entry, and copy the LinkedIn URL exactly as it appears in the sheet. Copy Group IDs exactly as they appear in the "Group ID" column, and never invent or rename one. Never use a group that is not on the "Hypothesis Groups" sheet. Include each contact once. fitScore is 0-100. When you finish, tell me how many contacts went into each group and how many got null.`;
+}
 
-// ── 3. Load the JSON ────────────────────────────────────────────────────────
+// ── 3. Load the JSON (one upload box per BDR) ───────────────────────────────
 
 const CHUNK = 1000;
 const LABELS = {
@@ -381,17 +380,61 @@ const LABELS = {
 };
 const GENERAL = { noUrl: 'No usable LinkedIn URL', notAllowed: 'BDR not one you can act for', noBdr: 'No BDR given and none of the chosen BDRs has the contact', ambiguous: 'No BDR given and more than one BDR has the contact' };
 
-async function readEntries(files) {
-    const out = [];
+let slotCounter = 0;
+
+function slotFor(b) {
+    let s = slots.get(b.id);
+    if (s) return s;
+    const n = ++slotCounter;
+    const el = document.createElement('div');
+    el.className = 'part-row'; el.style.display = 'block';
+    el.innerHTML = `
+        <div style="margin-bottom:.4rem;"><b>${esc(b.name)}</b> <span class="sub">${esc(b.email || '')}${b.customerName ? ' · ' + esc(b.customerName) : ''}</span></div>
+        <div class="btn-row">
+            <label class="btn btn-primary btn-sm" for="jsonFiles_${n}" style="margin:0;"><i class="fas fa-folder-open"></i> Choose JSON for ${esc(b.name)}</label>
+            <input type="file" id="jsonFiles_${n}" accept=".json,application/json" multiple hidden>
+            <button class="btn btn-outline btn-sm" data-f="apply" disabled><i class="fas fa-floppy-disk"></i> Save for ${esc(b.name)}</button>
+            <span class="sub" data-f="names"></span>
+        </div>
+        <div class="status-line" data-f="status"></div>
+        <div data-f="report"></div>`;
+    s = { el, input: el.querySelector('input[type=file]'), applyBtn: el.querySelector('[data-f=apply]'), names: el.querySelector('[data-f=names]'), status: el.querySelector('[data-f=status]'), report: el.querySelector('[data-f=report]'), entries: [], wrong: 0, wrongEmails: [] };
+    s.input.addEventListener('change', () => onSlotFiles(b, Array.from(s.input.files || [])));
+    s.applyBtn.addEventListener('click', () => applySlot(b));
+    slots.set(b.id, s);
+    return s;
+}
+
+function slotStatus(s, text, isError) { s.status.textContent = text || ''; s.status.classList.toggle('err', !!isError); }
+
+function renderImportSlots() {
+    const list = bdrs.filter(b => selected.has(b.id));
+    const box = $('importSlots');
+    if (!list.length) { box.innerHTML = '<div class="empty">Choose at least one BDR above.</div>'; return; }
+    box.replaceChildren(...list.map(b => slotFor(b).el));
+}
+
+/** Read one BDR's JSON file(s). Entries that name a different BDR are dropped, so a file can never be saved to the wrong person. */
+async function readEntries(files, b) {
+    const out = [], wrongEmails = [];
+    const mine = (b.email || '').trim().toLowerCase();
     for (const f of files) {
         let parsed;
         try { parsed = JSON.parse(await f.text()); } catch (e) { throw new Error(`"${f.name}" is not valid JSON (${e.message}). Ask ChatGPT to give you the file again as valid JSON.`); }
         const list = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.assignments) ? parsed.assignments : null);
         if (!list) throw new Error(`"${f.name}" has no "assignments" list.`);
-        list.forEach(e => { if (e && typeof e === 'object') out.push(e); });
+        list.forEach(e => {
+            if (!e || typeof e !== 'object') return;
+            const em = String(e.bdrEmail || '').trim().toLowerCase();
+            if (em && mine && em !== mine) { wrongEmails.push(em); return; }
+            out.push(e);
+        });
     }
-    if (!out.length) throw new Error('The file(s) contain no assignments.');
-    return out;
+    if (!out.length) {
+        if (wrongEmails.length) throw new Error(`These file(s) are for a different BDR (${[...new Set(wrongEmails)].slice(0, 3).join(', ')}), not ${b.name}. Use the upload box for that BDR instead.`);
+        throw new Error('The file(s) contain no assignments.');
+    }
+    return { entries: out, wrongEmails };
 }
 
 function mergeReports(into, r) {
@@ -405,21 +448,21 @@ function mergeReports(into, r) {
     Object.entries(r.unattributed || {}).forEach(([k, v]) => { into.unattributed[k] = [...(into.unattributed[k] || []), ...v].slice(0, 5); });
 }
 
-async function run(mode, progressText) {
+async function run(b, s, mode, progressText) {
     const agg = { totals: {}, perBdr: {}, unattributed: {} };
     let saved = { people: 0, records: 0 }, willSave = 0;
-    const fallbackBdrIds = [...selected];
     const onlyUnassigned = $('optOnlyUnassigned').checked;
-    for (let i = 0; i < parsedEntries.length; i += CHUNK) {
-        say('importStatus', `${progressText} ${Math.min(i + CHUNK, parsedEntries.length)} of ${parsedEntries.length}…`);
-        const r = await api('/multi/import', { method: 'POST', body: { mode, assignments: parsedEntries.slice(i, i + CHUNK), onlyUnassigned, fallbackBdrIds } });
+    for (let i = 0; i < s.entries.length; i += CHUNK) {
+        slotStatus(s, `${progressText} ${Math.min(i + CHUNK, s.entries.length)} of ${s.entries.length}…`);
+        // fallbackBdrIds is only this BDR, so an entry with no BDR email can only ever land on this BDR.
+        const r = await api('/multi/import', { method: 'POST', body: { mode, assignments: s.entries.slice(i, i + CHUNK), onlyUnassigned, fallbackBdrIds: [b.id] } });
         mergeReports(agg, r.report);
         if (mode === 'apply') { saved.people += r.saved.people; saved.records += r.saved.records; } else willSave += r.willSave;
     }
     return { agg, saved, willSave };
 }
 
-function renderReport(agg, { done, saved } = {}) {
+function renderReport(s, agg, { done, saved } = {}) {
     const ids = Object.keys(agg.perBdr).sort((a, b) => agg.perBdr[a].name.localeCompare(agg.perBdr[b].name));
     const c = (x, k) => x.counts[k] || 0;
     const rows = ids.map(id => {
@@ -438,45 +481,50 @@ function renderReport(agg, { done, saved } = {}) {
         return `<div class="note bad"><b>${agg.totals[k]}</b> ${esc(GENERAL[k].toLowerCase())}${ex.length ? `<details class="ex"><summary>Examples</summary>${ex.map(esc).join('<br>')}</details>` : ''}</div>`;
     }).join('');
     const dup = agg.totals.duplicate ? `<div class="note warn">${agg.totals.duplicate} contact(s) appear more than once in the file; the last entry for each was used.</div>` : '';
+    const wrong = s.wrong ? `<div class="note warn">${s.wrong} entr${s.wrong === 1 ? 'y' : 'ies'} named a different BDR (${esc([...new Set(s.wrongEmails)].slice(0, 3).join(', '))}) and ${s.wrong === 1 ? 'was' : 'were'} ignored.</div>` : '';
     const total = (agg.totals.assign || 0) + (agg.totals.replace || 0);
-    $('importReport').innerHTML = `
-        <div class="banner ${done ? 'live' : ''}" style="margin-top:1rem;">${done
+    s.report.innerHTML = `
+        <div class="banner ${done ? 'live' : ''}" style="margin-top:.8rem;">${done
             ? `<b>Saved.</b> ${saved.people} contact${saved.people === 1 ? '' : 's'} assigned to a hypothesis group (${saved.records} record${saved.records === 1 ? '' : 's'} updated).`
             : `<b>Checked, nothing saved yet.</b> ${total} contact${total === 1 ? '' : 's'} will be assigned to a group.`}</div>
         <div class="results-wrap"><table class="results"><thead><tr><th>BDR</th><th class="num">${done ? 'Assigned' : 'To assign'}</th><th class="num">Left alone</th><th class="num">No group fits</th><th class="num">Not found</th><th class="num">Wrong group</th><th>Details</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="empty-row">Nothing in the file could be tied to a BDR.</td></tr>'}</tbody></table></div>
-        ${general}${dup}`;
+        <tbody>${rows || '<tr><td colspan="7" class="empty-row">Nothing in the file could be tied to this BDR.</td></tr>'}</tbody></table></div>
+        ${general}${dup}${wrong}`;
 }
 
-async function onFiles(files) {
-    $('applyBtn').disabled = true; $('importReport').innerHTML = '';
-    if (!files.length) { $('fileNames').textContent = ''; return; }
-    $('fileNames').textContent = files.map(f => f.name).join(', ');
+async function onSlotFiles(b, files) {
+    const s = slotFor(b);
+    s.applyBtn.disabled = true; s.report.innerHTML = ''; s.entries = []; s.wrong = 0; s.wrongEmails = [];
+    if (!files.length) { s.names.textContent = ''; slotStatus(s, ''); return; }
+    s.names.textContent = files.map(f => f.name).join(', ');
     try {
-        parsedEntries = await readEntries(files);
-        const { agg, willSave } = await run('preview', 'Checking');
-        say('importStatus', `${parsedEntries.length} assignments read.`);
-        renderReport(agg);
-        $('applyBtn').disabled = willSave === 0;
-        if (willSave === 0) say('importStatus', `${parsedEntries.length} assignments read, but none would change anything. See the table for why.`, true);
-    } catch (e) { parsedEntries = []; say('importStatus', e.message, true); }
+        const r = await readEntries(files, b);
+        s.entries = r.entries; s.wrong = r.wrongEmails.length; s.wrongEmails = r.wrongEmails;
+        const { agg, willSave } = await run(b, s, 'preview', 'Checking');
+        slotStatus(s, `${s.entries.length} assignments read.`);
+        renderReport(s, agg);
+        s.applyBtn.disabled = willSave === 0;
+        if (willSave === 0) slotStatus(s, `${s.entries.length} assignments read, but none would change anything. See the table for why.`, true);
+    } catch (e) { s.entries = []; slotStatus(s, e.message, true); }
 }
 
-async function apply() {
-    if (!parsedEntries.length) return;
-    if (!confirm('Save these assignments? Each contact gets the hypothesis group shown in the check. Contacts left alone are not changed.')) return;
-    $('applyBtn').disabled = true;
+async function applySlot(b) {
+    const s = slotFor(b);
+    if (!s.entries.length) return;
+    if (!confirm(`Save these assignments for ${b.name}? Each contact gets the hypothesis group shown in the check. Contacts left alone are not changed.`)) return;
+    s.applyBtn.disabled = true;
     try {
-        const { agg, saved } = await run('apply', 'Saving');
-        say('importStatus', '');
-        renderReport(agg, { done: true, saved });
-        parsedEntries = []; $('jsonFiles').value = ''; $('fileNames').textContent = '';
-        if (data.size) { await loadSelected(); }            // refresh the counts above (the server already has the change)
+        const { agg, saved } = await run(b, s, 'apply', 'Saving');
+        slotStatus(s, '');
+        renderReport(s, agg, { done: true, saved });
+        s.entries = []; s.input.value = ''; s.names.textContent = '';
+        if (data.has(b.id)) await loadSelected({ only: [b.id] });      // refresh this BDR's counts above (the server already has the change)
     } catch (e) {
-        say('importStatus', `Stopped: ${e.message}. Some contacts may already be saved; check the file again to see what is left.`, true);
-        $('applyBtn').disabled = false;
+        slotStatus(s, `Stopped: ${e.message}. Some contacts may already be saved; check the file again to see what is left.`, true);
+        s.applyBtn.disabled = false;
     }
 }
+
 
 // ── Wiring ──────────────────────────────────────────────────────────────────
 
@@ -493,11 +541,21 @@ document.addEventListener('click', (e) => {
         }
         case 'load': loadSelected({ fresh: true }); break;
         case 'download': downloadPart(parseInt(b.dataset.part, 10)); break;
-        case 'toggle-prompt': { const p = $('promptText'); p.hidden = !p.hidden; b.textContent = p.hidden ? 'Show them' : 'Hide them'; break; }
-        case 'copy-prompt':
-            navigator.clipboard.writeText(PROMPT).then(() => { $('copyStatus').textContent = 'Copied.'; }, () => { $('promptText').hidden = false; $('copyStatus').textContent = 'Could not copy. Select the text below and copy it by hand.'; });
+        case 'show-prompt': {
+            const bd = bdrs.find(x => x.id === b.dataset.bdr); if (!bd) break;
+            const p = $('promptText'), same = !p.hidden && p.dataset.bdr === bd.id;
+            p.textContent = promptFor(bd); p.dataset.bdr = bd.id; p.hidden = same;
+            document.querySelectorAll('[data-action="show-prompt"]').forEach(x => { x.textContent = 'Show'; });
+            if (!same) b.textContent = 'Hide';
             break;
-        case 'apply': apply(); break;
+        }
+        case 'copy-prompt': {
+            const bd = bdrs.find(x => x.id === b.dataset.bdr); if (!bd) break;
+            navigator.clipboard.writeText(promptFor(bd)).then(
+                () => { $('copyStatus').textContent = `Copied the instructions for ${bd.name}.`; },
+                () => { const p = $('promptText'); p.textContent = promptFor(bd); p.dataset.bdr = bd.id; p.hidden = false; $('copyStatus').textContent = 'Could not copy. Select the text below and copy it by hand.'; });
+            break;
+        }
     }
 });
 $('bdrBox').addEventListener('change', (e) => {
@@ -507,8 +565,9 @@ $('bdrBox').addEventListener('change', (e) => {
 });
 $('bdrSearch').addEventListener('input', renderBdrList);
 ['optNeedsOnly', 'optSkipExcluded', 'optPerFile'].forEach(id => $(id).addEventListener('change', () => { if (data.size) renderLoaded(); }));
-$('jsonFiles').addEventListener('change', (e) => onFiles(Array.from(e.target.files || [])));
-$('optOnlyUnassigned').addEventListener('change', () => { if (parsedEntries.length && $('jsonFiles').files.length) onFiles(Array.from($('jsonFiles').files)); });
+$('optOnlyUnassigned').addEventListener('change', () => {
+    slots.forEach((s, id) => { const b = bdrs.find(x => x.id === id); if (b && s.entries.length && s.input.files.length) onSlotFiles(b, Array.from(s.input.files)); });
+});
 
 let started = false;
 async function start() {
