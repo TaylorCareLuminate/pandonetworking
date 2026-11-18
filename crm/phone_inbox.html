@@ -2,7 +2,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <!-- CACHE BUSTER v2.7.7 - CALLS STAY MADE: lists the people whose meetings were removed and marks those calls completed so they leave the queue. -->
+    <!-- CACHE BUSTER v2.7.9 - MEETING CLEANUP MOVED: removing accidental meetings and marking returned calls as made now live in Call Manager. Previous v2.7.3 - WORKING: Auth fixed + 404 cache + exists() compatibility -->
     <!-- TODO: Make "flagged" show as an outcome in phone-calls.html call history so agents can see contact was flagged by another agent -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1048,13 +1048,6 @@
                     </div>
                 </div>
 
-                <div id="callsReturnedPanel" style="display: none; margin: 0 0 1.25rem; padding: 1rem; border: 2px solid #d97706; border-radius: 8px; background: #fffbeb;">
-                    <div style="font-weight: 700; color: #92400e; margin-bottom: 0.35rem;">Calls put back in the queue</div>
-                    <p style="margin: 0 0 0.75rem; color: #78350f; font-size: 0.9rem;">These calls had a meeting removed and were returned to the queue. The person, company, and phone are still on the call. Marking them made records Good Number, No Message at $0.50 and takes them back out of the queue.</p>
-                    <div id="callsReturnedList"></div>
-                    <button type="button" id="markCallsReturnedBtn" onclick="markCallsReturnedAsMade()" style="margin-top: 0.75rem; background: #b45309; color: white; border: none; border-radius: 6px; padding: 0.55rem 0.9rem; font-weight: 700; cursor: pointer;">Mark selected calls as made</button>
-                </div>
-
                 <div class="filter-bar">
                     <div class="filter-group">
                         <label class="filter-label">Date Range</label>
@@ -1469,7 +1462,7 @@
 
     <script type="module">
         // 📄 PAGE VERSION FOR CACHE BUSTING
-        const PAGE_VERSION = 'v1.2.5-calls-stay-made';
+        const PAGE_VERSION = 'v1.2.7-cleanup-moved';
         console.log(`📄 Phone Inbox Page Version: ${PAGE_VERSION}`);
         console.log('🔥 Using Firebase Project: clemail (via secure wrapper)');
         console.log('📊 Data Sources: campaign_call_tracking (calls), emailRequests (emails), campaigns (names), outreach_sets (contacts), sends (email history)');
@@ -1481,11 +1474,9 @@
         import { getAuth, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js';
         import { getDatabase, ref, get, set, update, child, orderByChild, limitToFirst, equalTo, query as rtdbQuery } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-database.js';
         import { getApps } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js';
-        import { deleteField } from 'https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js';
-        import { calculateAchievementPool, qualifyingCallsAfterHistory } from '../js/payment-config.js';
         
         // Use CLEmail secure wrapper for Firestore
-        const { collection, getDocs, doc, getDoc, updateDoc, addDoc, setDoc, deleteDoc, query, where, orderBy, limit } = window.clemailFirestore;
+        const { collection, getDocs, doc, getDoc, updateDoc, addDoc, query, where, orderBy, limit } = window.clemailFirestore;
         const db = window.clemailDb;
         const auth = window.auth; // Auth from auth.js
         const rtdb = getDatabase(window.app); // Realtime DB from auth.js (HealthcareITDatabase)
@@ -1968,7 +1959,6 @@
         // Load scheduled calls
         async function loadScheduledCalls() {
             try {
-                loadCallsReturnedToQueue();
                 console.log('📅 Loading scheduled calls from campaign_call_tracking...');
                 console.log('   Using targeted outcome query — fetches all meetings & callbacks regardless of age');
                 
@@ -2207,12 +2197,7 @@
                             </div>
                         </div>
                     ` : `
-                        <div style="margin-top: 1rem; display: flex; flex-direction: column; gap: 0.5rem;">
-                            ${call.type === 'meeting' ? `
-                                <button class="btn btn-small" style="width: 100%; background: #dc2626; color: white;" onclick="window.removeAccidentalMeeting('${call.id}')">
-                                    <i class="fas fa-phone"></i> Change to Good Number ($0.50)
-                                </button>
-                            ` : ''}
+                        <div style="margin-top: 1rem;">
                             <button class="btn btn-success btn-small" style="width: 100%;" onclick="window.markScheduledCallAsCompleted('${call.id}')">
                                 <i class="fas fa-check"></i> Mark as Completed
                             </button>
@@ -4137,352 +4122,6 @@
             } catch (error) {
                 console.error('❌ Error completing email request:', error);
                 showAlert('Error marking email as completed', 'danger');
-            }
-        };
-
-        const MEETING_ADMINS = [
-            'samellsworth@careluminate.com',
-            'taylor@careluminate.com',
-            'taylordavis@careluminate.com'
-        ];
-        const RELATED_MEETING_WINDOW_MS = 2 * 60 * 60 * 1000;
-
-        function isMeetingAdmin() {
-            return MEETING_ADMINS.includes((currentUser?.email || '').toLowerCase());
-        }
-
-        const GOOD_NUMBER_OUTCOME = 'good-number-no-message';
-        const GOOD_NUMBER_PAY = 0.50;
-        let callsReturnedToQueue = [];
-
-        function activityContactName(data) {
-            return data.contactName || data.orgName || data.name || 'Unknown';
-        }
-
-        function activityCompanyName(data) {
-            return data.companyName || data.company || data.contactCompany || '';
-        }
-
-        function activityPhone(data) {
-            return data.phoneNumber || data.phone || data.contactPhone || '';
-        }
-
-        function activityCaller(data) {
-            const caller = data.assignedTo || data.reservedBy || data.createdBy || data.userEmail || '';
-            return String(caller).includes('@') ? caller : '';
-        }
-
-        async function loadCallsReturnedToQueue() {
-            const panel = document.getElementById('callsReturnedPanel');
-            const list = document.getElementById('callsReturnedList');
-            if (!panel || !list || !isMeetingAdmin()) return;
-            try {
-                const since = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-                const snapshot = await getDocs(query(
-                    collection(db, 'phone_activities'),
-                    where('undoneAt', '>=', since)
-                ));
-                callsReturnedToQueue = snapshot.docs
-                    .map((item) => ({ id: item.id, ...item.data() }))
-                    .filter((call) => !call.keptAsMadeAt && call.status !== 'completed')
-                    .sort((a, b) => String(b.undoneAt || '').localeCompare(String(a.undoneAt || '')));
-
-                if (callsReturnedToQueue.length === 0) {
-                    panel.style.display = 'none';
-                    return;
-                }
-
-                panel.style.display = 'block';
-                list.innerHTML = callsReturnedToQueue.map((call) => {
-                    const when = call.undoneAt ? new Date(call.undoneAt).toLocaleString() : '';
-                    const caller = activityCaller(call);
-                    return `
-                        <label style="display: block; padding: 0.55rem 0; border-top: 1px solid #fde68a; cursor: pointer;">
-                            <input type="checkbox" class="returned-call-check" value="${escapeHtml(call.id)}" checked style="margin-right: 0.5rem;">
-                            <strong>${escapeHtml(activityContactName(call))}</strong>
-                            ${activityCompanyName(call) ? ` — ${escapeHtml(activityCompanyName(call))}` : ''}
-                            <div style="margin-left: 1.4rem; color: #78350f; font-size: 0.85rem;">
-                                ${activityPhone(call) ? `Phone: ${escapeHtml(activityPhone(call))}<br>` : ''}
-                                Campaign: ${escapeHtml(call.campaignId || 'Unknown')}
-                                ${caller ? `<br>Assigned to: ${escapeHtml(caller)}` : '<br>Caller was cleared when the meeting was removed'}
-                                ${call.notes ? `<br>Notes: ${escapeHtml(call.notes)}` : ''}
-                                ${when ? `<br>Put back: ${escapeHtml(when)}` : ''}
-                            </div>
-                        </label>
-                    `;
-                }).join('');
-            } catch (error) {
-                console.error('❌ Could not list calls put back in the queue:', error);
-                panel.style.display = 'block';
-                list.innerHTML = `<p style="color: #991b1b;">Could not load these calls: ${escapeHtml(error.message || String(error))}</p>`;
-            }
-        }
-
-        window.markCallsReturnedAsMade = async function() {
-            if (!isMeetingAdmin()) return;
-            const selectedIds = new Set(
-                [...document.querySelectorAll('.returned-call-check:checked')].map((box) => box.value)
-            );
-            const selected = callsReturnedToQueue.filter((call) => selectedIds.has(call.id));
-            if (selected.length === 0) {
-                showAlert('Select at least one call to mark as made.', 'warning');
-                return;
-            }
-
-            const names = selected.map((call) => {
-                const company = activityCompanyName(call);
-                return company ? `${activityContactName(call)} (${company})` : activityContactName(call);
-            });
-            const confirmed = confirm(
-                `Mark ${selected.length} call${selected.length === 1 ? '' : 's'} as made?\n\n` +
-                `${names.join('\n')}\n\n` +
-                `Each stays out of the queue and is recorded as Good Number, No Message for $${GOOD_NUMBER_PAY.toFixed(2)}. The meeting stays off the schedule.`
-            );
-            if (!confirmed) return;
-
-            const button = document.getElementById('markCallsReturnedBtn');
-            if (button) button.disabled = true;
-            try {
-                const campaignsTouched = new Set();
-                const madeAt = new Date().toISOString();
-                for (const call of selected) {
-                    const caller = activityCaller(call);
-                    const completedAt = madeAt;
-                    const activityUpdate = {
-                        status: 'completed',
-                        outcome: GOOD_NUMBER_OUTCOME,
-                        completedAt,
-                        basePayment: GOOD_NUMBER_PAY,
-                        achievementPoolAwarded: 0,
-                        totalPayment: GOOD_NUMBER_PAY,
-                        phoneLastCalledAt: completedAt,
-                        keptAsMadeAt: completedAt,
-                        keptAsMadeBy: currentUser?.email || ''
-                    };
-                    if (caller) activityUpdate.completedBy = caller;
-                    await updateDoc(doc(db, 'phone_activities', call.id), activityUpdate);
-                    if (call.campaignId) {
-                        await addDoc(collection(db, 'campaign_call_tracking'), {
-                            campaignId: call.campaignId,
-                            callId: call.id,
-                            outcome: GOOD_NUMBER_OUTCOME,
-                            basePayment: GOOD_NUMBER_PAY,
-                            achievementPoolAwarded: 0,
-                            totalPayment: GOOD_NUMBER_PAY,
-                            timestamp: completedAt,
-                            userEmail: caller || '',
-                            callerName: caller || '',
-                            contactName: activityContactName(call),
-                            companyName: activityCompanyName(call),
-                            contactCompany: activityCompanyName(call),
-                            phoneNumber: activityPhone(call),
-                            contactPhone: activityPhone(call),
-                            contactEmail: call.contactEmail || call.email || '',
-                            outreachSetId: call.outreachSetId || '',
-                            notes: call.notes || 'Call kept after the meeting was removed',
-                            restoredAfterMeetingRemoval: true,
-                            restoredBy: currentUser?.email || ''
-                        });
-                        campaignsTouched.add(call.campaignId);
-                    }
-                }
-
-                for (const campaignId of campaignsTouched) {
-                    const snapshot = await getDocs(query(
-                        collection(db, 'campaign_call_tracking'),
-                        where('campaignId', '==', campaignId)
-                    ));
-                    const qualifyingCalls = qualifyingCallsAfterHistory(snapshot.docs.map((item) => item.data()));
-                    await setDoc(doc(db, 'campaign_pool_stats', campaignId), {
-                        qualifyingCalls,
-                        lastUpdated: new Date().toISOString(),
-                        lastUpdatedBy: currentUser?.email || 'admin-keep-call'
-                    }, { merge: true });
-                }
-
-                showAlert(
-                    `Marked ${selected.length} call${selected.length === 1 ? '' : 's'} as made, so they leave the queue: ${names.join('; ')}.`,
-                    'success'
-                );
-                await loadCallsReturnedToQueue();
-            } catch (error) {
-                console.error('❌ Could not mark calls as made:', error);
-                showAlert('Could not mark the calls as made: ' + (error.message || error), 'danger');
-            } finally {
-                if (button) button.disabled = false;
-            }
-        };
-
-        function callTimestampIso(value) {
-            if (!value) return '';
-            if (typeof value.toDate === 'function') return value.toDate().toISOString();
-            if (value instanceof Date) return value.toISOString();
-            if (typeof value === 'string') return value;
-            if (value.seconds !== undefined) return new Date(value.seconds * 1000).toISOString();
-            return '';
-        }
-
-        async function keepCallAsGoodNumber(meeting) {
-            await updateDoc(doc(db, 'campaign_call_tracking', meeting.id), {
-                outcome: GOOD_NUMBER_OUTCOME,
-                basePayment: GOOD_NUMBER_PAY,
-                achievementPoolAwarded: 0,
-                totalPayment: GOOD_NUMBER_PAY,
-                previousOutcome: meeting.outcome,
-                previousPoolAward: meeting.achievementPoolAwarded || 0,
-                meetingRemovedAt: new Date().toISOString(),
-                meetingRemovedBy: currentUser?.email || '',
-                additionalData: deleteField()
-            });
-
-            const timestamp = callTimestampIso(meeting.timestamp);
-            if (!timestamp || !meeting.userEmail) return;
-            const snapshot = await getDocs(query(
-                collection(db, 'phone_activities'),
-                where('completedAt', '==', timestamp)
-            ));
-            for (const activityDoc of snapshot.docs) {
-                const data = activityDoc.data();
-                if (data.outcome !== 'spoke-scheduled-meeting') continue;
-                if ((data.completedBy || '').toLowerCase() !== meeting.userEmail.toLowerCase()) continue;
-                await updateDoc(doc(db, 'phone_activities', activityDoc.id), {
-                    status: 'completed',
-                    outcome: GOOD_NUMBER_OUTCOME,
-                    basePayment: GOOD_NUMBER_PAY,
-                    achievementPoolAwarded: 0,
-                    totalPayment: GOOD_NUMBER_PAY,
-                    additionalData: deleteField(),
-                    meetingRemovedAt: new Date().toISOString(),
-                    meetingRemovedBy: currentUser?.email || ''
-                });
-            }
-        }
-
-        async function describePoolWithoutMeetings(campaignId, excludeIds, convertIds = new Set()) {
-            const poolDoc = await getDoc(doc(db, 'campaign_pool_stats', campaignId));
-            const poolExists = typeof poolDoc.exists === 'function' ? poolDoc.exists() : poolDoc.exists;
-            const beforeCalls = poolExists ? (poolDoc.data().qualifyingCalls || 0) : 0;
-            const snapshot = await getDocs(query(
-                collection(db, 'campaign_call_tracking'),
-                where('campaignId', '==', campaignId)
-            ));
-            const calls = snapshot.docs
-                .map((item) => ({ id: item.id, ...item.data() }))
-                .filter((call) => !excludeIds.has(call.id))
-                .map((call) => convertIds.has(call.id) ? { ...call, outcome: GOOD_NUMBER_OUTCOME } : call);
-            const afterCalls = qualifyingCallsAfterHistory(calls);
-            const remainingMeeting = [...calls].reverse().find((call) => call.outcome === 'spoke-scheduled-meeting') || null;
-            return {
-                beforeCalls,
-                beforeAmount: calculateAchievementPool(beforeCalls),
-                afterCalls,
-                afterAmount: calculateAchievementPool(afterCalls),
-                remainingMeeting
-            };
-        }
-
-        function formatPoolRestore(pool) {
-            if (!pool) return '';
-            let text = `Achievement pool restored from $${pool.beforeAmount.toFixed(2)} to $${pool.afterAmount.toFixed(2)} (${pool.afterCalls} qualifying calls).`;
-            if (pool.remainingMeeting && pool.afterCalls === 0 && pool.beforeCalls === 0) {
-                text += ' Another meeting is still resetting this pool. Remove that one too.';
-            }
-            return text;
-        }
-
-        async function reopenActivityCompletedAsMeeting(timestamp, userEmail) {
-            if (!timestamp || !userEmail) return;
-            const snapshot = await getDocs(query(
-                collection(db, 'phone_activities'),
-                where('completedAt', '==', String(timestamp))
-            ));
-            for (const activityDoc of snapshot.docs) {
-                const data = activityDoc.data();
-                if (data.outcome !== 'spoke-scheduled-meeting') continue;
-                if ((data.completedBy || '').toLowerCase() !== userEmail.toLowerCase()) continue;
-                await updateDoc(doc(db, 'phone_activities', activityDoc.id), {
-                    status: data.scheduledDate || data.scheduledAt ? 'scheduled' : 'pending',
-                    outcome: deleteField(),
-                    completedAt: deleteField(),
-                    completedBy: deleteField(),
-                    basePayment: deleteField(),
-                    achievementPoolAwarded: deleteField(),
-                    totalPayment: deleteField(),
-                    additionalData: deleteField(),
-                    notes: data.schedulingNotes || '',
-                    claimedBy: null,
-                    claimedAt: null,
-                    claimedByName: null,
-                    undoneAt: new Date().toISOString(),
-                    undoneBy: currentUser?.email || userEmail
-                });
-            }
-        }
-
-        window.removeAccidentalMeeting = async function(callId) {
-            if (!isMeetingAdmin()) {
-                showAlert('Only an administrator can remove a scheduled meeting.', 'danger');
-                return;
-            }
-            if (!/^[A-Za-z0-9_-]+$/.test(callId || '')) {
-                showAlert('That meeting could not be identified.', 'danger');
-                return;
-            }
-
-            try {
-                const meetingRef = doc(db, 'campaign_call_tracking', callId);
-                const snapshot = await getDoc(meetingRef);
-                const exists = typeof snapshot.exists === 'function' ? snapshot.exists() : snapshot.exists;
-                if (!exists) {
-                    showAlert('That meeting is already gone from the schedule.', 'info');
-                    await loadScheduledCalls();
-                    return;
-                }
-                const meeting = { id: callId, ...snapshot.data() };
-                if (meeting.outcome !== 'spoke-scheduled-meeting') {
-                    showAlert('That record is not a scheduled meeting, so it was left in place.', 'warning');
-                    return;
-                }
-
-                const slot = [meeting.additionalData?.date, meeting.additionalData?.time].filter(Boolean).join(' at ');
-                const poolPaid = Number(meeting.achievementPoolAwarded || 0).toFixed(2);
-                const preview = meeting.campaignId
-                    ? await describePoolWithoutMeetings(meeting.campaignId, new Set(), new Set([meeting.id]))
-                    : null;
-                const confirmed = confirm(
-                    `Change this one meeting into a paid call?\n\n` +
-                    `Contact: ${meeting.contactName || 'Unknown'}\n` +
-                    `Company: ${meeting.companyName || 'Unknown'}\n` +
-                    `When: ${slot || 'time not stored'}\n` +
-                    `Caller: ${meeting.userEmail || 'Unknown'}\n\n` +
-                    `The meeting comes off the schedule.\n` +
-                    `The caller keeps $${GOOD_NUMBER_PAY.toFixed(2)} for this call, recorded as Good Number, No Message.\n` +
-                    `The achievement pool bonus ($${poolPaid}) is removed from this call.\n` +
-                    `${preview ? `Achievement pool goes from $${preview.beforeAmount.toFixed(2)} to $${preview.afterAmount.toFixed(2)} (${preview.afterCalls} qualifying calls).\n` : ''}` +
-                    `\nNo other meetings are changed.`
-                );
-                if (!confirmed) return;
-
-                await keepCallAsGoodNumber(meeting);
-
-                let restored = null;
-                if (meeting.campaignId) {
-                    restored = await describePoolWithoutMeetings(meeting.campaignId, new Set());
-                    await setDoc(doc(db, 'campaign_pool_stats', meeting.campaignId), {
-                        qualifyingCalls: restored.afterCalls,
-                        lastUpdated: new Date().toISOString(),
-                        lastUpdatedBy: currentUser?.email || 'admin-meeting-removal'
-                    }, { merge: true });
-                }
-
-                showAlert(
-                    `Kept ${meeting.contactName || 'the call'} as Good Number, No Message ($${GOOD_NUMBER_PAY.toFixed(2)}). ${formatPoolRestore(restored)}`,
-                    'success'
-                );
-                await loadScheduledCalls();
-            } catch (error) {
-                console.error('❌ Error removing scheduled meeting:', error);
-                showAlert('Could not remove the meeting: ' + (error.message || error), 'danger');
             }
         };
 
