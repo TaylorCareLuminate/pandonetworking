@@ -19984,6 +19984,8 @@
                             harvest_fit_reason:   singleData.fitReason || '',
                             contact_connected_at: contact.connectedAt || null,
                             connection_origin:    contact.connectionOrigin || null,
+                            engagement_category:    contact.engagementCategory || null,
+                            close_contact_background: contact.closeContactBackground || null,
                             hypothesisGroupId:    hypGroupId || null,
                             hypothesisGroupName:  hypGroupName || null,
                             reviewStatus:         'pending_admin_review',
@@ -22166,6 +22168,8 @@
             const isPandoGroup = groupName === HARVEST_PANDO_GROUP;
             const hypPool = parseHarvestHypothesisValue(groupName);
             if (poolId) qs.set('poolId', poolId);
+            // Origin / count lookups need the whole pool, including contacts the client marked Do Not Engage.
+            if (opts.applyEngagement === false) qs.set('applyEngagement', 'false');
             // "Already connected" hypothesis pools need the pre-existing connections the server would
             // otherwise drop, so the only-our-connections checkbox is deliberately ignored for them.
             if (hypPool ? hypPool.mode === 'gen' : (onlyOurConnections || isPandoGroup)) qs.set('onlyOurConnections', 'true');
@@ -22206,6 +22210,7 @@
                     extra.contacts.forEach(c => { if (!have.has(harvestGroupNormUrl(c.linkedInUrl))) j.contacts.push(c); });
                     j.hypothesisExtraCount = extra.contacts.length;
                     j.hypothesisExtraSkipped = extra.skipped;
+                    j.hypothesisExtraDoNotEngage = extra.skippedDoNotEngage || 0;
                 }
             } else if (groupName && !isPandoGroup) {
                 const membership = await loadHarvestGroupMembership(bdrEmail, { force: !!opts.forceGroupRefresh });
@@ -22466,23 +22471,41 @@
             const originMap = await loadHarvestConnectionOriginMap(bdrEmail);
             if (!originMap) throw new Error('Could not check how each categorized connection was made (origin lookup failed). Try again.');
             const excluded = await loadHarvestManualExcludedUrls(bdrEmail);
+            // Connections the executive already had are Do Not Engage until the client says otherwise on Harvest Pool
+            // (Contact engagement). Only the ones they explicitly marked Engage are loaded.
+            const engagement = await loadHarvestEngagementChoices(bdrEmail);
             let recent = new Set();
             if (Number.isFinite(excludeDays) && excludeDays > 0) recent = await hfpLoadRecentlyMessagedUrls(bdrEmail, excludeDays);
             const contacts = [];
-            let skipped = 0;
+            let skipped = 0, skippedDoNotEngage = 0;
             members.forEach(norm => {
                 if (originMap.has(norm)) return;               // in the harvest pool (or a connection we generated) — handled by the pool list
                 const c = info.get(norm);
                 if (!c || !c.linkedInUrl) return;
+                const choice = engagement.get(norm);
+                if (!choice || choice.category === 'do_not_engage') { skippedDoNotEngage++; return; }
                 if (excluded.has(norm) || HARVEST_SKIP_CATEGORIES.includes(c.leadCategory) || recent.has(fpmNormalizeUrl(c.linkedInUrl))) { skipped++; return; }
                 contacts.push({
                     linkedInUrl: c.linkedInUrl, firstName: c.firstName, lastName: c.lastName, title: c.title, company: c.company,
                     connectedAt: null, connectionOrigin: 'pre_existing', poolId: '', poolName: '',
+                    engagementCategory: choice.category,
+                    ...(choice.category === 'engage_close' ? { closeContactBackground: choice.background || '' } : {}),
                     conversationId: c.conversationId, linkedInAccountId: c.linkedInAccountId, customerId: c.customerId
                 });
             });
             contacts.sort((a, b) => (a.lastName || '').localeCompare(b.lastName || ''));
-            return { contacts, skipped };
+            return { contacts, skipped, skippedDoNotEngage };
+        }
+
+        /** Saved "Contact engagement" choices (Harvest Pool page) → Map<normalizedUrl, { category, background }>. */
+        async function loadHarvestEngagementChoices(bdrEmail) {
+            const h = await harvestAuthHeaders();
+            const r = await fetch(`${HARVEST_RAILWAY_API}/api/connect/harvest-pool/engagement/${encodeURIComponent(bdrEmail)}`, { headers: h });
+            const j = await r.json();
+            if (!j.success) throw new Error(j.error || 'Could not load the contact engagement choices');
+            const map = new Map();
+            (j.entries || []).forEach(e => { const n = harvestGroupNormUrl(e.linkedInUrl || e.normalizedUrl); if (n) map.set(n, { category: e.category, background: e.background || '' }); });
+            return map;
         }
 
         // ── "Not our connection" flag ────────────────────────────────────────────────────────────
@@ -22530,7 +22553,8 @@
             try {
                 const payload = await fetchHarvestEligibleFromServer(bdrEmail, '', false, {
                     excludeRecentDays: 0,
-                    minDaysSinceConnection: 0
+                    minDaysSinceConnection: 0,
+                    applyEngagement: false
                 });
                 const map = new Map();
                 (payload.contacts || []).forEach(c => {
@@ -22750,9 +22774,11 @@
                 }
                 if (customGroup && customGroup !== HARVEST_PANDO_GROUP) {
                     addHarvestLog(`🏷️ Excluded ${poolPayload.excludedByGroupCount || 0} eligible contact(s) not in group "${harvestGroupDisplayName(customGroup)}".`);
-                    if (poolPayload.hypothesisExtraCount) addHarvestLog(`🧬 Added ${poolPayload.hypothesisExtraCount} already-connected contact(s) in this hypothesis group straight from the synced connections (they were not in the harvest pool).${poolPayload.hypothesisExtraSkipped ? ` ${poolPayload.hypothesisExtraSkipped} skipped (excluded / recently messaged).` : ''}`);
-                }
+                    if (poolPayload.hypothesisExtraCount) addHarvestLog(`🧬 Added ${poolPayload.hypothesisExtraCount} already-connected contact(s) in this hypothesis group straight from the synced connections (they were not in the harvest pool).${poolPayload.hypothesisExtraSkipped ? ` ${poolPayload.hypothesisExtraSkipped} skipped (excluded / recently messaged).` : ''}${poolPayload.hypothesisExtraDoNotEngage ? ` ${poolPayload.hypothesisExtraDoNotEngage} are Do Not Engage.` : ''}`);                }
 
+                if (poolPayload.excludedDoNotEngageCount) {
+                    addHarvestLog(`🚫 ${poolPayload.excludedDoNotEngageCount} contact(s) are marked Do Not Engage (Harvest Pool → Contact engagement) and were left out. Connections we did not generate are Do Not Engage until the client changes them.`);
+                }
                 if (poolPayload.excludeMessagedWithinDays) {
                     addHarvestLog(`🚫 Excluded ${poolPayload.excludedRecentlyMessagedCount || 0} contact(s) already messaged in the last ${poolPayload.excludeMessagedWithinDays} day(s).`);
                 }
@@ -22936,6 +22962,8 @@
                             harvest_fit_reason:   singleData.fitReason || '',
                             contact_connected_at: contact.connectedAt || null,
                             connection_origin:    contact.connectionOrigin || null,
+                            engagement_category:    contact.engagementCategory || null,
+                            close_contact_background: contact.closeContactBackground || null,
                             reviewStatus:         'pending_admin_review',
                             reviewed:             false,
                             deleted:              false,
@@ -28568,7 +28596,8 @@
                 const groupNote = customGroup
                     ? ` · group "${harvestGroupDisplayName(customGroup)}"${customGroup !== HARVEST_PANDO_GROUP ? ` (${poolPayload.excludedByGroupCount || 0} not in group excluded)` : ''}` +
                       (poolPayload.hypothesisExtraCount ? ` · ${poolPayload.hypothesisExtraCount} already-connected contact(s) added straight from your synced connections (not in the harvest pool)` : '') +
-                      (poolPayload.hypothesisExtraSkipped ? ` · ${poolPayload.hypothesisExtraSkipped} skipped (excluded / recently messaged)` : '')
+                      (poolPayload.hypothesisExtraSkipped ? ` · ${poolPayload.hypothesisExtraSkipped} skipped (excluded / recently messaged)` : '') +
+                      (poolPayload.hypothesisExtraDoNotEngage ? ` · ${poolPayload.hypothesisExtraDoNotEngage} marked Do Not Engage (set on Harvest Pool → Contact engagement)` : '')
                     : '';
                 hfpShowAlert(
                     `✅ ${contacts.length} harvest contacts loaded${skipped > 0 ? ` · ${skipped} already queued excluded` : ''}${recentNote}${preExistingNote}${groupNote}`,
@@ -29144,6 +29173,8 @@
                 // ("Not our connection"). Same field names a Harvest Run writes.
                 contact_connected_at: contact.connectedAt || null,
                 connection_origin:    contact.connectionOrigin || null,
+                engagement_category:    contact.engagementCategory || null,
+                close_contact_background: contact.closeContactBackground || null,
                 harvest_opener_used:  !!(openerInfo && openerInfo.opener),
                 harvest_opener_source: openerInfo?.source || 'none',
                 harvest_opener_text:  openerInfo?.opener  || '',
