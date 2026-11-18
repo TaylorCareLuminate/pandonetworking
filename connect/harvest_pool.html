@@ -316,7 +316,7 @@
 
                     <div class="panel">
                         <h3><i class="fas fa-file-excel" style="color:#15803d;"></i> Prefer Excel?</h3>
-                        <p class="muted" style="margin:0 0 10px;">Download the list, fill in the <strong>Engagement Category</strong> column (a dropdown is provided) and a <strong>Background</strong> for any Close Contact, then upload it here whenever you're ready.</p>
+                        <p class="muted" style="margin:0 0 10px;">Download the list, fill in the <strong>Engagement Category</strong> column (a dropdown is provided) and a <strong>Background</strong> for any Close Contact, then upload it here whenever you're ready. The file also lists each contact's <strong>location, education and experience</strong>; if we don't have those on file yet you can enrich them for $0.01 per contact when you download.</p>
                         <div class="row" style="align-items:center;">
                             <span class="admin-only" id="engExportWrap"><button type="button" class="btn btn-secondary" id="engExportBtn"><i class="fas fa-download"></i> Download Excel</button></span>
                             <label class="btn btn-secondary" style="margin:0;text-transform:none;letter-spacing:0;font-size:14px;color:var(--gray-900);">
@@ -324,6 +324,7 @@
                                 <input type="file" id="engUploadInput" accept=".xlsx" style="display:none;" />
                             </label>
                         </div>
+                        <div id="engProfilePanel" style="margin-top:12px;"></div>
                         <div id="engUploadPreview" style="margin-top:12px;"></div>
                     </div>
 
@@ -1963,9 +1964,114 @@
                 document.head.appendChild(s);
             });
         }
-        const XL_HEADERS = ['BDR Email', 'First Name', 'Last Name', 'Title', 'Company', 'Hypothesis Group', 'LinkedIn URL', 'Connection', 'Engagement Category', 'Background (required for Close Contact)'];
+        const XL_HEADERS = ['BDR Email', 'First Name', 'Last Name', 'Title', 'Company', 'Location', 'Hypothesis Group', 'LinkedIn URL', 'Connection', 'Engagement Category', 'Background (required for Close Contact)', 'Education', 'Experience'];
+        const XL_NA = '(not available)';
 
+        // ── Profile data for the Excel: location, education, experience (+ paid enrichment when missing) ──
+        eng.profiles = new Map();   // normalizedUrl -> { location, education, experience, needsEnrichment }
+        eng.profilesBdr = null;
+        eng.price = 0.01;
+        eng.enrichEnabled = true;
+        eng.enrichCancel = false;
+        const money = (n) => '$' + (Math.round(n * 100) / 100).toFixed(2);
+
+        async function postJson(path, body) {
+            const h = await authHeaders();
+            const resp = await fetch(`${RAILWAY}${path}`, { method: 'POST', headers: h, body: JSON.stringify(body) });
+            const j = await resp.json().catch(() => ({}));
+            if (!resp.ok || !j.success) throw new Error(j.error || `Request failed (${resp.status})`);
+            return j;
+        }
+
+        /** Fetch what we already have on file for every connection (cheap, nothing is charged). */
+        async function gatherProfileData(onProgress) {
+            if (eng.profilesBdr !== eng.bdr) { eng.profiles = new Map(); eng.profilesBdr = eng.bdr; }
+            const todo = eng.rows.filter((r) => !eng.profiles.has(r.normalizedUrl));
+            for (let i = 0; i < todo.length; i += 300) {
+                const chunk = todo.slice(i, i + 300);
+                const j = await postJson(`/api/connect/harvest-pool/profile-data/${encodeURIComponent(eng.bdr)}`, { urls: chunk.map((r) => r.linkedInUrl) });
+                eng.price = j.pricePerContactUsd; eng.enrichEnabled = j.enrichmentEnabled !== false;
+                chunk.forEach((r) => {
+                    eng.profiles.set(r.normalizedUrl, j.profiles[r.normalizedUrl] || { location: '', education: '', experience: '', needsEnrichment: false });
+                });
+                if (onProgress) onProgress(Math.min(i + 300, todo.length), todo.length);
+            }
+        }
+        const needEnrichmentRows = () => eng.rows.filter((r) => (eng.profiles.get(r.normalizedUrl) || {}).needsEnrichment);
+
+        function renderProfilePanel(msg) {
+            const box = $('engProfilePanel');
+            const need = needEnrichmentRows();
+            if (!need.length && !msg) { box.innerHTML = ''; return; }
+            const cost = money(need.length * eng.price);
+            box.innerHTML = `<div style="border:1px solid #fcd34d;background:#fffbeb;border-radius:10px;padding:12px 14px;">
+                ${msg ? `<div style="margin-bottom:8px;">${msg}</div>` : ''}
+                ${need.length ? `<div><strong>${need.length} of ${eng.rows.length} contacts are missing location, education or experience.</strong>
+                    Enrich them from LinkedIn to include that in the Excel.</div>
+                <div class="row" style="margin-top:10px;align-items:center;">
+                    ${eng.enrichEnabled ? `<button type="button" class="btn btn-amber" id="engEnrichBtn"><i class="fas fa-wand-magic-sparkles"></i> Enrich ${need.length} contact${need.length === 1 ? '' : 's'} — ${cost}</button>` : '<span class="muted">Enrichment is turned off right now.</span>'}
+                    <button type="button" class="btn btn-secondary" id="engSkipEnrichBtn"><i class="fas fa-download"></i> Download without enriching</button>
+                    <span class="muted">${money(eng.price)} per contact enriched · contacts we can't find on LinkedIn are not charged</span>
+                </div>` : ''}</div>`;
+            const eb = $('engEnrichBtn'); if (eb) eb.addEventListener('click', runEnrichment);
+            const sb = $('engSkipEnrichBtn'); if (sb) sb.addEventListener('click', async () => { $('engProfilePanel').innerHTML = ''; await buildEngagementExcel(); });
+        }
+
+        async function runEnrichment() {
+            const need = needEnrichmentRows();
+            if (!need.length) return;
+            if (!confirm(`Enrich ${need.length} contact(s) for up to ${money(need.length * eng.price)} (${money(eng.price)} each)?\n\nContacts we can't find on LinkedIn are not charged. This can take a few minutes.`)) return;
+            const box = $('engProfilePanel');
+            eng.enrichCancel = false;
+            let done = 0, enriched = 0, notFound = 0, charged = 0, failedMsg = '';
+            const status = () => {
+                box.innerHTML = `<div style="border:1px solid #fcd34d;background:#fffbeb;border-radius:10px;padding:12px 14px;">
+                    <i class="fas fa-spinner fa-spin"></i> Enriching… ${done} / ${need.length} looked up · ${enriched} enriched · ${money(charged)} so far
+                    <button type="button" class="btn btn-secondary" id="engEnrichCancel" style="margin-left:12px;padding:6px 12px;">Stop</button></div>`;
+                $('engEnrichCancel').addEventListener('click', () => { eng.enrichCancel = true; $('engEnrichCancel').disabled = true; });
+            };
+            status();
+            const STEP = 100;
+            for (let i = 0; i < need.length && !eng.enrichCancel; i += STEP) {
+                const chunk = need.slice(i, i + STEP);
+                try {
+                    const j = await postJson(`/api/connect/harvest-pool/enrich-profiles/${encodeURIComponent(eng.bdr)}`, { urls: chunk.map((r) => r.linkedInUrl) });
+                    Object.entries(j.profiles || {}).forEach(([k, v]) => eng.profiles.set(k, v));
+                    enriched += j.enriched || 0; notFound += j.notFound || 0; charged += j.chargedUsd || 0;
+                } catch (e) { failedMsg = e.message || String(e); break; }
+                done += chunk.length;
+                status();
+            }
+            const stopped = eng.enrichCancel;
+            const summary = `Enriched <strong>${enriched}</strong> contact(s) for <strong>${money(charged)}</strong>` +
+                (notFound ? `; ${notFound} could not be found (not charged)` : '') + '.' +
+                (stopped ? ' Stopped early.' : '') +
+                (failedMsg ? ` <span style="color:#b91c1c;">Stopped: ${escapeHtml(failedMsg)}</span>` : '');
+            if (failedMsg || stopped) { renderProfilePanel(summary); return; }
+            box.innerHTML = `<div class="toast ok">${summary} Building your Excel…</div>`;
+            await buildEngagementExcel();
+            box.innerHTML = `<div class="toast ok">${summary}</div>`;
+        }
+
+        /** "Download Excel" button: check profile data first, offer paid enrichment if some is missing, then build. */
         async function exportEngagementExcel() {
+            if (!isAdmin || !eng.rows.length) return;
+            const btn = $('engExportBtn'); const prev = btn.innerHTML;
+            btn.disabled = true;
+            try {
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Checking profile data…';
+                await gatherProfileData((d, t) => { btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Checking profile data… ${d}/${t}`; });
+                if (needEnrichmentRows().length) { renderProfilePanel(''); return; }
+                $('engProfilePanel').innerHTML = '';
+                await buildEngagementExcel();
+            } catch (e) {
+                engToast('Export failed: ' + (e.message || e), 'err');
+            } finally {
+                btn.disabled = false; btn.innerHTML = prev;
+            }
+        }
+
+        async function buildEngagementExcel() {
             if (!isAdmin || !eng.rows.length) return;
             const btn = $('engExportBtn'); const prev = btn.innerHTML;
             btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Building…';
@@ -1983,11 +2089,12 @@
                     `  • ${ENG_LABELS.do_not_engage} — we will not contact this person.`,
                     'Connections we did not generate for you are pre-set to “Do Not Engage”. Change any you want us to engage.',
                     'The “Hypothesis Group” column shows which group each contact fits; use the filter arrows on the header row to show one group at a time (then you can copy a category down the visible rows).',
-                    'Do not edit the BDR Email, Hypothesis Group or LinkedIn URL columns. Save as .xlsx and upload it on the Harvest Pool page (Contact engagement → Upload filled Excel).'
+                    `The “Location”, “Education” and “Experience” columns come from each contact's LinkedIn profile (“${XL_NA}” means we don't have it on file). They are for your reference only.`,
+                    'Do not edit the BDR Email, Hypothesis Group, LinkedIn URL, Location, Education or Experience columns. Save as .xlsx and upload it on the Harvest Pool page (Contact engagement → Upload filled Excel).'
                 ].forEach((t, i) => { const c = info.getCell(i + 1, 1); c.value = t; c.alignment = { wrapText: true, vertical: 'top' }; if (i === 0) c.font = { bold: true, size: 14 }; });
 
                 const ws = wb.addWorksheet('Contacts', { views: [{ state: 'frozen', ySplit: 1 }] });
-                ws.columns = [{ width: 28 }, { width: 14 }, { width: 16 }, { width: 34 }, { width: 28 }, { width: 34 }, { width: 46 }, { width: 18 }, { width: 32 }, { width: 60 }];
+                ws.columns = [{ width: 28 }, { width: 14 }, { width: 16 }, { width: 34 }, { width: 28 }, { width: 26 }, { width: 34 }, { width: 46 }, { width: 18 }, { width: 32 }, { width: 60 }, { width: 50 }, { width: 60 }];
                 const hr = ws.addRow(XL_HEADERS);
                 hr.font = { bold: true, color: { argb: 'FFFFFFFF' } };
                 hr.eachCell((c) => { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF12314C' } }; });
@@ -1999,20 +2106,22 @@
                     return a.origin === b.origin ? 0 : a.origin === 'generated' ? -1 : 1;
                 });
                 rows.forEach((r) => {
-                    ws.addRow([eng.bdr, r.firstName, r.lastName, r.title, r.company, r.hypothesisGroupName || '(none yet)', r.linkedInUrl,
-                        r.origin === 'generated' ? 'Generated by us' : 'Already had', ENG_LABELS[r.category], r.background || '']);
+                    const pd = eng.profiles.get(r.normalizedUrl) || {};
+                    ws.addRow([eng.bdr, r.firstName, r.lastName, r.title, r.company, pd.location || XL_NA, r.hypothesisGroupName || '(none yet)', r.linkedInUrl,
+                        r.origin === 'generated' ? 'Generated by us' : 'Already had', ENG_LABELS[r.category], r.background || '',
+                        pd.education || XL_NA, pd.experience || XL_NA]);
                 });
                 const last = rows.length + 1;
                 for (let i = 2; i <= last; i++) {
-                    ws.getCell(`I${i}`).dataValidation = {
+                    ws.getCell(`J${i}`).dataValidation = {
                         type: 'list', allowBlank: false, showErrorMessage: true, errorTitle: 'Pick from the list',
                         error: 'Choose one of the three engagement categories.',
                         formulae: [`"${Object.values(ENG_LABELS).join(',')}"`]
                     };
-                    ws.getCell(`J${i}`).alignment = { wrapText: true, vertical: 'top' };
-                    ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'].forEach((col) => { ws.getCell(`${col}${i}`).font = { color: { argb: 'FF475569' } }; });
+                    ['K', 'L', 'M'].forEach((col) => { ws.getCell(`${col}${i}`).alignment = { wrapText: true, vertical: 'top' }; });
+                    ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'L', 'M'].forEach((col) => { ws.getCell(`${col}${i}`).font = { color: { argb: 'FF475569' } }; });
                 }
-                ws.autoFilter = { from: 'A1', to: `J${last}` };
+                ws.autoFilter = { from: 'A1', to: `M${last}` };
                 const buf = await wb.xlsx.writeBuffer();
                 const a = document.createElement('a');
                 a.href = URL.createObjectURL(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
@@ -2126,7 +2235,7 @@
             const card = $('connectionsCard'), cta = $('engagementCta'), sec = $('engagementSection');
             const token = ++eng.token;
             if (hide) { card.style.display = cta.style.display = sec.style.display = 'none'; return; }
-            if (eng.bdr !== bdr) { eng.sel.clear(); eng.page = eng.connPage = 1; }
+            if (eng.bdr !== bdr) { eng.sel.clear(); eng.page = eng.connPage = 1; if ($('engProfilePanel')) $('engProfilePanel').innerHTML = ''; }
             eng.bdr = bdr;
             card.style.display = 'block';
             $('connBody').innerHTML = '<tr><td colspan="7" class="muted" style="padding:16px;">Loading connections…</td></tr>';
