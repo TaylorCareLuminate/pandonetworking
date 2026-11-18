@@ -227,11 +227,70 @@ const POST_VIEWS = {
 const POST_STATUS = { ready: 'Ready', scheduled: 'Scheduled', claimed: 'Publishing now', sending: 'Publishing now', sent: 'Posted', dry_run: 'Checked, not sent (test mode)', missed: 'Missed its time', blocked: 'Stopped', failed: 'Failed', outcome_unknown: 'Check LinkedIn' };
 const KIND_ICON = { promo: 'fa-bullhorn', news: 'fa-newspaper', reaction: 'fa-comments' };
 
-/** The value a datetime-local input wants (local time), a day from now at 9:00. */
-function defaultWhen() {
-    const d = new Date(Date.now() + 24 * 3600e3); d.setHours(9, 0, 0, 0);
-    const p = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+const pad2 = (n) => String(n).padStart(2, '0');
+/** The value a datetime-local input wants (local time). */
+const toLocalInput = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+const dayKey = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+
+const chosenWhen = new Map();          // post id -> a time the BDR picked by hand (kept while the list redraws)
+const postErrors = new Map();          // post id -> why scheduling it failed
+let slotMap = new Map();               // post id -> the suggested time (see suggestSlots)
+
+/** When posts are already waiting or went out, so new ones are placed around them. */
+function takenTimes() {
+    const t = [];
+    posts.forEach(p => {
+        const at = ['scheduled', 'claimed', 'sending'].includes(p.status) ? p.scheduledFor : (p.status === 'sent' ? p.sentAt : null);
+        const d = at ? new Date(at) : null;
+        if (d && !Number.isNaN(d.getTime())) t.push({ at: d, repost: p.kind === 'repost' });
+    });
+    return t;
+}
+
+/**
+ * Hands out times one after another, on weekdays starting tomorrow: the BDR's own posts at 9:00, reposts at 13:00, one of each kind a
+ * day at most. A time is skipped when it is closer to another post than the gap allows: the gap between two of the BDR's own posts,
+ * or the shorter one when a repost is involved. `used` is the list of { at, repost } already taken (new times are added to it).
+ * Returns a function that gives the next time for a kind (or null when the allowed period ends).
+ */
+function slotPicker(used) {
+    const rules = postInfo.rules || {};
+    const postGap = (rules.postGapHours || 10) * 3600e3, repostGap = (rules.repostGapHours || 2) * 3600e3;
+    const limit = Date.now() + (rules.maxLeadDays || 60) * 86400e3;
+    return function next(repost) {
+        const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(repost ? 13 : 9, 0, 0, 0);
+        for (; d.getTime() <= limit; d.setDate(d.getDate() + 1)) {
+            if (d.getDay() === 0 || d.getDay() === 6) continue;
+            if (used.some(u => (u.repost === !!repost && dayKey(u.at) === dayKey(d)) || Math.abs(u.at.getTime() - d.getTime()) < (repost || u.repost ? repostGap : postGap))) continue;
+            const pick = new Date(d); used.push({ at: pick, repost: !!repost }); return pick;
+        }
+        return null;
+    };
+}
+
+/** Times the BDR picked by hand on posts that are not yet scheduled (the other suggestions are placed around them). */
+function chosenTimes(skipChosen) {
+    const out = [];
+    posts.filter(p => ['ready', 'missed', 'blocked'].includes(p.status)).forEach(p => {
+        const v = chosenWhen.get(p.id) || (skipChosen ? slotMap.get(p.id) : null); const d = v ? new Date(v) : null;
+        if (d && !Number.isNaN(d.getTime())) out.push({ at: d, repost: p.kind === 'repost' });
+    });
+    return out;
+}
+
+/** A different day for every post that can still be scheduled, so a batch can be approved in one go. */
+function suggestSlots() {
+    const editable = posts.filter(p => ['ready', 'missed', 'blocked'].includes(p.status));
+    const next = slotPicker([...takenTimes(), ...chosenTimes(false)]);
+    const out = new Map();
+    editable.forEach(p => { if (!chosenWhen.get(p.id)) { const d = next(p.kind === 'repost'); out.set(p.id, d ? toLocalInput(d) : ''); } });
+    return out;
+}
+
+/** The next free time for a repost started from a network post. */
+function nextFreeTime() {
+    const d = slotPicker([...takenTimes(), ...chosenTimes(true)])(true);
+    return d ? toLocalInput(d) : '';
 }
 
 async function loadPosts(quiet) {
@@ -258,7 +317,12 @@ function renderPosts() {
     const typing = document.activeElement && document.activeElement.closest('#posts') ? document.activeElement : null;
     if (typing && typing.tagName !== 'BUTTON') return;
     const list = posts.filter(POST_VIEWS[postView]);
-    $('posts').innerHTML = list.map(postHtml).join('') || `<div class="empty">${esc(empty)}</div>`;
+    slotMap = suggestSlots();
+    const readyCount = list.filter(p => p.status === 'ready').length;
+    const bulk = postView === 'ready' && readyCount >= 2
+        ? `<div class="btn-row" style="margin-bottom:1rem;"><button class="btn btn-primary" data-pact="schedule-all"><i class="fas fa-calendar-check"></i> Schedule all ${readyCount} on the dates shown</button>
+            <span class="sub">Suggested dates are one weekday apart starting tomorrow (your own posts at 9:00, reposts at 1:00 pm). Change any of them first if you like. Nothing is scheduled until you click.</span></div>` : '';
+    $('posts').innerHTML = bulk + (list.map(postHtml).join('') || `<div class="empty">${esc(empty)}</div>`);
     list.forEach(loadPostImage);
 }
 
@@ -267,7 +331,7 @@ function postHtml(p) {
     const when = p.scheduledFor ? PC.fmt(p.scheduledFor) : '';
     const act = [];
     if (p.status === 'ready' || p.status === 'missed' || p.status === 'blocked') {
-        act.push(`<input type="datetime-local" data-when="${esc(p.id)}" value="${esc(defaultWhen())}" style="padding:.4rem .5rem;border:1px solid var(--line-strong);border-radius:4px;font-family:var(--sans);">`);
+        act.push(`<input type="datetime-local" data-when="${esc(p.id)}" value="${esc(chosenWhen.get(p.id) || slotMap.get(p.id) || '')}" style="padding:.4rem .5rem;border:1px solid var(--line-strong);border-radius:4px;font-family:var(--sans);">`);
         act.push(`<button class="btn btn-primary btn-sm" data-pact="schedule" data-id="${esc(p.id)}"><i class="fas fa-clock"></i> Schedule</button>`);
         act.push(`<button class="btn btn-outline btn-sm" data-pact="save" data-id="${esc(p.id)}">Save my edits</button>`);
         act.push(`<button class="btn btn-outline btn-sm" data-pact="dismiss" data-id="${esc(p.id)}">Not for me</button>`);
@@ -292,16 +356,22 @@ function postHtml(p) {
         notes.push('<div class="sub">Too close to:</div>' + p.duplicateOf.map(m => `<div class="sub">"${esc(m.excerpt || '')}"${m.at ? ` (${esc(PC.fmt(m.at))})` : ''}</div>`).join(''));
         notes.push('<div class="sub">Change the wording enough that it says something new, then schedule it again.</div>');
     }
+    if (postErrors.get(p.id) && ['ready', 'missed', 'blocked'].includes(p.status)) notes.push(`<div class="err">${esc(postErrors.get(p.id))}</div>`);
     const icon = KIND_ICON[p.kind] || 'fa-pen';
+    const rep = p.kind === 'repost';
+    const q = p.quoted || {};
+    const original = rep ? `<div class="sub" style="margin-top:.5rem;"><strong>${esc(q.authorName || 'Someone in your network')}</strong>${q.authorTitle ? `, ${esc(q.authorTitle)}` : ''}</div>
+            <div class="sub" style="white-space:pre-wrap;">${esc(q.excerpt || '')}${(q.excerpt || '').length >= 400 ? '…' : ''}</div>
+            ${q.url && PC.linkedInUrl(q.url) ? `<div class="sub"><a href="${esc(PC.linkedInUrl(q.url))}" target="_blank" rel="noopener noreferrer">Open the original on LinkedIn</a></div>` : ''}` : '';
     return `<div class="pc-item" data-pcard="${esc(p.id)}">
         <div>
             <div class="pc-meta"><span class="badge ${esc(p.status)}">${esc(POST_STATUS[p.status] || p.status)}</span><span><i class="fas ${icon}"></i> ${esc(p.kindLabel || p.kind)}</span></div>
             <img alt="Picture for this post" data-pimg="${esc(p.id)}" hidden style="max-width:100%;border-radius:6px;">
-            ${p.hasImage ? '' : '<div class="sub">No picture.</div>'}
+            ${rep ? original : (p.hasImage ? '' : '<div class="sub">No picture.</div>')}
         </div>
         <div class="pc-side">
-            <h3>The post</h3>
-            <textarea data-ptext="${esc(p.id)}" rows="12" ${editable ? '' : 'readonly'}>${esc(p.text)}</textarea>
+            <h3>${rep ? 'Your words (optional)' : 'The post'}</h3>
+            <textarea data-ptext="${esc(p.id)}" rows="${rep ? 4 : 12}" ${editable ? '' : 'readonly'} ${rep ? 'placeholder="Leave this empty to repost it as it is."' : ''}>${esc(p.text)}</textarea>
             <div class="pc-count">${p.text.length} characters</div>
             ${notes.join('')}
             <div class="btn-row" style="margin-top:.6rem;">${act.join('')}</div>
@@ -319,6 +389,36 @@ async function loadPostImage(p) {
     if (url) { img.src = url; img.hidden = false; }
 }
 
+/** Save any change to the words, then schedule the post for the time shown on its card. Throws with a plain message when it cannot. */
+async function scheduleCard(card, p) {
+    const text = card.querySelector('[data-ptext]');
+    const v = card.querySelector('[data-when]').value;
+    const at = v ? new Date(v) : null;
+    if (!at || Number.isNaN(at.getTime())) throw new Error('Choose a date and time first.');
+    if (!text.readOnly && text.value !== p.text) await ideasApi(`/ideas/${encodeURIComponent(p.id)}/edit`, { method: 'POST', body: { text: text.value } });
+    const out = await ideasApi(`/ideas/${encodeURIComponent(p.id)}/schedule`, { method: 'POST', body: { at: at.toISOString() } });
+    chosenWhen.delete(p.id); postErrors.delete(p.id);
+    return out;
+}
+
+/** Every post on the Ready list, each on the date shown on its card, one after another. */
+async function scheduleAll(btn) {
+    const cards = [...document.querySelectorAll('#posts [data-pcard]')].filter(c => { const p = posts.find(x => x.id === c.dataset.pcard); return p && p.status === 'ready'; });
+    if (!cards.length) return;
+    if (!confirm(`Schedule ${cards.length} posts on the dates shown? Each one is published at its time unless you cancel it first.`)) return;
+    btn.disabled = true;
+    let ok = 0, failed = 0;
+    for (const card of cards) {
+        const p = posts.find(x => x.id === card.dataset.pcard);
+        const st = card.querySelector('[data-pstatus]');
+        st.className = 'status-line'; st.textContent = 'Scheduling…';
+        try { await scheduleCard(card, p); ok++; st.textContent = 'Scheduled.'; }
+        catch (e) { failed++; postErrors.set(p.id, e.message); st.textContent = e.message; st.className = 'status-line error'; }
+    }
+    say('postsStatus', `Scheduled ${ok} post${ok === 1 ? '' : 's'}.${failed ? ` ${failed} could not be scheduled; the reason is shown on each one.` : ''}`, failed > 0);
+    await loadPosts(true);
+}
+
 async function postAction(btn) {
     const id = btn.dataset.id, act = btn.dataset.pact, p = posts.find(x => x.id === id); if (!p) return;
     const card = btn.closest('[data-pcard]'), st = card.querySelector('[data-pstatus]');
@@ -327,17 +427,14 @@ async function postAction(btn) {
     st.className = 'status-line'; st.textContent = '';
     btn.disabled = true;
     try {
-        if (act === 'save' || (act === 'schedule' && !text.readOnly && text.value !== p.text)) {
+        if (act === 'save') {
             await ideasApi(`/ideas/${encodeURIComponent(id)}/edit`, { method: 'POST', body: { text: text.value } });
-            if (act === 'save') { st.textContent = 'Saved.'; await loadPosts(true); return; }
+            st.textContent = 'Saved.'; await loadPosts(true); return;
         }
         if (act === 'schedule') {
-            const v = card.querySelector('[data-when]').value;
-            const at = v ? new Date(v) : null;
-            if (!at || Number.isNaN(at.getTime())) throw new Error('Choose a date and time first.');
-            const out = await ideasApi(`/ideas/${encodeURIComponent(id)}/schedule`, { method: 'POST', body: { at: at.toISOString() } });
+            // Stays on the Ready list, so the next post can be approved straight away.
+            const out = await scheduleCard(card, p);
             say('postsStatus', `Scheduled for ${PC.fmt(out.scheduledFor)}.`);
-            postView = 'scheduled'; document.querySelectorAll('#postTabs button').forEach(x => x.classList.toggle('on', x.dataset.pview === 'scheduled'));
         } else if (act === 'unschedule') {
             await ideasApi(`/ideas/${encodeURIComponent(id)}/unschedule`, { method: 'POST', body: {} });
         } else if (act === 'dismiss') {
@@ -369,10 +466,57 @@ $('viewTabs').addEventListener('click', (e) => {
     document.querySelectorAll('#viewTabs button').forEach(x => x.classList.toggle('on', x === b));
     view = b.dataset.view; render();
 });
+$('posts').addEventListener('change', (e) => {
+    const w = e.target.closest('input[data-when]'); if (!w) return;
+    if (w.value) chosenWhen.set(w.dataset.when, w.value); else chosenWhen.delete(w.dataset.when);
+});
+
+/** The buttons on a network post that start a repost. */
+async function repostAction(btn) {
+    const a = btn.dataset.action, id = btn.dataset.id;
+    const card = btn.closest('[data-card]'), panel = card.querySelector('[data-panel]'), st = card.querySelector('[data-status]');
+    if (a === 'show-posts') {
+        postView = 'scheduled'; document.querySelectorAll('#postTabs button').forEach(x => x.classList.toggle('on', x.dataset.pview === 'scheduled'));
+        renderPosts(); $('postsCard').scrollIntoView({ behavior: 'smooth', block: 'start' }); return;
+    }
+    if (a === 'repost-close') { panel.hidden = true; return; }
+    if (a === 'repost-open') {
+        panel.hidden = !panel.hidden;
+        if (!panel.hidden) {
+            repostMsgs.delete(id);
+            const when = card.querySelector('[data-rwhen]');
+            if (!when.value) when.value = nextFreeTime();
+            card.querySelector('[data-rtext]').focus();
+        }
+        return;
+    }
+    // repost-go: make the repost, then give it a time. If the time is refused, the repost stays under Your posts (Ready).
+    const v = card.querySelector('[data-rwhen]').value;
+    const at = v ? new Date(v) : null;
+    if (!at || Number.isNaN(at.getTime())) { st.textContent = 'Choose a date and time first.'; st.className = 'status-line error'; return; }
+    btn.disabled = true; st.className = 'status-line'; st.textContent = 'Scheduling…';
+    let made = null;
+    try {
+        made = await ideasApi('/reposts', { method: 'POST', body: { bdrId, repostId: id, text: card.querySelector('[data-rtext]').value } });
+        const out = await ideasApi(`/ideas/${encodeURIComponent(made.idea.id)}/schedule`, { method: 'POST', body: { at: at.toISOString() } });
+        repostMsgs.delete(id);
+        await loadPosts(true);
+        render();
+        say('postsStatus', `Repost scheduled for ${PC.fmt(out.scheduledFor)}.`);
+    } catch (e) {
+        repostMsgs.set(id, `${e.message}${made ? ' The repost is saved under Your posts (Ready), where you can pick another time.' : ''}`);
+        await loadPosts(true).catch(() => {});
+        render();
+    }
+}
+
 document.addEventListener('click', (e) => {
-    const pb = e.target.closest('button[data-pact]'); if (pb) { postAction(pb); return; }
+    const pb = e.target.closest('button[data-pact]'); if (pb) { if (pb.dataset.pact === 'schedule-all') scheduleAll(pb); else postAction(pb); return; }
     const b = e.target.closest('button[data-action]'); if (!b) return;
-    if (b.dataset.action === 'refresh') load(); else if (b.dataset.action === 'refresh-posts') loadPosts(); else if (b.dataset.action === 'add-post') addPost(b); else cardAction(b);
+    const a = b.dataset.action;
+    if (a === 'refresh') load(); else if (a === 'refresh-posts') loadPosts(); else if (a === 'add-post') addPost(b);
+    else if (a === 'repost-open' || a === 'repost-close' || a === 'repost-go' || a === 'show-posts') repostAction(b);
+    else cardAction(b);
 });
 window.addEventListener('pagehide', () => {
     imageUrls.forEach(u => { if (u) URL.revokeObjectURL(u); });
