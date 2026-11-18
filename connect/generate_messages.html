@@ -5486,7 +5486,7 @@
                     </select>
                 </div>
                 <div class="form-group" style="margin-bottom: 12px;">
-                    <label for="hfpGroupSelect" style="font-size: 13px; font-weight: 600; color: var(--gray-700);"><i class="fas fa-tags" style="color: #059669;"></i> Custom group <span style="font-weight: 400; color: var(--gray-500);">(optional)</span></label>
+                    <label for="hfpGroupSelect" style="font-size: 13px; font-weight: 600; color: var(--gray-700);"><i class="fas fa-tags" style="color: #059669;"></i> Hypothesis group / custom group <span style="font-weight: 400; color: var(--gray-500);">(optional — your 🧬 hypothesis groups are listed here, not in the Harvest Pool list above)</span></label>
                     <select id="hfpGroupSelect" style="width: 100%; padding: 8px 12px; border: 1px solid #86efac; border-radius: 6px; font-size: 14px;">
                         <option value="">— Select a BDR first —</option>
                     </select>
@@ -22196,6 +22196,17 @@
                     (hypPool.mode === 'gen' || c.connectionOrigin === 'pre_existing'));
                 j.excludedByGroupCount = before - j.contacts.length;
                 j.hypothesisPool = hypPool;
+
+                if (hypPool.mode === 'pre') {
+                    // The harvest pool only contains connections we can prove we generated plus manually labeled
+                    // pre-existing ones. A categorized connection with neither is simply a connection the executive
+                    // already had, so add those straight from the BDR's synced connections (heyreach_contacts).
+                    const extra = await harvestHypothesisPreExistingContacts(bdrEmail, hypPool.groupId, members, poolId, excludeDays);
+                    const have = new Set(j.contacts.map(c => harvestGroupNormUrl(c.linkedInUrl)));
+                    extra.contacts.forEach(c => { if (!have.has(harvestGroupNormUrl(c.linkedInUrl))) j.contacts.push(c); });
+                    j.hypothesisExtraCount = extra.contacts.length;
+                    j.hypothesisExtraSkipped = extra.skipped;
+                }
             } else if (groupName && !isPandoGroup) {
                 const membership = await loadHarvestGroupMembership(bdrEmail, { force: !!opts.forceGroupRefresh });
                 const members = membership.get(groupName) || new Set();
@@ -22211,7 +22222,12 @@
         // heyreach_contacts.customGroups (array of group names). "Connections Generated Through
         // Pando" is a built-in group that always exists — its membership is computed (not stored).
         const HARVEST_PANDO_GROUP = 'Connections Generated Through Pando';
-        const HARVEST_GROUP_CONTACT_FIELDS = ['linkedin_url', 'profileUrl', 'leadProfileUrl', 'linkedInUrl', 'customGroups', 'hypothesisFit'];
+        const HARVEST_GROUP_CONTACT_FIELDS = ['linkedin_url', 'profileUrl', 'leadProfileUrl', 'linkedInUrl', 'customGroups', 'hypothesisFit',
+            // Needed to build a message-ready contact for categorized connections that are not in the harvest pool
+            'firstName', 'first_name', 'leadFirstName', 'lastName', 'last_name', 'leadLastName',
+            'title', 'position', 'occupation', 'headline', 'leadTitle',
+            'company', 'companyName', 'currentCompany', 'leadCompanyName',
+            'conversationId', 'linkedInAccountId', 'customerId', 'leadCategory'];
 
         // ── Hypothesis-group pools (best-fit groups imported on My Leads from the ChatGPT JSON) ──
         // Stored on each contact as heyreach_contacts.hypothesisFit = { groupId, groupName, score, ... }.
@@ -22237,7 +22253,8 @@
         }
         const HARVEST_GROUP_CACHE_MS = 120000;
         const harvestGroupNamesCache = { bdr: null, at: 0, names: null };
-        const harvestGroupMembershipCache = { bdr: null, at: 0, map: null };
+        // info: Map<normalizedUrl, contact fields> for every hypothesis-categorized connection of the BDR
+        const harvestGroupMembershipCache = { bdr: null, at: 0, map: null, info: new Map() };
 
         /** Same normalization My Leads uses when it matches URLs (and the Railway harvest service). */
         function harvestGroupNormUrl(url) {
@@ -22282,6 +22299,7 @@
             await ensureLinkedInEmailMapLoaded();
             const { collection: col, query: q, where: wh, getDocs: gd } = window.clemailFirestore;
             const map = new Map();
+            const info = new Map();
             const lookups = [];
             for (const email of hfpEmailVariants(bdrEmail)) {
                 for (const field of ['accountEmail', 'bdrEmail', 'linkedInAccountEmail']) {
@@ -22304,6 +22322,19 @@
                                     if (!map.has(hypKey)) map.set(hypKey, new Set());
                                     map.get(hypKey).add(norm);
                                     if (fit.groupName) harvestHypNames.set(fit.groupId, fit.groupName);
+                                    if (!info.has(norm)) {
+                                        info.set(norm, {
+                                            linkedInUrl: data.profileUrl || data.linkedin_url || data.leadProfileUrl || data.linkedInUrl || '',
+                                            firstName: data.firstName || data.first_name || data.leadFirstName || '',
+                                            lastName: data.lastName || data.last_name || data.leadLastName || '',
+                                            title: data.title || data.position || data.occupation || data.headline || data.leadTitle || '',
+                                            company: data.company || data.companyName || data.currentCompany || data.leadCompanyName || '',
+                                            conversationId: data.conversationId || '',
+                                            linkedInAccountId: data.linkedInAccountId != null ? data.linkedInAccountId : null,
+                                            customerId: data.customerId || null,
+                                            leadCategory: data.leadCategory || ''
+                                        });
+                                    }
                                 }
                             }))
                             .catch(e => console.warn(`[Harvest groups] heyreach_contacts ${field}=${email} lookup failed:`, e?.message || e))
@@ -22314,6 +22345,7 @@
             harvestGroupMembershipCache.bdr = key;
             harvestGroupMembershipCache.at = Date.now();
             harvestGroupMembershipCache.map = map;
+            harvestGroupMembershipCache.info = info;
             return map;
         }
 
@@ -22391,15 +22423,66 @@
                 let gen = null, pre = null;
                 if (originMap) {
                     gen = 0; pre = 0;
+                    // Every categorized contact is one of the BDR's synced connections. The harvest pool only
+                    // lists connections we can prove we generated (a HeyReach accept / manual "Pando originated"
+                    // label) plus manually labeled pre-existing ones, so a categorized connection with no origin
+                    // on file is one the executive already had — counted as "already connected", not dropped.
                     members.forEach(url => {
+                        const ci = harvestGroupMembershipCache.info.get(url);
+                        if (ci && HARVEST_SKIP_CATEGORIES.includes(ci.leadCategory)) return;
                         const info = originMap.get(url);
-                        if (!info) return;
-                        if (info.origin === 'pre_existing') pre++;
-                        else if (!isNotOurConnectionOrigin(info.origin)) gen++;
+                        if (!info || isNotOurConnectionOrigin(info.origin)) pre++;
+                        else gen++;
                     });
                 }
                 return { groupId, name: harvestHypNames.get(groupId) || groupId, total: members.size, gen, pre };
             }).sort((a, b) => a.name.localeCompare(b.name));
+        }
+
+        const HARVEST_SKIP_CATEGORIES = ['Exclude', 'Manual Manage'];
+
+        /** Normalized URLs the admin excluded from the harvest pool (manual label originType 'excluded'). */
+        async function loadHarvestManualExcludedUrls(bdrEmail) {
+            const h = await harvestAuthHeaders();
+            const r = await fetch(`${HARVEST_RAILWAY_API}/api/connect/harvest-pool/manual-contacts/${encodeURIComponent(bdrEmail)}`, { headers: h });
+            const j = await r.json();
+            if (!j.success) throw new Error(j.error || 'Could not load the harvest exclusion list');
+            const out = new Set();
+            (j.entries || []).forEach(e => { if (e && e.originType === 'excluded') out.add(harvestGroupNormUrl(e.linkedInUrl || e.normalizedUrl)); });
+            return out;
+        }
+
+        /**
+         * "Already connected" hypothesis pool, beyond what the harvest pool lists: categorized connections of this BDR
+         * that have no HeyReach accept / manual label on file (so the server never put them in the pool) and are not
+         * excluded. Returned as message-ready contacts flagged connectionOrigin 'pre_existing'.
+         * A specific harvest pool selection (poolId) returns nothing here — these contacts belong to no pool.
+         */
+        async function harvestHypothesisPreExistingContacts(bdrEmail, groupId, members, poolId, excludeDays) {
+            const empty = { contacts: [], skipped: 0 };
+            if (poolId) return empty;
+            await loadHarvestGroupMembership(bdrEmail); // makes sure the contact info cache is current
+            const info = harvestGroupMembershipCache.info;
+            const originMap = await loadHarvestConnectionOriginMap(bdrEmail);
+            if (!originMap) throw new Error('Could not check how each categorized connection was made (origin lookup failed). Try again.');
+            const excluded = await loadHarvestManualExcludedUrls(bdrEmail);
+            let recent = new Set();
+            if (Number.isFinite(excludeDays) && excludeDays > 0) recent = await hfpLoadRecentlyMessagedUrls(bdrEmail, excludeDays);
+            const contacts = [];
+            let skipped = 0;
+            members.forEach(norm => {
+                if (originMap.has(norm)) return;               // in the harvest pool (or a connection we generated) — handled by the pool list
+                const c = info.get(norm);
+                if (!c || !c.linkedInUrl) return;
+                if (excluded.has(norm) || HARVEST_SKIP_CATEGORIES.includes(c.leadCategory) || recent.has(fpmNormalizeUrl(c.linkedInUrl))) { skipped++; return; }
+                contacts.push({
+                    linkedInUrl: c.linkedInUrl, firstName: c.firstName, lastName: c.lastName, title: c.title, company: c.company,
+                    connectedAt: null, connectionOrigin: 'pre_existing', poolId: '', poolName: '',
+                    conversationId: c.conversationId, linkedInAccountId: c.linkedInAccountId, customerId: c.customerId
+                });
+            });
+            contacts.sort((a, b) => (a.lastName || '').localeCompare(b.lastName || ''));
+            return { contacts, skipped };
         }
 
         // ── "Not our connection" flag ────────────────────────────────────────────────────────────
@@ -22667,6 +22750,7 @@
                 }
                 if (customGroup && customGroup !== HARVEST_PANDO_GROUP) {
                     addHarvestLog(`🏷️ Excluded ${poolPayload.excludedByGroupCount || 0} eligible contact(s) not in group "${harvestGroupDisplayName(customGroup)}".`);
+                    if (poolPayload.hypothesisExtraCount) addHarvestLog(`🧬 Added ${poolPayload.hypothesisExtraCount} already-connected contact(s) in this hypothesis group straight from the synced connections (they were not in the harvest pool).${poolPayload.hypothesisExtraSkipped ? ` ${poolPayload.hypothesisExtraSkipped} skipped (excluded / recently messaged).` : ''}`);
                 }
 
                 if (poolPayload.excludeMessagedWithinDays) {
@@ -28482,7 +28566,9 @@
                     ? ` · ${poolPayload.excludedPreExistingCount} pre-existing connection(s) excluded`
                     : '';
                 const groupNote = customGroup
-                    ? ` · group "${harvestGroupDisplayName(customGroup)}"${customGroup !== HARVEST_PANDO_GROUP ? ` (${poolPayload.excludedByGroupCount || 0} not in group excluded)` : ''}`
+                    ? ` · group "${harvestGroupDisplayName(customGroup)}"${customGroup !== HARVEST_PANDO_GROUP ? ` (${poolPayload.excludedByGroupCount || 0} not in group excluded)` : ''}` +
+                      (poolPayload.hypothesisExtraCount ? ` · ${poolPayload.hypothesisExtraCount} already-connected contact(s) added straight from your synced connections (not in the harvest pool)` : '') +
+                      (poolPayload.hypothesisExtraSkipped ? ` · ${poolPayload.hypothesisExtraSkipped} skipped (excluded / recently messaged)` : '')
                     : '';
                 hfpShowAlert(
                     `✅ ${contacts.length} harvest contacts loaded${skipped > 0 ? ` · ${skipped} already queued excluded` : ''}${recentNote}${preExistingNote}${groupNote}`,
