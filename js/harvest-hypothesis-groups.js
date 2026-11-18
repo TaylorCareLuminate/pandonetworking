@@ -20,7 +20,9 @@
 (function () {
     'use strict';
 
-    const CONTACT_FIELDS = ['accountEmail', 'bdrEmail', 'linkedin_url', 'profileUrl', 'leadProfileUrl', 'linkedInUrl', 'hypothesisFit'];
+    const CONTACT_FIELDS = ['accountEmail', 'bdrEmail', 'linkedin_url', 'profileUrl', 'leadProfileUrl', 'linkedInUrl', 'hypothesisFit', 'leadCategory'];
+    /** Lead categories that are never worked (same list as Generate Messages). */
+    const SKIP_CATEGORIES = ['Exclude', 'Manual Manage'];
     const GEN_LABEL = 'Generated through Pando';
     const PRE_LABEL = 'Already connected (not by Pando)';
 
@@ -77,7 +79,7 @@
                             const fit = x.hypothesisFit && typeof x.hypothesisFit === 'object' && x.hypothesisFit.groupId ? x.hypothesisFit : null;
                             if (!fit) return;
                             const n = normUrl(x.profileUrl || x.linkedin_url || x.leadProfileUrl || x.linkedInUrl || '');
-                            if (n) fits.set(n, { groupId: fit.groupId, groupName: fit.groupName || fit.groupId, score: fit.score == null ? null : fit.score });
+                            if (n) fits.set(n, { groupId: fit.groupId, groupName: fit.groupName || fit.groupId, score: fit.score == null ? null : fit.score, leadCategory: x.leadCategory || '' });
                         }))
                         .catch((e) => console.warn('[harvest-hypothesis] heyreach_contacts', field, email, e && e.message))
                 );
@@ -88,14 +90,29 @@
     }
 
     /** Eligible harvest pool contacts (carry connectionOrigin) from Railway. */
-    async function loadPoolContacts(bdrEmail, ctx, poolId) {
+    async function loadPoolContacts(bdrEmail, ctx, poolId, wholePool) {
         const h = await ctx.authHeaders();
-        let url = `${ctx.railway}/api/connect/harvest-pool/eligible-contacts/${encodeURIComponent(bdrEmail)}?excludeRecentDays=0`;
+        // applyEngagement=false: counts must not shrink just because a contact is marked Do Not Engage.
+        let url = `${ctx.railway}/api/connect/harvest-pool/eligible-contacts/${encodeURIComponent(bdrEmail)}?excludeRecentDays=0&applyEngagement=false`;
+        if (wholePool) url += '&minDaysSinceConnection=0'; // every connection the server knows how it was made, not only the "old enough" ones
         if (poolId) url += `&poolId=${encodeURIComponent(poolId)}`;
         const r = await fetch(url, { headers: h });
         const j = await r.json();
         if (!j.success) throw new Error(j.error || 'Could not load harvest pool contacts');
         return j.contacts || [];
+    }
+
+    /** Normalized URLs the admin excluded from the harvest pool (manual label originType 'excluded'). */
+    async function loadExcludedUrls(bdrEmail, ctx) {
+        const out = new Set();
+        try {
+            const h = await ctx.authHeaders();
+            const r = await fetch(`${ctx.railway}/api/connect/harvest-pool/manual-contacts/${encodeURIComponent(bdrEmail)}`, { headers: h });
+            const j = await r.json();
+            if (!j.success) throw new Error(j.error || 'failed');
+            (j.entries || []).forEach((e) => { if (e && e.originType === 'excluded') out.add(normUrl(e.linkedInUrl || e.normalizedUrl)); });
+        } catch (e) { console.warn('[harvest-hypothesis] exclusion list:', e && e.message); }
+        return out;
     }
 
     /**
@@ -105,23 +122,48 @@
      * Only contacts that are in the harvest pool are counted.
      */
     async function loadPools(bdrEmail, ctx, poolId) {
-        const [contacts, fits] = await Promise.all([loadPoolContacts(bdrEmail, ctx, poolId), loadFits(bdrEmail)]);
+        // A specific pool selection only lists that pool's members; "already connected" people belong to no pool.
+        const withOutside = !poolId;
+        const [contacts, fits, known, excluded] = await Promise.all([
+            loadPoolContacts(bdrEmail, ctx, poolId, false),
+            loadFits(bdrEmail),
+            withOutside ? loadPoolContacts(bdrEmail, ctx, '', true) : Promise.resolve([]),
+            withOutside ? loadExcludedUrls(bdrEmail, ctx) : Promise.resolve(new Set())
+        ]);
         const groups = new Map();
         const uncategorized = { gen: 0, pre: 0 };
-        contacts.forEach((c) => {
-            const n = normUrl(c.linkedInUrl);
-            const side = isPreExisting(c.connectionOrigin) ? 'pre' : 'gen';
-            const fit = fits.get(n);
-            if (!fit) { uncategorized[side]++; return; }
+        const addToGroup = (n, fit, side) => {
             let g = groups.get(fit.groupId);
             if (!g) { g = { groupId: fit.groupId, name: fit.groupName, gen: 0, pre: 0, total: 0, genUrls: new Set(), preUrls: new Set() }; groups.set(fit.groupId, g); }
             g[side]++; g.total++;
             g[side + 'Urls'].add(n);
+        };
+        const poolUrls = new Set();
+        contacts.forEach((c) => {
+            const n = normUrl(c.linkedInUrl);
+            poolUrls.add(n);
+            const side = isPreExisting(c.connectionOrigin) ? 'pre' : 'gen';
+            const fit = fits.get(n);
+            if (!fit) { uncategorized[side]++; return; }
+            addToGroup(n, fit, side);
         });
+
+        // Categorized connections the server never put in the pool (no HeyReach accept / manual label on file):
+        // these are the people the executive already had. They are the "Previous Connections".
+        let outsidePool = 0;
+        if (withOutside) {
+            const knownUrls = new Set(known.map((c) => normUrl(c.linkedInUrl)));
+            fits.forEach((fit, n) => {
+                if (poolUrls.has(n) || knownUrls.has(n) || excluded.has(n) || SKIP_CATEGORIES.includes(fit.leadCategory)) return;
+                addToGroup(n, fit, 'pre');
+                outsidePool++;
+            });
+        }
         return {
             groups: [...groups.values()].sort((a, b) => a.name.localeCompare(b.name)),
             uncategorized,
             poolSize: contacts.length,
+            outsidePool,            // categorized "Previous Connections" that are not in the harvest pool itself
             contacts,
             fits
         };
