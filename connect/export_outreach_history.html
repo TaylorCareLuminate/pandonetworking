@@ -1696,6 +1696,10 @@
                 const mapped = accountIdMap.get(String(data.linkedInAccountId));
                 if (mapped && emailSet.has(mapped)) owned = true;
             }
+            if (!owned && data.unipileAccountId) {
+                const mapped = accountIdMap.get(String(data.unipileAccountId));
+                if (mapped && emailSet.has(mapped)) owned = true;
+            }
             if (!owned) return;
 
             const url = extractActivityUrl(data);
@@ -1894,63 +1898,311 @@
         return events;
     }
 
-    // ── Load scheduled meetings ───────────────────────────────────────────────
-    async function loadScheduledMeetings(emailArr, inboxByUrl, inboxByBdr) {
-        const scheduledSet = new Set();
-        const chunks = [];
-        for (let i = 0; i < emailArr.length; i += 30) chunks.push(emailArr.slice(i, i + 30));
+    // ── Load scheduled meetings (across all scheduling collections) ──────────
+    async function loadAllClientScheduledMeetingRecords({
+        emailArr = [],
+        emailToCanonical = new Map(),
+        accountIdMap = new Map(),
+        customerIds = [],
+        inboxByBdr = [],
+        sentItems = [],
+        allowlist = null
+    } = {}) {
+        const emailSet = new Set((emailArr || []).map(e => String(e || '').toLowerCase()).filter(Boolean));
+        emailToCanonical.forEach((v, k) => { if (k) emailSet.add(k); if (v) emailSet.add(v); });
+        const customerIdSet = new Set((customerIds || []).map(c => String(c || '').trim()).filter(Boolean));
 
-        for (const chunk of chunks) {
-            if (!chunk.length) continue;
-            try {
-                const q = query(
-                    collection(emailDB, 'activity_tracking'),
-                    where('activity_type', '==', 'meeting_scheduled'),
-                    where('bdr_email', 'in', chunk),
-                    limit(2000)
-                );
-                const snap = await getDocs(q).catch(() => null);
-                if (snap) snap.forEach(d => {
-                    const url = normalizeUrl(d.data().contact_linkedin_url || '');
-                    if (url) scheduledSet.add(url);
-                });
-            } catch(e) { console.warn('activity_tracking scheduled failed:', e); }
-        }
-
-        // Use entry.liUrl (not the map key, which is now the composite "liUrl||bdrEmail")
-        inboxByUrl.forEach(entry => {
-            if (entry.responseCategory === 'Scheduled' && entry.liUrl) scheduledSet.add(entry.liUrl);
+        const convIdToEntry = new Map();
+        const knownSlugs = new Set();
+        const knownUrls = new Set();
+        const addKnownUrl = raw => {
+            const u = normalizeUrl(raw);
+            if (u) knownUrls.add(u);
+            const sl = extractLiSlug(raw);
+            if (sl) knownSlugs.add(sl);
+        };
+        (inboxByBdr || []).forEach(entry => {
+            if (!entry) return;
+            if (entry.liUrl) addKnownUrl(entry.liUrl);
+            if (entry.conversationId) {
+                convIdToEntry.set(String(entry.conversationId), entry);
+                convIdToEntry.set(String(entry.conversationId).replace(/^webhook_/, ''), entry);
+            }
+            if (entry.id) {
+                convIdToEntry.set(String(entry.id), entry);
+                convIdToEntry.set(String(entry.id).replace(/^webhook_/, ''), entry);
+            }
+        });
+        (sentItems || []).forEach(item => {
+            addKnownUrl(
+                item.prospect_li_url || item.contact_linkedin_url || item.prospect_linkedin_url ||
+                item.linkedin_url || item.linkedInUrl || item.contactLinkedInUrl || ''
+            );
         });
 
-        const allInbox = inboxByBdr || [];
-        if (allInbox.length > 0) {
-            const convIdToUrl = new Map();
-            allInbox.forEach(entry => {
-                if (entry.conversationId && entry.liUrl) {
-                    convIdToUrl.set(entry.conversationId, entry.liUrl);
-                    convIdToUrl.set(String(entry.conversationId).replace(/^webhook_/, ''), entry.liUrl);
-                }
-                if (entry.id && entry.liUrl) {
-                    convIdToUrl.set(entry.id, entry.liUrl);
-                    convIdToUrl.set(String(entry.id).replace(/^webhook_/, ''), entry.liUrl);
-                }
+        const matchesScope = ({ emails = [], customerId = '', linkedInAccountId = null, unipileAccountId = '', url = '', convId = '' }) => {
+            for (const raw of emails) {
+                const e = String(raw || '').toLowerCase().trim();
+                if (e && emailSet.has(e)) return { matched: true, bdr: emailToCanonical.get(e) || e };
+            }
+            if (linkedInAccountId !== null && linkedInAccountId !== undefined && linkedInAccountId !== '') {
+                const mapped = accountIdMap.get(String(linkedInAccountId));
+                if (mapped && emailSet.has(mapped)) return { matched: true, bdr: emailToCanonical.get(mapped) || mapped };
+            }
+            if (unipileAccountId) {
+                const mapped = accountIdMap.get(String(unipileAccountId));
+                if (mapped && emailSet.has(mapped)) return { matched: true, bdr: emailToCanonical.get(mapped) || mapped };
+            }
+            const cidStr = String(customerId || '').trim();
+            if (cidStr && customerIdSet.size && !customerIdSet.has(cidStr)) {
+                return { matched: false, bdr: '' };
+            }
+            if (cidStr && customerIdSet.has(cidStr)) {
+                return { matched: true, bdr: '' };
+            }
+            // If an explicit non-admin email is present and is NOT one of this client's BDRs, reject
+            const nonEmptyEmails = emails.map(x => String(x || '').toLowerCase().trim()).filter(Boolean);
+            const hasForeignNonAdmin = nonEmptyEmails.some(e => !emailSet.has(e) && !isAdminEmail(e));
+            if (hasForeignNonAdmin) return { matched: false, bdr: '' };
+
+            // Admin-saved or blank-email record: match via conversation ID or contact LinkedIn URL in this client's scope
+            const normCid = String(convId || '').replace(/^webhook_/, '');
+            const convEntry = convIdToEntry.get(String(convId || '')) || (normCid ? convIdToEntry.get(normCid) : null);
+            if (convEntry) return { matched: true, bdr: convEntry.bdrEmail || '' };
+            const u = normalizeUrl(url);
+            const sl = extractLiSlug(url);
+            if ((u && knownUrls.has(u)) || (sl && knownSlugs.has(sl)) || (allowlist && allowlist.hasOutreach(url))) {
+                return { matched: true, bdr: (allowlist && allowlist.bdrForUrl ? allowlist.bdrForUrl(url) : '') || '' };
+            }
+            return { matched: false, bdr: '' };
+        };
+
+        const records = [];
+        const [
+            actTrackSnap,
+            noReplySnap,
+            ovSchedSnap,
+            inboxSchedSnap,
+            hrActSchedSnap,
+            liMsgSchedSnap
+        ] = await Promise.all([
+            getDocs(query(collection(emailDB, 'activity_tracking'), where('activity_type', '==', 'meeting_scheduled'), limit(10000)))
+                .catch(e => { console.warn('activity_tracking meeting_scheduled query failed:', e); return null; }),
+            getDocs(collection(emailDB, 'connected_no_reply_scheduled'))
+                .catch(e => { console.warn('connected_no_reply_scheduled query failed:', e); return null; }),
+            getDocs(query(collection(emailDB, 'conversation_category_overrides'), where('responseCategory', '==', 'Scheduled'), limit(5000)))
+                .catch(e => { console.warn('conversation_category_overrides Scheduled query failed:', e); return null; }),
+            getDocs(query(collection(emailDB, 'heyreach_inbox'), where('responseCategory', '==', 'Scheduled'), limit(5000)))
+                .catch(e => { console.warn('heyreach_inbox Scheduled query failed:', e); return null; }),
+            getDocs(query(collection(emailDB, 'heyreach_activity'), where('responseCategory', '==', 'Scheduled'), limit(5000)))
+                .catch(e => { console.warn('heyreach_activity Scheduled query failed:', e); return null; }),
+            getDocs(query(collection(emailDB, 'linkedinMessages'), where('responseCategory', '==', 'Scheduled'), limit(5000)))
+                .catch(e => { console.warn('linkedinMessages Scheduled query failed:', e); return null; })
+        ]);
+
+        // 1) activity_tracking (`meeting_scheduled`)
+        if (actTrackSnap) {
+            actTrackSnap.forEach(d => {
+                const data = d.data();
+                const url = data.contact_linkedin_url || data.linkedinUrl || '';
+                const cid = String(data.conversation_id || data.conversationId || '');
+                const sc = matchesScope({
+                    emails: [data.account_email, data.bdr_email, data.bdr_auth_email],
+                    customerId: data.customer_id || data.customerId || '',
+                    url,
+                    convId: cid
+                });
+                if (!sc.matched) return;
+                records.push({
+                    id: d.id,
+                    _source: 'activity_tracking',
+                    _clientScoped: true,
+                    _humanConfirmed: true,
+                    ...data,
+                    bdr_email: sc.bdr || data.bdr_email || '',
+                    contact_linkedin_url: normalizeUrl(url || (convIdToEntry.get(cid) && convIdToEntry.get(cid).liUrl) || '')
+                });
             });
-            try {
-                const snap = await getDocs(query(
-                    collection(emailDB, 'conversation_category_overrides'),
-                    where('responseCategory', '==', 'Scheduled'),
-                    limit(2000)
-                )).catch(e => { console.warn('conversation_category_overrides failed:', e); return null; });
-                if (snap) {
-                    snap.forEach(d => {
-                        const cid = String((d.data() && d.data().conversationId) || '').replace(/^webhook_/, '');
-                        const url = convIdToUrl.get(d.id) || (cid ? convIdToUrl.get(cid) : '');
-                        if (url) scheduledSet.add(url);
-                    });
-                }
-            } catch(e) { console.warn('conversation_category_overrides scheduled failed:', e); }
         }
 
+        // 2) connected_no_reply_scheduled
+        if (noReplySnap) {
+            noReplySnap.forEach(d => {
+                const data = d.data();
+                const url = data.linkedinUrl || data.contact_linkedin_url || '';
+                const sc = matchesScope({
+                    emails: [data.bdrEmail, data.accountEmail],
+                    customerId: data.customerId || data.customer_id || '',
+                    url
+                });
+                if (!sc.matched) return;
+                records.push({
+                    id: d.id,
+                    _source: 'connected_no_reply_scheduled',
+                    _clientScoped: true,
+                    _humanConfirmed: true,
+                    ...data,
+                    bdr_email: sc.bdr || data.bdrEmail || '',
+                    contact_linkedin_url: normalizeUrl(url),
+                    contact_name: data.contactName || `${data.contactFirstName || ''} ${data.contactLastName || ''}`.trim() || '',
+                    contact_company: data.contactCompany || '',
+                    contact_title: data.contactTitle || '',
+                    scheduled_by: data.markedBy || '',
+                    scheduled_at: data.markedAt || data.createdAt || null
+                });
+            });
+        }
+
+        // 3) conversation_category_overrides (`responseCategory === 'Scheduled'`)
+        if (ovSchedSnap) {
+            ovSchedSnap.forEach(d => {
+                const data = d.data();
+                const rawCid = String(data.conversationId || d.id || '');
+                let url = data.leadProfileUrl || data.contactLinkedInUrl || data.linkedInUrl || '';
+                if (!url && /^webhook_/i.test(rawCid)) {
+                    const wSlug = rawCid.replace(/^webhook_/i, '').replace(/_[a-z0-9_]+_at_[a-z0-9_]+$/i, '');
+                    if (wSlug) url = `https://www.linkedin.com/in/${wSlug}`;
+                }
+                const convEntry = convIdToEntry.get(d.id) || convIdToEntry.get(rawCid) || convIdToEntry.get(rawCid.replace(/^webhook_/, '')) || null;
+                if (!url && convEntry && convEntry.liUrl) url = convEntry.liUrl;
+                const sc = matchesScope({
+                    emails: [data.accountEmail, data.bdrEmail, convEntry && convEntry.bdrEmail],
+                    customerId: data.customerId || data.customer_id || (convEntry && convEntry.customerId) || '',
+                    url,
+                    convId: rawCid
+                });
+                if (!sc.matched) return;
+                records.push({
+                    id: d.id,
+                    _source: 'conversation_category_overrides',
+                    _clientScoped: true,
+                    ...data,
+                    conversation_id: rawCid,
+                    bdr_email: sc.bdr || data.bdrEmail || '',
+                    contact_linkedin_url: normalizeUrl(url),
+                    contact_name: data.leadName || data.contactName || (convEntry && convEntry.leadName) || '',
+                    contact_company: data.leadCompany || (convEntry && convEntry.leadCompany) || '',
+                    contact_title: data.leadTitle || (convEntry && convEntry.leadTitle) || '',
+                    scheduled_by: data.scheduledBy || data.updatedBy || ''
+                });
+            });
+        }
+
+        // 4) heyreach_inbox (`responseCategory === 'Scheduled'`)
+        if (inboxSchedSnap) {
+            inboxSchedSnap.forEach(d => {
+                const data = d.data();
+                if (String(data.kind || '').toLowerCase() === 'post_reply') return;
+                const corr = data.rawData?.correspondentProfile || data.rawData?.correspondent || data.correspondent || {};
+                const url = data.leadProfileUrl || data.linkedin_url || data.leadLinkedInUrl || data.linkedInUrl || data.profileUrl || corr.profileUrl || corr.profile_url || '';
+                const sc = matchesScope({
+                    emails: [data.accountEmail, data.bdrEmail, data.linkedInAccountEmail],
+                    customerId: data.customerId || '',
+                    linkedInAccountId: data.linkedInAccountId,
+                    unipileAccountId: data.unipileAccountId || '',
+                    url,
+                    convId: data.conversationId || d.id
+                });
+                if (!sc.matched) return;
+                const msgs = data.rawData?.messages || data.messages || [];
+                const msgDates = msgs.map(m => safeToDate(m && (m.createdAt || m.timestamp || m.created_at))).filter(Boolean).sort((a, b) => a - b);
+                const latestMsgAt = msgDates.length ? msgDates[msgDates.length - 1] : (data.lastMessageAt || data.latestMessageAt || null);
+                records.push({
+                    id: d.id,
+                    _source: 'heyreach_inbox',
+                    _clientScoped: true,
+                    ...data,
+                    conversation_id: String(data.conversationId || d.id),
+                    bdr_email: sc.bdr || data.bdrEmail || data.accountEmail || '',
+                    contact_linkedin_url: normalizeUrl(url),
+                    contact_name: (`${data.leadFirstName || corr.firstName || ''} ${data.leadLastName || corr.lastName || ''}`.trim()) || data.leadName || corr.name || '',
+                    contact_company: data.companyName || data.leadCompany || corr.companyName || corr.company || '',
+                    contact_title: data.leadPosition || data.leadTitle || corr.position || corr.headline || '',
+                    scheduled_by: data.scheduledBy || '',
+                    lastMessageAt: latestMsgAt
+                });
+            });
+        }
+
+        // 5) heyreach_activity (`responseCategory === 'Scheduled'`, e.g. Catch Meetings / Admin Alerts / Webhook threads)
+        if (hrActSchedSnap) {
+            hrActSchedSnap.forEach(d => {
+                const data = d.data();
+                const url = extractActivityUrl(data);
+                const sc = matchesScope({
+                    emails: [data.accountEmail, data.bdrEmail, data.linkedInAccountEmail],
+                    customerId: data.customerId || '',
+                    linkedInAccountId: data.linkedInAccountId,
+                    unipileAccountId: data.unipileAccountId || '',
+                    url,
+                    convId: data.conversationId || d.id
+                });
+                if (!sc.matched) return;
+                records.push({
+                    id: d.id,
+                    _source: 'heyreach_activity',
+                    _clientScoped: true,
+                    ...data,
+                    conversation_id: String(data.conversationId || d.id),
+                    bdr_email: sc.bdr || data.bdrEmail || data.accountEmail || '',
+                    contact_linkedin_url: url,
+                    contact_name: (`${data.leadFirstName || ''} ${data.leadLastName || ''}`.trim()) || data.leadName || '',
+                    contact_company: data.leadCompany || data.companyName || '',
+                    contact_title: data.leadPosition || data.leadTitle || '',
+                    scheduled_by: data.scheduledBy || '',
+                    lastMessageAt: data.timestamp || data.receivedAt || null
+                });
+            });
+        }
+
+        // 6) linkedinMessages (`responseCategory === 'Scheduled'`)
+        if (liMsgSchedSnap) {
+            liMsgSchedSnap.forEach(d => {
+                const data = d.data();
+                const url = data.senderProfileUrl || data.leadProfileUrl || data.linkedinUrl || data.linkedInUrl || '';
+                const sc = matchesScope({
+                    emails: [data.accountEmail, data.bdrEmail, data.userEmail],
+                    customerId: data.customerId || '',
+                    url,
+                    convId: data.conversationId || d.id
+                });
+                if (!sc.matched) return;
+                records.push({
+                    id: d.id,
+                    _source: 'linkedinMessages',
+                    _clientScoped: true,
+                    ...data,
+                    conversation_id: String(data.conversationId || d.id),
+                    bdr_email: sc.bdr || data.bdrEmail || data.accountEmail || '',
+                    contact_linkedin_url: normalizeUrl(url),
+                    contact_name: data.senderName || data.leadName || '',
+                    contact_company: data.senderCompany || data.leadCompany || '',
+                    contact_title: data.senderTitle || data.leadTitle || '',
+                    scheduled_by: data.scheduledBy || '',
+                    lastMessageAt: data.receivedAt || data.timestamp || data.createdAt || null
+                });
+            });
+        }
+
+        return records;
+    }
+
+    async function loadScheduledMeetings(emailArr, inboxByUrl, inboxByBdr, opts = {}) {
+        const scheduledSet = new Set();
+        const records = await loadAllClientScheduledMeetingRecords({
+            emailArr,
+            accountIdMap: opts.accountIdMap || new Map(),
+            customerIds: opts.customerIds || [],
+            inboxByBdr: inboxByBdr || [],
+            sentItems: opts.sentItems || []
+        });
+        records.forEach(r => {
+            const u = normalizeUrl(r.contact_linkedin_url || '');
+            if (u) scheduledSet.add(u);
+        });
+        (inboxByBdr || []).forEach(entry => {
+            if (entry && entry.responseCategory === 'Scheduled' && entry.liUrl) scheduledSet.add(entry.liUrl);
+        });
         return scheduledSet;
     }
 
