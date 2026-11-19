@@ -23,7 +23,7 @@
         // Bump PAGE_VERSION (and the matching value in
         // export_outreach_history.version.json) whenever this file changes.
         (function () {
-            var PAGE_VERSION = '2026-11-19.2';
+            var PAGE_VERSION = '2026-11-19.3';
             var VERSION_URL = 'export_outreach_history.version.json';
             var GUARD_KEY = 'eoh_version_reload_guard';
 
@@ -1744,6 +1744,63 @@
         return connectionDateMap;
     }
 
+    // ── Weekly report: accepted-connection events (mirrors outcomes.html loadAcceptedConnections) ──
+    // `heyreach_activity` is shared by every customer, so a global eventType scan with a limit (what
+    // loadConnectionDates does) returns an arbitrary subset once the collection is large. Like outcomes.html
+    // we instead query server-side by the BDRs' HeyReach account ids (eventType == ACCEPTED, newest first, no
+    // limit → auto-paginated), plus Unipile account ids, and only fall back to email fields when no account
+    // id resolves. Returns one record per event; callers dedupe per (BDR, contact).
+    async function loadAcceptedConnectionEvents(opts) {
+        const { emailSet, canonEmailsSet, accountIdMap, emailToCanonical, heyreachIds, unipileIds, emailsArr } = opts;
+        const accWhere = [['eventType', '==', 'CONNECTION_REQUEST_ACCEPTED']];
+        const docs = new Map();
+        const add = list => (list || []).forEach(d => { if (!docs.has(d.id)) docs.set(d.id, d); });
+        const hrIds = Array.from(new Set((heyreachIds || []).filter(v => v !== undefined && v !== null && v !== '')));
+        const uniIds = Array.from(new Set((unipileIds || []).filter(Boolean)));
+
+        if (hrIds.length) {
+            try {
+                add(await wrQueryIn('heyreach_activity', 'linkedInAccountId', hrIds, { where: accWhere, orderBy: 'timestamp', timeoutMs: 300000 }));
+            } catch (e) {
+                // composite index (eventType + linkedInAccountId + timestamp) unavailable → retry unordered
+                add(await wrQueryIn('heyreach_activity', 'linkedInAccountId', hrIds, { where: accWhere, timeoutMs: 300000 }));
+            }
+        }
+        if (uniIds.length) {
+            add(await wrQueryIn('heyreach_activity', 'unipileAccountId', uniIds, { where: accWhere, timeoutMs: 300000 }).catch(() => []));
+        }
+        if (!hrIds.length && !uniIds.length) {
+            wrPartial.push('No HeyReach/Unipile account ids resolved for these BDRs — fell back to email-field lookups, which can miss events that carry only an account id.');
+            const [a, b] = await Promise.all([
+                wrQueryIn('heyreach_activity', 'bdrEmail', emailsArr, { where: accWhere, timeoutMs: 300000 }).catch(() => []),
+                wrQueryIn('heyreach_activity', 'accountEmail', emailsArr, { where: accWhere, timeoutMs: 300000 }).catch(() => [])
+            ]);
+            add(a); add(b);
+        }
+
+        const lcs = v => String(v || '').toLowerCase().trim();
+        const events = [];
+        docs.forEach(d => {
+            if (d.eventType !== 'CONNECTION_REQUEST_ACCEPTED') return;
+            const mapped = (d.linkedInAccountId != null && accountIdMap.get(String(d.linkedInAccountId))) ||
+                           (d.unipileAccountId && accountIdMap.get(String(d.unipileAccountId))) || '';
+            const rawBdr = lcs(mapped || d.bdrEmail || d.accountEmail || d.linkedInAccountEmail || '');
+            if (!rawBdr) return;
+            if (!(emailSet.has(rawBdr) || canonEmailsSet.has(rawBdr) || canonEmailsSet.has(emailToCanonical.get(rawBdr) || ''))) return;
+            const rawUrl = d.leadProfileUrl || d.linkedInUrl || (d.rawData && (d.rawData.leadProfileUrl || (d.rawData.correspondent && d.rawData.correspondent.profile_url))) || '';
+            if (!normalizeUrl(rawUrl)) return;
+            const at = safeToDate(d.timestamp);
+            if (!at) return;
+            events.push({
+                rawUrl,
+                at,
+                bdr: emailToCanonical.get(rawBdr) || rawBdr,
+                name: `${d.leadFirstName || d.firstName || ''} ${d.leadLastName || d.lastName || ''}`.trim() || d.leadName || ''
+            });
+        });
+        return events;
+    }
+
     // ── Load current LinkedIn connections (heyreach_contacts) ────────────────
     async function loadCurrentConnections(emailArr) {
         const urls = new Set();
@@ -2215,6 +2272,15 @@
         const rows = [];
         const seen = new Set();
 
+        // Acceptance date by exact URL first, then by LinkedIn slug (country subdomains / tracking variants).
+        const lookupConnDate = u => {
+            if (!u) return null;
+            const direct = connectionDateMap.get(u);
+            if (direct) return direct;
+            const sl = extractLiSlug(u);
+            return (sl && connectionDateMap.get(`slug:${sl}`)) || null;
+        };
+
         // ── Group every non-connect_queue send event by "liUrl||bdrEmail" ─────────────
         const convIdToUrl = new Map();
         inboxByBdr.forEach(e => {
@@ -2433,8 +2499,9 @@
             const itemMsgType    = String(item.message_type || 'connect').toLowerCase();
             const isConnectInvite = itemMsgType === 'connect' || itemMsgType === 'connection' || itemMsgType === 'connect_only' ||
                 Boolean(liUrl && (sentConnectInviteUrlSet.has(liUrl) || (allowlist && allowlist.hasConnectInvite(liUrl, { name: contactName, bdrEmail }))));
-            const rawConnDate    = liUrl ? connectionDateMap.get(liUrl) : null;
-            const connDate       = (pandoOnly && !isConnectInvite) ? null : rawConnDate;
+            // connectionDateMap is already limited to contacts with Pando outreach on record (see weekly report).
+            const rawConnDate    = liUrl ? lookupConnDate(liUrl) : null;
+            const connDate       = rawConnDate;
             const msgType        = classifyMessageType(item);
             const rawMessages    = inbox?.rawMessages || [];
             const replied        = inbox?.hasLeadReply ? 1 : 0;
@@ -2562,8 +2629,8 @@
             const weSentARequest  = pandoOnly
                 ? Boolean(sentConnectInviteUrlSet.has(liUrl) || (allowlist && allowlist.hasConnectInvite(liUrl, { name: inbox?.leadName || '', bdrEmail })))
                 : sentRequestUrlSet.has(liUrl);
-            const rawConnDate     = connectionDateMap.get(liUrl) || null;
-            const connDate        = (pandoOnly && !weSentARequest) ? null : rawConnDate;
+            const rawConnDate     = lookupConnDate(liUrl) || null;
+            const connDate        = rawConnDate;
             const bdrName         = bdrEmailToName.get(bdrEmail) || bdrEmail;
             const connectedFlag   = connDate ? 1 : 0;
             const anyConnected    = (connectedFlag === 1 || currentConnectionUrls.has(liUrl)) ? 1 : 0;
@@ -2904,7 +2971,7 @@
     // All report math/sheet layout lives in weekly_client_report.js; this block
     // only loads the data (read-only) and drives the UI.
     // ═════════════════════════════════════════════════════════════════════════
-    const WR_MODULE_URL = './weekly_client_report.js?v=3';
+    const WR_MODULE_URL = './weekly_client_report.js?v=4';
     let wrLast = null;            // { wb, report, fileBase } from the latest build
     let wrPartial = [];           // partial-failure notes from the loader currently running
     const wrEl = id => document.getElementById(id);
@@ -2959,7 +3026,7 @@
         const errs = [];
         const jobs = chunk30(vals).map(async ch => {
             try {
-                let q = query(collection(emailDB, collName), where(field, 'in', ch), ...(opts.where || []).map(w => where(w[0], w[1], w[2])));
+                let q = query(collection(emailDB, collName), where(field, 'in', ch), ...(opts.where || []).map(w => where(w[0], w[1], w[2])), ...(opts.orderBy ? [orderBy(opts.orderBy, 'desc')] : []));
                 if (opts.select && typeof q.select === 'function') q = q.select(...opts.select);
                 const snap = await getDocs(q, { timeoutMs: opts.timeoutMs || 120000 });
                 snap.forEach(d => { if (!out.has(d.id)) out.set(d.id, { id: d.id, ...d.data() }); });
@@ -3163,16 +3230,27 @@
             const connectActivity = allConnectActivity.filter(a => sinceOk(a.timestamp || a.createdAt));
 
             const outboundActivities = await wrLoad(diagnostics, 'heyreach_activity (outbound campaign/engine sends)', 'Loading outbound campaign & Unipile sends…', async () => {
-                const [byBdr, byAcc, byCust] = await Promise.all([
+                // Also look sends up by HeyReach / Unipile account id: webhook events frequently carry only
+                // linkedInAccountId (no bdrEmail/accountEmail), exactly like outcomes.html's loadActuallySentConnections.
+                const sentWhere = [['eventType', '==', 'CONNECTION_REQUEST_SENT']];
+                const [byBdr, byAcc, byCust, byHrId, byUniId] = await Promise.all([
                     wrQueryIn('heyreach_activity', 'bdrEmail', emailsArr).catch(() => []),
                     wrQueryIn('heyreach_activity', 'accountEmail', emailsArr).catch(() => []),
-                    customerIdsArr.length ? wrQueryIn('heyreach_activity', 'customerId', customerIdsArr).catch(() => []) : Promise.resolve([])
+                    customerIdsArr.length ? wrQueryIn('heyreach_activity', 'customerId', customerIdsArr).catch(() => []) : Promise.resolve([]),
+                    wrQueryIn('heyreach_activity', 'linkedInAccountId', clientHeyreachAccountIds, { where: sentWhere, timeoutMs: 240000 }).catch(() => []),
+                    wrQueryIn('heyreach_activity', 'unipileAccountId', clientUnipileAccountIds, { where: sentWhere, timeoutMs: 240000 }).catch(() => [])
                 ]);
                 const m = new Map();
-                [...byBdr, ...byAcc, ...byCust].forEach(d => {
+                [...byBdr, ...byAcc, ...byCust, ...byHrId, ...byUniId].forEach(d => {
                     if (m.has(d.id)) return;
                     const et = d.eventType || '';
-                    if (et === 'CONNECTION_REQUEST_SENT' || et === 'MESSAGE_SENT' || et === 'INMAIL_SENT') m.set(d.id, d);
+                    if (et === 'CONNECTION_REQUEST_SENT' || et === 'MESSAGE_SENT' || et === 'INMAIL_SENT') {
+                        if (!d.bdrEmail && !d.accountEmail && !d.linkedInAccountEmail) {
+                            const seat = accountIdMap.get(String(d.linkedInAccountId)) || accountIdMap.get(String(d.unipileAccountId)) || '';
+                            if (seat) d.bdrEmail = seat;
+                        }
+                        m.set(d.id, d);
+                    }
                 });
                 return Array.from(m.values());
             }) || [];
@@ -3302,23 +3380,34 @@
                 note: `Kept ${inboxByBdr.length} Pando-originated conversation(s) (${inboxByBdr.filter(e => e.hasLeadReply).length} with a reply); excluded ${excludedInboxCount} non-Pando conversation(s) (inbound-initiated, post comments, or no Pando outreach record).`
             });
 
-            const rawConnectionDateMap = await wrLoad(diagnostics, 'heyreach_activity (connection accepted)', 'Loading connection-accepted events…', () => loadConnectionDates(emailsArr, accountIdMap)) || new Map();
+            const rawAcceptedEvents = await wrLoad(diagnostics, 'heyreach_activity (connection accepted)', 'Loading connection-accepted events…', () => loadAcceptedConnectionEvents({
+                emailSet, canonEmailsSet, accountIdMap, emailToCanonical,
+                heyreachIds: clientHeyreachAccountIds, unipileIds: clientUnipileAccountIds, emailsArr
+            }), r => `${r.length} accepted-connection events for this client's seats (all time)`) || [];
+            // Same eligibility as outcomes.html: a (BDR, contact) pair counts when we have outreach on record
+            // for that contact (connect_queue push or HeyReach/Unipile send event).
             const connectionDateMap = new Map();
+            const acceptedEvents = [];
             let excludedConnectionsCount = 0;
-            rawConnectionDateMap.forEach((ts, url) => {
-                if (allowlist.hasConnectInvite(url)) connectionDateMap.set(url, ts);
-                else excludedConnectionsCount++;
+            const setEarliest = (key, ts) => { if (key) { const prev = connectionDateMap.get(key); if (!prev || ts < prev) connectionDateMap.set(key, ts); } };
+            rawAcceptedEvents.forEach(ev => {
+                const meta = { name: ev.name, bdrEmail: ev.bdr };
+                if (!allowlist.hasOutreach(ev.rawUrl, meta)) { excludedConnectionsCount++; return; }
+                const url = allowlist.canonicalUrlFor(ev.rawUrl, meta) || normalizeUrl(ev.rawUrl);
+                acceptedEvents.push({ url, at: ev.at, bdr: ev.bdr });
+                setEarliest(url, ev.at);
+                setEarliest(normalizeUrl(ev.rawUrl), ev.at);
+                const sl = extractLiSlug(url) || extractLiSlug(ev.rawUrl);
+                if (sl) setEarliest(`slug:${sl}`, ev.at);
             });
             allowlist.manualHlDates.forEach((ts, url) => {
                 if (!connectionDateMap.has(url)) connectionDateMap.set(url, ts);
             });
-            if (excludedConnectionsCount > 0) {
-                diagnostics.push({
-                    source: 'connections (Pando/HealthLuminate-origin filter)',
-                    rows: connectionDateMap.size,
-                    note: `Excluded ${excludedConnectionsCount} connection-accepted event(s) with no matching Pando connection invite.`
-                });
-            }
+            diagnostics.push({
+                source: 'connections (Pando/HealthLuminate-origin filter)',
+                rows: acceptedEvents.length,
+                note: `Counted ${acceptedEvents.length} accepted-connection event(s) for contacts with Pando/HealthLuminate outreach on record; excluded ${excludedConnectionsCount} with no outreach record (organic / not sent through Pando).`
+            });
 
             const scheduledUrlSet = new Set();
             meetingEvents.forEach(m => {
@@ -3462,7 +3551,7 @@
                 diagnostics,
                 allowlist, allConnectActivity, outboundActivities, manualHarvest,
                 hypothesisGroups: companyGroups,
-                queue, dataset: reportDataset, inbox: rawInboxByBdr, meetingEvents, sendEvents,
+                queue, dataset: reportDataset, acceptedEvents, inbox: rawInboxByBdr, meetingEvents, sendEvents,
                 crmNotes, overrides, connectActivity, exclusions, workLog,
                 pipelineRuns, contactSearches, importedContacts, deletedContacts,
                 analysis,

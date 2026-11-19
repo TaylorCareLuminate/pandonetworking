@@ -11,7 +11,7 @@
  * Also importable from Node for tests (no browser globals used).
  */
 
-export const REPORT_VERSION = '2026-11-19.2';
+export const REPORT_VERSION = '2026-11-19.3';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Small helpers
@@ -314,8 +314,12 @@ export function buildPandoOriginAllowlist(src = {}) {
         if (!a) return;
         const et = a.eventType || '';
         if (et !== 'CONNECTION_REQUEST_SENT' && et !== 'MESSAGE_SENT' && et !== 'INMAIL_SENT') return;
+        // Connection requests only ever come from HeyReach campaigns / the Unipile engine (never a manual
+        // LinkedIn invite), and HeyReach webhooks don't always carry a campaign id — outcomes.html counts
+        // every CONNECTION_REQUEST_SENT event, so do the same. Messages still need a campaign/engine tag
+        // because inbox replies typed by hand are also logged as MESSAGE_SENT.
         const isCampaignOrEngine = Boolean(a.campaignId || a.heyreachCampaignId || lc(a.provider) === 'unipile');
-        if (!isCampaignOrEngine) return;
+        if (et !== 'CONNECTION_REQUEST_SENT' && !isCampaignOrEngine) return;
         const u = a.leadProfileUrl || a.linkedInUrl || (a.rawData && a.rawData.correspondent && a.rawData.correspondent.profile_url) || (a.rawData && a.rawData.leadProfileUrl) || '';
         const nm = `${a.leadFirstName || ''} ${a.leadLastName || ''}`.trim() || a.leadName || '';
         const bdr = a.bdrEmail || a.accountEmail || a.linkedInAccountEmail || '';
@@ -1154,6 +1158,29 @@ export function assembleReport(inp) {
         });
     });
 
+    // Connections accepted: counted straight from CONNECTION_REQUEST_ACCEPTED events, one per (BDR, contact)
+    // pair per day — the same method as outcomes.html "Period vs. Rest of Time". Deriving it from the contact
+    // dataset instead silently dropped acceptances for contacts that had no matching dataset row.
+    const acceptedEvents = Array.isArray(inp.acceptedEvents) ? inp.acceptedEvents : null;
+    const acceptedPairDays = new Map(); // pair -> Set(day)
+    if (acceptedEvents) {
+        acceptedEvents.forEach(ev => {
+            const day = ev.day || (ev.at ? dayKey(ev.at) : '');
+            const ck = liSlug(ev.url || '') || normUrl(ev.url || '');
+            if (!day || !ck) return;
+            const pair = `${canonical(ev.bdr || '')}|${ck}`;
+            if (!acceptedPairDays.has(pair)) acceptedPairDays.set(pair, new Set());
+            acceptedPairDays.get(pair).add(day);
+        });
+        acceptedPairDays.forEach(days => days.forEach(d => bump(S.accepted, d)));
+    }
+    const acceptedIn = (a, b) => {
+        if (!acceptedEvents) return sumRange(S.accepted, a, b);
+        let n = 0;
+        acceptedPairDays.forEach(days => { for (const d of days) if (d >= a && d <= b) { n++; break; } });
+        return n;
+    };
+
     dataset.forEach(r => {
         const hist = r.conversation_history || [];
         const bdrDays = new Set(), contactDays = new Set();
@@ -1168,8 +1195,8 @@ export function assembleReport(inp) {
         contactDays.forEach(dk => bump(S.repliedContacts, dk));
         const connDay = r.connection_datetime ? dayKey(r.connection_datetime) : (r.connection_date || '');
         const meta = { name: r.contact_name || '', bdrEmail: r.bdr_email || '' };
-        const pandoConn = r.connected === 1 && (!hasOriginAllowlist || allowlist.hasConnectInvite(r.contact_linkedin_url, meta));
-        if (pandoConn && connDay) bump(S.accepted, connDay);
+        const pandoConn = r.connected === 1 && (!hasOriginAllowlist || allowlist.hasOutreach(r.contact_linkedin_url, meta));
+        if (!acceptedEvents && pandoConn && connDay) bump(S.accepted, connDay);
         rowInfo.set(r, { bdrDays, contactDays, connDay: pandoConn ? connDay : '', pandoConn, firstDay: firstBdr || r.first_outreach_date || '' });
     });
 
@@ -1232,7 +1259,7 @@ export function assembleReport(inp) {
     const sec = t => kpis.push({ section: t });
     sec('A. Outreach results — events that happened during the period');
     kpis.push(kpi('Connection requests / outreach sent (distinct contacts)', sumRange(S.sentToHeyreach, P.start, P.end), sumRange(S.sentToHeyreach, PV.start, PV.end), 'Contacts whose message was pushed to the sending platform in the period (date = push/approval date).'));
-    kpis.push(kpi('Connections accepted', sumRange(S.accepted, P.start, P.end), sumRange(S.accepted, PV.start, PV.end), 'Acceptance date, among contacts we reached out to.'));
+    kpis.push(kpi('Connections accepted', acceptedIn(P.start, P.end), acceptedIn(PV.start, PV.end), 'Acceptance date (HeyReach/Unipile CONNECTION_REQUEST_ACCEPTED events), one per BDR + contact — same counting as Outcomes "Period vs. Rest of Time", limited to contacts we reached out to.'));
     kpis.push(kpi('Contacts who replied (distinct)', repliedIn(P.start, P.end), repliedIn(PV.start, PV.end), 'A contact counts if they sent at least one message during the period.'));
     kpis.push(kpi('Inbound messages received from contacts', sumRange(S.contactMessages, P.start, P.end), sumRange(S.contactMessages, PV.start, PV.end), 'Every message sent BY a prospect in the period (can exceed distinct repliers).'));
     kpis.push(kpi('Meetings scheduled', sumRange(S.meetings, P.start, P.end), sumRange(S.meetings, PV.start, PV.end), 'Meetings scheduled/logged in the period across Company Conversations, Admin Alerts, Catch Meetings, Connected-No-Reply, and Activity Tracking (deduplicated to one per contact).'));
