@@ -5250,6 +5250,18 @@
                     </p>
                 </a>
 
+                <a href="ai_instructions_training.html" class="page-card page-card-featured" target="_blank" rel="noopener">
+                    <div class="page-card-header">
+                        <div class="page-card-icon">
+                            <i class="fas fa-wand-magic-sparkles"></i>
+                        </div>
+                        <h3 class="page-card-title">AI Instructions &amp; Training Data</h3>
+                    </div>
+                    <p class="page-card-description">
+                        Edit AI instructions by client, BDR and hypothesis group. Download the AI-draft vs what-was-sent dataset plus a ChatGPT package, then import the JSON it returns.
+                    </p>
+                </a>
+
                 <a href="analysis_results.html" class="page-card page-card-featured" target="_blank" rel="noopener">
                     <div class="page-card-header">
                         <div class="page-card-icon">
@@ -9071,6 +9083,14 @@ Rules:
                 ));
                 const failed = results.find(resp => !resp.ok);
                 if (failed) throw new Error(`HTTP ${failed.status}`);
+                // Dismissed without a send: if the AI had drafted something, record that it went unused
+                try {
+                    const _dismissed = _liAlerts.find(a => a.id === alertId);
+                    if (_dismissed && _dismissed.aiDraft && !_dismissed._liSentLogged) {
+                        _dismissed._liSentLogged = true;
+                        _liLogReplyDraftEvent(_dismissed, 'dismissed_without_sending', {}).catch(e => console.warn('[LiAlerts] Draft log failed:', e.message));
+                    }
+                } catch (_) { /* logging must never block a dismiss */ }
                 // Remove from local list and re-render
                 _liAlerts = _liAlerts.filter(a => !ids.includes(a.id));
                 _liAllAlertsDeduped = (_liAllAlertsDeduped || []).filter(a => !ids.includes(a.id));
@@ -9451,6 +9471,10 @@ If there are no embarrassing mistakes, respond {"ok": true, "issues": []}.`;
                     if (textarea) textarea.value = '';
                     const ccEl = document.getElementById(`li-cc-${alertId}`);
                     if (ccEl) ccEl.textContent = '0';
+                    // Keep the AI draft / what-was-sent pair for the AI Instructions & Training Data page
+                    alert_obj._liSentLogged = true;
+                    _liLogReplyDraftEvent(alert_obj, 'sent', { sentText: message, engine: data.engine || 'heyreach', engineStatus: data.status || '' })
+                        .catch(e => console.warn('[LiAlerts] Draft log failed:', e.message));
                     // Auto-dismiss the alert after sending
                     await window.liDismissOne(alertId);
                 } else {
@@ -9779,7 +9803,208 @@ If there are no embarrassing mistakes, respond {"ok": true, "issues": []}.`;
             return ctx;
         }
 
-        function _liBuildDraftPrompt(alertObj, bdrEmail, profile, recentReplies, ctx) {
+        // ── Admin-managed reply instructions (company-wide / client / BDR / hypothesis group) ──
+        // Edited on ai_instructions_training.html and stored in connect_ai_instructions/<layer>__<id>
+        // (field replyDraftInstructions). They are added to the drafting prompt, so a change on that
+        // page changes the next first draft. The instructions in force are saved with each draft
+        // (aiDraftInstructions) so the AI-draft / what-was-sent dataset can be tied to what produced it.
+        const LI_INSTR_COLLECTION = 'connect_ai_instructions';
+        const LI_DRAFT_LOG_COLLECTION = 'connect_reply_draft_log';
+        const _liInstrDocCache = new Map();    // doc id -> { at, data }
+        const _liBdrClientCache = new Map();   // bdr email -> { at, customerId }
+        const _liClientNameCache = new Map();  // customerId -> display name
+
+        function _liInstrDocId(layer, id) {
+            return `${layer}__${String(id || '').trim().toLowerCase().replace(/[^a-z0-9@._-]/g, '_')}`;
+        }
+
+        async function _liReadInstructionDoc(layer, id) {
+            if (!id || !window.clemailFirestore || !window.clemailDb) return null;
+            const docId = _liInstrDocId(layer, id);
+            const hit = _liInstrDocCache.get(docId);
+            if (hit && (Date.now() - hit.at) < 60000) return hit.data;
+            let data = null;
+            try {
+                const { doc, getDoc } = window.clemailFirestore;
+                const snap = await getDoc(doc(window.clemailDb, LI_INSTR_COLLECTION, docId));
+                data = (snap && snap.exists) ? (snap.data() || null) : null;
+            } catch (err) {
+                console.warn('[LiAlerts][ReplyInstructions] Could not read', docId, err.message);
+            }
+            _liInstrDocCache.set(docId, { at: Date.now(), data });
+            return data;
+        }
+
+        async function _liResolveClientForBdr(emails, fallbackCustomerId) {
+            let customerId = '';
+            const { doc, getDoc, collection, query, where, getDocs, limit } = window.clemailFirestore;
+            for (const email of emails) {
+                const key = String(email || '').toLowerCase();
+                if (!key) continue;
+                const hit = _liBdrClientCache.get(key);
+                if (hit && (Date.now() - hit.at) < 600000) {
+                    if (hit.customerId) { customerId = hit.customerId; break; }
+                    continue;
+                }
+                let cid = '';
+                try {
+                    const snap = await getDocs(query(collection(window.clemailDb, 'bdr_leaders'), where('primaryEmail', '==', key), limit(1)));
+                    snap.forEach(d => { if (!cid) cid = (d.data() || {}).customerId || ''; });
+                } catch (err) {
+                    console.warn('[LiAlerts][ReplyInstructions] bdr_leaders lookup failed for', key, err.message);
+                }
+                _liBdrClientCache.set(key, { at: Date.now(), customerId: cid });
+                if (cid) { customerId = cid; break; }
+            }
+            customerId = customerId || fallbackCustomerId || '';
+            let name = '';
+            if (customerId) {
+                if (_liClientNameCache.has(customerId)) {
+                    name = _liClientNameCache.get(customerId);
+                } else {
+                    try {
+                        const s = await getDoc(doc(window.clemailDb, 'customerList', customerId));
+                        const d = (s && s.exists) ? (s.data() || {}) : {};
+                        name = d.name || d.shortName || d.customerName || '';
+                    } catch (_) { /* name is optional */ }
+                    _liClientNameCache.set(customerId, name);
+                }
+            }
+            return { customerId, name };
+        }
+
+        // Returns { text, snapshot }. Never throws; on any failure the draft is simply generated without the extra block.
+        async function _liGetReplyInstructions(alertObj, canonicalEmail, emailVariants, ctx) {
+            try {
+                if (!window.clemailFirestore || !window.clemailDb) return { text: '', snapshot: null };
+                const client = await _liResolveClientForBdr([canonicalEmail, ...(emailVariants || [])], alertObj.customerId);
+                const groupId = (ctx && ctx.hypothesisGroup && ctx.hypothesisGroup.id) || '';
+                const groupName = (ctx && ctx.hypothesisGroup && (ctx.hypothesisGroup.name || ctx.hypothesisGroup.id)) || '';
+                const [g, c, b, h] = await Promise.all([
+                    _liReadInstructionDoc('global', 'all'),
+                    _liReadInstructionDoc('client', client.customerId),
+                    _liReadInstructionDoc('bdr', canonicalEmail),
+                    _liReadInstructionDoc('group', groupId)
+                ]);
+                const pick = d => String((d && d.replyDraftInstructions) || '').trim();
+                const parts = { global: pick(g), client: pick(c), bdr: pick(b), group: pick(h) };
+                const sections = [];
+                if (parts.global) sections.push(`COMPANY-WIDE:\n${parts.global}`);
+                if (parts.client) sections.push(`CLIENT${client.name ? ` (${client.name})` : ''}:\n${parts.client}`);
+                if (parts.bdr) sections.push(`THIS BDR (${canonicalEmail}):\n${parts.bdr}`);
+                if (parts.group) sections.push(`HYPOTHESIS GROUP${groupName ? ` "${groupName}"` : ''}:\n${parts.group}`);
+                return {
+                    text: sections.join('\n\n'),
+                    snapshot: {
+                        global: parts.global || null,
+                        client: parts.client || null,
+                        bdr: parts.bdr || null,
+                        group: parts.group || null,
+                        clientId: client.customerId || null,
+                        clientName: client.name || null,
+                        bdrEmail: canonicalEmail || null,
+                        groupId: groupId || null,
+                        groupName: groupName || null
+                    }
+                };
+            } catch (err) {
+                console.warn('[LiAlerts][ReplyInstructions] Skipped:', err.message);
+                return { text: '', snapshot: null };
+            }
+        }
+
+        function _liTsToIso(ts) {
+            try {
+                if (!ts) return null;
+                if (typeof ts === 'string') return ts;
+                if (typeof ts.toDate === 'function') return ts.toDate().toISOString();
+                if (ts instanceof Date) return ts.toISOString();
+                if (typeof ts === 'number') return new Date(ts).toISOString();
+                if (ts._seconds != null) return new Date(ts._seconds * 1000).toISOString();
+                if (ts.seconds != null) return new Date(ts.seconds * 1000).toISOString();
+            } catch (_) { /* fall through */ }
+            return null;
+        }
+
+        // Rough 0..1 "how much of the AI draft survived" score (word-set Jaccard). Good enough to sort edits by size.
+        function _liDraftSimilarity(a, b) {
+            const tok = s => new Set(String(s || '').toLowerCase().replace(/[^a-z0-9'\s]/g, ' ').split(/\s+/).filter(Boolean));
+            const A = tok(a), B = tok(b);
+            if (!A.size && !B.size) return 1;
+            let inter = 0;
+            A.forEach(w => { if (B.has(w)) inter++; });
+            const union = A.size + B.size - inter;
+            return union ? Math.round((inter / union) * 1000) / 1000 : 0;
+        }
+
+        // Saves one row per reply decision so we can later see what the AI drafted vs what actually went out.
+        // outcome: 'sent' | 'dismissed_without_sending' | 'regenerated'. All fields are read synchronously
+        // (before the first await) because the alert is removed from the page right after a send/dismiss.
+        async function _liLogReplyDraftEvent(alertObj, outcome, extra) {
+            if (!alertObj || !window.clemailFirestore || !window.clemailDb) return;
+            extra = extra || {};
+            const snap = alertObj.aiDraftInstructions || null;
+            const sentText = extra.sentText != null ? String(extra.sentText) : null;
+            const aiDraft = alertObj.aiDraft || null;
+            let sentSource = null;
+            if (sentText != null) {
+                if (!aiDraft) sentSource = 'written_without_ai_draft';
+                else if (sentText.trim() === String(aiDraft).trim()) sentSource = 'ai_draft_unchanged';
+                else sentSource = 'ai_draft_edited';
+            }
+            const conversation = (alertObj.messages || []).slice(-12).map(m => ({
+                from: (m.sender === 'ME' || m.sender === 'account') ? 'BDR' : 'PROSPECT',
+                at: _liTsToIso(m.createdAt || m.timestamp),
+                text: String(typeof _liExtractMessageText === 'function' ? _liExtractMessageText(m) : (m.body || m.text || m.message || '')).slice(0, 3000)
+            }));
+            const lastProspect = [...conversation].reverse().find(m => m.from === 'PROSPECT');
+            const payload = {
+                outcome,
+                stream: 'reply',
+                alertId: alertObj.id || null,
+                conversationId: alertObj.conversationId || null,
+                customerId: alertObj.customerId || null,
+                clientId: (snap && snap.clientId) || alertObj.customerId || null,
+                clientName: (snap && snap.clientName) || alertObj.customerName || null,
+                bdrEmail: (snap && snap.bdrEmail) || (alertObj.bdrEmail || '').toLowerCase() || null,
+                bdrName: alertObj.bdrName || null,
+                hypothesisGroup: alertObj.aiDraftHypothesisGroup || (snap && snap.groupName) || null,
+                hypothesisGroupId: (snap && snap.groupId) || null,
+                leadName: alertObj.leadName || [alertObj.leadFirstName, alertObj.leadLastName].filter(Boolean).join(' ') || null,
+                leadPosition: alertObj.leadPosition || null,
+                leadCompany: alertObj.leadCompany || null,
+                leadProfileUrl: alertObj.leadProfileUrl || null,
+                lastProspectMessage: lastProspect ? lastProspect.text : null,
+                conversation,
+                aiDraft,
+                aiDraftPreHuman: alertObj.aiDraftPreHuman || null,
+                aiDraftAt: _liTsToIso(alertObj.aiDraftAt),
+                aiDraftModel: alertObj.aiDraftModel || null,
+                aiDraftHumanStyle: alertObj.aiDraftHumanStyle || null,
+                aiDraftInstructions: snap,
+                sentText,
+                sentSource,
+                similarity: (sentText != null && aiDraft) ? _liDraftSimilarity(aiDraft, sentText) : null,
+                aiDraftLength: aiDraft ? aiDraft.length : null,
+                sentLength: sentText != null ? sentText.length : null,
+                responseCategory: alertObj.responseCategory || null,
+                engine: extra.engine || null,
+                engineStatus: extra.engineStatus || null,
+                by: (window.auth && window.auth.currentUser && window.auth.currentUser.email) || null,
+                at: new Date(),
+                atIso: new Date().toISOString()
+            };
+            // Firestore rejects undefined; JSON round-trip drops them (Date was already converted where needed).
+            const clean = JSON.parse(JSON.stringify(payload));
+            clean.at = new Date();
+            const { collection, addDoc } = window.clemailFirestore;
+            await addDoc(collection(window.clemailDb, LI_DRAFT_LOG_COLLECTION), clean);
+        }
+
+        function _liBuildDraftPrompt(alertObj, bdrEmail, profile, recentReplies, ctx, replyInstr) {
+            const instructionsSection = (replyInstr && replyInstr.text)
+                ? `=== ADDITIONAL REPLY INSTRUCTIONS (set by admins from analysis of past drafts; follow these, and where they conflict with the rules below they win, except the plain-text and punctuation rules) ===\n${replyInstr.text}\n\n`
+                : '';
             const leadName = alertObj.leadName || [alertObj.leadFirstName, alertObj.leadLastName].filter(Boolean).join(' ') || 'the prospect';
             const firstName = alertObj.leadFirstName || leadName.split(/\s+/)[0] || '';
 
@@ -9867,7 +10092,7 @@ ${repliesSection}
 === BDR'S APPROVED QUICK TEXT SNIPPETS (reuse phrasing/links from these when they fit naturally) ===
 ${inserts || 'None on file.'}
 
-=== YOUR TASK ===
+${instructionsSection}=== YOUR TASK ===
 Write the BDR's reply to the prospect's latest message.
 
 Rules:
@@ -9993,13 +10218,19 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 const emails = [...new Set([canonicalEmail, (alertObj.bdrEmail || '').toLowerCase(), alertObj.bdrEmail].filter(Boolean))];
                 const bdrEmailVariants = [...new Set(emails.map(e => e.toLowerCase()))];
 
-                if (force) _liContactContextCache.delete(id);
+                if (force) {
+                    _liContactContextCache.delete(id);
+                    // A forced regenerate replaces a draft nobody used: keep that pair for the training dataset
+                    if (alertObj.aiDraft) _liLogReplyDraftEvent(alertObj, 'regenerated', {}).catch(e => console.warn('[LiAlerts] Draft log failed:', e.message));
+                    _liInstrDocCache.clear();
+                }
                 const [recentReplies, ctx] = await Promise.all([
                     _liGetRecentBdrReplies(emails),
                     _liGetContactContext(alertObj, bdrEmailVariants)
                 ]);
 
-                const prompt = _liBuildDraftPrompt(alertObj, canonicalEmail, profile, recentReplies, ctx);
+                const replyInstr = await _liGetReplyInstructions(alertObj, canonicalEmail, bdrEmailVariants, ctx);
+                const prompt = _liBuildDraftPrompt(alertObj, canonicalEmail, profile, recentReplies, ctx, replyInstr);
                 let draft = _liCleanDraft(await _liCallAiModel(prompt));
                 if (draft.length > 1990) draft = draft.slice(0, 1990);
 
@@ -10036,6 +10267,9 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                 alertObj.aiDraftAt = new Date();
                 alertObj.aiDraftModel = LI_AI_MODEL;
                 alertObj.aiDraftHumanStyle = humanStyleUsed;
+                alertObj.aiDraftPreHuman = preHumanDraft;
+                alertObj.aiDraftHypothesisGroup = (ctx.hypothesisGroup && (ctx.hypothesisGroup.name || ctx.hypothesisGroup.id)) || null;
+                alertObj.aiDraftInstructions = replyInstr.snapshot || null;
 
                 // Persist so the draft survives refreshes and shows on any device
                 try {
@@ -10048,7 +10282,8 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
                             aiDraftModel: LI_AI_MODEL,
                             aiDraftHumanStyle: humanStyleUsed,
                             aiDraftPreHuman: preHumanDraft,
-                            aiDraftHypothesisGroup: (ctx.hypothesisGroup && (ctx.hypothesisGroup.name || ctx.hypothesisGroup.id)) || null
+                            aiDraftHypothesisGroup: (ctx.hypothesisGroup && (ctx.hypothesisGroup.name || ctx.hypothesisGroup.id)) || null,
+                            aiDraftInstructions: replyInstr.snapshot || null
                         });
                     }
                 } catch (persistErr) {
