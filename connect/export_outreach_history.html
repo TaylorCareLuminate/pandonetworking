@@ -23,7 +23,7 @@
         // Bump PAGE_VERSION (and the matching value in
         // export_outreach_history.version.json) whenever this file changes.
         (function () {
-            var PAGE_VERSION = '2026-11-19.1';
+            var PAGE_VERSION = '2026-11-19.2';
             var VERSION_URL = 'export_outreach_history.version.json';
             var GUARD_KEY = 'eoh_version_reload_guard';
 
@@ -1360,22 +1360,36 @@
                 }
             });
             const allEmailsArr = Array.from(allEmailsSet);
+            const targetCustomerIds = Array.from(new Set(targetBdrs.map(b => b && b.customerId).filter(Boolean)));
+            const singleTargetBdr = targetBdrs.length === 1 ? (targetBdrs[0].primaryEmail || targetBdrs[0].id || '').toLowerCase() : '';
 
             const s1 = addStep('Loading your sent outreach (connect_queue)…');
             const sentItems = await loadConnectQueue(allEmailsArr, daysBack, MAX_ROWS);
             doneStep(s1, `${sentItems.length} outreach records loaded`);
 
+            const accountInfo = await loadAccountIdMapping(allEmailsSet);
+            const accountIdMap = accountInfo.map;
+
             const s2 = addStep('Loading conversation threads (heyreach_inbox)…');
-            const { inboxByUrl, inboxByBdr } = await loadInbox(allEmailsArr, emailToCanonical);
+            const { inboxByUrl, inboxByBdr } = await loadInbox(allEmailsArr, emailToCanonical, {
+                accountIdMap,
+                customerIds: targetCustomerIds,
+                heyreachAccountIds: accountInfo.heyreachIds,
+                unipileAccountIds: accountInfo.unipileIds,
+                singleBdrEmail: singleTargetBdr
+            });
             doneStep(s2, `${inboxByUrl.size} conversations indexed`);
 
             const s3 = addStep('Loading connection acceptance dates…');
-            const accountIdMap = await loadAccountIdMapping();
             const connectionDateMap = await loadConnectionDates(allEmailsArr, accountIdMap);
             doneStep(s3, `${connectionDateMap.size} connection dates found`);
 
             const s4 = addStep('Loading scheduled meeting records…');
-            const scheduledUrlSet = await loadScheduledMeetings(allEmailsArr, inboxByUrl, inboxByBdr);
+            const scheduledUrlSet = await loadScheduledMeetings(allEmailsArr, inboxByUrl, inboxByBdr, {
+                accountIdMap,
+                customerIds: targetCustomerIds,
+                sentItems
+            });
             doneStep(s4, `${scheduledUrlSet.size} contacts scheduled a meeting`);
 
             const s5 = addStep('Loading current LinkedIn connections…');
@@ -1476,8 +1490,15 @@
         return results;
     }
 
+    function extractLiSlug(url) {
+        if (!url) return '';
+        const m = String(url).split(/[?#]/)[0].match(/linkedin\.com\/(?:in|pub)\/([^/]+)/i);
+        if (!m) return '';
+        try { return decodeURIComponent(m[1]).toLowerCase().trim(); } catch (_) { return m[1].toLowerCase().trim(); }
+    }
+
     // ── Load heyreach_inbox ───────────────────────────────────────────────────
-    async function loadInbox(emailArr, emailToCanonical = new Map()) {
+    async function loadInbox(emailArr, emailToCanonical = new Map(), opts = {}) {
         // inboxByUrl: "liUrl||bdrEmail" → inbox doc data. MUST be keyed by BDR too, not just
         // the lead's URL — the same LinkedIn contact can legitimately show up in more than one
         // BDR's/client's heyreach_inbox (e.g. targeted by two different client campaigns), and
@@ -1488,6 +1509,12 @@
         const inboxByUrl = new Map();
         const inboxByBdr = [];
         const seenIds = new Set();
+        const accountIdMap = opts.accountIdMap || new Map();
+        const customerIdList = Array.from(new Set((opts.customerIds || []).map(x => String(x || '').trim()).filter(Boolean)));
+        const customerIdSet = new Set(customerIdList);
+        const heyreachAccountIds = Array.from(new Set((opts.heyreachAccountIds || []).filter(v => v !== null && v !== undefined && v !== '')));
+        const unipileAccountIds = Array.from(new Set((opts.unipileAccountIds || []).map(x => String(x || '').trim()).filter(Boolean)));
+        const singleBdrEmail = String(opts.singleBdrEmail || '').toLowerCase();
 
         const fields = ['accountEmail', 'bdrEmail', 'linkedInAccountEmail', 'uploadedByEmail'];
         const chunks = [];
@@ -1502,6 +1529,26 @@
                         .catch(e => { console.warn(`heyreach_inbox ${field} failed:`, e); return null; })
                 );
             }
+        }
+        // Also query by customerId / linkedInAccountId / unipileAccountId so conversations synced
+        // when `linkedInAccount.emailAddress` was null (common on HeyReach/Unipile webhooks) are never missed.
+        for (const chunk of chunk30(customerIdList)) {
+            promises.push(
+                getDocs(query(collection(emailDB, 'heyreach_inbox'), where('customerId', 'in', chunk), limit(50000)))
+                    .catch(e => { console.warn('heyreach_inbox customerId failed:', e); return null; })
+            );
+        }
+        for (const chunk of chunk30(heyreachAccountIds)) {
+            promises.push(
+                getDocs(query(collection(emailDB, 'heyreach_inbox'), where('linkedInAccountId', 'in', chunk), limit(50000)))
+                    .catch(e => { console.warn('heyreach_inbox linkedInAccountId failed:', e); return null; })
+            );
+        }
+        for (const chunk of chunk30(unipileAccountIds)) {
+            promises.push(
+                getDocs(query(collection(emailDB, 'heyreach_inbox'), where('unipileAccountId', 'in', chunk), limit(50000)))
+                    .catch(e => { console.warn('heyreach_inbox unipileAccountId failed:', e); return null; })
+            );
         }
 
         const allowedEmails = new Set(emailArr.map(e => e.toLowerCase()));
@@ -1521,19 +1568,32 @@
                     data.leadName || data.lead_name || correspondent.name || correspondent.fullName || '';
                 const title   = data.leadPosition || data.leadTitle || correspondent.position || correspondent.headline || '';
                 const company = data.companyName  || data.leadCompany || correspondent.companyName || correspondent.company || '';
-                const liUrl   = normalizeUrl(data.leadProfileUrl || correspondent.profileUrl || '');
+                const liUrl   = normalizeUrl(
+                    data.leadProfileUrl || data.linkedin_url || data.leadLinkedInUrl ||
+                    data.linkedInUrl || data.profileUrl || correspondent.profileUrl || correspondent.profile_url || ''
+                );
                 let rawBdrEmail = (data.accountEmail || data.bdrEmail || data.linkedInAccountEmail || '').toLowerCase();
+                if (!rawBdrEmail && data.linkedInAccountId !== undefined && data.linkedInAccountId !== null) {
+                    rawBdrEmail = accountIdMap.get(String(data.linkedInAccountId)) || '';
+                }
+                if (!rawBdrEmail && data.unipileAccountId) {
+                    rawBdrEmail = accountIdMap.get(String(data.unipileAccountId)) || '';
+                }
                 if (!rawBdrEmail && data.uploadedByEmail && allowedEmails.has(String(data.uploadedByEmail).toLowerCase())) {
                     rawBdrEmail = String(data.uploadedByEmail).toLowerCase();
+                }
+                if (!rawBdrEmail && data.customerId && customerIdSet.has(String(data.customerId)) && singleBdrEmail) {
+                    rawBdrEmail = singleBdrEmail;
                 }
                 // Guard against cross-BDR leaks from the `uploadedByEmail` query: if this doc's
                 // actual BDR email isn't one of the BDR emails in scope, skip it.
                 if (rawBdrEmail && !allowedEmails.has(rawBdrEmail) && !emailToCanonical.has(rawBdrEmail)) return;
+                if (!rawBdrEmail && !(data.customerId && customerIdSet.has(String(data.customerId)))) return;
                 // Canonicalize to the BDR's primary email so work-email and LinkedIn-seat-email
                 // records for the same real BDR key to the same "liUrl||bdrEmail" bucket.
-                const bdrEmail = emailToCanonical.get(rawBdrEmail) || rawBdrEmail;
+                const bdrEmail = emailToCanonical.get(rawBdrEmail) || rawBdrEmail || singleBdrEmail;
                 const rawMessages = data.rawData?.messages || data.messages || [];
-                const hasLeadReply = rawMessages.some(m =>
+                const hasLeadReply = Boolean(data.hasProspectReply || data.leadReplied) || rawMessages.some(m =>
                     m.sender === 'CORRESPONDENT' || m.sender === 'lead' || m.direction === 'inbound'
                 );
                 const responseCategory = data.responseCategory || '';
@@ -1548,6 +1608,7 @@
                     post_url:      data.post_url       || data.rawData?.post_url      || '',
                     post_url_source: data.post_url_source || data.rawData?.post_url_source || '',
                     conversationId: data.conversationId || d.id,
+                    customerId:    data.customerId || '',
                     leadName: fullName,
                     leadTitle: title,
                     leadCompany: company,
@@ -1558,7 +1619,19 @@
                     responseCategory,
                     followUpCategory: data.followUpCategory || '',
                     followUpInvitesSent: data.followUpInvitesSent,
-                    ignored: data.ignored === true
+                    ignored: data.ignored === true,
+                    manualCategoryOverride: data.manualCategoryOverride === true || data.manualOverride === true,
+                    scheduledAt: data.scheduledAt || null,
+                    firstScheduledAt: data.firstScheduledAt || null,
+                    scheduledBy: data.scheduledBy || '',
+                    meetingWillingnessDate: data.meetingWillingnessDate || null,
+                    lastManualUpdateAt: data.lastManualUpdateAt || null,
+                    meetingDateTime: data.meetingDateTime || null,
+                    meetingDateSource: data.meetingDateSource || '',
+                    meetingCommitted: data.meetingCommitted === true,
+                    meetingCommittedAt: data.meetingCommittedAt || null,
+                    lastMessageAt: data.lastMessageAt || data.latestMessageAt || null,
+                    updatedAt: data.updatedAt || null
                 };
 
                 // Composite key: only join this conversation to rows from the SAME BDR/campaign.
@@ -1570,19 +1643,32 @@
         return { inboxByUrl, inboxByBdr };
     }
 
-    // ── Load heyreachAccountId → bdrEmail mapping ────────────────────────────
-    async function loadAccountIdMapping() {
+    // ── Load heyreachAccountId / unipileAccountId → bdrEmail mapping ─────────
+    async function loadAccountIdMapping(scopeEmailSet = null) {
         const map = new Map();
+        const heyreachIds = [];
+        const unipileIds = [];
         try {
             const snap = await getDocs(collection(emailDB, 'linkedin_accounts'));
             snap.forEach(d => {
                 const data = d.data();
-                if (data.heyreachAccountId && data.bdrEmail) {
-                    map.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
+                const bdr = String(data.bdrEmail || data.accountEmail || data.email || '').toLowerCase();
+                if (data.heyreachAccountId && bdr) {
+                    map.set(String(data.heyreachAccountId), bdr);
+                    if (!scopeEmailSet || scopeEmailSet.has(bdr)) {
+                        heyreachIds.push(data.heyreachAccountId);
+                        heyreachIds.push(String(data.heyreachAccountId));
+                    }
+                }
+                if (data.unipileAccountId && bdr) {
+                    map.set(String(data.unipileAccountId), bdr);
+                    if (!scopeEmailSet || scopeEmailSet.has(bdr)) {
+                        unipileIds.push(String(data.unipileAccountId));
+                    }
                 }
             });
         } catch(e) { console.warn('linkedin_accounts load failed:', e); }
-        return map;
+        return { map, heyreachIds, unipileIds };
     }
 
     function extractActivityUrl(data) {
