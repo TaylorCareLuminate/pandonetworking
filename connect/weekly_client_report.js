@@ -11,7 +11,7 @@
  * Also importable from Node for tests (no browser globals used).
  */
 
-export const REPORT_VERSION = '2026-11-19.3';
+export const REPORT_VERSION = '2026-11-19.4';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Small helpers
@@ -95,7 +95,7 @@ export function isMemberIdSlug(slug) {
 const normPersonName = s => lc(s).replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
 const isAdminDomainEmail = e => /@(?:healthluminate|careluminate)\.com$/i.test(String(e || '').trim());
 
-const normConvId = s => String(s || '').replace(/^webhook_/, '');
+export const normConvId = s => String(s || '').replace(/^webhook_/, '');
 const isTrue = v => v === true || v === 'true';
 
 // ─────────────────────────────────────────────────────────────────────────────
