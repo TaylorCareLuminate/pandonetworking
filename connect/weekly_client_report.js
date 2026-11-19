@@ -435,22 +435,32 @@ export function assembleReport(inp) {
 
     const nonPandoConvIds = new Set();
     const inboundPairs = new Set();
+    const pandoPairs = new Set();
     const pandoInbox = [];
     (inp.inbox || []).forEach(e => {
         if (isPandoConversation(e, allowlist, canonEmailSet)) {
             pandoInbox.push(e);
+            const b = canonical((e && e.bdrEmail) || '');
+            const u = normUrl((e && e.liUrl) || '');
+            const sl = liSlug((e && e.liUrl) || '');
+            if (u) pandoPairs.add(`${u}||${b}`);
+            if (sl) pandoPairs.add(`${sl}||${b}`);
         } else {
             if (e && e.id) nonPandoConvIds.add(normConvId(e.id));
             if (e && e.conversationId) nonPandoConvIds.add(normConvId(e.conversationId));
-            const bi = allowlist.blankInviteInfo(e && e.liUrl);
-            if (e && e.liUrl && !conversationStartedByUs(e.rawMessages || [], bi)) {
-                const b = canonical(e.bdrEmail || '');
-                inboundPairs.add(`${normUrl(e.liUrl)}||${b}`);
-                const sl = liSlug(e.liUrl);
-                if (sl) inboundPairs.add(`${sl}||${b}`);
+            // Post comments (`kind: 'post_reply'`) are never DM conversations — never mark the contact inbound-started from a comment
+            if (e && lc(e.kind) !== 'post_reply' && e.liUrl) {
+                const bi = allowlist.blankInviteInfo(e.liUrl);
+                if (!conversationStartedByUs(e.rawMessages || [], bi)) {
+                    const b = canonical(e.bdrEmail || '');
+                    inboundPairs.add(`${normUrl(e.liUrl)}||${b}`);
+                    const sl = liSlug(e.liUrl);
+                    if (sl) inboundPairs.add(`${sl}||${b}`);
+                }
             }
         }
     });
+    pandoPairs.forEach(p => inboundPairs.delete(p));
 
     const queuePage = q => {
         const d = q.d;
