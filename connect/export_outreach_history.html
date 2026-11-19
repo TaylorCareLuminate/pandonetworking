@@ -2236,14 +2236,33 @@
         });
         buildStats.eventsWithoutContact = eventsWithoutContact;
 
-        // Best HeyReach thread per contact+BDR (the one with the most messages)
+        // Best HeyReach thread per contact+BDR (the one with the most messages), plus a
+        // same-BDR slug index so country-subdomain variants (`uk.linkedin.com/in/jane` vs `linkedin.com/in/jane`) join cleanly.
         const bestInboxByKey = new Map();
+        const bestInboxBySlugBdr = new Map();
         inboxByBdr.forEach(e => {
             if (!e.liUrl || !e.bdrEmail) return;
             const k = `${e.liUrl}||${e.bdrEmail}`;
             const prev = bestInboxByKey.get(k);
             if (!prev || (e.rawMessages || []).length > (prev.rawMessages || []).length) bestInboxByKey.set(k, e);
+            const sl = extractLiSlug(e.liUrl);
+            if (sl) {
+                const sk = `${sl}||${e.bdrEmail}`;
+                const prevSl = bestInboxBySlugBdr.get(sk);
+                if (!prevSl || (e.rawMessages || []).length > (prevSl.rawMessages || []).length) bestInboxBySlugBdr.set(sk, e);
+            }
         });
+        const scheduledSlugs = new Set();
+        scheduledUrlSet.forEach(u => {
+            const sl = extractLiSlug(u);
+            if (sl) scheduledSlugs.add(sl);
+        });
+        const isUrlScheduled = u => {
+            if (!u) return false;
+            if (scheduledUrlSet.has(u)) return true;
+            const sl = extractLiSlug(u);
+            return Boolean(sl && scheduledSlugs.has(sl));
+        };
 
         const SOURCE_LABELS = {
             connect_request:         'Connection request',
@@ -2341,8 +2360,9 @@
             ).trim();
             if (!text) return [];
             const sentDate = safeToDate(
-                item.adminApprovedAt || item.customerApprovedAt ||
-                item.pushed_at || item.created_at || item.uploaded_date || item.generated_at
+                item.pushed_to_heyreach_at || item.heyreach_push_date || item.pushed_date || item.pushed_at ||
+                item.auto_push_timestamp || item.adminApprovedAt || item.customerApprovedAt ||
+                item.created_at || item.uploaded_date || item.generated_at
             );
             return [{
                 sender:   'BDR',
@@ -2376,15 +2396,15 @@
                 item.prospect_li_url || item.contact_linkedin_url || item.prospect_linkedin_url ||
                 item.linkedin_url || item.linkedInUrl || item.contactLinkedInUrl || ''
             );
-            const rawBdrEmail = (item.account_email || item.bdr_auth_email || item.bdr_email || '').toLowerCase();
+            const rawBdrEmail = (item.account_email || item.bdr_auth_email || item.bdr_email || item.bdr_leader_email || '').toLowerCase();
             // Canonicalize before keying — otherwise a BDR's work-email queue record and
             // LinkedIn-seat-email queue record for the same prospect look like two different
             // BDRs and both survive the dedup check below, producing duplicate contact rows.
             const bdrEmail = emailToCanonical.get(rawBdrEmail) || rawBdrEmail;
             const key = `${liUrl}||${bdrEmail}`;
-            const liSlugPart = (liUrl.match(/linkedin\.com\/in\/([^/]+)/i) || [])[1] || '';
+            const liSlugPart = extractLiSlug(liUrl);
             if (seen.has(key)) return;
-            if (pandoOnly && inboundPairs && liUrl && (inboundPairs.has(key) || (liSlugPart && inboundPairs.has(`${liSlugPart}||${bdrEmail}`)))) return;
+            if (pandoOnly && inboundPairs && liUrl && !isUrlScheduled(liUrl) && (inboundPairs.has(key) || (liSlugPart && inboundPairs.has(`${liSlugPart}||${bdrEmail}`)))) return;
             seen.add(key);
 
             const firstName = item.contactFirstName || item.prospect_first_name || item.firstName || '';
@@ -2393,11 +2413,11 @@
             const cqTitle   = item.contactTitle || item.prospect_title || item.prospect_position || item.position || item.title || '';
             const cqCompany = item.contactCompany || item.prospect_company || item.company || item.company_name || '';
 
-            // Composite (liUrl||bdrEmail) match only — never fall back to a URL-only match,
-            // which would risk attaching a different BDR's/client's real conversation to this
-            // row. If there's no exact match, rawMessages stays empty and this row falls back
-            // to whatever synthetic/queue-only message handling already exists below.
-            let inbox = (liUrl && bdrEmail) ? (bestInboxByKey.get(key) || inboxByUrl.get(key)) : null;
+            // Composite (liUrl||bdrEmail) or same-BDR slug match only — never fall back to a URL-only match,
+            // which would risk attaching a different BDR's/client's real conversation to this row.
+            let inbox = (liUrl && bdrEmail)
+                ? (bestInboxByKey.get(key) || inboxByUrl.get(key) || (liSlugPart ? bestInboxBySlugBdr.get(`${liSlugPart}||${bdrEmail}`) : null))
+                : null;
             if (pandoOnly && inbox && isPandoConvFn && !isPandoConvFn(inbox)) {
                 return;
             }
@@ -2412,13 +2432,13 @@
             const bdrName        = bdrEmailToName.get(bdrEmail) || bdrEmail;
             const itemMsgType    = String(item.message_type || 'connect').toLowerCase();
             const isConnectInvite = itemMsgType === 'connect' || itemMsgType === 'connection' || itemMsgType === 'connect_only' ||
-                Boolean(liUrl && (sentConnectInviteUrlSet.has(liUrl) || (allowlist && allowlist.hasConnectInvite(liUrl))));
+                Boolean(liUrl && (sentConnectInviteUrlSet.has(liUrl) || (allowlist && allowlist.hasConnectInvite(liUrl, { name: contactName, bdrEmail }))));
             const rawConnDate    = liUrl ? connectionDateMap.get(liUrl) : null;
             const connDate       = (pandoOnly && !isConnectInvite) ? null : rawConnDate;
             const msgType        = classifyMessageType(item);
             const rawMessages    = inbox?.rawMessages || [];
             const replied        = inbox?.hasLeadReply ? 1 : 0;
-            const scheduled      = (liUrl && scheduledUrlSet.has(liUrl)) ? 1 : 0;
+            const scheduled      = isUrlScheduled(liUrl) ? 1 : 0;
             const connected      = connDate ? 1 : 0;
             const anyConnected   = (connected === 1 || (liUrl && currentConnectionUrls.has(liUrl))) ? 1 : 0;
             const connectedByHL  = pandoOnly
@@ -2426,13 +2446,26 @@
                 : ((connected === 1 || anyConnected === 1) ? 1 : 0);
             const currentlyConnected = pandoOnly ? connectedByHL : anyConnected;
             const sentDate       = safeToDate(
-                item.adminApprovedAt || item.customerApprovedAt ||
-                item.pushed_at || item.created_at || item.uploaded_date || item.generated_at
+                item.pushed_to_heyreach_at || item.heyreach_push_date || item.pushed_date || item.pushed_at ||
+                item.auto_push_timestamp || item.adminApprovedAt || item.customerApprovedAt ||
+                item.created_at || item.uploaded_date || item.generated_at
             );
 
-            const baseHistory = rawMessages.length
+            let baseHistory = rawMessages.length
                 ? makeConversationHistory(rawMessages)
                 : syntheticHistoryFromQueueItem(item);
+            // On Unipile, LinkedIn invitation notes are omitted from chat message lists, so a prospect's
+            // reply can appear as the only message in `rawMessages`. Prepend the queue item's opening note
+            // when it was sent on/before the first thread message so the opening message is preserved.
+            if (rawMessages.length && !baseHistory.some(isBdrMsg)) {
+                const synth = syntheticHistoryFromQueueItem(item);
+                if (synth.length) {
+                    const firstMsgDate = baseHistory[0]?.date || '';
+                    if (!synth[0].date || !firstMsgDate || synth[0].date <= firstMsgDate) {
+                        baseHistory = [...synth, ...baseHistory];
+                    }
+                }
+            }
 
             // Fold in follow-ups / replies / Quick Message sends for the same contact that the
             // connect_queue record doesn't know about.
@@ -2486,14 +2519,15 @@
         const extraKeys = new Set();
         eventsByKey.forEach((_, k) => extraKeys.add(k));
         bestInboxByKey.forEach((entry, k) => {
+            const entrySched = isUrlScheduled(entry.liUrl);
             if (pandoOnly) {
-                if (!allowlist || !allowlist.hasOutreach(entry.liUrl)) return;
+                if (!entrySched && (!allowlist || !allowlist.hasOutreach(entry.liUrl, { name: entry.leadName, bdrEmail: entry.bdrEmail }))) return;
                 if (isPandoConvFn && !isPandoConvFn(entry)) return;
             }
             const hasBdrMessage = (entry.rawMessages || []).some(m =>
                 m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound');
-            if (!(hasBdrMessage || (!pandoOnly && scheduledUrlSet.has(entry.liUrl)))) return;
-            if (buildStats.sinceMs && !scheduledUrlSet.has(entry.liUrl)) {
+            if (!(hasBdrMessage || entrySched)) return;
+            if (buildStats.sinceMs && !entrySched) {
                 // Date-range filter: skip threads with no activity inside the window
                 const lastTs = Math.max(0, ...(entry.rawMessages || []).map(m => (safeToDate(m.createdAt || m.timestamp) || 0) && safeToDate(m.createdAt || m.timestamp).getTime()));
                 if (lastTs && lastTs < buildStats.sinceMs) return;
@@ -2506,26 +2540,27 @@
             const sep      = key.indexOf('||');
             const liUrl    = key.slice(0, sep);
             const bdrEmail = key.slice(sep + 2);
-            const liSlugPart = (liUrl.match(/linkedin\.com\/in\/([^/]+)/i) || [])[1] || '';
-            if (pandoOnly && inboundPairs && (inboundPairs.has(key) || (liSlugPart && inboundPairs.has(`${liSlugPart}||${bdrEmail}`)))) return;
-            if (pandoOnly && allowlist && !allowlist.hasOutreach(liUrl)) return;
+            const liSlugPart = extractLiSlug(liUrl);
+            const urlSched = isUrlScheduled(liUrl);
+            if (pandoOnly && inboundPairs && !urlSched && (inboundPairs.has(key) || (liSlugPart && inboundPairs.has(`${liSlugPart}||${bdrEmail}`)))) return;
+            let inbox       = bestInboxByKey.get(key) || null;
+            if (pandoOnly && !urlSched && allowlist && !allowlist.hasOutreach(liUrl, { name: inbox?.leadName || '', bdrEmail })) return;
             seen.add(key);
 
-            let inbox       = bestInboxByKey.get(key) || null;
             if (pandoOnly && inbox && isPandoConvFn && !isPandoConvFn(inbox)) return;
             const keyEvents = eventsByKey.get(key) || [];
             const baseHistory = inbox ? makeConversationHistory(inbox.rawMessages || []) : [];
             const merged      = mergeEvents(baseHistory, keyEvents);
             const convHistory = merged.history;
             const sources     = new Set(merged.kinds);
-            if (baseHistory.some(isBdrMsg)) sources.add('heyreach_thread');
+            if (baseHistory.some(isBdrMsg) || (urlSched && baseHistory.length)) sources.add('heyreach_thread');
             const histRange   = historyDateRange(convHistory);
 
             const bdrMsgCount     = convHistory.filter(isBdrMsg).length;
-            if (pandoOnly && !bdrMsgCount) return;
+            if (pandoOnly && !bdrMsgCount && !urlSched) return;
             const contactMsgCount = convHistory.filter(m => m.sender === 'Contact').length;
             const weSentARequest  = pandoOnly
-                ? Boolean(sentConnectInviteUrlSet.has(liUrl) || (allowlist && allowlist.hasConnectInvite(liUrl)))
+                ? Boolean(sentConnectInviteUrlSet.has(liUrl) || (allowlist && allowlist.hasConnectInvite(liUrl, { name: inbox?.leadName || '', bdrEmail })))
                 : sentRequestUrlSet.has(liUrl);
             const rawConnDate     = connectionDateMap.get(liUrl) || null;
             const connDate        = (pandoOnly && !weSentARequest) ? null : rawConnDate;
@@ -2560,11 +2595,11 @@
                 hypothesis_group_name:      '',
                 hypothesis_variation_id:    '',
                 hypothesis_variation_label: '',
-                first_outreach_date:   histRange.first,
+                first_outreach_date:   histRange.first || histRange.last,
                 last_message_date:     histRange.last,
                 message_type:          msgType,
                 replied:               inbox?.hasLeadReply ? 1 : 0,
-                scheduled:             scheduledUrlSet.has(liUrl) ? 1 : 0,
+                scheduled:             urlSched ? 1 : 0,
                 total_messages:        convHistory.length,
                 bdr_messages:          bdrMsgCount,
                 contact_messages:      contactMsgCount,
@@ -2869,7 +2904,7 @@
     // All report math/sheet layout lives in weekly_client_report.js; this block
     // only loads the data (read-only) and drives the UI.
     // ═════════════════════════════════════════════════════════════════════════
-    const WR_MODULE_URL = './weekly_client_report.js?v=2';
+    const WR_MODULE_URL = './weekly_client_report.js?v=3';
     let wrLast = null;            // { wb, report, fileBase } from the latest build
     let wrPartial = [];           // partial-failure notes from the loader currently running
     const wrEl = id => document.getElementById(id);
@@ -2898,7 +2933,7 @@
         let s, e;
         if (kind === 'lastWeek') { s = new Date(mon); s.setDate(mon.getDate() - 7); e = new Date(s); e.setDate(s.getDate() + 6); }
         else if (kind === 'thisWeek') { s = mon; e = today; }
-        else { e = new Date(today); e.setDate(today.getDate() - 1); s = new Date(e); s.setDate(e.getDate() - 6); }
+        else { e = new Date(today); s = new Date(e); s.setDate(e.getDate() - 6); }
         wrEl('wrStart').value = wrDayStr(s);
         wrEl('wrEnd').value = wrDayStr(e);
     };
@@ -3027,24 +3062,42 @@
                 });
             });
 
-            // Load linkedin_accounts up front so both HeyReach account IDs AND any additional
-            // seat alias emails for these BDRs are mapped before querying connect_queue / inbox.
+            // Load linkedin_accounts up front so HeyReach account IDs, Unipile account IDs, AND any
+            // additional seat alias emails for these BDRs are mapped before querying connect_queue / inbox.
+            const customerIds = new Set(bdrs.map(b => b.customerId).filter(Boolean));
+            const clientHeyreachAccountIds = [];
+            const clientUnipileAccountIds = [];
             const accountIdMap = await wrLoad(diagnostics, 'linkedin_accounts', 'Loading LinkedIn account mapping…', async () => {
                 const map = new Map();
                 const snap = await getDocs(collection(emailDB, 'linkedin_accounts'));
                 snap.forEach(d => {
                     const data = d.data();
-                    if (data.heyreachAccountId && data.bdrEmail) {
-                        map.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
+                    const seatEmail = String(data.bdrEmail || data.accountEmail || data.email || '').toLowerCase();
+                    if (data.heyreachAccountId && seatEmail) {
+                        map.set(String(data.heyreachAccountId), seatEmail);
+                    }
+                    if (data.unipileAccountId && seatEmail) {
+                        map.set(String(data.unipileAccountId), seatEmail);
                     }
                     const seatBdr = String(data.bdrEmail || '').toLowerCase();
                     const canonPrimary = (seatBdr && emailToCanonical.get(seatBdr)) ||
+                        (seatEmail && emailToCanonical.get(seatEmail)) ||
                         (data.bdrLeaderId && bdrLeaderIds.has(data.bdrLeaderId)
                             ? ((bdrs.find(b => b.id === data.bdrLeaderId) || {}).primaryEmail || '').toLowerCase()
                             : '');
                     if (canonPrimary) {
                         const nm = bdrEmailToName.get(canonPrimary) || canonPrimary;
                         [data.bdrEmail, data.accountEmail, data.email, data.linkedInEmail].forEach(a => registerBdrAlias(a, canonPrimary, nm));
+                        if (data.customerId) customerIds.add(data.customerId);
+                        if (data.heyreachAccountId !== undefined && data.heyreachAccountId !== null && data.heyreachAccountId !== '') {
+                            clientHeyreachAccountIds.push(data.heyreachAccountId);
+                            clientHeyreachAccountIds.push(String(data.heyreachAccountId));
+                            map.set(String(data.heyreachAccountId), canonPrimary);
+                        }
+                        if (data.unipileAccountId) {
+                            clientUnipileAccountIds.push(String(data.unipileAccountId));
+                            map.set(String(data.unipileAccountId), canonPrimary);
+                        }
                     }
                 });
                 return map;
@@ -3055,7 +3108,8 @@
             const canonEmailsSet = new Set([...emailSet, ...Object.values(canonObj)].filter(Boolean));
             const namesObj = {}; bdrEmailToName.forEach((v, k) => { namesObj[emailToCanonical.get(k) || k] = v; });
             const targetBdrs = bdrs;
-            const customerIds = new Set(bdrs.map(b => b.customerId).filter(Boolean));
+            const customerIdsArr = Array.from(customerIds);
+            const singleClientBdr = bdrs.length === 1 ? (bdrs[0].primaryEmail || bdrs[0].id || '').toLowerCase() : '';
             const prevStart = mod.prevPeriod({ start, end }).start;
             const sinceOk = v => scopeAll || !v || mod.dayKey(v) >= prevStart; // keep current + previous period only
 
@@ -3069,13 +3123,14 @@
 
             // ── every queue record (not just sent) for this client's BDRs ──
             const queue = await wrLoad(diagnostics, 'connect_queue', 'Loading message queue records (generated / reviewed / sent)…', async () => {
-                const [qAcc, qAuth, qBdr] = await Promise.all([
+                const [qAcc, qAuth, qBdr, qLeader] = await Promise.all([
                     wrQueryIn('connect_queue', 'account_email', emailsArr, { timeoutMs: 180000 }),
                     wrQueryIn('connect_queue', 'bdr_auth_email', emailsArr, { timeoutMs: 180000 }).catch(() => []),
-                    wrQueryIn('connect_queue', 'bdr_email', emailsArr, { timeoutMs: 180000 }).catch(() => [])
+                    wrQueryIn('connect_queue', 'bdr_email', emailsArr, { timeoutMs: 180000 }).catch(() => []),
+                    wrQueryIn('connect_queue', 'bdr_leader_email', emailsArr, { timeoutMs: 180000 }).catch(() => [])
                 ]);
                 const m = new Map();
-                [...qAcc, ...qAuth, ...qBdr].forEach(d => { if (!m.has(d.id)) m.set(d.id, d); });
+                [...qAcc, ...qAuth, ...qBdr, ...qLeader].forEach(d => { if (!m.has(d.id)) m.set(d.id, d); });
                 return Array.from(m.values());
             }, r => `${r.filter(d => mod.isQueueItemSent(d)).length} sent to the sending platform`) || [];
             const sentItems = queue.filter(d => mod.isQueueItemSent(d));
@@ -3107,6 +3162,21 @@
             }) || [];
             const connectActivity = allConnectActivity.filter(a => sinceOk(a.timestamp || a.createdAt));
 
+            const outboundActivities = await wrLoad(diagnostics, 'heyreach_activity (outbound campaign/engine sends)', 'Loading outbound campaign & Unipile sends…', async () => {
+                const [byBdr, byAcc, byCust] = await Promise.all([
+                    wrQueryIn('heyreach_activity', 'bdrEmail', emailsArr).catch(() => []),
+                    wrQueryIn('heyreach_activity', 'accountEmail', emailsArr).catch(() => []),
+                    customerIdsArr.length ? wrQueryIn('heyreach_activity', 'customerId', customerIdsArr).catch(() => []) : Promise.resolve([])
+                ]);
+                const m = new Map();
+                [...byBdr, ...byAcc, ...byCust].forEach(d => {
+                    if (m.has(d.id)) return;
+                    const et = d.eventType || '';
+                    if (et === 'CONNECTION_REQUEST_SENT' || et === 'MESSAGE_SENT' || et === 'INMAIL_SENT') m.set(d.id, d);
+                });
+                return Array.from(m.values());
+            }) || [];
+
             const rawActivityEvents = await wrLoad(diagnostics, 'activity_tracking (follow-ups/replies)', 'Loading follow-ups & replies…', () => loadActivityMessages(emailsArr)) || [];
             const quickEvents = await wrLoad(diagnostics, 'quick_message_campaign_leads', 'Loading Quick Message campaign sends…', () => loadQuickMessageLeads(targetBdrs, emailToCanonical)) || [];
             const slotEvents = await wrLoad(diagnostics, 'linkedin_message_queue', 'Loading scheduled DM sends…', () => loadScheduledSends(emailsArr)) || [];
@@ -3115,18 +3185,84 @@
 
             // Build the Pando/HealthLuminate origin allowlist across all Pando outreach channels.
             const allowlist = mod.buildPandoOriginAllowlist({
+                canon: canonObj,
                 queue,
                 connectActivity: allConnectActivity,
+                outboundActivities,
                 quickEvents,
                 slotEvents,
                 activityEvents: rawActivityEvents,
                 manualHarvest
             });
 
-            // ── conversations + connections + meetings (filtered strictly to Pando/HealthLuminate origin) ──
-            const inboxRes = await wrLoad(diagnostics, 'heyreach_inbox', 'Loading conversation threads…', () => loadInbox(emailsArr, emailToCanonical),
-                r => `${r.inboxByBdr.filter(e => e.hasLeadReply).length} raw threads with a contact message`);
+            // ── conversations + overrides + scheduled meetings + connections ──
+            const inboxRes = await wrLoad(diagnostics, 'heyreach_inbox', 'Loading conversation threads…', () => loadInbox(emailsArr, emailToCanonical, {
+                accountIdMap,
+                customerIds: customerIdsArr,
+                heyreachAccountIds: clientHeyreachAccountIds,
+                unipileAccountIds: clientUnipileAccountIds,
+                singleBdrEmail: singleClientBdr
+            }), r => `${r.inboxByBdr.filter(e => e.hasLeadReply).length} raw threads with a contact message`);
             const rawInboxByBdr = inboxRes ? inboxRes.inboxByBdr : [];
+
+            // Load category overrides & scheduled-meeting records across ALL collections BEFORE filtering conversations
+            const baseOverrides = await wrLoad(diagnostics, 'conversation_category_overrides', 'Loading conversation categories & flags…', async () => {
+                const [byBdr, byAcc] = await Promise.all([
+                    wrQueryIn('conversation_category_overrides', 'bdrEmail', emailsArr).catch(() => []),
+                    wrQueryIn('conversation_category_overrides', 'accountEmail', emailsArr).catch(() => [])
+                ]);
+                const m = new Map();
+                [...byBdr, ...byAcc].forEach(d => m.set(d.id, d));
+                return Array.from(m.values());
+            }) || [];
+
+            const meetingEvents = await wrLoad(
+                diagnostics,
+                'scheduled meetings (all sources)',
+                'Loading scheduled meetings across all tools…',
+                () => loadAllClientScheduledMeetingRecords({
+                    emailArr: emailsArr,
+                    emailToCanonical,
+                    accountIdMap,
+                    customerIds: customerIdsArr,
+                    inboxByBdr: rawInboxByBdr,
+                    sentItems,
+                    allowlist
+                }),
+                recs => {
+                    const bySrc = {};
+                    (recs || []).forEach(r => { const k = r._source || 'other'; bySrc[k] = (bySrc[k] || 0) + 1; });
+                    return Object.entries(bySrc).map(([k, v]) => `${k}=${v}`).join(', ');
+                }
+            ) || [];
+
+            // Merge any client-scoped Scheduled override docs found by loadAllClientScheduledMeetingRecords into `overrides`
+            const overrideMap = new Map();
+            baseOverrides.forEach(o => overrideMap.set(o.id, o));
+            meetingEvents.forEach(m => {
+                if (m && m._source === 'conversation_category_overrides' && m.id && !overrideMap.has(m.id)) {
+                    overrideMap.set(m.id, m);
+                }
+            });
+            const overrides = Array.from(overrideMap.values());
+
+            const ovByConvLocal = new Map();
+            const ovBySlugLocal = new Map();
+            overrides.slice().sort((a, b) => {
+                const ta = safeToDate(a && (a.updatedAt || a.scheduledAt || a.createdAt));
+                const tb = safeToDate(b && (b.updatedAt || b.scheduledAt || b.createdAt));
+                return (ta ? ta.getTime() : 0) - (tb ? tb.getTime() : 0);
+            }).forEach(o => {
+                const k1 = mod.normConvId(o.conversationId), k2 = mod.normConvId(o.id);
+                if (k1) ovByConvLocal.set(k1, o);
+                if (k2) ovByConvLocal.set(k2, o);
+                const rawCid = String(o.conversationId || o.id || '');
+                const wSlug = /^webhook_/i.test(rawCid) ? rawCid.replace(/^webhook_/i, '').replace(/_[a-z0-9_]+_at_[a-z0-9_]+$/i, '').toLowerCase() : '';
+                const sl = extractLiSlug(o.leadProfileUrl || o.contactLinkedInUrl || o.linkedInUrl || '') || wSlug;
+                if (sl) ovBySlugLocal.set(sl, o);
+            });
+            const lookupOvLocal = e => ovByConvLocal.get(mod.normConvId(e.id)) || ovByConvLocal.get(mod.normConvId(e.conversationId)) || (extractLiSlug(e.liUrl) ? ovBySlugLocal.get(extractLiSlug(e.liUrl)) : null) || null;
+
             const inboxByUrl = new Map();
             const inboxByBdr = [];
             const nonPandoConvIds = new Set();
@@ -3134,7 +3270,10 @@
             const pandoPairs = new Set();
             let excludedInboxCount = 0;
             rawInboxByBdr.forEach(e => {
-                if (mod.isPandoConversation(e, allowlist, canonEmailsSet)) {
+                const canonUrl = allowlist.canonicalUrlFor(e.liUrl, { name: e.leadName, bdrEmail: e.bdrEmail }) || e.liUrl;
+                if (canonUrl && (!e.liUrl || mod.isMemberIdSlug(mod.liSlug(e.liUrl)))) e.liUrl = canonUrl;
+                const ov = lookupOvLocal(e);
+                if (mod.isPandoConversation(e, allowlist, canonEmailsSet, ov)) {
                     inboxByBdr.push(e);
                     if (e.liUrl && e.bdrEmail) inboxByUrl.set(`${e.liUrl}||${e.bdrEmail}`, e);
                     const canonBdr = emailToCanonical.get(e.bdrEmail) || e.bdrEmail || '';
@@ -3143,11 +3282,11 @@
                     if (sl) pandoPairs.add(`${sl}||${canonBdr}`);
                 } else {
                     excludedInboxCount++;
-                    if (e.id) nonPandoConvIds.add(String(e.id).replace(/^webhook_/, ''));
-                    if (e.conversationId) nonPandoConvIds.add(String(e.conversationId).replace(/^webhook_/, ''));
+                    if (e.id) nonPandoConvIds.add(mod.normConvId(e.id));
+                    if (e.conversationId) nonPandoConvIds.add(mod.normConvId(e.conversationId));
                     if (String(e.kind || '').toLowerCase() !== 'post_reply' && e.liUrl) {
-                        const bi = allowlist.blankInviteInfo(e.liUrl);
-                        if (!mod.conversationStartedByUs(e.rawMessages || [], bi)) {
+                        const pi = allowlist.priorOutreachInfo(e.liUrl, { name: e.leadName, bdrEmail: e.bdrEmail });
+                        if (!mod.conversationStartedByUs(e.rawMessages || [], pi)) {
                             const canonBdr = emailToCanonical.get(e.bdrEmail) || e.bdrEmail || '';
                             inboundPairs.add(`${e.liUrl}||${canonBdr}`);
                             const sl = mod.liSlug(e.liUrl);
@@ -3181,8 +3320,20 @@
                 });
             }
 
-            const rawScheduledUrlSet = await wrLoad(diagnostics, 'meetings (activity_tracking + categories)', 'Loading scheduled meetings…', () => loadScheduledMeetings(emailsArr, inboxByUrl, inboxByBdr)) || new Set();
-            const scheduledUrlSet = new Set(Array.from(rawScheduledUrlSet).filter(u => allowlist.hasOutreach(u)));
+            const scheduledUrlSet = new Set();
+            meetingEvents.forEach(m => {
+                const raw = m && (m.contact_linkedin_url || m.linkedinUrl || m.leadProfileUrl || '');
+                const u = allowlist.canonicalUrlFor(raw, { name: m.contact_name || '', bdrEmail: m.bdr_email || '', allowNameFallback: true }) || normalizeUrl(raw);
+                if (u) scheduledUrlSet.add(u);
+                const uRaw = normalizeUrl(raw);
+                if (uRaw) scheduledUrlSet.add(uRaw);
+            });
+            inboxByBdr.forEach(e => {
+                const ov = lookupOvLocal(e);
+                const effCat = (ov && ov.manualCategoryOverride === true && ov.responseCategory) || e.responseCategory || (ov && ov.responseCategory) || '';
+                if (effCat === 'Scheduled' && e.liUrl) scheduledUrlSet.add(e.liUrl);
+            });
+
             const rawCurrentConnectionUrls = await wrLoad(diagnostics, 'heyreach_contacts', 'Loading current connections…', () => loadCurrentConnections(emailsArr)) || new Set();
             // Only keep current LinkedIn connections for contacts Pando actually sent a connection request to
             const currentConnectionUrls = new Set(Array.from(rawCurrentConnectionUrls).filter(u => allowlist.hasConnectInvite(u)));
@@ -3190,57 +3341,36 @@
             // Map Pando conversation IDs → LinkedIn URLs so follow-up events without a URL can still be verified
             const pandoConvIdToUrl = new Map();
             inboxByBdr.forEach(e => {
-                if (e.conversationId && e.liUrl) pandoConvIdToUrl.set(String(e.conversationId).replace(/^webhook_/, ''), e.liUrl);
-                if (e.id && e.liUrl) pandoConvIdToUrl.set(String(e.id).replace(/^webhook_/, ''), e.liUrl);
+                if (e.conversationId && e.liUrl) pandoConvIdToUrl.set(mod.normConvId(e.conversationId), e.liUrl);
+                if (e.id && e.liUrl) pandoConvIdToUrl.set(mod.normConvId(e.id), e.liUrl);
             });
             const activityEvents = rawActivityEvents.filter(ev => {
                 if (mod.NON_PANDO_ACTIVITY_TYPES.has(ev.kind)) return false;
-                const cid = String(ev.conversationId || '').replace(/^webhook_/, '');
+                const cid = mod.normConvId(ev.conversationId || '');
                 if (cid && nonPandoConvIds.has(cid)) return false;
                 const url = ev.liUrl || (cid ? pandoConvIdToUrl.get(cid) : '') || '';
                 if (mod.PANDO_ORIGINATING_ACTIVITY_TYPES.has(ev.kind)) return Boolean(url);
                 return Boolean(url && allowlist.hasOutreach(url));
             });
 
-            const rawMeetingEvents = await wrLoad(diagnostics, 'activity_tracking (meeting_scheduled)', 'Loading meeting-scheduled records…', async () => {
-                const where_ = [['activity_type', '==', 'meeting_scheduled']];
-                const [a, b] = await Promise.all([
-                    wrQueryIn('activity_tracking', 'bdr_email', emailsArr, { where: where_ }).catch(() => []),
-                    wrQueryIn('activity_tracking', 'bdr_auth_email', emailsArr, { where: where_ }).catch(() => [])
-                ]);
-                const m = new Map(); [...a, ...b].forEach(d => m.set(d.id, d));
-                return Array.from(m.values());
-            }) || [];
-            const meetingEvents = rawMeetingEvents.filter(m => {
-                const cid = String(m.conversation_id || '').replace(/^webhook_/, '');
-                if (cid && nonPandoConvIds.has(cid)) return false;
-                const url = normalizeUrl(m.contact_linkedin_url || '');
-                const rawBdr = String(m.bdr_email || m.bdr_auth_email || '').toLowerCase();
-                const canonBdr = emailToCanonical.get(rawBdr) || rawBdr;
-                if (url && inboundPairs.has(`${url}||${canonBdr}`)) return false;
-                return !url || allowlist.hasOutreach(url);
-            });
-
             const sendEvents = [...activityEvents, ...quickEvents, ...slotEvents].filter(ev => {
-                const cid = String(ev.conversationId || '').replace(/^webhook_/, '');
+                const cid = mod.normConvId(ev.conversationId || '');
                 if (cid && nonPandoConvIds.has(cid)) return false;
                 return true;
             });
 
-            // ── Company Conversations extras: CRM notes (comments) + category overrides ──
+            // ── Company Conversations extras: CRM notes (comments) ──
             const rawCrmNotes = await wrLoad(diagnostics, 'connect_linkedin_crm (CRM notes)', 'Loading CRM notes / comments…',
                 () => wrQueryIn('connect_linkedin_crm', 'bdrEmail', emailsArr)) || [];
             const crmNotes = rawCrmNotes.filter(n => {
-                const cid = String(n.conversationId || '').replace(/^webhook_/, '');
+                const cid = mod.normConvId(n.conversationId || '');
                 if (cid && nonPandoConvIds.has(cid)) return false;
                 const url = normalizeUrl(n.linkedInUrl || '');
                 const rawBdr = String(n.bdrEmail || '').toLowerCase();
                 const canonBdr = emailToCanonical.get(rawBdr) || rawBdr;
-                if (url && inboundPairs.has(`${url}||${canonBdr}`)) return false;
-                return !url || allowlist.hasOutreach(url);
+                if (url && !scheduledUrlSet.has(url) && inboundPairs.has(`${url}||${canonBdr}`)) return false;
+                return !url || scheduledUrlSet.has(url) || allowlist.hasOutreach(url, { name: n.leadName || '', bdrEmail: canonBdr });
             });
-            const overrides = await wrLoad(diagnostics, 'conversation_category_overrides', 'Loading conversation categories & flags…',
-                () => wrQueryIn('conversation_category_overrides', 'bdrEmail', emailsArr)) || [];
 
             // ── Activity records ──
             const exclusions = (await wrLoad(diagnostics, 'prospect_exclusions + connect_exclusions', 'Loading contact exclusions…', async () => {
@@ -3312,7 +3442,7 @@
                     pandoOnly: true,
                     allowlist,
                     inboundPairs,
-                    isPandoConversation: e => mod.isPandoConversation(e, allowlist, canonEmailsSet)
+                    isPandoConversation: e => mod.isPandoConversation(e, allowlist, canonEmailsSet, lookupOvLocal(e))
                 }
             );
             wrStepDone(stAsm, `Assembling contact-level history: ${reportDataset.length.toLocaleString()} contacts`);
@@ -3322,12 +3452,17 @@
             const report = mod.assembleReport({
                 period: { start, end },
                 options: { historyScope: scopeAll ? 'all' : 'period', includeMessages: optMessages },
-                company: { name: company, emails: emailsArr, bdrs: bdrs.map(b => ({ name: b.name || '', email: (b.primaryEmail || b.id || '').toLowerCase() })) },
+                company: {
+                    name: company,
+                    emails: emailsArr,
+                    customerIds: customerIdsArr,
+                    bdrs: bdrs.map(b => ({ name: b.name || '', email: (b.primaryEmail || b.id || '').toLowerCase() }))
+                },
                 canon: canonObj, bdrNames: namesObj,
                 diagnostics,
-                allowlist, allConnectActivity, manualHarvest,
+                allowlist, allConnectActivity, outboundActivities, manualHarvest,
                 hypothesisGroups: companyGroups,
-                queue, dataset: reportDataset, inbox: inboxByBdr, meetingEvents, sendEvents,
+                queue, dataset: reportDataset, inbox: rawInboxByBdr, meetingEvents, sendEvents,
                 crmNotes, overrides, connectActivity, exclusions, workLog,
                 pipelineRuns, contactSearches, importedContacts, deletedContacts,
                 analysis,
@@ -3347,8 +3482,25 @@
 
             const kp = report.kpis.filter(k => !k.section).slice(0, 6)
                 .map(k => `<li>${escHtml(k.label)}: <strong>${escHtml(String(k.cur))}</strong>${k.prev !== '' ? ` (previous period: ${escHtml(String(k.prev))})` : ''}</li>`).join('');
+            const mInPeriod = report.meetingsInPeriod || [];
+            const mAllTime = report.meetingsAllTime || [];
+            let meetingSummaryHtml = '';
+            if (mInPeriod.length > 0) {
+                const items = mInPeriod.map(m => {
+                    const who = escHtml(m.contact_name || m.linkedin_url || 'Contact');
+                    const co = m.contact_company ? ` (${escHtml(m.contact_company)})` : '';
+                    const bdrLabel = m.bdr_name ? ` — ${escHtml(m.bdr_name)}` : '';
+                    const dtLabel = m.meeting_date_time ? `, meeting ${escHtml(m.meeting_date_time)}` : '';
+                    return `${who}${co}${bdrLabel} [logged ${escHtml(m.scheduled_logged_date)}${dtLabel}]`;
+                }).join('; ');
+                meetingSummaryHtml = `<div style="margin-top:.55rem;padding:.5rem .7rem;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;color:#065f46;font-size:.86rem;"><i class="fas fa-calendar-check"></i> <strong>Meetings scheduled in period (${mInPeriod.length}):</strong> ${items}</div>`;
+            } else if (mAllTime.length > 0) {
+                const latest = mAllTime[0];
+                meetingSummaryHtml = `<div style="margin-top:.55rem;padding:.5rem .7rem;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;color:#92400e;font-size:.85rem;"><i class="fas fa-info-circle"></i> No meetings were logged inside <strong>${escHtml(start)} to ${escHtml(end)}</strong>, though <strong>${mAllTime.length}</strong> scheduled meeting(s) exist for this client outside that range (most recent: <strong>${escHtml(latest.scheduled_logged_date || '')}</strong> — ${escHtml(latest.contact_name || latest.linkedin_url || 'Contact')}). Check the date range or switch History Scope to <em>All time</em> to include them in detail sheets.</div>`;
+            }
             const failed = diagnostics.filter(d => /FAILED/.test(d.note || ''));
             wrEl('wrResult').innerHTML = `<strong>Report ready — ${escHtml(fileBase)}.xlsx</strong> (${report.sheets.length} sheets).<ul>${kp}</ul>` +
+                meetingSummaryHtml +
                 (failed.length ? `<div style="margin-top:.5rem;color:#92400e;"><i class="fas fa-exclamation-triangle"></i> ${failed.length} data source(s) failed to load: ${failed.map(f => escHtml(f.source)).join(', ')} — see the <em>Load_Diagnostics</em> sheet.</div>` : '') +
                 `<div style="margin-top:.6rem;"><strong>Next:</strong> upload the .xlsx to ChatGPT, then click <em>Copy ChatGPT Prompt</em> and paste it. The first sheet (README_FOR_CHATGPT) explains every sheet and metric.</div>`;
             wrEl('wrResult').style.display = 'block';
