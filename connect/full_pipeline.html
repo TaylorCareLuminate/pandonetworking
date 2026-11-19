@@ -496,7 +496,7 @@
         <!-- ══════════ STEP 5: Models & options ══════════ -->
         <div class="section">
             <div class="section-title"><span class="step-num">5</span> AI Models &amp; Options</div>
-            <p class="section-help">The chosen models are recorded on every message (<code>buildModel</code> / <code>opusReviewModel</code>) and in the run report for later analysis in Connect Analysis Data.</p>
+            <p class="section-help">The chosen models are recorded on every message (<code>buildModel</code> / <code>opusReviewModel</code>) and in the run report. The model that actually wrote each message is saved as <code>writingModel</code> and compared on Connect Analysis Results. Default model(s) for writing and checking are set on AI Models Admin — tick several and they're used interchangeably, picked at random per message.</p>
             <div class="grid-2">
                 <div class="form-group">
                     <label for="fpBuildModel"><i class="fas fa-pen"></i> Message Build Model</label>
@@ -508,7 +508,7 @@
                         <option value="qwen/qwen3-235b-a22b">Qwen3 235B</option>
                         <option value="deepseek/deepseek-chat-v3-0324">DeepSeek V3</option>
                     </select>
-                    <div class="form-help">Applies to Internet Search message writing (the main Full AI path). About Me / Post Reply messages keep their own tested prompts and models.</div>
+                    <div class="form-help" id="fpBuildModelHelp">Applies to Internet Search message writing (the main Full AI path). About Me / Post Reply messages keep their own tested prompts and models.</div>
                 </div>
                 <div class="form-group">
                     <label for="fpOpusModel"><i class="fas fa-microscope"></i> Opus Review Model</label>
@@ -519,6 +519,7 @@
                         <option value="claude-haiku">Claude Haiku 3.5</option>
                         <option value="llama-maverick">Llama 4 Maverick</option>
                     </select>
+                    <div class="form-help" id="fpOpusModelHelp"></div>
                 </div>
             </div>
             <div class="grid-3">
@@ -1677,7 +1678,10 @@
                 const resolvedPrompt = resolveFinalReviewPrompt(rule.userPrompt || '', ctx, org);
                 const payload = [{ id: 'single', context: ctx, resolvedPrompt }];
                 const perModelFlags = [];
-                for (const model of (rule.models || [])) {
+                const ruleModels = window.AiModelCatalog
+                    ? window.AiModelCatalog.expandRoleSentinels(rule.models, fpCatalogModels, 'anthropic/claude-sonnet-5.5')
+                    : (rule.models || []);
+                for (const model of ruleModels) {
                     try {
                         const results = await callFinalAiReviewApi(token, model, payload, rule, addLog);
                         const r = (results || [])[0];
@@ -6968,6 +6972,18 @@
         const FP_STORY_MAX_USES = 7;
         let fpStoryUsageByUrl = null; // Map<storyKey, useCount> — reset once per run in fpRunPipeline
 
+        // Model defaults. FP_DEFAULT_MODEL is what the dropdowns start on when no model is ticked on
+        // AI Models Admin; fpCatalogModels is the loaded catalog (Writing / Checking ticks live on it).
+        const FP_DEFAULT_MODEL = 'anthropic/claude-opus-5.5';
+        let fpCatalogModels = [];
+        // Run-report tally of how many messages each writing model wrote.
+        function fpCountBuildModel(report, model) {
+            if (!report || !report.models || !model) return;
+            const list = report.models.buildModelCounts = report.models.buildModelCounts || [];
+            const row = list.find(r => r.model === model);
+            if (row) row.count++; else list.push({ model, count: 1 });
+        }
+
         function fpStoryKey(story) {
             return (story && (story.url || story.headline)) || JSON.stringify(story || {});
         }
@@ -7267,8 +7283,25 @@
                 : `Run the Full Pipeline for hypothesis group "${groupName}"?\n\nScan name: "${scanName}"\n• ${fpRunOrgs.length} organization(s) in the queue${scanNameNote}${dupeNote}${orgTypeNoteForConfirm}${notFoundUrlNote}${backfillNoteForConfirm}${orgLimitNoteForConfirm}${orgDataNoteForConfirm}\n• ${bdrPlan.length} BDR(s), ${totalTarget} total messages\n\nEach organization is first checked against the DNC list (DNC matches are skipped before any scan). Contacts already connected to the BDR on LinkedIn are dropped — only net-new connections. Then each organization is scanned with Apify (this is the main cost), contacts are filtered by the Target Contact rules — matches are tagged with this hypothesis group and stay in prospect_contacts (whether or not they end up with a message), while rule-dropped contacts are moved to prospect_contacts_deleted — news is searched once per organization, and messages are generated + Opus reviewed one at a time.`;
             if (!confirm(confirmBody)) return;
 
-            const buildModel   = document.getElementById('fpBuildModel').value;
-            const opusModel    = document.getElementById('fpOpusModel').value;
+            // Model choices. When "🎲 Random from checked defaults" is selected (the default once models
+            // are ticked on ai_models_admin.html), a fresh model is drawn for EVERY contact (writing) and
+            // EVERY message review (checking) — see fpPickBuildModel / fpPickOpusModel.
+            const buildModelChoice = document.getElementById('fpBuildModel').value;
+            const opusModelChoice  = document.getElementById('fpOpusModel').value;
+            const buildModelIsRandom = buildModelChoice === window.AiModelCatalog.RANDOM_VALUE.write;
+            const opusModelIsRandom  = opusModelChoice === window.AiModelCatalog.RANDOM_VALUE.check;
+            const buildModelPool = buildModelIsRandom ? window.AiModelCatalog.roleModels(fpCatalogModels, 'write').map(m => m.slug) : [];
+            const opusModelPool  = opusModelIsRandom  ? window.AiModelCatalog.roleModels(fpCatalogModels, 'check').map(m => m.slug) : [];
+            // `buildModel` / `opusModel` are the run-level labels (logs + run report). In random mode they
+            // read "random(a, b)"; the per-message picks are in fpPickBuildModel() / fpPickOpusModel().
+            const buildModel   = buildModelIsRandom ? `random(${buildModelPool.join(', ') || FP_DEFAULT_MODEL})` : buildModelChoice;
+            const opusModel    = opusModelIsRandom  ? `random(${opusModelPool.join(', ')  || FP_DEFAULT_MODEL})` : opusModelChoice;
+            const fpPickBuildModel = () => buildModelIsRandom
+                ? window.AiModelCatalog.resolveRoleChoice(buildModelChoice, fpCatalogModels, 'write', FP_DEFAULT_MODEL)
+                : buildModelChoice;
+            const fpPickOpusModel = () => opusModelIsRandom
+                ? window.AiModelCatalog.resolveRoleChoice(opusModelChoice, fpCatalogModels, 'check', FP_DEFAULT_MODEL)
+                : opusModelChoice;
             const routingMode  = document.getElementById('fpRoutingMode').value;
             const connFilterOn = document.getElementById('fpConnFilterEnabled').checked;
             const connFilterMin = parseInt(document.getElementById('fpConnFilterMin').value) || 100;
@@ -7504,7 +7537,14 @@
                 hypothesisGroupId: groupId,
                 hypothesisGroupName: groupName,
                 bdrPlan: bdrPlan.map(b => ({ ...b })),
-                models: { buildModel, opusModel },
+                models: {
+                    buildModel, opusModel,
+                    buildModelRandom: buildModelIsRandom, opusModelRandom: opusModelIsRandom,
+                    buildModelPool, opusModelPool,
+                    // How many messages each writing model actually wrote this run (Internet Search path
+                    // only): [{ model, count }] — an array, not a map, because model slugs contain "." and "/"
+                    buildModelCounts: []
+                },
                 settings: {
                     routingMode, connectionFilterEnabled: connFilterOn, minConnectionCount: connFilterMin,
                     opusExcludeMode, crossBdrEnabled, finalReviewEnabled, profileMsgFallback: profileMsgFallbackOn,
@@ -7573,6 +7613,9 @@
                     : `⏭️ Skipping ${notFoundUrlCount} organization(s) entirely — already researched with no URL found (no re-research, no scan job) — check "Re-search..." in Step 3 to retry them.`, 'dim');
             }
             addLog(`🧠 Models: build = ${buildModel}, Opus review = ${opusModel}`);
+            if (buildModelIsRandom || opusModelIsRandom) {
+                addLog(`🎲 Random model selection is ON — ${buildModelIsRandom ? `each contact's message is written by a randomly chosen one of ${buildModelPool.length} checked writing model(s)` : ''}${buildModelIsRandom && opusModelIsRandom ? '; ' : ''}${opusModelIsRandom ? `each Opus Review uses a randomly chosen one of ${opusModelPool.length} checked review model(s)` : ''}. Set them on AI Models Admin.`, 'info');
+            }
             if (orgDataCfg.enabled) {
                 const selCols = fpOrgDataColumns.filter(c => !orgDataCfg.excludedSet.has(c.name));
                 addLog(`📋 Organization Data Columns ON — ${selCols.length} column(s) (${selCols.map(c => c.name).slice(0, 8).join(', ')}${selCols.length > 8 ? ', …' : ''}); ${orgDataQueueCount} of ${fpRunOrgs.length} queued organization(s) have data. Sent to: ${orgDataStageLabels.join(' · ')}.`, orgDataQueueCount > 0 ? 'info' : 'warning');
@@ -8478,6 +8521,10 @@
                                         }
                                     }
                                     report.aiCallCounts.generate++;
+                                    // Writing model for THIS contact — a fresh random draw from the checked
+                                    // "Writing" defaults when random mode is on (otherwise the one selected).
+                                    const contactBuildModel = fpPickBuildModel();
+                                    if (buildModelIsRandom) addLog(`   🎲 Writing model for this contact: ${contactBuildModel}`, 'dim');
                                     const _singleBody = JSON.stringify({
                                         bdrEmail,
                                         bdrContext,
@@ -8488,7 +8535,7 @@
                                         existingProfileData,
                                         ...(orgNewsItems !== null ? { orgPreVerifiedItems: assignedStory ? [assignedStory] : [] } : {}),
                                         ...(orgCustomResearchPayload ? { orgCustomResearch: orgCustomResearchPayload } : {}),
-                                        messageModel: buildModel
+                                        messageModel: contactBuildModel
                                     });
                                     let singleRes;
                                     for (let _attempt = 1; _attempt <= 2; _attempt++) {
@@ -8602,7 +8649,11 @@
                                                         reviewStatus:         'pending_admin_review',
                                                         // Full Pipeline extras — for analysis + traceability
                                                         pipelineRunId:        runId,
-                                                        buildModel:           buildModel,
+                                                        buildModel:           contactBuildModel,
+                                                        // Profile Message is written by its own fixed generator, so the
+                                                        // selected writing model did NOT write it — leave writingModel
+                                                        // empty so Connect Analysis Results doesn't credit it to a model.
+                                                        writingModel:         null,
                                                         hypothesisGroupId:    groupId,
                                                         hypothesisGroupName:  groupName,
                                                         // Message Variation — recorded so outcomes.html can report performance per variation
@@ -8636,7 +8687,7 @@
                                                             messageReviewInstructions: fpOpusInstructionsForOrg(fpReviewInstrFor(variationPM), org, orgData('opus')),
                                                             bdrOpusInstructions: bdrOpusInstr,
                                                             excludeMode: opusExcludeMode,
-                                                            opusModel,
+                                                            opusModel: fpPickOpusModel(),
                                                             profile: buildOpusProfilePayload(pProfile, fallbackProfileData, {
                                                                 currentTitle: singleData.prospectTitle || prospect.title || '',
                                                                 currentCompany: singleData.prospectCompany || prospect.company || ''
@@ -8754,7 +8805,13 @@
                                             reviewStatus:         'pending_admin_review',
                                             // Full Pipeline extras — for analysis + traceability
                                             pipelineRunId:        runId,
-                                            buildModel:           buildModel,
+                                            buildModel:           contactBuildModel,
+                                            // writingModel = the model that REALLY wrote this message, for the per-model
+                                            // results on Connect Analysis Results. The selected model is only honored by
+                                            // the Internet Search writer; About Me / Post Reply keep their own fixed models,
+                                            // so they are left untagged rather than credited to a model that didn't write them.
+                                            writingModel:         src === 'Internet Search' ? contactBuildModel : null,
+                                            writingModelMode:     src === 'Internet Search' ? (buildModelIsRandom ? 'random' : 'selected') : null,
                                             hypothesisGroupId:    groupId,
                                             hypothesisGroupName:  groupName,
                                             // Message Variation — recorded so outcomes.html can report performance per variation
@@ -8792,7 +8849,7 @@
                                                 messageReviewInstructions: fpOpusInstructionsForOrg(fpReviewInstrFor(variation), org, orgData('opus')),
                                                 bdrOpusInstructions: bdrOpusInstr,
                                                 excludeMode: opusExcludeMode,
-                                                opusModel,
+                                                opusModel: fpPickOpusModel(),
                                                 profile: buildOpusProfilePayload(pd, existingProfileData, {
                                                     currentTitle: singleData.prospectTitle || prospect.title || '',
                                                     currentCompany: singleData.prospectCompany || prospect.company || ''
@@ -8840,6 +8897,8 @@
                                         }
                                     }
                                     if (savedCount > 0) {
+                                        // Per-model tally for the run report (only the Internet Search writer honors the model).
+                                        if (src === 'Internet Search') fpCountBuildModel(report, contactBuildModel);
                                         // Only count this story as "used" when a message was ACTUALLY saved —
                                         // previously the usage cap was burned even when the save loop skipped
                                         // every message, so one org story could hit 7/7 with zero real messages.
@@ -8856,7 +8915,7 @@
                                         // text — this is a generation failure, NOT a save. The old code logged
                                         // a false "✅ saved to queue" here, which hid the failure completely.
                                         addLog(`   ⚠️ [${src}] server reported ${msgsToSave.length} message(s) but every one had EMPTY text — NOTHING was saved for this contact`, 'warning');
-                                        fpTallyNoMessage(orgReport, prospect, 'build model returned empty text', `${src} message came back blank from the build model (${buildModel || 'default'}) — nothing saved to the queue`);
+                                        fpTallyNoMessage(orgReport, prospect, 'build model returned empty text', `${src} message came back blank from the build model (${contactBuildModel || 'default'}) — nothing saved to the queue`);
                                     }
 
                                 } catch (prospectErr) {
@@ -9651,8 +9710,9 @@
             // Model dropdowns come from the shared AI model catalog (ai_models_admin.html).
             // Claude Opus 5.5 is pinned and selected for both message build and Opus review;
             // on load failure the built-in list in the markup is used.
-            const fpDefaultModel = 'anthropic/claude-opus-5.5';
+            const fpDefaultModel = FP_DEFAULT_MODEL;
             window.AiModelCatalog.load().then(models => {
+                fpCatalogModels = models;
                 const catalogModels = models.filter(m => m.slug !== fpDefaultModel);
                 window.AiModelCatalog.populateSelect(document.getElementById('fpBuildModel'), catalogModels, {
                     selected: fpDefaultModel,
@@ -9674,15 +9734,22 @@
                         { value: 'llama-maverick', label: 'Llama 4 Maverick (legacy)' }
                     ]
                 });
-                // The Organization Type classifier — lets you pick which AI agent decides
-                // each organization's type. Defaults to Claude Sonnet 5.5, same as Build Model.
-                window.AiModelCatalog.populateSelect(document.getElementById('fpOrgTypeClassifierModel'), models, {
-                    selected: 'anthropic/claude-sonnet-5.5'
+                // Models ticked on AI Models Admin (Writing / Checking columns): add a "🎲 Random from
+                // checked defaults" option and make it the starting choice, so each message uses one of
+                // them at random (a specific model can still be picked to pin the whole run).
+                const fpWriteRandom = window.AiModelCatalog.addRandomOption(document.getElementById('fpBuildModel'), models, 'write');
+                const fpCheckRandom = window.AiModelCatalog.addRandomOption(document.getElementById('fpOpusModel'), models, 'check');
+                const fpBuildHelp = document.getElementById('fpBuildModelHelp');
+                if (fpBuildHelp && fpWriteRandom) fpBuildHelp.innerHTML += ' <strong>🎲 Random mode:</strong> each contact is written by a randomly chosen one of the models ticked under <em>Writing</em> on AI Models Admin, and the model used is saved on the message (<code>writingModel</code>) so Connect Analysis Results can compare them.';
+                const fpOpusHelp = document.getElementById('fpOpusModelHelp');
+                if (fpOpusHelp && fpCheckRandom) fpOpusHelp.innerHTML = '<strong>🎲 Random mode:</strong> each Opus Review uses a randomly chosen one of the models ticked under <em>Checking</em> on AI Models Admin.';
+                // The Organization Type classifier — uses the Scans default(s) from AI Models Admin.
+                window.AiModelCatalog.populateForRole(document.getElementById('fpOrgTypeClassifierModel'), models, 'scan', {
+                    fallback: 'anthropic/claude-sonnet-5.5'
                 });
-                // Message Variation's "AI decides by criteria" mode — which AI agent reads each
-                // contact's profile against every variation's AI Selection Criteria.
-                window.AiModelCatalog.populateSelect(document.getElementById('fpVariationAiModel'), models, {
-                    selected: 'anthropic/claude-sonnet-5.5'
+                // Message Variation's "AI decides by criteria" mode — uses the Scans default(s) from AI Models Admin.
+                window.AiModelCatalog.populateForRole(document.getElementById('fpVariationAiModel'), models, 'scan', {
+                    fallback: 'anthropic/claude-sonnet-5.5'
                 });
             }).catch(() => {});
 

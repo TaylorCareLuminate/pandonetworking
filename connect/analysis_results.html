@@ -1246,7 +1246,7 @@ const STYLE_EXAMPLE_KEYS = [
     'audience_org_type', 'bdr_performance', 'ai_feel', 'company_vs_prospect',
     'personal_sharing', 'connect_phrasing', 'exclamation_use', 'emoji_use', 'abbreviation_use',
     'request_day_of_week', 'request_time_of_day', 'request_day_time',
-    'message_variation',
+    'message_variation', 'message_model',
     'rhetorical_question_timing', 'about_us_timing', 'meeting_ask_timing'
 ];
 
@@ -1267,6 +1267,11 @@ const RESEARCH_DIMENSIONS = [
     // display-ready (rawLevels) and the panel only renders when the segment actually has
     // a variation test running (hideWhenEmpty) — most hypothesis groups don't.
     { group: 'Message Craft', key: 'message_variation', title: 'Message Angles Tested (A/B)', icon: 'fa-flask', rawLevels: true, hideWhenEmpty: true },
+    // Which AI model wrote the opening message (research.message_model, from the writingModel stamped on
+    // each queued message by Full Pipeline / Generate Messages). Labels are model slugs, shown as-is
+    // (rawLevels). Not hideWhenEmpty: until messages written under a model have outcomes, the panel
+    // explains how models get tagged instead of silently vanishing.
+    { group: 'Message Craft', key: 'message_model', title: 'AI Writing Model', icon: 'fa-microchip', rawLevels: true },
     // "WHEN does it first happen" timing breakdowns (research.*_timing) — one row per position
     // (Never / First half of message 1 / ... / Message 3+). Each is paired with its signal
     // family's per-position KeyItems (keys.working / keys.not_working, ids like
@@ -1346,7 +1351,7 @@ const SPEED_ORDER = ['<1h', '1-3h', 'Same day (3-24h)', '1-3 days', '3+ days'];
 const RATE_LOW_N = 20;
 
 // Rate tables that fold rows beyond N into a "Show more" disclosure, keyed by dimKey.
-const RATE_TABLE_COLLAPSE_AFTER = { message_variation: 12 };
+const RATE_TABLE_COLLAPSE_AFTER = { message_variation: 12, message_model: 12 };
 
 const GLOSSARY = [
     ['Blended Score', 'The headline KPI: 15% connect rate + 35% reply rate + 50% meeting rate. Weighted toward meetings, but still rewards a healthy top of funnel. Higher is better.'],
@@ -2847,6 +2852,45 @@ function renderMessageVariation(rows) {
     `;
 }
 
+// "AI Writing Model" — research.message_model: one row per AI model that wrote opening messages
+// (the writingModel Full Pipeline / Generate Messages stamp on each queued message — in random
+// mode every contact gets a freshly drawn model, so each model sees a comparable mix of
+// contacts). Shows a side-by-side summary (share of messages + connect / reply / meeting rate),
+// then the usual rate bars / examples drawer / compare widget. Messages whose writer doesn't
+// honor the chosen model (About Me, Post Reply, Profile Message) or that predate model tracking
+// carry no model and are left out — hence the "tagged messages" total below. Only a clearly-ahead
+// model with enough volume gets the "Leading model" call-out.
+function renderMessageModel(rows) {
+    if (!Array.isArray(rows) || !rows.length) {
+        return `<p class="empty-note">No messages in this segment are tagged with a writing model yet. Tick one or more models under <strong>Writing</strong> on AI Models Admin, then generate messages with Full Pipeline or Generate Messages (Full AI) — each message records which model wrote it, and results appear here once those contacts have been through the nightly analysis run. Messages written before model tracking, and About Me / Post Reply / Profile Message messages (which use their own fixed models), are not tagged.</p>`;
+    }
+    const list = rows.map(r => ({ ...r, rawLevel: true }));
+    const total = list.reduce((s, r) => s + (r.n || 0), 0);
+    const byReply = list.slice().sort((a, b) => (b.reply_rate || 0) - (a.reply_rate || 0));
+    const top = byReply[0];
+    const hasLeader = list.length > 1 && !!top && (top.reply_rate || 0) > 0 && (top.n || 0) >= RATE_LOW_N;
+    const summaryRows = byReply.map(r => {
+        const lowN = (r.n || 0) < RATE_LOW_N;
+        return `<tr${lowN ? ' style="opacity:0.55;" title="Fewer than ' + RATE_LOW_N + ' messages — too early to call."' : ''}>
+            <td>${escapeHtml(String(r.level))}</td>
+            <td>${fmtNum(r.n)}<span class="sub">${total > 0 ? fmtPct(100 * (r.n || 0) / total, 0) : '—'} of tagged</span></td>
+            <td>${fmtPct(r.connect_rate)}</td>
+            <td>${fmtPct(r.reply_rate)}</td>
+            <td>${fmtPct(r.meeting_rate, 2)}</td>
+        </tr>`;
+    }).join('');
+    return `
+        <p class="card-subtitle" style="margin-bottom:0.9rem;"><i class="fas fa-microchip"></i> How messages performed by the AI model that wrote them, ranked by reply rate. Based on ${fmtNum(total)} model-tagged message${total === 1 ? '' : 's'} across ${list.length} model${list.length === 1 ? '' : 's'}. Messages with no model recorded (written before tracking, or by a writer that ignores the model setting) are left out. Models with fewer than ${RATE_LOW_N} messages are faded: too early to call.</p>
+        <div class="aud-scroll">
+            <table class="aud-summary-table">
+                <thead><tr><th>Model</th><th>Messages</th><th>Connect</th><th>Reply</th><th>Meeting</th></tr></thead>
+                <tbody>${summaryRows}</tbody>
+            </table>
+        </div>
+        ${renderRateTable(list, false, 'message_model', 'reply_rate', hasLeader, 'Leading model')}
+    `;
+}
+
 // research.message_type excludes surround_connections (they need a teammate already
 // connected, so they aren't comparable for driver analysis). segment.message_type_overview
 // covers ALL rows including surround_connections — shown below the driver-eligible table so
@@ -2972,6 +3016,7 @@ function renderResearch(research) {
             else if (dim.special === 'day_time') innerHtml = renderDayTimeHeatmap(data, dim.key, CURRENT_MEETING_ONLY ? 'meeting_rate' : 'reply_rate');
             else if (dim.special === 'signal_timing') innerHtml = renderSignalFamily(SIGNAL_FAMILIES[dim.family], data);
             else if (dim.key === 'message_variation') innerHtml = renderMessageVariation(data);
+            else if (dim.key === 'message_model') innerHtml = renderMessageModel(data);
             else if (dim.key === 'message_type') innerHtml = renderMessageType(data);
             else innerHtml = renderRateTable(data, dim.ordinal, dim.key);
             // Message 2 only: same signal split by how warm their first reply was.

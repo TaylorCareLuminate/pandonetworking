@@ -292,6 +292,9 @@ Forms used: mirrored shorthand, lowercase start, dropped "Do you"`;
     // Model call
     // ------------------------------------------------------------------
     async function callModel(prompt) {
+        const activeModel = global.AiModelCatalog
+            ? await global.AiModelCatalog.pickForRoleAsync('write', MODEL)
+            : MODEL;
         let lastErr;
         for (let attempt = 1; attempt <= 2; attempt++) {
             const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -303,7 +306,7 @@ Forms used: mirrored shorthand, lowercase start, dropped "Do you"`;
                     signal: ctrl ? ctrl.signal : undefined,
                     body: JSON.stringify({
                         provider: 'openrouter',
-                        model: MODEL,
+                        model: activeModel,
                         prompt,
                         temperature: 0.7,
                         max_tokens: 700

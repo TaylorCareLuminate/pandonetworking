@@ -6721,35 +6721,41 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                 document.getElementById('bulkAiInstructions').focus();
                 return;
             }
-            const model = document.getElementById('bulkAiModel').value;
+            const modelChoice = document.getElementById('bulkAiModel').value;
+            const modelLabel = window.AiModelCatalog ? window.AiModelCatalog.labelFor(_smCatalogModels, modelChoice) : modelChoice;
             let items = bulkEditableQueued(!!document.getElementById('bulkAiIncludeUnresolved').checked);
             const lim = parseInt(document.getElementById('bulkAiLimit').value, 10);
             if (lim > 0) items = items.slice(0, lim);
             if (!items.length) { showDeleteToast('No editable queued messages to edit.', true); return; }
             if (_bulkAiProposals.length && !confirm('Generating again discards the proposed edits currently shown (nothing has been saved). Continue?')) return;
-            if (items.length > 50 && !confirm(`This will send ${items.length} messages to ${model}. Tip: use "Only first N messages" to test your instructions on a few first.\n\nContinue with all ${items.length}?`)) return;
+            if (items.length > 50 && !confirm(`This will send ${items.length} messages to ${modelLabel}. Tip: use "Only first N messages" to test your instructions on a few first.\n\nContinue with all ${items.length}?`)) return;
 
-            _bulkBusy = true; _bulkAiAbort = false; _bulkAiProposals = []; _bulkAiLastMsg = ''; _bulkAiRunMeta = { model, instructions };
+            _bulkBusy = true; _bulkAiAbort = false; _bulkAiProposals = []; _bulkAiLastMsg = ''; _bulkAiRunMeta = { model: modelChoice, instructions };
             bulkAiRender();
             document.getElementById('btnBulkRun').disabled = true;
             document.getElementById('btnBulkAiGenerate').disabled = true;
             document.getElementById('btnBulkAiStop').style.display = 'inline-flex';
-            try { localStorage.setItem(BULK_AI_MODEL_LS_KEY, model); } catch (e) { /* ignore */ }
 
-            const batchSize = (bulkAiIsHiddenReasoningModel(model) || /opus/i.test(model)) ? 4 : 8; // slow models get smaller batches
+            const poolHint = window.AiModelCatalog && modelChoice === window.AiModelCatalog.RANDOM_VALUE.write
+                ? window.AiModelCatalog.roleSummary(_smCatalogModels, 'write')
+                : modelChoice;
+            const batchSize = (bulkAiIsHiddenReasoningModel(poolHint) || /opus/i.test(poolHint)) ? 4 : 8; // slow models get smaller batches
             const batches = [];
             for (let i = 0; i < items.length; i += batchSize) {
                 batches.push(items.slice(i, i + batchSize).map((item, j) => ({ id: 'm' + (i + j), idx: i + j, item })));
             }
             const found = new Map(); // idx → proposal
             let processed = 0, failedBatches = 0, unchanged = 0, missing = 0, lastErr = '';
-            bulkAiSetSummary(`Asking ${model}… 0 / ${items.length}`);
+            bulkAiSetSummary(`Asking ${modelLabel}… 0 / ${items.length}`);
 
             // Runs one batch. If the model times out or returns unusable output, the batch is split in half and each half
             // is retried (down to single messages), and messages the model skipped are re-asked once — so a slow or
             // truncated response costs a few extra calls instead of losing the whole batch.
             const runBatch = async (batch, depth = 0) => {
                 if (_bulkAiAbort) return;
+                const batchModel = window.AiModelCatalog
+                    ? window.AiModelCatalog.resolveRoleChoice(modelChoice, _smCatalogModels, 'write', BULK_AI_DEFAULT_MODEL)
+                    : modelChoice;
                 try {
                     const payload = batch.map(b => ({
                         id: b.id,
@@ -6761,7 +6767,7 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                     }));
                     let results;
                     try {
-                        results = await bulkAiCallModel(payload, instructions, model);
+                        results = await bulkAiCallModel(payload, instructions, batchModel);
                     } catch (err) {
                         if (err.message === 'Stopped') throw err;
                         if (batch.length > 1) {
@@ -6798,7 +6804,7 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                     if (err.message !== 'Stopped') { failedBatches++; lastErr = err.message || String(err); console.warn('[BulkAI] batch failed:', lastErr); }
                 }
                 processed += batch.length;
-                bulkAiSetSummary(`Asking ${model}… ${Math.min(processed, items.length)} / ${items.length} — ${found.size} edit${found.size !== 1 ? 's' : ''} so far`);
+                bulkAiSetSummary(`Asking ${batchModel}… ${Math.min(processed, items.length)} / ${items.length} — ${found.size} edit${found.size !== 1 ? 's' : ''} so far`);
             };
             await bulkPool(batches, 3, batch => runBatch(batch));
 
@@ -6854,29 +6860,38 @@ Return ONLY a JSON array with exactly one object per input message, in this form
             bulkAiRender();
         }
 
+        let _smCatalogModels = [];
+
         async function initBulkAiModelSelect() {
             const sel = document.getElementById('bulkAiModel');
+            const hypSel = document.getElementById('bulkHypModel');
             const noteEl = document.getElementById('bulkAiModelNote');
-            let saved = '';
-            try { saved = localStorage.getItem(BULK_AI_MODEL_LS_KEY) || ''; } catch (e) { /* ignore */ }
             let models = [];
             if (window.AiModelCatalog) {
                 try {
                     models = await window.AiModelCatalog.load();
-                    const def = (models.find(m => m.isDefault) || {}).slug;
-                    window.AiModelCatalog.populateSelect(sel, models, { selected: saved || def || BULK_AI_DEFAULT_MODEL });
+                    _smCatalogModels = models;
+                    window.AiModelCatalog.populateForRole(sel, models, 'write', {
+                        fallback: BULK_AI_DEFAULT_MODEL,
+                        randomOption: true
+                    });
+                    if (hypSel) {
+                        window.AiModelCatalog.populateForRole(hypSel, models, 'check', {
+                            fallback: 'anthropic/claude-opus-5.5',
+                            randomOption: true,
+                            extraOptions: [
+                                { value: 'kimi-k3',        label: 'Kimi K3 (legacy)' },
+                                { value: 'llama-maverick', label: 'Llama Maverick (legacy)' }
+                            ]
+                        });
+                    }
                 } catch (e) { console.warn('[BulkAI] Model catalog wiring skipped:', e.message); }
-            } else if (saved) {
-                sel.value = saved;
             }
             const updateNote = () => {
                 noteEl.textContent = (window.AiModelCatalog ? window.AiModelCatalog.noteFor(models, sel.value) : '') || '';
             };
             updateNote();
-            sel.addEventListener('change', () => {
-                try { localStorage.setItem(BULK_AI_MODEL_LS_KEY, sel.value); } catch (e) { /* ignore */ }
-                updateNote();
-            });
+            sel.addEventListener('change', updateNote);
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -7108,7 +7123,8 @@ Return ONLY a JSON array with exactly one object per input message, in this form
             if (!group) { showDeleteToast('Pick a hypothesis group first.', true); return; }
             const vars = hypActiveVariations(group);
             let varMode = document.getElementById('bulkHypVariation').value;
-            const model = document.getElementById('bulkHypModel').value;
+            const modelChoice = document.getElementById('bulkHypModel').value;
+            const modelLabel = window.AiModelCatalog ? window.AiModelCatalog.labelFor(_smCatalogModels, modelChoice) : modelChoice;
             const extra = document.getElementById('bulkHypExtra').value.trim();
             const bdrEmail = currentViewedBdrEmail();
             const bdr = bdrLeaders.find(b => (b.primaryEmail || '').toLowerCase() === bdrEmail);
@@ -7123,7 +7139,7 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                 || vars.some(v => (v.prompt || '').trim()) || bdrInstr || extra;
             if (!hasInstr) { showDeleteToast('This group has no review instructions. Add some on Connect Hypothesis Documentation or type extra instructions here.', true); return; }
             if (_bulkHypProposals.length && !confirm('Running again discards the proposals currently shown (nothing has been saved). Continue?')) return;
-            if (items.length > 50 && !confirm(`This will send ${items.length} messages to the ${model} reviewer under "${group.name || group.id}". Tip: use "Only first N messages" to try it on a few first.\n\nContinue with all ${items.length}?`)) return;
+            if (items.length > 50 && !confirm(`This will send ${items.length} messages to the ${modelLabel} reviewer under "${group.name || group.id}". Tip: use "Only first N messages" to try it on a few first.\n\nContinue with all ${items.length}?`)) return;
 
             _bulkBusy = true; _bulkHypAbort = false; _bulkHypProposals = []; _bulkHypLastMsg = '';
             bulkHypRender();
@@ -7158,7 +7174,7 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                 return vars.find(v => v.id === varMode) || null;
             };
             const assigned = items.map((item, i) => ({ id: 'h' + i, idx: i, item, variation: pickVar() }));
-            _bulkHypRunMeta = { group, model, mode: varMode, instructions: extra };
+            _bulkHypRunMeta = { group, model: modelChoice, mode: varMode, instructions: extra };
             try { if (picker) console.log('[HypReview] variation split:', window.VariationPerformance.describe(picker.allocation()).lines.join('\n')); } catch (e) { /* ignore */ }
 
             // 2. One reviewer prompt per variation bucket, batched like Fast Connect Review
@@ -7211,7 +7227,10 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                     let prompt = batch.prompt;
                     if (payload.some(p => p.messageType === 'connect')) prompt += '\n\nCRITICAL RULE: Messages with messageType "connect" are LinkedIn connection requests. LinkedIn enforces a hard 275-character limit. Any connect message whose text exceeds 275 characters MUST be shortened in improvedMessage — shorten aggressively while keeping the personal hook intact.';
                     if (payload.some(p => p.messageType === 'message')) prompt += '\n\nMESSAGE TYPE CONTEXT: Messages with messageType "message" are direct LinkedIn messages to existing connections — they are NOT connection requests. There is NO 275-character limit for these.';
-                    const results = await hypOpusCall(token, payload, prompt, model, companyName);
+                    const batchHypModel = window.AiModelCatalog
+                        ? window.AiModelCatalog.resolveRoleChoice(modelChoice, _smCatalogModels, 'check', 'anthropic/claude-opus-5.5')
+                        : modelChoice;
+                    const results = await hypOpusCall(token, payload, prompt, batchHypModel, companyName);
 
                     // Shorten any connection note still over 275 chars (up to 3 extra passes, like Fast Connect Review)
                     const over = () => results.filter(r => { const a = byId.get(r.id); return a && isConnectionNoteItem(a.item) && textOf(r).length > getEditCharLimit(a.item); });
@@ -7224,7 +7243,7 @@ Return ONLY a JSON array with exactly one object per input message, in this form
                         });
                         const shortenPrompt = 'Each message below is a LinkedIn connection request that is over the 275-character limit. The _shortenBy field shows exactly how many characters must be removed. Shorten each message by at least that many characters while keeping its meaning and personal hook (abbreviate org names, drop filler words and non-essential clauses). Return the shortened text in improvedMessage and set exclude to false.';
                         let retry;
-                        try { retry = await hypOpusCall(token, retryPayload, shortenPrompt, model, companyName); } catch (e) { break; }
+                        try { retry = await hypOpusCall(token, retryPayload, shortenPrompt, batchHypModel, companyName); } catch (e) { break; }
                         retry.forEach(rr => {
                             const orig = results.find(r => r.id === rr.id); const t = textOf(rr);
                             if (orig && t) { orig.improvedMessage = t; orig.editedText = t; }

@@ -5451,6 +5451,7 @@
     <!-- Firestore wrapper (auth.js is already loaded in <head>; a second include
          would throw "Identifier 'AUTH_VERSION' has already been declared") -->
     <script src="../js/clemail-firestore-wrapper.js"></script>
+    <script src="../js/ai-model-catalog.js"></script>
     <!-- html2canvas for LinkedIn reply alert conversation snapshots -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <!-- "Notify BDR" meeting-booked email dialog (shared with company_review_replies.html) -->
@@ -6054,6 +6055,154 @@
             }).join('');
         }
 
+        // ---- "Follow up" panel on a "Comment on your post" card ------------------------------------------------------------------
+        // The AI drafts a public reply, a connection request (not connected) and a personal message (connected); each has its own
+        // editable box and its own Send button, so one, two or all can be sent. Everything the person typed lives in _liFu, because
+        // the cards are re-rendered from scratch on every poll.
+        const _liFu = new Map();   // alertId -> { plan, busy, error, texts:{}, sending:{}, results:{} }
+        const LI_FU_ROWS = {
+            reply:   { label: 'Reply to the comment', icon: 'fa-reply',     btn: 'Post reply',      max: 1250, note: 'Public. Appears under your post as an answer to this comment.' },
+            invite:  { label: 'Connection request',   icon: 'fa-user-plus', btn: 'Send request',    max: 200,  note: 'Goes out with this note. LinkedIn allows about 200 characters.' },
+            message: { label: 'Personal message',     icon: 'fa-envelope',  btn: 'Send message',    max: 1900, note: 'Private message. Sent as a conversation with them.' }
+        };
+        const LI_FU_CONN = {
+            first:         ['#dcfce7', '#166534', 'fa-user-check', 'Connected (1st degree)'],
+            not_connected: ['#fef3c7', '#92400e', 'fa-user-plus',  'Not connected'],
+            pending:       ['#e0e7ff', '#3730a3', 'fa-hourglass-half', 'Connection request pending'],
+            unknown:       ['#f1f5f9', '#475569', 'fa-circle-question', 'Connection not known']
+        };
+        function _liFuState(alert) {
+            let s = _liFu.get(alert.id);
+            if (!s) {
+                s = { plan: alert.followupPlan || null, busy: false, error: '', texts: {}, sending: {}, results: { ...(alert.followupSent || {}) } };
+                _liFu.set(alert.id, s);
+            }
+            return s;
+        }
+        function _liFuRowsToShow(plan) {
+            if (!plan) return [];
+            const out = [];
+            for (const k of ['reply', 'invite', 'message']) {
+                if (plan.drafts && plan.drafts[k] !== undefined) out.push(k);
+                else if (plan.errors && plan.errors[k]) out.push(k);   // the draft failed: still offer a box to write by hand
+            }
+            return out;
+        }
+        function _liFuBodyHtml(alert) {
+            const id = alert.id, eid = _liEscHtml(id);
+            const s = _liFuState(alert), plan = s.plan;
+            const q = (v) => _liEscHtml(String(v == null ? '' : v));
+            const bar = `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:0.6rem;">
+                <button type="button" class="btn-li-ai-regen" id="li-fu-draft-${eid}" ${s.busy ? 'disabled' : ''} onclick="window.liFollowupDraft('${eid}', ${plan ? 'true' : 'false'})">
+                    ${s.busy ? '<i class="fas fa-spinner fa-spin"></i> Drafting…' : (plan ? '<i class="fas fa-sync-alt"></i> Redraft with AI' : '<i class="fas fa-robot"></i> Draft with AI')}
+                </button>
+                ${plan ? (() => { const c = LI_FU_CONN[plan.connection] || LI_FU_CONN.unknown; return `<span class="li-alert-badge" style="background:${c[0]};color:${c[1]};font-weight:700;"><i class="fas ${c[2]}"></i> ${c[3]}</span>`; })() : ''}
+                ${plan && plan.headline ? `<span style="font-size:0.78rem;color:#64748b;">${q(plan.headline)}</span>` : ''}
+            </div>`;
+            if (!plan) {
+                return bar + `<p style="margin:0;font-size:0.86rem;color:#475569;line-height:1.5;">The AI reads the comment and your post, checks whether you are connected, and drafts a reply to the comment plus a connection request or a personal message, whichever fits. You can edit each one and send one or several.</p>`
+                    + (s.error ? `<div style="margin-top:0.5rem;color:#b91c1c;font-size:0.84rem;">${q(s.error)}</div>` : '');
+            }
+            const rows = _liFuRowsToShow(plan);
+            const rowHtml = rows.map((k) => {
+                const def = LI_FU_ROWS[k];
+                const text = s.texts[k] !== undefined ? s.texts[k] : (plan.drafts[k] || '');
+                const res = s.results[k];
+                const done = res && ['queued', 'scheduled', 'sent'].includes(res.status);
+                const bad = res && !res.error && ['held', 'cancelled', 'failed'].includes(res.status);
+                const sending = !!s.sending[k];
+                const over = text.length > def.max;
+                return `<div style="background:#fff;border:1px solid #ddd6fe;border-radius:8px;padding:0.6rem 0.75rem;margin-bottom:0.55rem;">
+                    <div style="font-weight:700;color:#4c1d95;font-size:0.88rem;"><i class="fas ${def.icon}"></i> ${def.label}
+                        <span style="font-weight:500;color:#64748b;font-size:0.76rem;margin-left:6px;">${def.note}</span></div>
+                    ${plan.errors && plan.errors[k] ? `<div style="color:#b45309;font-size:0.8rem;margin-top:4px;">${q(plan.errors[k])}</div>` : ''}
+                    <textarea id="li-fu-text-${k}-${eid}" class="li-reply-textarea" rows="3" ${done || sending ? 'readonly' : ''} placeholder="${def.label}…"
+                        oninput="window.liFollowupEdit('${eid}','${k}',this.value)">${q(text)}</textarea>
+                    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px;">
+                        <span class="li-char-count" id="li-fu-cc-${k}-${eid}"${over ? ' style="color:#b91c1c;font-weight:700;"' : ''}>${text.length} / ${def.max}</span>
+                        <button type="button" class="btn-li-send" id="li-fu-send-${k}-${eid}" ${done || sending ? 'disabled' : ''} onclick="window.liFollowupSend('${eid}','${k}')">
+                            ${sending ? '<i class="fas fa-spinner fa-spin"></i> Sending…' : done ? '<i class="fas fa-check"></i> Queued' : `<i class="fas ${def.icon}"></i> ${def.btn}`}
+                        </button>
+                    </div>
+                    ${done ? `<div style="color:#166534;font-size:0.82rem;margin-top:4px;"><i class="fas fa-check-circle"></i> ${q(res.note || 'Queued in the LinkedIn engine. It goes out within a minute or two.')}</div>` : ''}
+                    ${bad ? `<div style="color:#b91c1c;font-size:0.82rem;margin-top:4px;"><i class="fas fa-triangle-exclamation"></i> Not sent: ${q(res.reason || 'the LinkedIn engine refused it')}. Edit the text and try again.</div>` : ''}
+                    ${res && res.error ? `<div style="color:#b91c1c;font-size:0.82rem;margin-top:4px;"><i class="fas fa-triangle-exclamation"></i> ${q(res.error)}</div>` : ''}
+                </div>`;
+            }).join('');
+            return bar
+                + (plan.note ? `<div style="font-size:0.8rem;color:#92400e;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:0.4rem 0.6rem;margin-bottom:0.55rem;">${q(plan.note)}</div>` : '')
+                + (s.error ? `<div style="color:#b91c1c;font-size:0.84rem;margin-bottom:0.5rem;">${q(s.error)}</div>` : '')
+                + (rowHtml || '<p style="margin:0;font-size:0.86rem;color:#475569;">Nothing to draft for this comment.</p>');
+        }
+        function _liFuRefresh(alertId) {
+            const alert = _liAlerts.find(a => a.id === alertId);
+            const el = document.getElementById(`li-fu-body-${alertId}`);
+            if (alert && el) el.innerHTML = _liFuBodyHtml(alert);
+        }
+        async function _liFuCall(alertId, path, body) {
+            const token = window.auth && window.auth.currentUser ? await window.auth.currentUser.getIdToken() : null;
+            if (!token) throw new Error('You are signed out. Reload the page and sign in again.');
+            const resp = await fetch(`${RAILWAY_BASE}/post-comments/admin/comment-followup/${encodeURIComponent(alertId)}/${path}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(body || {})
+            });
+            let data = null;
+            try { data = await resp.json(); } catch (_) { /* not JSON */ }
+            if (!resp.ok) throw new Error((data && (data.error || data.message)) || `HTTP ${resp.status}`);
+            return data || {};
+        }
+        window.liFollowupEdit = function (alertId, action, value) {
+            const alert = _liAlerts.find(a => a.id === alertId);
+            if (!alert) return;
+            const s = _liFuState(alert);
+            s.texts[action] = value;
+            const cc = document.getElementById(`li-fu-cc-${action}-${alertId}`);
+            if (cc) {
+                const max = LI_FU_ROWS[action].max;
+                cc.textContent = `${value.length} / ${max}`;
+                cc.style.color = value.length > max ? '#b91c1c' : '';
+                cc.style.fontWeight = value.length > max ? '700' : '';
+            }
+        };
+        window.liFollowupDraft = async function (alertId, force) {
+            const alert = _liAlerts.find(a => a.id === alertId);
+            if (!alert) return;
+            const s = _liFuState(alert);
+            if (s.busy) return;
+            if (force && Object.keys(s.texts).some(k => s.texts[k] && s.texts[k] !== ((s.plan && s.plan.drafts) || {})[k]) && !confirm('Redrafting replaces the text you have edited. Continue?')) return;
+            s.busy = true; s.error = ''; _liFuRefresh(alertId);
+            try {
+                const data = await _liFuCall(alertId, 'prepare', { force: !!force });
+                s.plan = data.plan || null;
+                s.texts = {};
+                alert.followupPlan = s.plan;
+            } catch (e) {
+                console.error('[LiAlerts] Follow-up draft error:', e);
+                s.error = `Could not draft: ${e.message}`;
+            } finally {
+                s.busy = false; _liFuRefresh(alertId);
+            }
+        };
+        window.liFollowupSend = async function (alertId, action) {
+            const alert = _liAlerts.find(a => a.id === alertId);
+            if (!alert) return;
+            const s = _liFuState(alert);
+            const def = LI_FU_ROWS[action];
+            const text = String(s.texts[action] !== undefined ? s.texts[action] : ((s.plan && s.plan.drafts) || {})[action] || '').trim();
+            if (!text) { window.alert('Write something first.'); return; }
+            if (text.length > def.max) { window.alert(`That is ${text.length} characters; ${def.label.toLowerCase()} allows ${def.max}.`); return; }
+            if (s.sending[action]) return;
+            s.sending[action] = true; _liFuRefresh(alertId);
+            try {
+                const data = await _liFuCall(alertId, 'send', { action, text });
+                s.results[action] = data.result || {};
+            } catch (e) {
+                console.error('[LiAlerts] Follow-up send error:', e);
+                s.results[action] = { status: 'failed', error: e.message };
+            } finally {
+                s.sending[action] = false; _liFuRefresh(alertId);
+            }
+        };
+
         function _liRenderCard(alert) {
             const id = alert.id;
             const leadName = alert.leadName || [alert.leadFirstName, alert.leadLastName].filter(Boolean).join(' ') || 'Unknown';
@@ -6139,7 +6288,7 @@
                     <div style="font-weight:600;color:#4c1d95;margin-bottom:0.3rem;"><i class="fas fa-comment-dots"></i> A comment on your LinkedIn post, not a message</div>
                     ${pctx.postExcerpt ? `<div style="font-size:0.85rem;color:#5b21b6;background:#fff;border:1px solid #ddd6fe;border-left:4px solid #7c3aed;border-radius:6px;padding:0.55rem 0.75rem;white-space:pre-wrap;line-height:1.5;">${_liEscHtml(pctx.postExcerpt)}</div>` : ''}
                     <div style="font-size:0.8rem;color:#6d28d9;margin-top:0.45rem;">
-                        ${postLink ? `<a href="${_liEscHtml(postLink)}" target="_blank" rel="noopener noreferrer" style="color:#5b21b6;font-weight:600;"><i class="fab fa-linkedin"></i> Open on LinkedIn to answer</a> &middot; ` : ''}Comments are answered on LinkedIn itself.
+                        ${postLink ? `<a href="${_liEscHtml(postLink)}" target="_blank" rel="noopener noreferrer" style="color:#5b21b6;font-weight:600;"><i class="fab fa-linkedin"></i> Open on LinkedIn</a> &middot; ` : ''}Use Follow up below to reply to the comment, send a connection request, or message them.
                     </div>
                 </div>` : ''}
 
@@ -6201,9 +6350,9 @@
                     </div>
                     <div class="li-category-saved-tag" id="li-cat-saved-${_liEscHtml(id)}"><i class="fas fa-check-circle"></i> Saved</div>
 
-                    <!-- Reply Compose (kept in the page for a post comment so the card's scripts find it, but hidden: a comment is answered on LinkedIn) -->
-                    ${isPostReply ? `<div class="li-alert-compose"><h5><i class="fas fa-comment-dots" style="color:#7c3aed;"></i> Reply on LinkedIn</h5>
-                        <p style="margin:0;font-size:0.88rem;color:#475569;line-height:1.5;">Comments on a post cannot be answered as a message from here.${postLink ? ` <a href="${_liEscHtml(postLink)}" target="_blank" rel="noopener noreferrer" style="font-weight:600;">Open on LinkedIn</a>` : ''}</p></div>` : ''}
+                    <!-- A comment on a post is not a message, so the normal reply box below is hidden for it; this panel replaces it. -->
+                    ${isPostReply ? `<div class="li-alert-compose" id="li-fu-${_liEscHtml(id)}"><h5><i class="fas fa-comment-dots" style="color:#7c3aed;"></i> Follow up${postLink ? ` <a href="${_liEscHtml(postLink)}" target="_blank" rel="noopener noreferrer" style="font-weight:500;font-size:0.8rem;margin-left:8px;">Open on LinkedIn</a>` : ''}</h5>
+                        <div id="li-fu-body-${_liEscHtml(id)}">${_liFuBodyHtml(alert)}</div></div>` : ''}
                     <div class="li-alert-compose"${isPostReply ? ' style="display:none;"' : ''}>
                         <h5><i class="fas fa-paper-plane" style="color:#12314C;"></i> Send Reply</h5>
                         <div class="li-ai-draft-bar" id="li-ai-bar-${_liEscHtml(id)}">
@@ -6346,7 +6495,7 @@ Rules:
 - Never invent a name, company, or details that are not supported by the conversation.
 - If several people are recommended, pick the first/primary one.`;
 
-            const raw = await _liCallAiModel(prompt, { temperature: 0.1, max_tokens: 600 });
+            const raw = await _liCallAiModel(prompt, { role: 'scan', temperature: 0.1, max_tokens: 600 });
             const m = raw.match(/\{[\s\S]*\}/);
             if (!m) throw new Error('Could not parse AI response');
             const result = JSON.parse(m[0]);
@@ -7677,10 +7826,13 @@ Rules:
                 }).join('\n');
                 const today = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
                 const prompt = `You are analyzing a LinkedIn sales conversation to determine if and when to follow up.\n\nToday's date: ${today}\n\nCONVERSATION:\n${transcript}\n\nAnalyze this conversation and respond with ONLY a valid JSON object (no markdown, no explanation outside the JSON):\n{\n  "engagementLevel": "low" or "medium" or "high",\n  "maxFollowUps": 1 or 2 or 3,\n  "suggestedDate": "YYYY-MM-DD",\n  "reason": "brief explanation under 50 words",\n  "specificDateMentioned": true or false,\n  "specificDateText": "what they said verbatim, or null"\n}\n\nRules:\n- low engagement (short reply like Thanks, emoji only, one-word answers) → maxFollowUps: 1, follow up in 14 days\n- medium engagement (asked questions, showed interest, had a back-and-forth exchange) → maxFollowUps: 2, follow up in 7 days\n- high engagement (wanted to meet, scheduling fell through, multi-turn engaged conversation) → maxFollowUps: 3, follow up in 3-5 days\n- If they mentioned a specific future time (next month, in Q3, after the holidays, etc.) → use that as suggestedDate\n- If the last message was from BDR with no prospect response, choose an appropriate wait time\n- Never suggest a date in the past`;
+                const scanModel = window.AiModelCatalog
+                    ? await window.AiModelCatalog.pickForRoleAsync('scan', 'meta-llama/llama-4-maverick')
+                    : 'meta-llama/llama-4-maverick';
                 const resp = await fetch(`${RAILWAY_BASE}/api/ai-profile-eval`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ provider: 'openrouter', model: 'meta-llama/llama-4-maverick', prompt, temperature: 0.1, max_tokens: 300 })
+                    body: JSON.stringify({ provider: 'openrouter', model: scanModel, prompt, temperature: 0.1, max_tokens: 300 })
                 });
                 const data = await resp.json();
                 const raw = (data.message || data.response || '').trim();
@@ -9231,7 +9383,7 @@ If there are no embarrassing mistakes, respond {"ok": true, "issues": []}.`;
             try {
                 const raw = await _liCallAiModel(
                     _liBuildSendCheckPrompt(alertObj, message, alertObj.aiDraft || ''),
-                    { temperature: 0, max_tokens: 600, lowReasoning: true }
+                    { role: 'check', temperature: 0, max_tokens: 600, lowReasoning: true }
                 );
                 const result = _liParseSendCheck(raw);
                 if (result.ok) {
@@ -9733,12 +9885,15 @@ Return ONLY the reply message text — no quotes, no preamble, no explanation.`;
         }
 
         async function _liCallAiModel(prompt, opts = {}) {
+            const role = opts.role || 'write';
+            const resolvedModel = opts.model
+                || (window.AiModelCatalog ? await window.AiModelCatalog.pickForRoleAsync(role, LI_AI_MODEL) : LI_AI_MODEL);
             const resp = await fetch(`${RAILWAY_BASE}/api/ai-profile-eval`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     provider: 'openrouter',
-                    model: opts.model || LI_AI_MODEL,
+                    model: resolvedModel,
                     prompt,
                     ...(opts.lowReasoning ? { lowReasoning: true } : {}),
                     temperature: opts.temperature ?? 0.4,
@@ -10071,8 +10226,12 @@ Rules:
 - Only state facts you found; never invent details.
 - If you cannot confidently identify the company, say so in a single sentence instead of guessing.`;
             const p = (async () => {
+                const researchBase = window.AiModelCatalog
+                    ? await window.AiModelCatalog.pickForRoleAsync('research', LI_AI_MODEL)
+                    : LI_AI_MODEL;
+                const employerModel = researchBase.replace(/:online$/i, '') + ':online';
                 const text = _liCleanCompanySummary(await _liCallAiModel(prompt, {
-                    model: LI_EMPLOYER_MODEL, temperature: 0.2, max_tokens: 700, lowReasoning: true
+                    model: employerModel, temperature: 0.2, max_tokens: 700, lowReasoning: true
                 }));
                 if (!text) throw new Error('Empty summary');
                 return text;

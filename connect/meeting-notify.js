@@ -32,8 +32,12 @@
     if (window.PandoMeetingNotify) return;
 
     const RAILWAY = 'https://railwayclemail-production.up.railway.app';
-    const AI_MODEL = 'anthropic/claude-opus-4.7';
-    const EMPLOYER_MODEL = AI_MODEL + ':online'; // web-enabled, same as the employer cards on Index Admin
+    const AI_MODEL = 'anthropic/claude-opus-5.5';
+
+    async function pickNotifyModel(role) {
+        if (window.AiModelCatalog) return window.AiModelCatalog.pickForRoleAsync(role, AI_MODEL);
+        return AI_MODEL;
+    }
     // The only people these emails can come from, each tied to their PRIMARY address. The mailbox
     // connected on OAuth Email Connections under exactly that address is the one that sends. The
     // other local parts / domains are used only to find a person's existing signature (they have
@@ -90,12 +94,13 @@
     }
 
     async function callAi(prompt, opts = {}) {
+        const model = opts.model || (await pickNotifyModel('write'));
         const resp = await fetch(`${RAILWAY}/api/ai-profile-eval`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 provider: 'openrouter',
-                model: opts.model || AI_MODEL,
+                model,
                 prompt,
                 temperature: opts.temperature ?? 0.5,
                 max_tokens: opts.max_tokens ?? 900
@@ -233,7 +238,8 @@ Rules:
 - Plain text only: no markdown, no bullet points, no headings, no citations or links, no preamble.
 - Only state facts you found; never invent details.
 - If you cannot confidently identify the company, say so in a single sentence instead of guessing.`;
-        return cleanSummary(await callAi(prompt, { model: EMPLOYER_MODEL, temperature: 0.2, max_tokens: 700 }));
+        const researchBase = await pickNotifyModel('research');
+        return cleanSummary(await callAi(prompt, { model: researchBase.replace(/:online$/i, '') + ':online', temperature: 0.2, max_tokens: 700 }));
     }
 
     function buildDetailsText(employers) {

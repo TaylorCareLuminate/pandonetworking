@@ -897,19 +897,23 @@ window.aiGenerate = async () => {
     const instr = $('aiInstr').value.trim(); if (!instr) { say('aiStatus', 'Describe the change you want first.', true); $('aiInstr').focus(); return; }
     let list = scope(); const lim = parseInt($('aiLimit').value, 10); if (lim > 0) list = list.slice(0, lim);
     if (!list.length) { say('aiStatus', 'There are no editable rows to work on. Check the filters and status.', true); return; }
-    const model = $('aiModel').value;
+    const modelChoice = $('aiModel').value;
+    const modelLabel = window.AiModelCatalog ? window.AiModelCatalog.labelFor(models, modelChoice) : modelChoice;
     if (proposals.length && !confirm('Generating again discards the proposed edits shown now (nothing has been saved). Continue?')) return;
-    if (list.length > 50 && !confirm(`This sends ${list.length} messages to ${model}. Tip: use "Only first N rows" to test your instructions on a few first.\n\nContinue with all ${list.length}?`)) return;
-    try { localStorage.setItem('linkedinScheduled.aiModel', model); } catch (_) { /* ignore */ }
-    aiBusy = true; aiAbort = false; proposals = []; flags = []; proposalSource = `AI edit (${model})`; $('btnAiGo').disabled = true; $('btnAiStop').hidden = false;
-    const size = /kimi|qwen|deepseek|grok|opus/i.test(model) ? 4 : 8; const batches = [];
+    if (list.length > 50 && !confirm(`This sends ${list.length} messages to ${modelLabel}. Tip: use "Only first N rows" to test your instructions on a few first.\n\nContinue with all ${list.length}?`)) return;
+    aiBusy = true; aiAbort = false; proposals = []; flags = []; proposalSource = `AI edit (${modelLabel})`; $('btnAiGo').disabled = true; $('btnAiStop').hidden = false;
+    const poolStr = window.AiModelCatalog && modelChoice === window.AiModelCatalog.RANDOM_VALUE.write ? window.AiModelCatalog.roleSummary(models, 'write') : modelChoice;
+    const size = /kimi|qwen|deepseek|grok|opus/i.test(poolStr) ? 4 : 8; const batches = [];
     for (let k = 0; k < list.length; k += size) batches.push(list.slice(k, k + size).map((item, j) => ({ id: 'm' + (k + j), item })));
     let done = 0, failed = 0, unchanged = 0, lastErr = '';
     const runBatch = async (batch) => {
         if (aiAbort) return;
+        const batchModel = window.AiModelCatalog
+            ? window.AiModelCatalog.resolveRoleChoice(modelChoice, models, 'write', 'anthropic/claude-sonnet-5.5')
+            : modelChoice;
         try {
             let results;
-            try { results = await aiCall(batch.map(b => payloadFor(b.item, b.id)), instr, model); }
+            try { results = await aiCall(batch.map(b => payloadFor(b.item, b.id)), instr, batchModel); }
             catch (err) { if (err.message === 'Stopped') throw err; if (batch.length > 1) { const mid = Math.ceil(batch.length / 2); await runBatch(batch.slice(0, mid)); await runBatch(batch.slice(mid)); return; } throw err; }
             const byId = new Map(results.map(r => [String(r.id), r]));
             for (const b of batch) {
@@ -919,7 +923,7 @@ window.aiGenerate = async () => {
                 proposals.push({ id: b.item.id, item: b.item, oldMessage: b.item.text || '', newMessage: nt, limit: limitOf(b.item), include: nt.length <= limitOf(b.item), reason: '' });
             }
         } catch (err) { if (err.message === 'Stopped') return; failed += batch.length; lastErr = err.message; }
-        finally { done += batch.length; say('aiStatus', `Asking ${model}… ${Math.min(done, list.length)} / ${list.length}`); }
+        finally { done += batch.length; say('aiStatus', `Asking ${batchModel}… ${Math.min(done, list.length)} / ${list.length}`); }
     };
     try { for (const b of batches) { if (aiAbort) break; await runBatch(b); } }
     finally {
@@ -1086,13 +1090,18 @@ window.applyProposals = async () => {
 
 // ── AI model picker, boot ───────────────────────────────────────────────────
 async function initModels() {
-    const sel_ = $('aiModel'); let saved = ''; try { saved = localStorage.getItem('linkedinScheduled.aiModel') || ''; } catch (_) { /* ignore */ }
+    const sel_ = $('aiModel');
     if (window.AiModelCatalog) {
-        try { models = await window.AiModelCatalog.load(); const def = (models.find(m => m.isDefault) || {}).slug; window.AiModelCatalog.populateSelect(sel_, models, { selected: saved || def || 'anthropic/claude-sonnet-5.5' }); }
-        catch (e) { console.warn('Model catalog skipped:', e.message); }
-    } else if (saved) sel_.value = saved;
+        try {
+            models = await window.AiModelCatalog.load();
+            window.AiModelCatalog.populateForRole(sel_, models, 'write', {
+                fallback: 'anthropic/claude-sonnet-5.5',
+                randomOption: true
+            });
+        } catch (e) { console.warn('Model catalog skipped:', e.message); }
+    }
     const note = () => { $('aiModelNote').textContent = (window.AiModelCatalog ? window.AiModelCatalog.noteFor(models, sel_.value) : '') || ''; };
-    note(); sel_.addEventListener('change', () => { try { localStorage.setItem('linkedinScheduled.aiModel', sel_.value); } catch (_) { /* ignore */ } note(); });
+    note(); sel_.addEventListener('change', note);
 }
 onAuthStateChanged(auth, async (u) => {
     if (!u) return;

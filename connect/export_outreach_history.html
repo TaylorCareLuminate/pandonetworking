@@ -23,7 +23,7 @@
         // Bump PAGE_VERSION (and the matching value in
         // export_outreach_history.version.json) whenever this file changes.
         (function () {
-            var PAGE_VERSION = '2026-11-17.1';
+            var PAGE_VERSION = '2026-11-19.1';
             var VERSION_URL = 'export_outreach_history.version.json';
             var GUARD_KEY = 'eoh_version_reload_guard';
 
@@ -737,8 +737,8 @@
     <div class="wr-panel" id="wrPanel">
         <h2><i class="fas fa-file-invoice"></i> Weekly Client Report <span style="font-size:.7rem;font-weight:700;background:#ede9fe;color:#5b21b6;padding:.15rem .5rem;border-radius:20px;">ADMIN</span></h2>
         <div class="wr-sub">
-            Builds <strong>one Excel workbook</strong> with everything we did and achieved for a client in a chosen period: headline KPIs vs. the previous period,
-            daily activity, outcomes by message type / BDR / hypothesis, every conversation, reply categories and CRM notes (Company Conversations),
+            Builds <strong>one Excel workbook</strong> with everything we did and achieved for a client in a chosen period (filtered strictly to connections, messages, and conversations originated by Pando/HealthLuminate — pre-existing LinkedIn connections, inbound-initiated conversations, and personal messages are excluded): headline KPIs vs. the previous period,
+            daily activity, outcomes by message type / BDR / hypothesis, every Pando-originated conversation, reply categories and CRM notes (Company Conversations),
             hypothesis documentation, success analysis, message-generation &amp; review audit trail, pipeline runs, data-management activity and a unified work log.
             The first sheet is a <strong>README written for ChatGPT</strong> that explains every sheet and metric — upload the workbook and paste the prompt to get the client report.
         </div>
@@ -1504,6 +1504,8 @@
             }
         }
 
+        const allowedEmails = new Set(emailArr.map(e => e.toLowerCase()));
+
         const results = await Promise.all(promises);
         results.forEach(snap => {
             if (!snap) return;
@@ -1520,7 +1522,13 @@
                 const title   = data.leadPosition || data.leadTitle || correspondent.position || correspondent.headline || '';
                 const company = data.companyName  || data.leadCompany || correspondent.companyName || correspondent.company || '';
                 const liUrl   = normalizeUrl(data.leadProfileUrl || correspondent.profileUrl || '');
-                const rawBdrEmail = (data.accountEmail || data.bdrEmail || data.linkedInAccountEmail || '').toLowerCase();
+                let rawBdrEmail = (data.accountEmail || data.bdrEmail || data.linkedInAccountEmail || '').toLowerCase();
+                if (!rawBdrEmail && data.uploadedByEmail && allowedEmails.has(String(data.uploadedByEmail).toLowerCase())) {
+                    rawBdrEmail = String(data.uploadedByEmail).toLowerCase();
+                }
+                // Guard against cross-BDR leaks from the `uploadedByEmail` query: if this doc's
+                // actual BDR email isn't one of the BDR emails in scope, skip it.
+                if (rawBdrEmail && !allowedEmails.has(rawBdrEmail) && !emailToCanonical.has(rawBdrEmail)) return;
                 // Canonicalize to the BDR's primary email so work-email and LinkedIn-seat-email
                 // records for the same real BDR key to the same "liUrl||bdrEmail" bucket.
                 const bdrEmail = emailToCanonical.get(rawBdrEmail) || rawBdrEmail;
@@ -1532,6 +1540,7 @@
 
                 const entry = {
                     id: d.id,
+                    kind:          data.kind          || '',
                     source:        data.source        || data.rawData?.source        || '',
                     generated_via: data.generated_via || data.rawData?.generated_via || '',
                     uploadedVia:   data.uploadedVia   || data.rawData?.uploadedVia   || '',
@@ -1605,23 +1614,26 @@
 
             const url = extractActivityUrl(data);
             const ts  = safeToDate(data.timestamp);
-            if (url && ts && !connectionDateMap.has(url)) {
-                connectionDateMap.set(url, ts);
+            if (url && ts) {
+                const prev = connectionDateMap.get(url);
+                if (!prev || ts < prev) connectionDateMap.set(url, ts);
             }
         }
 
+        let globalTruncated = false;
         try {
             const snap = await getDocs(query(
                 collection(emailDB, 'heyreach_activity'),
                 where('eventType', '==', 'CONNECTION_REQUEST_ACCEPTED'),
                 limit(20000)
             ));
+            if (snap.size >= 20000) globalTruncated = true;
             snap.forEach(processDoc);
         } catch(e) {
             console.warn('Global heyreach_activity query failed:', e);
         }
 
-        if (connectionDateMap.size === 0) {
+        if (connectionDateMap.size === 0 || globalTruncated) {
             const queried = new Set();
             for (const email of emailArr) {
                 if (queried.has(email)) continue;
@@ -1679,10 +1691,12 @@
     // a send is recorded. Each returns "events": { kind, liUrl, rawBdrs[]/bdrEmail, name, text, date, ... }
     const MESSAGE_ACTIVITY_TYPES = new Set([
         'follow_up_message',              // company_review_replies / review_replies / conversation_lookup / delayed_replies_send (+ connected-no-reply sends)
+        'bulk_follow_up_message',
+        'harvest_follow_up_message',
         'fast_message_via_conversation',  // fast_message_speedup
         'fast_outreach_message',          // current_connections_fast_outreach
         'fast_outreach_bulk_message',
-        'personal_message_reply'          // personal_messages
+        'personal_message_reply'          // personal_messages (excluded in Weekly Client Report)
     ]);
 
     function chunk30(arr) {
@@ -1826,7 +1840,14 @@
         if (allInbox.length > 0) {
             const convIdToUrl = new Map();
             allInbox.forEach(entry => {
-                if (entry.conversationId && entry.liUrl) convIdToUrl.set(entry.conversationId, entry.liUrl);
+                if (entry.conversationId && entry.liUrl) {
+                    convIdToUrl.set(entry.conversationId, entry.liUrl);
+                    convIdToUrl.set(String(entry.conversationId).replace(/^webhook_/, ''), entry.liUrl);
+                }
+                if (entry.id && entry.liUrl) {
+                    convIdToUrl.set(entry.id, entry.liUrl);
+                    convIdToUrl.set(String(entry.id).replace(/^webhook_/, ''), entry.liUrl);
+                }
             });
             try {
                 const snap = await getDocs(query(
@@ -1836,7 +1857,8 @@
                 )).catch(e => { console.warn('conversation_category_overrides failed:', e); return null; });
                 if (snap) {
                     snap.forEach(d => {
-                        const url = convIdToUrl.get(d.id);
+                        const cid = String((d.data() && d.data().conversationId) || '').replace(/^webhook_/, '');
+                        const url = convIdToUrl.get(d.id) || (cid ? convIdToUrl.get(cid) : '');
                         if (url) scheduledSet.add(url);
                     });
                 }
@@ -1847,7 +1869,11 @@
     }
 
     // ── Build rows ────────────────────────────────────────────────────────────
-    function buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet, bdrEmailToName, bdrEmailToCompany = new Map(), currentConnectionUrls = new Set(), emailToCanonical = new Map(), extraEvents = []) {
+    function buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet, bdrEmailToName, bdrEmailToCompany = new Map(), currentConnectionUrls = new Set(), emailToCanonical = new Map(), extraEvents = [], opts = {}) {
+        const pandoOnly = Boolean(opts && opts.pandoOnly);
+        const allowlist = (opts && opts.allowlist) || null;
+        const inboundPairs = (opts && opts.inboundPairs) || null;
+        const isPandoConvFn = (opts && opts.isPandoConversation) || null;
         const rows = [];
         const seen = new Set();
 
@@ -1937,9 +1963,18 @@
         }
 
         const sentRequestUrlSet = new Set();
+        const sentConnectInviteUrlSet = new Set();
         sentItems.forEach(item => {
-            const u = normalizeUrl(item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || item.linkedInUrl || '');
-            if (u) sentRequestUrlSet.add(u);
+            const u = normalizeUrl(
+                item.prospect_li_url || item.contact_linkedin_url || item.prospect_linkedin_url ||
+                item.linkedin_url || item.linkedInUrl || item.contactLinkedInUrl || ''
+            );
+            if (!u) return;
+            sentRequestUrlSet.add(u);
+            const mt = String(item.message_type || 'connect').toLowerCase();
+            if (mt === 'connect' || mt === 'connection' || mt === 'connect_only') {
+                sentConnectInviteUrlSet.add(u);
+            }
         });
 
         function makeConversationHistory(rawMessages) {
@@ -1999,14 +2034,19 @@
         }
 
         sentItems.forEach(item => {
-            const liUrl   = normalizeUrl(item.prospect_li_url || item.contact_linkedin_url || item.linkedin_url || item.linkedInUrl || '');
-            const rawBdrEmail = (item.account_email || '').toLowerCase();
+            const liUrl   = normalizeUrl(
+                item.prospect_li_url || item.contact_linkedin_url || item.prospect_linkedin_url ||
+                item.linkedin_url || item.linkedInUrl || item.contactLinkedInUrl || ''
+            );
+            const rawBdrEmail = (item.account_email || item.bdr_auth_email || item.bdr_email || '').toLowerCase();
             // Canonicalize before keying — otherwise a BDR's work-email queue record and
             // LinkedIn-seat-email queue record for the same prospect look like two different
             // BDRs and both survive the dedup check below, producing duplicate contact rows.
             const bdrEmail = emailToCanonical.get(rawBdrEmail) || rawBdrEmail;
             const key = `${liUrl}||${bdrEmail}`;
+            const liSlugPart = (liUrl.match(/linkedin\.com\/in\/([^/]+)/i) || [])[1] || '';
             if (seen.has(key)) return;
+            if (pandoOnly && inboundPairs && liUrl && (inboundPairs.has(key) || (liSlugPart && inboundPairs.has(`${liSlugPart}||${bdrEmail}`)))) return;
             seen.add(key);
 
             const firstName = item.contactFirstName || item.prospect_first_name || item.firstName || '';
@@ -2019,7 +2059,10 @@
             // which would risk attaching a different BDR's/client's real conversation to this
             // row. If there's no exact match, rawMessages stays empty and this row falls back
             // to whatever synthetic/queue-only message handling already exists below.
-            const inbox = (liUrl && bdrEmail) ? (bestInboxByKey.get(key) || inboxByUrl.get(key)) : null;
+            let inbox = (liUrl && bdrEmail) ? (bestInboxByKey.get(key) || inboxByUrl.get(key)) : null;
+            if (pandoOnly && inbox && isPandoConvFn && !isPandoConvFn(inbox)) {
+                return;
+            }
             const keyEvents = eventsByKey.get(key) || [];
             const evName    = keyEvents.find(e => e.name)?.name       || '';
             const evTitle   = keyEvents.find(e => e.title)?.title     || '';
@@ -2029,14 +2072,21 @@
             const contactTitle   = inbox?.leadTitle   || cqTitle   || evTitle   || '';
             const contactCompany = inbox?.leadCompany || cqCompany || evCompany || '';
             const bdrName        = bdrEmailToName.get(bdrEmail) || bdrEmail;
-            const connDate       = liUrl ? connectionDateMap.get(liUrl) : null;
+            const itemMsgType    = String(item.message_type || 'connect').toLowerCase();
+            const isConnectInvite = itemMsgType === 'connect' || itemMsgType === 'connection' || itemMsgType === 'connect_only' ||
+                Boolean(liUrl && (sentConnectInviteUrlSet.has(liUrl) || (allowlist && allowlist.hasConnectInvite(liUrl))));
+            const rawConnDate    = liUrl ? connectionDateMap.get(liUrl) : null;
+            const connDate       = (pandoOnly && !isConnectInvite) ? null : rawConnDate;
             const msgType        = classifyMessageType(item);
             const rawMessages    = inbox?.rawMessages || [];
             const replied        = inbox?.hasLeadReply ? 1 : 0;
             const scheduled      = (liUrl && scheduledUrlSet.has(liUrl)) ? 1 : 0;
             const connected      = connDate ? 1 : 0;
-            const currentlyConnected = (connected === 1 || (liUrl && currentConnectionUrls.has(liUrl))) ? 1 : 0;
-            const connectedByHL  = (connected === 1 || currentlyConnected === 1) ? 1 : 0;
+            const anyConnected   = (connected === 1 || (liUrl && currentConnectionUrls.has(liUrl))) ? 1 : 0;
+            const connectedByHL  = pandoOnly
+                ? ((connected === 1 || (isConnectInvite && anyConnected === 1)) ? 1 : 0)
+                : ((connected === 1 || anyConnected === 1) ? 1 : 0);
+            const currentlyConnected = pandoOnly ? connectedByHL : anyConnected;
             const sentDate       = safeToDate(
                 item.adminApprovedAt || item.customerApprovedAt ||
                 item.pushed_at || item.created_at || item.uploaded_date || item.generated_at
@@ -2091,15 +2141,20 @@
 
         // ── Contacts NOT in connect_queue ────────────────────────────────────────────
         // Anyone we messaged by any other route: follow-ups/replies sent from the review pages,
-        // Quick Message campaign adds, fast outreach, scheduled DM slots, or messages sent
-        // directly in HeyReach (any HeyReach thread where the BDR sent at least one message).
-        // Scheduled contacts are still included even when no BDR message is on record.
+        // Quick Message campaign adds, fast outreach, scheduled DM slots, or (in the personal
+        // export only) messages sent directly in HeyReach. In `pandoOnly` mode (Weekly Client
+        // Report), raw HeyReach/LinkedIn conversations without a Pando/HealthLuminate outreach
+        // record — and inbound-initiated conversations — are strictly excluded.
         const extraKeys = new Set();
         eventsByKey.forEach((_, k) => extraKeys.add(k));
         bestInboxByKey.forEach((entry, k) => {
+            if (pandoOnly) {
+                if (!allowlist || !allowlist.hasOutreach(entry.liUrl)) return;
+                if (isPandoConvFn && !isPandoConvFn(entry)) return;
+            }
             const hasBdrMessage = (entry.rawMessages || []).some(m =>
                 m.sender === 'ME' || m.sender === 'account' || m.direction === 'outbound');
-            if (!(hasBdrMessage || scheduledUrlSet.has(entry.liUrl))) return;
+            if (!(hasBdrMessage || (!pandoOnly && scheduledUrlSet.has(entry.liUrl)))) return;
             if (buildStats.sinceMs && !scheduledUrlSet.has(entry.liUrl)) {
                 // Date-range filter: skip threads with no activity inside the window
                 const lastTs = Math.max(0, ...(entry.rawMessages || []).map(m => (safeToDate(m.createdAt || m.timestamp) || 0) && safeToDate(m.createdAt || m.timestamp).getTime()));
@@ -2110,12 +2165,16 @@
 
         extraKeys.forEach(key => {
             if (seen.has(key)) return;
-            seen.add(key);
             const sep      = key.indexOf('||');
             const liUrl    = key.slice(0, sep);
             const bdrEmail = key.slice(sep + 2);
+            const liSlugPart = (liUrl.match(/linkedin\.com\/in\/([^/]+)/i) || [])[1] || '';
+            if (pandoOnly && inboundPairs && (inboundPairs.has(key) || (liSlugPart && inboundPairs.has(`${liSlugPart}||${bdrEmail}`)))) return;
+            if (pandoOnly && allowlist && !allowlist.hasOutreach(liUrl)) return;
+            seen.add(key);
 
-            const inbox     = bestInboxByKey.get(key) || null;
+            let inbox       = bestInboxByKey.get(key) || null;
+            if (pandoOnly && inbox && isPandoConvFn && !isPandoConvFn(inbox)) return;
             const keyEvents = eventsByKey.get(key) || [];
             const baseHistory = inbox ? makeConversationHistory(inbox.rawMessages || []) : [];
             const merged      = mergeEvents(baseHistory, keyEvents);
@@ -2125,13 +2184,18 @@
             const histRange   = historyDateRange(convHistory);
 
             const bdrMsgCount     = convHistory.filter(isBdrMsg).length;
+            if (pandoOnly && !bdrMsgCount) return;
             const contactMsgCount = convHistory.filter(m => m.sender === 'Contact').length;
-            const connDate        = connectionDateMap.get(liUrl) || null;
+            const weSentARequest  = pandoOnly
+                ? Boolean(sentConnectInviteUrlSet.has(liUrl) || (allowlist && allowlist.hasConnectInvite(liUrl)))
+                : sentRequestUrlSet.has(liUrl);
+            const rawConnDate     = connectionDateMap.get(liUrl) || null;
+            const connDate        = (pandoOnly && !weSentARequest) ? null : rawConnDate;
             const bdrName         = bdrEmailToName.get(bdrEmail) || bdrEmail;
             const connectedFlag   = connDate ? 1 : 0;
-            const currentlyConnected = (connectedFlag === 1 || currentConnectionUrls.has(liUrl)) ? 1 : 0;
-            const weSentARequest  = sentRequestUrlSet.has(liUrl);
-            const connectedByHL   = (connectedFlag === 1 || (weSentARequest && currentlyConnected === 1)) ? 1 : 0;
+            const anyConnected    = (connectedFlag === 1 || currentConnectionUrls.has(liUrl)) ? 1 : 0;
+            const connectedByHL   = (connectedFlag === 1 || (weSentARequest && anyConnected === 1)) ? 1 : 0;
+            const currentlyConnected = pandoOnly ? connectedByHL : anyConnected;
 
             // Type: keep HeyReach's own classification when it has one, otherwise label by route.
             let msgType = inbox ? classifyMessageType(inbox) : 'other';
@@ -2467,7 +2531,7 @@
     // All report math/sheet layout lives in weekly_client_report.js; this block
     // only loads the data (read-only) and drives the UI.
     // ═════════════════════════════════════════════════════════════════════════
-    const WR_MODULE_URL = './weekly_client_report.js?v=1';
+    const WR_MODULE_URL = './weekly_client_report.js?v=2';
     let wrLast = null;            // { wb, report, fileBase } from the latest build
     let wrPartial = [];           // partial-failure notes from the loader currently running
     const wrEl = id => document.getElementById(id);
@@ -2601,15 +2665,56 @@
             // ── identity maps (same canonicalisation rules as the personal export) ──
             const bdrEmailToName = new Map(), bdrEmailToCompany = new Map(), emailToCanonical = new Map();
             const emailSet = new Set();
+            const bdrLeaderIds = new Set();
+            const registerBdrAlias = (alias, primary, name) => {
+                const a = String(alias || '').trim().toLowerCase();
+                if (!a || !a.includes('@')) return;
+                emailSet.add(a);
+                bdrEmailToName.set(a, name);
+                bdrEmailToCompany.set(a, company);
+                if (primary) emailToCanonical.set(a, primary);
+            };
             bdrs.forEach(bdr => {
                 const primary = (bdr.primaryEmail || bdr.id || '').toLowerCase();
                 const liEmail = bdr._liEmail || linkedInEmailAssociations.get(primary) || null;
                 const name = bdr.name || primary;
-                if (primary) { emailSet.add(primary); bdrEmailToName.set(primary, name); bdrEmailToCompany.set(primary, company); emailToCanonical.set(primary, primary); }
-                if (liEmail) { emailSet.add(liEmail); bdrEmailToName.set(liEmail, name); bdrEmailToCompany.set(liEmail, company); if (primary) emailToCanonical.set(liEmail, primary); }
+                if (bdr.id) bdrLeaderIds.add(bdr.id);
+                if (primary) registerBdrAlias(primary, primary, name);
+                if (liEmail) registerBdrAlias(liEmail, primary, name);
+                [bdr.linkedInEmail, bdr.email, bdr.authEmail].forEach(a => registerBdrAlias(a, primary, name));
+                (bdr.linkedInAccounts || []).forEach(acc => {
+                    if (!acc) return;
+                    if (typeof acc === 'string') registerBdrAlias(acc, primary, name);
+                    else [acc.email, acc.bdrEmail, acc.accountEmail, acc.linkedInEmail].forEach(a => registerBdrAlias(a, primary, name));
+                });
             });
+
+            // Load linkedin_accounts up front so both HeyReach account IDs AND any additional
+            // seat alias emails for these BDRs are mapped before querying connect_queue / inbox.
+            const accountIdMap = await wrLoad(diagnostics, 'linkedin_accounts', 'Loading LinkedIn account mapping…', async () => {
+                const map = new Map();
+                const snap = await getDocs(collection(emailDB, 'linkedin_accounts'));
+                snap.forEach(d => {
+                    const data = d.data();
+                    if (data.heyreachAccountId && data.bdrEmail) {
+                        map.set(String(data.heyreachAccountId), data.bdrEmail.toLowerCase());
+                    }
+                    const seatBdr = String(data.bdrEmail || '').toLowerCase();
+                    const canonPrimary = (seatBdr && emailToCanonical.get(seatBdr)) ||
+                        (data.bdrLeaderId && bdrLeaderIds.has(data.bdrLeaderId)
+                            ? ((bdrs.find(b => b.id === data.bdrLeaderId) || {}).primaryEmail || '').toLowerCase()
+                            : '');
+                    if (canonPrimary) {
+                        const nm = bdrEmailToName.get(canonPrimary) || canonPrimary;
+                        [data.bdrEmail, data.accountEmail, data.email, data.linkedInEmail].forEach(a => registerBdrAlias(a, canonPrimary, nm));
+                    }
+                });
+                return map;
+            }) || new Map();
+
             const emailsArr = Array.from(emailSet);
             const canonObj = {}; emailToCanonical.forEach((v, k) => { canonObj[k] = v; });
+            const canonEmailsSet = new Set([...emailSet, ...Object.values(canonObj)].filter(Boolean));
             const namesObj = {}; bdrEmailToName.forEach((v, k) => { namesObj[emailToCanonical.get(k) || k] = v; });
             const targetBdrs = bdrs;
             const customerIds = new Set(bdrs.map(b => b.customerId).filter(Boolean));
@@ -2625,10 +2730,17 @@
             }) || [];
 
             // ── every queue record (not just sent) for this client's BDRs ──
-            const queue = await wrLoad(diagnostics, 'connect_queue', 'Loading message queue records (generated / reviewed / sent)…',
-                () => wrQueryIn('connect_queue', 'account_email', emailsArr, { timeoutMs: 180000 }),
-                r => `${r.filter(d => d.pushed_to_heyreach === true).length} sent to the sending platform`) || [];
-            const sentItems = queue.filter(d => d.pushed_to_heyreach === true);
+            const queue = await wrLoad(diagnostics, 'connect_queue', 'Loading message queue records (generated / reviewed / sent)…', async () => {
+                const [qAcc, qAuth, qBdr] = await Promise.all([
+                    wrQueryIn('connect_queue', 'account_email', emailsArr, { timeoutMs: 180000 }),
+                    wrQueryIn('connect_queue', 'bdr_auth_email', emailsArr, { timeoutMs: 180000 }).catch(() => []),
+                    wrQueryIn('connect_queue', 'bdr_email', emailsArr, { timeoutMs: 180000 }).catch(() => [])
+                ]);
+                const m = new Map();
+                [...qAcc, ...qAuth, ...qBdr].forEach(d => { if (!m.has(d.id)) m.set(d.id, d); });
+                return Array.from(m.values());
+            }, r => `${r.filter(d => mod.isQueueItemSent(d)).length} sent to the sending platform`) || [];
+            const sentItems = queue.filter(d => mod.isQueueItemSent(d));
 
             // Groups for this client = assigned to its BDRs/customer, or stamped on its queue records
             const queueGroupIds = new Set(queue.map(d => d.hypothesisGroupId).filter(Boolean));
@@ -2644,21 +2756,107 @@
             const groupIds = companyGroups.map(g => g.id);
             diagnostics.push({ source: 'hypothesis groups for this client', rows: companyGroups.length, note: companyGroups.map(g => g.name || g.id).slice(0, 25).join('; ') });
 
-            // ── conversations + connections + meetings (reuses the personal-export loaders) ──
-            const inboxRes = await wrLoad(diagnostics, 'heyreach_inbox', 'Loading conversation threads…', () => loadInbox(emailsArr, emailToCanonical),
-                r => `${r.inboxByBdr.filter(e => e.hasLeadReply).length} conversations with a reply from the contact`);
-            const inboxByUrl = inboxRes ? inboxRes.inboxByUrl : new Map();
-            const inboxByBdr = inboxRes ? inboxRes.inboxByBdr : [];
+            // ── Pando outreach & activity records (loaded before filtering conversations/connections) ──
+            const allConnectActivity = await wrLoad(diagnostics, 'connect_activity', 'Loading platform push records…', async () => {
+                const [a, b, c] = await Promise.all([
+                    wrQueryIn('connect_activity', 'bdrEmail', emailsArr),
+                    wrQueryIn('connect_activity', 'account_email', emailsArr).catch(() => []),
+                    wrQueryIn('connect_activity', 'accountEmail', emailsArr).catch(() => [])
+                ]);
+                const m = new Map();
+                [...a, ...b, ...c].forEach(d => { if (!m.has(d.id)) m.set(d.id, d); });
+                return Array.from(m.values());
+            }) || [];
+            const connectActivity = allConnectActivity.filter(a => sinceOk(a.timestamp || a.createdAt));
 
-            const accountIdMap = await wrLoad(diagnostics, 'linkedin_accounts', 'Loading LinkedIn account mapping…', () => loadAccountIdMapping()) || new Map();
-            const connectionDateMap = await wrLoad(diagnostics, 'heyreach_activity (connection accepted)', 'Loading connection-accepted events…', () => loadConnectionDates(emailsArr, accountIdMap)) || new Map();
-            const scheduledUrlSet = await wrLoad(diagnostics, 'meetings (activity_tracking + categories)', 'Loading scheduled meetings…', () => loadScheduledMeetings(emailsArr, inboxByUrl, inboxByBdr)) || new Set();
-            const currentConnectionUrls = await wrLoad(diagnostics, 'heyreach_contacts', 'Loading current connections…', () => loadCurrentConnections(emailsArr)) || new Set();
-            const activityEvents = await wrLoad(diagnostics, 'activity_tracking (follow-ups/replies)', 'Loading follow-ups & replies…', () => loadActivityMessages(emailsArr)) || [];
+            const rawActivityEvents = await wrLoad(diagnostics, 'activity_tracking (follow-ups/replies)', 'Loading follow-ups & replies…', () => loadActivityMessages(emailsArr)) || [];
             const quickEvents = await wrLoad(diagnostics, 'quick_message_campaign_leads', 'Loading Quick Message campaign sends…', () => loadQuickMessageLeads(targetBdrs, emailToCanonical)) || [];
             const slotEvents = await wrLoad(diagnostics, 'linkedin_message_queue', 'Loading scheduled DM sends…', () => loadScheduledSends(emailsArr)) || [];
+            const manualHarvest = await wrLoad(diagnostics, 'harvest_pool_manual_contacts', 'Loading manual Pando-origin connection labels…',
+                () => wrQueryIn('harvest_pool_manual_contacts', 'bdrEmail', emailsArr).catch(() => [])) || [];
 
-            const meetingEvents = await wrLoad(diagnostics, 'activity_tracking (meeting_scheduled)', 'Loading meeting-scheduled records…', async () => {
+            // Build the Pando/HealthLuminate origin allowlist across all Pando outreach channels.
+            const allowlist = mod.buildPandoOriginAllowlist({
+                queue,
+                connectActivity: allConnectActivity,
+                quickEvents,
+                slotEvents,
+                activityEvents: rawActivityEvents,
+                manualHarvest
+            });
+
+            // ── conversations + connections + meetings (filtered strictly to Pando/HealthLuminate origin) ──
+            const inboxRes = await wrLoad(diagnostics, 'heyreach_inbox', 'Loading conversation threads…', () => loadInbox(emailsArr, emailToCanonical),
+                r => `${r.inboxByBdr.filter(e => e.hasLeadReply).length} raw threads with a contact message`);
+            const rawInboxByBdr = inboxRes ? inboxRes.inboxByBdr : [];
+            const inboxByUrl = new Map();
+            const inboxByBdr = [];
+            const nonPandoConvIds = new Set();
+            const inboundPairs = new Set();
+            let excludedInboxCount = 0;
+            rawInboxByBdr.forEach(e => {
+                if (mod.isPandoConversation(e, allowlist, canonEmailsSet)) {
+                    inboxByBdr.push(e);
+                    if (e.liUrl && e.bdrEmail) inboxByUrl.set(`${e.liUrl}||${e.bdrEmail}`, e);
+                } else {
+                    excludedInboxCount++;
+                    if (e.id) nonPandoConvIds.add(String(e.id).replace(/^webhook_/, ''));
+                    if (e.conversationId) nonPandoConvIds.add(String(e.conversationId).replace(/^webhook_/, ''));
+                    const bi = allowlist.blankInviteInfo(e.liUrl);
+                    if (e.liUrl && !mod.conversationStartedByUs(e.rawMessages || [], bi)) {
+                        const canonBdr = emailToCanonical.get(e.bdrEmail) || e.bdrEmail || '';
+                        inboundPairs.add(`${e.liUrl}||${canonBdr}`);
+                        const sl = mod.liSlug(e.liUrl);
+                        if (sl) inboundPairs.add(`${sl}||${canonBdr}`);
+                    }
+                }
+            });
+            diagnostics.push({
+                source: 'heyreach_inbox (Pando/HealthLuminate-origin filter)',
+                rows: inboxByBdr.length,
+                note: `Kept ${inboxByBdr.length} Pando-originated conversation(s) (${inboxByBdr.filter(e => e.hasLeadReply).length} with a reply); excluded ${excludedInboxCount} non-Pando conversation(s) (inbound-initiated, post comments, or no Pando outreach record).`
+            });
+
+            const rawConnectionDateMap = await wrLoad(diagnostics, 'heyreach_activity (connection accepted)', 'Loading connection-accepted events…', () => loadConnectionDates(emailsArr, accountIdMap)) || new Map();
+            const connectionDateMap = new Map();
+            let excludedConnectionsCount = 0;
+            rawConnectionDateMap.forEach((ts, url) => {
+                if (allowlist.hasConnectInvite(url)) connectionDateMap.set(url, ts);
+                else excludedConnectionsCount++;
+            });
+            allowlist.manualHlDates.forEach((ts, url) => {
+                if (!connectionDateMap.has(url)) connectionDateMap.set(url, ts);
+            });
+            if (excludedConnectionsCount > 0) {
+                diagnostics.push({
+                    source: 'connections (Pando/HealthLuminate-origin filter)',
+                    rows: connectionDateMap.size,
+                    note: `Excluded ${excludedConnectionsCount} connection-accepted event(s) with no matching Pando connection invite.`
+                });
+            }
+
+            const rawScheduledUrlSet = await wrLoad(diagnostics, 'meetings (activity_tracking + categories)', 'Loading scheduled meetings…', () => loadScheduledMeetings(emailsArr, inboxByUrl, inboxByBdr)) || new Set();
+            const scheduledUrlSet = new Set(Array.from(rawScheduledUrlSet).filter(u => allowlist.hasOutreach(u)));
+            const rawCurrentConnectionUrls = await wrLoad(diagnostics, 'heyreach_contacts', 'Loading current connections…', () => loadCurrentConnections(emailsArr)) || new Set();
+            // Only keep current LinkedIn connections for contacts Pando actually sent a connection request to
+            const currentConnectionUrls = new Set(Array.from(rawCurrentConnectionUrls).filter(u => allowlist.hasConnectInvite(u)));
+
+            // Map Pando conversation IDs → LinkedIn URLs so follow-up events without a URL can still be verified
+            const pandoConvIdToUrl = new Map();
+            inboxByBdr.forEach(e => {
+                if (e.conversationId && e.liUrl) pandoConvIdToUrl.set(String(e.conversationId).replace(/^webhook_/, ''), e.liUrl);
+                if (e.id && e.liUrl) pandoConvIdToUrl.set(String(e.id).replace(/^webhook_/, ''), e.liUrl);
+            });
+            const activityEvents = rawActivityEvents.filter(ev => {
+                if (mod.NON_PANDO_ACTIVITY_TYPES.has(ev.kind)) return false;
+                const cid = String(ev.conversationId || '').replace(/^webhook_/, '');
+                if (cid && nonPandoConvIds.has(cid)) return false;
+                const url = ev.liUrl || (cid ? pandoConvIdToUrl.get(cid) : '') || '';
+                if (mod.PANDO_ORIGINATING_ACTIVITY_TYPES.has(ev.kind)) return Boolean(url);
+                return Boolean(url && allowlist.hasOutreach(url));
+            });
+
+            const rawMeetingEvents = await wrLoad(diagnostics, 'activity_tracking (meeting_scheduled)', 'Loading meeting-scheduled records…', async () => {
                 const where_ = [['activity_type', '==', 'meeting_scheduled']];
                 const [a, b] = await Promise.all([
                     wrQueryIn('activity_tracking', 'bdr_email', emailsArr, { where: where_ }).catch(() => []),
@@ -2667,18 +2865,38 @@
                 const m = new Map(); [...a, ...b].forEach(d => m.set(d.id, d));
                 return Array.from(m.values());
             }) || [];
+            const meetingEvents = rawMeetingEvents.filter(m => {
+                const cid = String(m.conversation_id || '').replace(/^webhook_/, '');
+                if (cid && nonPandoConvIds.has(cid)) return false;
+                const url = normalizeUrl(m.contact_linkedin_url || '');
+                const rawBdr = String(m.bdr_email || m.bdr_auth_email || '').toLowerCase();
+                const canonBdr = emailToCanonical.get(rawBdr) || rawBdr;
+                if (url && inboundPairs.has(`${url}||${canonBdr}`)) return false;
+                return !url || allowlist.hasOutreach(url);
+            });
 
-            const sendEvents = [...activityEvents, ...quickEvents, ...slotEvents];
+            const sendEvents = [...activityEvents, ...quickEvents, ...slotEvents].filter(ev => {
+                const cid = String(ev.conversationId || '').replace(/^webhook_/, '');
+                if (cid && nonPandoConvIds.has(cid)) return false;
+                return true;
+            });
 
             // ── Company Conversations extras: CRM notes (comments) + category overrides ──
-            const crmNotes = await wrLoad(diagnostics, 'connect_linkedin_crm (CRM notes)', 'Loading CRM notes / comments…',
+            const rawCrmNotes = await wrLoad(diagnostics, 'connect_linkedin_crm (CRM notes)', 'Loading CRM notes / comments…',
                 () => wrQueryIn('connect_linkedin_crm', 'bdrEmail', emailsArr)) || [];
+            const crmNotes = rawCrmNotes.filter(n => {
+                const cid = String(n.conversationId || '').replace(/^webhook_/, '');
+                if (cid && nonPandoConvIds.has(cid)) return false;
+                const url = normalizeUrl(n.linkedInUrl || '');
+                const rawBdr = String(n.bdrEmail || '').toLowerCase();
+                const canonBdr = emailToCanonical.get(rawBdr) || rawBdr;
+                if (url && inboundPairs.has(`${url}||${canonBdr}`)) return false;
+                return !url || allowlist.hasOutreach(url);
+            });
             const overrides = await wrLoad(diagnostics, 'conversation_category_overrides', 'Loading conversation categories & flags…',
                 () => wrQueryIn('conversation_category_overrides', 'bdrEmail', emailsArr)) || [];
 
             // ── Activity records ──
-            const connectActivity = (await wrLoad(diagnostics, 'connect_activity', 'Loading quick-message push records…',
-                () => wrQueryIn('connect_activity', 'bdrEmail', emailsArr)) || []).filter(a => sinceOk(a.timestamp || a.createdAt));
             const exclusions = (await wrLoad(diagnostics, 'prospect_exclusions + connect_exclusions', 'Loading contact exclusions…', async () => {
                 const [a, b] = await Promise.all([
                     wrQueryIn('prospect_exclusions', 'excludedByBdr', emailsArr).catch(() => []),
@@ -2737,11 +2955,20 @@
                 diagnostics.push({ source: 'connect_analysis/latest.json', rows: 0, note: 'Skipped by option.' });
             }
 
-            // ── Assemble contact-level history (existing logic) ──
+            // ── Assemble contact-level history (Pando/HealthLuminate-originated only) ──
             const stAsm = wrStep('Assembling contact-level history…');
             buildStats = {};
             buildStats.sinceMs = 0;
-            const reportDataset = buildRows(sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet, bdrEmailToName, bdrEmailToCompany, currentConnectionUrls, emailToCanonical, sendEvents);
+            const reportDataset = buildRows(
+                sentItems, inboxByUrl, inboxByBdr, connectionDateMap, scheduledUrlSet,
+                bdrEmailToName, bdrEmailToCompany, currentConnectionUrls, emailToCanonical, sendEvents,
+                {
+                    pandoOnly: true,
+                    allowlist,
+                    inboundPairs,
+                    isPandoConversation: e => mod.isPandoConversation(e, allowlist, canonEmailsSet)
+                }
+            );
             wrStepDone(stAsm, `Assembling contact-level history: ${reportDataset.length.toLocaleString()} contacts`);
             diagnostics.push({ source: 'contact-level dataset (buildRows)', rows: reportDataset.length, note: buildStats.eventsWithoutContact ? `${buildStats.eventsWithoutContact} send records had no LinkedIn URL and could not be matched to a contact` : '' });
 
@@ -2752,6 +2979,7 @@
                 company: { name: company, emails: emailsArr, bdrs: bdrs.map(b => ({ name: b.name || '', email: (b.primaryEmail || b.id || '').toLowerCase() })) },
                 canon: canonObj, bdrNames: namesObj,
                 diagnostics,
+                allowlist, allConnectActivity, manualHarvest,
                 hypothesisGroups: companyGroups,
                 queue, dataset: reportDataset, inbox: inboxByBdr, meetingEvents, sendEvents,
                 crmNotes, overrides, connectActivity, exclusions, workLog,

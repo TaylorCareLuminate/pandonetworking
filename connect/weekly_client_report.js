@@ -11,7 +11,7 @@
  * Also importable from Node for tests (no browser globals used).
  */
 
-export const REPORT_VERSION = '2026-11-17.1';
+export const REPORT_VERSION = '2026-11-19.1';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Small helpers
@@ -76,8 +76,232 @@ export function normUrl(url) {
     return String(url).toLowerCase().trim().split(/[?#]/)[0].replace(/\/$/, '').replace(/^https?:\/\//i, '').replace(/^www\./i, '');
 }
 
+/** Extract the LinkedIn `/in/<slug>` identifier for cross-source matching (handles country subdomains & URL encoding). */
+export function liSlug(url) {
+    if (!url) return '';
+    const raw = String(url).trim().split(/[?#]/)[0];
+    const m = raw.match(/linkedin\.com\/in\/([^/]+)/i);
+    if (!m) return '';
+    let slug = m[1].toLowerCase().trim();
+    try { slug = decodeURIComponent(slug).toLowerCase().trim(); } catch (_) {}
+    return slug;
+}
+
 const normConvId = s => String(s || '').replace(/^webhook_/, '');
 const isTrue = v => v === true || v === 'true';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pando / HealthLuminate origin helpers
+// ─────────────────────────────────────────────────────────────────────────────
+// The executive's LinkedIn inbox (`heyreach_inbox`) and connection list (`heyreach_contacts`)
+// mirror their ENTIRE LinkedIn account — including pre-existing connections, personal chats,
+// inbound cold pitches/recruiters where the other person wrote first, and mirrored post comments
+// (`kind: 'post_reply'`). None of those originated from Pando/HealthLuminate and none belong in
+// the Weekly Client Report.
+const LEAD_SENDERS = new Set(['correspondent', 'lead', 'them', 'inbound', 'contact']);
+const OUR_SENDERS  = new Set(['me', 'account', 'outbound', 'bdr']);
+
+/** Activity types recorded from non-Pando personal-inbox tools (personal_messages.html). */
+export const NON_PANDO_ACTIVITY_TYPES = new Set(['personal_message_reply']);
+
+/** Activity types that themselves initiate Pando/HealthLuminate outreach to a contact. */
+export const PANDO_ORIGINATING_ACTIVITY_TYPES = new Set([
+    'fast_outreach_message',
+    'fast_outreach_bulk_message',
+    'fast_message_via_conversation',
+    'bulk_follow_up_message',
+    'harvest_follow_up_message'
+]);
+
+export function extractQueueUrl(d) {
+    if (!d) return '';
+    return normUrl(
+        d.prospect_li_url || d.contact_linkedin_url || d.prospect_linkedin_url ||
+        d.linkedin_url || d.linkedInUrl || d.contactLinkedInUrl || ''
+    );
+}
+
+export function isQueueItemSent(d) {
+    if (!d) return false;
+    return isTrue(d.pushed_to_heyreach) || Boolean(d.pushed_to_heyreach_at || d.pushed_at) || lc(d.status) === 'sent';
+}
+
+export function isConnectInviteItem(d) {
+    const t = lc((d && d.message_type) || 'connect');
+    return t === 'connect' || t === 'connection' || t === 'connect_only';
+}
+
+/**
+ * True when the conversation thread was initiated by our side (BDR / Pando) rather than inbound
+ * by the contact. Mirrors `company_review_replies.html` (`convFirstMessageInbound`),
+ * `index_admin.html` (`_liAlertFirstMessageInbound`), `inbox_interest.js`, and server
+ * `conversationStartedByUs()`, with an explicit allowance for `connect_only` blank connection
+ * requests sent prior to the contact's first message.
+ */
+export function conversationStartedByUs(rawMessages, opts = {}) {
+    if (!Array.isArray(rawMessages) || rawMessages.length === 0) return true;
+    const nonEmpty = rawMessages.filter(m => m && String(m.body ?? m.text ?? m.message ?? '').trim().length > 0);
+    const list = nonEmpty.length ? nonEmpty : rawMessages;
+    let ordered = list;
+    const dated = list.map(m => ({ m, at: toDate(m && (m.createdAt || m.timestamp || m.created_at || m.sentAt || m.date || m.datetime)) }));
+    if (dated.every(x => x.at)) {
+        ordered = dated.slice().sort((a, b) => a.at - b.at).map(x => x.m);
+    }
+    const first = ordered[0] || {};
+    const sender = lc(first.senderType || first.sender || first.direction || '');
+    if (LEAD_SENDERS.has(sender)) {
+        if (opts && opts.hadPriorBlankInvite) {
+            const firstAt = toDate(first.createdAt || first.timestamp || first.created_at || first.sentAt || first.date || first.datetime);
+            if (!opts.blankInviteAt || !firstAt || opts.blankInviteAt <= firstAt) return true;
+        }
+        return false;
+    }
+    return OUR_SENDERS.has(sender);
+}
+
+/**
+ * Build the allowlist of contacts whose outreach or connection originated from Pando/HealthLuminate.
+ */
+export function buildPandoOriginAllowlist(src = {}) {
+    const outreachUrls       = new Set();
+    const outreachSlugs      = new Set();
+    const connectInviteUrls  = new Set();
+    const connectInviteSlugs = new Set();
+    const blankInviteAtByKey = new Map();
+    const manualHlDates      = new Map();
+
+    const addOutreach = rawUrl => {
+        const u = normUrl(rawUrl);
+        if (u) outreachUrls.add(u);
+        const sl = liSlug(rawUrl);
+        if (sl) outreachSlugs.add(sl);
+    };
+    const addConnectInvite = rawUrl => {
+        addOutreach(rawUrl);
+        const u = normUrl(rawUrl);
+        if (u) connectInviteUrls.add(u);
+        const sl = liSlug(rawUrl);
+        if (sl) connectInviteSlugs.add(sl);
+    };
+    const recordBlankInvite = (rawUrl, at) => {
+        const dt = toDate(at);
+        for (const k of [normUrl(rawUrl), liSlug(rawUrl)]) {
+            if (!k) continue;
+            const prev = blankInviteAtByKey.get(k);
+            if (prev === undefined || (dt && (!prev || dt < prev))) blankInviteAtByKey.set(k, dt || null);
+        }
+    };
+
+    // 1) connect_queue items actually sent/pushed by PandoConnect
+    (src.queue || []).forEach(raw => {
+        const d = raw && raw.d ? raw.d : raw;
+        if (!isQueueItemSent(d)) return;
+        const u = extractQueueUrl(d);
+        if (!u) return;
+        if (isConnectInviteItem(d)) {
+            addConnectInvite(u);
+            const noteText = String(
+                d.message_to_contact || d.message || d.messageText || d.messageContent ||
+                d.custom_message || d.note || d.connection_note || ''
+            ).trim();
+            if (isTrue(d.connection_only) || !noteText) {
+                recordBlankInvite(u, d.pushed_to_heyreach_at || d.pushed_at || d.adminApprovedAt || d.customerApprovedAt || d.created_at || d.uploaded_date || d.generated_at);
+            }
+        } else {
+            addOutreach(u);
+        }
+    });
+
+    // 2) connect_activity push records (excluding profile-search logs and failed pushes)
+    (src.connectActivity || []).forEach(a => {
+        if (!a) return;
+        if (lc(a.activityType) === 'search' || lc(a.status) === 'failed') return;
+        const u = a.contactLinkedInUrl || a.prospect_li_url || a.linkedin_url || a.linkedInUrl || a.leadProfileUrl || '';
+        if (!u) return;
+        const via = lc(a.via);
+        const actionType = lc(a.actionType);
+        const isMsgOnly = via.includes('quick_message') || via.includes('message_campaign') || actionType.includes('message') || lc(a.activityType) === 'message';
+        if (isMsgOnly) addOutreach(u);
+        else addConnectInvite(u);
+    });
+
+    // 3) Quick Message campaign leads pushed by PandoConnect
+    (src.quickEvents || []).forEach(e => {
+        if (e) addOutreach(e.liUrl || e.linkedinUrl || '');
+    });
+
+    // 4) Scheduled DM slots queued & sent via PandoConnect (linkedin_message_queue)
+    (src.slotEvents || []).forEach(e => {
+        if (e) addOutreach(e.liUrl || e.recipientLinkedInUrl || '');
+    });
+
+    // 5) Outbound Pando tools in activity_tracking (fast outreach, fast message, bulk/harvest follow-ups)
+    (src.activityEvents || []).forEach(e => {
+        if (!e) return;
+        const kind = e.kind || e.activity_type || '';
+        if (NON_PANDO_ACTIVITY_TYPES.has(kind)) return;
+        if (PANDO_ORIGINATING_ACTIVITY_TYPES.has(kind)) addOutreach(e.liUrl || e.contact_linkedin_url || '');
+    });
+
+    // 6) Contacts manually labeled "Pando Executive Networking originated" in Harvest Pool Admin
+    (src.manualHarvest || []).forEach(m => {
+        if (!m || m.originType !== 'healthluminate') return;
+        const raw = m.linkedInUrl || m.normalizedUrl || '';
+        const u = normUrl(raw);
+        if (!u) return;
+        addConnectInvite(u);
+        const dt = toDate(m.referenceDate);
+        if (dt && (!manualHlDates.has(u) || dt < manualHlDates.get(u))) manualHlDates.set(u, dt);
+    });
+
+    const hasOutreach = rawUrl => {
+        if (!rawUrl) return false;
+        const u = normUrl(rawUrl);
+        if (u && outreachUrls.has(u)) return true;
+        const sl = liSlug(rawUrl);
+        return Boolean(sl && outreachSlugs.has(sl));
+    };
+    const hasConnectInvite = rawUrl => {
+        if (!rawUrl) return false;
+        const u = normUrl(rawUrl);
+        if (u && connectInviteUrls.has(u)) return true;
+        const sl = liSlug(rawUrl);
+        return Boolean(sl && connectInviteSlugs.has(sl));
+    };
+    const blankInviteInfo = rawUrl => {
+        if (!rawUrl) return { hadPriorBlankInvite: false, blankInviteAt: null };
+        const u = normUrl(rawUrl);
+        if (u && blankInviteAtByKey.has(u)) return { hadPriorBlankInvite: true, blankInviteAt: blankInviteAtByKey.get(u) };
+        const sl = liSlug(rawUrl);
+        if (sl && blankInviteAtByKey.has(sl)) return { hadPriorBlankInvite: true, blankInviteAt: blankInviteAtByKey.get(sl) };
+        return { hadPriorBlankInvite: false, blankInviteAt: null };
+    };
+
+    return {
+        outreachUrls,
+        outreachSlugs,
+        connectInviteUrls,
+        connectInviteSlugs,
+        manualHlDates,
+        size: outreachUrls.size,
+        hasOutreach,
+        hasConnectInvite,
+        blankInviteInfo
+    };
+}
+
+/**
+ * True when a `heyreach_inbox` conversation originated from Pando/HealthLuminate for this client:
+ * not a post comment (`kind: 'post_reply'`), belongs to a BDR in scope, has a Pando outreach
+ * record for the contact, and was initiated by our side rather than inbound by the contact.
+ */
+export function isPandoConversation(entry, allowlist, allowedEmails = null) {
+    if (!entry || lc(entry.kind) === 'post_reply') return false;
+    if (allowedEmails && allowedEmails.size && entry.bdrEmail && !allowedEmails.has(lc(entry.bdrEmail))) return false;
+    if (!entry.liUrl || !allowlist || !allowlist.hasOutreach(entry.liUrl)) return false;
+    const bi = allowlist.blankInviteInfo(entry.liUrl);
+    return conversationStartedByUs(entry.rawMessages || [], bi);
+}
 const bump = (map, key, n = 1) => { if (key) map.set(key, (map.get(key) || 0) + n); };
 const sumRange = (map, a, b) => { let t = 0; map.forEach((v, k) => { if (k >= a && k <= b) t += v; }); return t; };
 
@@ -155,6 +379,7 @@ export function assembleReport(inp) {
     const clientName = inp.company.name;
     const diag = (inp.diagnostics || []).slice();
     const emailSet = new Set((inp.company.emails || []).map(lc));
+    const canonEmailSet = new Set([...emailSet, ...[...emailSet].map(canonical), ...((inp.company.bdrs || []).map(b => canonical(b.email)))].filter(Boolean));
     const groupName = {};
     (inp.hypothesisGroups || []).forEach(g => { groupName[g.id] = g.name || g.id; });
 
@@ -166,7 +391,7 @@ export function assembleReport(inp) {
         const ln = d.contactLastName || d.prospect_last_name || d.lastName || '';
         return {
             d, id: d.id, bdr,
-            url: normUrl(d.prospect_li_url || d.contact_linkedin_url || d.linkedin_url || d.linkedInUrl || ''),
+            url: extractQueueUrl(d),
             name: (fn + ' ' + ln).trim() || d.leadName || d.prospect_name || '',
             title: d.contactTitle || d.prospect_title || d.prospect_position || d.position || d.title || '',
             company: d.contactCompany || d.prospect_company || d.company || d.company_name || '',
@@ -179,13 +404,53 @@ export function assembleReport(inp) {
             deletedAt: toDate(d.deleted_date || d.deletedAt),
             deletedBy: d.deleted_by || d.deletedBy || '',
             deletedReason: d.deleted_reason || d.deletionMethod || '',
-            pushed: isTrue(d.pushed_to_heyreach),
+            pushed: isQueueItemSent(d),
             pushedAt: toDate(d.pushed_to_heyreach_at || d.pushed_at),
             sentAt: toDate(d.pushed_to_heyreach_at || d.pushed_at || d.adminApprovedAt || d.customerApprovedAt || d.created_at || d.uploaded_date || d.generated_at),
             reviewStatus: rs
         };
     });
     const sentQ = queue.filter(q => q.pushed);
+
+    // ── Pando / HealthLuminate origin filter ────────────────────────────────
+    // Exclude connections, messages, and conversations that did not originate from Pando/HealthLuminate
+    // (organic LinkedIn chats, pre-existing connections, inbound-initiated conversations, post comments,
+    // and personal_messages.html replies).
+    const allowlist = inp.allowlist || buildPandoOriginAllowlist({
+        queue: inp.queue || [],
+        connectActivity: inp.allConnectActivity || inp.connectActivity || [],
+        quickEvents: (inp.sendEvents || []).filter(e => e && e.kind === 'quick_message_campaign'),
+        slotEvents: (inp.sendEvents || []).filter(e => e && e.kind === 'scheduled_message'),
+        activityEvents: inp.sendEvents || [],
+        manualHarvest: inp.manualHarvest || []
+    });
+    const hasOriginAllowlist = Boolean(
+        inp.allowlist ||
+        (inp.queue && inp.queue.length) ||
+        (inp.allConnectActivity && inp.allConnectActivity.length) ||
+        (inp.connectActivity && inp.connectActivity.length) ||
+        (inp.sendEvents && inp.sendEvents.length) ||
+        (inp.manualHarvest && inp.manualHarvest.length)
+    );
+
+    const nonPandoConvIds = new Set();
+    const inboundPairs = new Set();
+    const pandoInbox = [];
+    (inp.inbox || []).forEach(e => {
+        if (isPandoConversation(e, allowlist, canonEmailSet)) {
+            pandoInbox.push(e);
+        } else {
+            if (e && e.id) nonPandoConvIds.add(normConvId(e.id));
+            if (e && e.conversationId) nonPandoConvIds.add(normConvId(e.conversationId));
+            const bi = allowlist.blankInviteInfo(e && e.liUrl);
+            if (e && e.liUrl && !conversationStartedByUs(e.rawMessages || [], bi)) {
+                const b = canonical(e.bdrEmail || '');
+                inboundPairs.add(`${normUrl(e.liUrl)}||${b}`);
+                const sl = liSlug(e.liUrl);
+                if (sl) inboundPairs.add(`${sl}||${b}`);
+            }
+        }
+    });
 
     const queuePage = q => {
         const d = q.d;
@@ -223,7 +488,18 @@ export function assembleReport(inp) {
 
     // ── Dataset rows (contact-level history built by the page's buildRows) ──
     const rowInfo = new Map();
-    const dataset = inp.dataset || [];
+    const dataset = (inp.dataset || []).filter(r => {
+        if (!r) return false;
+        const bdr = canonical(r.bdr_email || '');
+        if (bdr && canonEmailSet.size && !canonEmailSet.has(bdr)) return false;
+        if (r.outreach_sources === 'HeyReach conversation') return false;
+        if (hasOriginAllowlist && !allowlist.hasOutreach(r.contact_linkedin_url)) return false;
+        const u = normUrl(r.contact_linkedin_url || '');
+        const sl = liSlug(r.contact_linkedin_url || '');
+        if ((u && inboundPairs.has(`${u}||${bdr}`)) || (sl && inboundPairs.has(`${sl}||${bdr}`))) return false;
+        if (!conversationStartedByUs(r.conversation_history || [], allowlist.blankInviteInfo(r.contact_linkedin_url))) return false;
+        return true;
+    });
     dataset.forEach(r => {
         const hist = r.conversation_history || [];
         const bdrDays = new Set(), contactDays = new Set();
@@ -237,19 +513,26 @@ export function assembleReport(inp) {
         });
         contactDays.forEach(dk => bump(S.repliedContacts, dk));
         const connDay = r.connection_datetime ? dayKey(r.connection_datetime) : (r.connection_date || '');
-        if (r.connected === 1 && connDay) bump(S.accepted, connDay);
-        rowInfo.set(r, { bdrDays, contactDays, connDay, firstDay: firstBdr || r.first_outreach_date || '' });
+        const pandoConn = r.connected === 1 && (!hasOriginAllowlist || allowlist.hasConnectInvite(r.contact_linkedin_url));
+        if (pandoConn && connDay) bump(S.accepted, connDay);
+        rowInfo.set(r, { bdrDays, contactDays, connDay: pandoConn ? connDay : '', pandoConn, firstDay: firstBdr || r.first_outreach_date || '' });
     });
 
     // ── Meetings scheduled (activity_tracking meeting_scheduled, deduped per contact) ──
     const meetingByUrl = new Map();
     (inp.meetingEvents || []).forEach(m => {
+        if (m.conversation_id && nonPandoConvIds.has(normConvId(m.conversation_id))) return;
         const url = normUrl(m.contact_linkedin_url || '');
+        const sl = liSlug(m.contact_linkedin_url || '');
+        const bdr = canonical(m.bdr_email || m.bdr_auth_email || '');
+        if (bdr && canonEmailSet.size && !canonEmailSet.has(bdr)) return;
+        if (hasOriginAllowlist && url && !allowlist.hasOutreach(url)) return;
+        if ((url && inboundPairs.has(`${url}||${bdr}`)) || (sl && inboundPairs.has(`${sl}||${bdr}`))) return;
         const day = dayKey(m.scheduled_at || m.meeting_scheduled_date || m.timestamp || m.created_at || m.createdAt);
         if (!day) return;
         const key = url || m.id;
         if (!meetingByUrl.has(key) || day < meetingByUrl.get(key).day) {
-            meetingByUrl.set(key, { day, by: m.scheduled_by || '', bdr: canonical(m.bdr_email || m.bdr_auth_email || ''), name: m.contact_name || '', company: m.contact_company || '', url });
+            meetingByUrl.set(key, { day, by: m.scheduled_by || '', bdr, name: m.contact_name || '', company: m.contact_company || '', url });
         }
     });
     meetingByUrl.forEach(v => bump(S.meetings, v.day));
@@ -258,10 +541,29 @@ export function assembleReport(inp) {
     const sendEvents = (inp.sendEvents || []).map(e => {
         const known = (e.rawBdrs || []).find(x => canon[lc(x)]);
         return { ...e, bdr: e.bdrEmail ? canonical(e.bdrEmail) : (known ? canonical(known) : ''), day: dayKey(e.date) };
+    }).filter(e => {
+        if (NON_PANDO_ACTIVITY_TYPES.has(e.kind)) return false;
+        if (e.bdr && canonEmailSet.size && !canonEmailSet.has(e.bdr)) return false;
+        if (e.conversationId && nonPandoConvIds.has(normConvId(e.conversationId))) return false;
+        const u = normUrl(e.liUrl || '');
+        const sl = liSlug(e.liUrl || '');
+        if ((u && inboundPairs.has(`${u}||${e.bdr}`)) || (sl && inboundPairs.has(`${sl}||${e.bdr}`))) return false;
+        if (PANDO_ORIGINATING_ACTIVITY_TYPES.has(e.kind) || e.kind === 'quick_message_campaign' || e.kind === 'scheduled_message') return true;
+        return !hasOriginAllowlist || (Boolean(e.liUrl) && allowlist.hasOutreach(e.liUrl));
     });
     sendEvents.forEach(e => bump(S.followUps, e.day));
 
-    (inp.crmNotes || []).forEach(n => bump(S.crmNotes, dayKey(n.createdAt)));
+    const pandoCrmNotes = (inp.crmNotes || []).filter(n => {
+        const bdr = canonical(n.bdrEmail || '');
+        if (bdr && canonEmailSet.size && !canonEmailSet.has(bdr)) return false;
+        if (n.conversationId && nonPandoConvIds.has(normConvId(n.conversationId))) return false;
+        const u = normUrl(n.linkedInUrl || '');
+        const sl = liSlug(n.linkedInUrl || '');
+        if ((u && inboundPairs.has(`${u}||${bdr}`)) || (sl && inboundPairs.has(`${sl}||${bdr}`))) return false;
+        if (hasOriginAllowlist && u && !allowlist.hasOutreach(u)) return false;
+        return true;
+    });
+    pandoCrmNotes.forEach(n => bump(S.crmNotes, dayKey(n.createdAt)));
     (inp.exclusions || []).forEach(x => bump(S.exclusions, dayKey(x.excludedAt)));
     (inp.pipelineRuns || []).forEach(r => bump(S.pipelineRuns, dayKey(r.startedAt)));
     (inp.contactSearches || []).forEach(j => bump(S.contactScans, dayKey(j.submittedAt)));
@@ -271,7 +573,7 @@ export function assembleReport(inp) {
     // ── Funnel helper (contact cohort) ──────────────────────────────────────
     const funnel = rows => {
         const n = rows.length;
-        const connected = rows.filter(r => r.connected === 1).length;
+        const connected = rows.filter(r => { const info = rowInfo.get(r); return info ? info.pandoConn : r.connected === 1; }).length;
         const replied = rows.filter(r => r.replied === 1).length;
         const scheduled = rows.filter(r => r.scheduled === 1).length;
         return {
@@ -489,7 +791,7 @@ export function assembleReport(inp) {
             hypothesis_group: r.hypothesis_group_id ? (groupName[r.hypothesis_group_id] || r.hypothesis_group_name || r.hypothesis_group_id) : '',
             hypothesis_variation: r.hypothesis_variation_label || '',
             first_outreach_date: i.firstDay, last_message_date: r.last_message_date,
-            connected: yn(r.connected === 1), connection_date: r.connection_date, currently_connected: yn(r.currently_connected_on_linkedin === 1),
+            connected: yn(i.pandoConn), connection_date: i.pandoConn ? r.connection_date : '',
             replied: yn(r.replied === 1), scheduled: yn(r.scheduled === 1), meeting_date: meet ? meet.day : '',
             reached_in_period: yn(flags.reached_in_period), connected_in_period: yn(flags.connected_in_period),
             bdr_msg_in_period: yn(flags.bdr_msg_in_period), contact_msg_in_period: yn(flags.contact_msg_in_period), meeting_in_period: yn(flags.meeting_in_period),
@@ -504,12 +806,12 @@ export function assembleReport(inp) {
         col('contact_name', 'Contact Name', 22), col('contact_title', 'Title', 28), col('contact_company', 'Company', 26),
         col('linkedin_url', 'LinkedIn URL', 34), col('bdr_name', 'BDR', 20), col('bdr_email', 'BDR Email', 26), col('client_company', 'Client', 20),
         col('message_type', 'Message Type', 20, 'How the opening message was written (post reply, news, profile, etc.).'),
-        col('outreach_sources', 'How We Reached Them', 28, 'Every route used: connection request, campaign message, follow-up/reply, quick message, fast outreach, scheduled DM, HeyReach thread.'),
+        col('outreach_sources', 'How We Reached Them', 28, 'Every Pando/HealthLuminate route used: connection request, campaign message, follow-up/reply, quick message, fast outreach, scheduled DM.'),
         col('hypothesis_group', 'Hypothesis Group', 28, 'The targeting hypothesis (audience + angle) this contact belongs to.'),
         col('hypothesis_variation', 'Message Variation', 22, 'A/B message variation used (if any).'),
         col('first_outreach_date', 'First Outreach Date', 14), col('last_message_date', 'Last Message Date', 14),
-        col('connected', 'Connection Accepted', 11, 'Yes if a connection-accepted event was recorded.'),
-        col('connection_date', 'Connection Date', 14), col('currently_connected', 'Currently Connected (Any Source)', 14),
+        col('connected', 'Connection Accepted', 11, 'Yes if a connection request originated by Pando/HealthLuminate was accepted.'),
+        col('connection_date', 'Connection Date', 14),
         col('replied', 'Replied', 9), col('scheduled', 'Meeting Scheduled', 11), col('meeting_date', 'Meeting Logged Date', 14),
         col('reached_in_period', 'First Reached In Period', 12), col('connected_in_period', 'Accepted In Period', 12),
         col('bdr_msg_in_period', 'We Messaged In Period', 12), col('contact_msg_in_period', 'They Replied In Period', 12), col('meeting_in_period', 'Meeting In Period', 12),
@@ -570,7 +872,7 @@ export function assembleReport(inp) {
         ovByConv.set(key, merged);
     });
     const notesByConv = new Map(), notesByUrlBdr = new Map();
-    (inp.crmNotes || []).forEach(n => {
+    pandoCrmNotes.forEach(n => {
         const k = normConvId(n.conversationId);
         if (k) { if (!notesByConv.has(k)) notesByConv.set(k, []); notesByConv.get(k).push(n); }
         const uk = `${normUrl(n.linkedInUrl)}||${canonical(n.bdrEmail)}`;
@@ -579,7 +881,7 @@ export function assembleReport(inp) {
     });
     const isLeadMsg = m => m.sender === 'CORRESPONDENT' || m.sender === 'lead' || m.direction === 'inbound';
     const replyRowsAll = [];
-    (inp.inbox || []).forEach(e => {
+    pandoInbox.forEach(e => {
         if (!e.hasLeadReply) return;
         const ov = ovByConv.get(normConvId(e.id)) || ovByConv.get(normConvId(e.conversationId)) || {};
         const msgs = (e.rawMessages || []).map(m => ({ lead: isLeadMsg(m), at: toDate(m.createdAt || m.timestamp || m.created_at), text: (m.body || m.text || m.message || '').trim() }));
@@ -654,7 +956,7 @@ export function assembleReport(inp) {
     };
 
     // ── Sheet: CRM_Notes (comments) ─────────────────────────────────────────
-    const noteRows = (inp.crmNotes || []).filter(n => scopeAll || inP(dayKey(n.createdAt), P.start, P.end))
+    const noteRows = pandoCrmNotes.filter(n => scopeAll || inP(dayKey(n.createdAt), P.start, P.end))
         .map(n => ({
             created_at: fmtDT(n.createdAt), created_by: n.createdBy || '', bdr_name: bdrNameOf(n.bdrEmail), bdr_email: canonical(n.bdrEmail),
             contact_name: n.leadName || '', contact_title: n.leadPosition || '', contact_company: n.leadCompany || '', linkedin_url: normUrl(n.linkedInUrl),
@@ -851,7 +1153,7 @@ export function assembleReport(inp) {
         add(noon(day), tool.includes('pipeline') ? 'full_pipeline' : (tool.includes('generate') ? 'generate_messages' : 'fast_connect_review'), 'review', 'contacts_excluded', actor, bdr, `${arr.length} contact(s) excluded from outreach${tool ? ` (${tool})` : ''}`, arr.length, '', 'prospect_exclusions / connect_exclusions');
     });
     // follow-ups/replies/fast outreach events
-    const KIND_PAGE = { follow_up_message: 'company_review_replies', fast_message_via_conversation: 'fast_message_speedup', fast_outreach_message: 'current_connections_fast_outreach', fast_outreach_bulk_message: 'current_connections_fast_outreach', personal_message_reply: 'personal_messages', quick_message_campaign: 'quick message campaign', scheduled_message: 'linkedin scheduled DMs' };
+    const KIND_PAGE = { follow_up_message: 'company_review_replies', bulk_follow_up_message: 'company_review_replies', harvest_follow_up_message: 'company_review_replies', fast_message_via_conversation: 'fast_message_speedup', fast_outreach_message: 'current_connections_fast_outreach', fast_outreach_bulk_message: 'current_connections_fast_outreach', quick_message_campaign: 'quick message campaign', scheduled_message: 'linkedin scheduled DMs' };
     aggregate(sendEvents.filter(e => inP(e.day, P.start, P.end)), e => [e.day, e.bdr, e.kind].join('|'), (arr, k) => {
         const [day, bdr, kind] = k.split('|');
         add(noon(day), KIND_PAGE[kind] || kind, 'follow-up', kind, '', bdr, `${arr.length} follow-up/reply message(s) sent (${kind})`, arr.length, '', 'activity_tracking / quick_message_campaign_leads / linkedin_message_queue');
@@ -860,7 +1162,7 @@ export function assembleReport(inp) {
         if (!inP(m.day, P.start, P.end)) return;
         add(noon(m.day), 'company_review_replies', 'outcome', 'meeting_scheduled', m.by, m.bdr, `Meeting scheduled with ${m.name || m.url}${m.company ? ' (' + m.company + ')' : ''}`, 1, '', 'activity_tracking');
     });
-    aggregate((inp.crmNotes || []).filter(n => inP(dayKey(n.createdAt), P.start, P.end)), n => [dayKey(n.createdAt), canonical(n.bdrEmail), n.createdBy || ''].join('|'), (arr, k) => {
+    aggregate(pandoCrmNotes.filter(n => inP(dayKey(n.createdAt), P.start, P.end)), n => [dayKey(n.createdAt), canonical(n.bdrEmail), n.createdBy || ''].join('|'), (arr, k) => {
         const [day, bdr, actor] = k.split('|');
         add(noon(day), 'company_review_replies', 'review', 'crm_notes_added', actor, bdr, `${arr.length} conversation note(s) added`, arr.length, '', 'connect_linkedin_crm');
     });
@@ -1146,8 +1448,9 @@ export function buildInstructions(report) {
     w('8. **Appendix: data notes** — any caveats (see section 5 below and the `Load_Diagnostics` sheet).');
     w('');
     w('## 3. Key definitions');
-    w('- **Outreach sent / contacts reached** — distinct prospects whose connection request or message was pushed to the sending platform. The date used is the push/approval date.');
-    w('- **Accepted (connected)** — LinkedIn recorded the prospect accepting our connection request.');
+    w('- **Pando / HealthLuminate-originated only** — every sheet in this workbook is filtered to connections, messages and conversations that originated from our outreach platform. Pre-existing LinkedIn connections, inbound-initiated conversations (where the other person messaged first) and personal LinkedIn chats outside our campaigns are excluded.');
+    w('- **Outreach sent / contacts reached** — distinct prospects whose connection request or message was pushed to the sending platform by our team. The date used is the push/approval date.');
+    w('- **Accepted (connected)** — LinkedIn recorded the prospect accepting a connection request originated by us.');
     w('- **Replied** — the prospect sent at least one message back (any time, or "in period" when stated).');
     w('- **Meeting scheduled** — a meeting-scheduled record was logged (or the conversation was categorised "Scheduled").');
     w('- **Accept % / Reply % / Meeting %** — each divided by contacts reached. **Replied % of accepted** and **Meetings % of replied** are the step conversion rates. **Contacts per meeting** = contacts reached ÷ meetings (lower is better).');
