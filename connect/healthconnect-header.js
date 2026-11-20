@@ -136,7 +136,7 @@ const HEALTHCONNECT_CONFIG = {
                 { label: 'A/B Outcome Comparison', href: 'ab_outcomes_comparison.html', icon: 'fa-balance-scale-left' },
                 { label: 'Connect Success Analysis', href: 'analysis_results.html', icon: 'fa-lightbulb' },
                 { label: 'Analysis Dataset (Probit)', href: 'analysis_data.html', icon: 'fa-database' },
-                { label: 'AI Instructions & Training Data', href: 'ai_instructions_training.html', icon: 'fa-wand-magic-sparkles' },
+                { label: 'AI Reply Instructions & Training Data', href: 'ai_instructions_training.html', icon: 'fa-wand-magic-sparkles' },
                 { label: 'Phrase Explorer', href: 'phrase_explorer.html', icon: 'fa-spell-check' },
                 { label: 'Research Hypotheses', href: 'connect_hypothesis_documentation.html', icon: 'fa-flask' },
                 { label: 'Target Contact / Exclude Rules', href: 'hypothesis_target_rules.html', icon: 'fa-crosshairs' },
